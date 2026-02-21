@@ -282,6 +282,8 @@ dependencies = [
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-func",
+ "fsqlite-mvcc",
+ "fsqlite-observability",
  "fsqlite-pager",
  "fsqlite-parser",
  "fsqlite-planner",

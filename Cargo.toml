@@ -33,6 +33,8 @@ fsqlite-planner = { path = "/dp/frankensqlite/crates/fsqlite-planner" }
 fsqlite-wal = { path = "/dp/frankensqlite/crates/fsqlite-wal" }
 fsqlite-btree = { path = "/dp/frankensqlite/crates/fsqlite-btree" }
 fsqlite-ast = { path = "/dp/frankensqlite/crates/fsqlite-ast" }
+fsqlite-mvcc = { path = "/dp/frankensqlite/crates/fsqlite-mvcc" }
+fsqlite-observability = { path = "/dp/frankensqlite/crates/fsqlite-observability" }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }

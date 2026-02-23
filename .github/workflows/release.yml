@@ -223,6 +223,22 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      - name: Validate required artifacts present
+        run: |
+          MISSING=()
+          for platform in linux_amd64 darwin_amd64 darwin_arm64; do
+            if ! ls artifacts/br-*-${platform}.* 1>/dev/null 2>&1; then
+              MISSING+=("$platform")
+            fi
+          done
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "::error::Missing required platform artifacts: ${MISSING[*]}"
+            echo "Release cannot proceed without all required platforms."
+            echo "Missing: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "All required platform artifacts present."
+
       - name: Generate combined checksums
         run: |
           cd artifacts
@@ -292,8 +308,7 @@ jobs:
 
           | Platform | Architecture | File |
           |----------|--------------|------|
-          | Linux | x86_64 (musl, static) | `br-${{ github.ref_name }}-linux_amd64.tar.gz` |
-          | Linux | ARM64 (musl, static) | `br-${{ github.ref_name }}-linux_arm64.tar.gz` |
+          | Linux | x86_64 (gnu) | `br-${{ github.ref_name }}-linux_amd64.tar.gz` |
           | macOS | x86_64 (Intel) | `br-${{ github.ref_name }}-darwin_amd64.tar.gz` |
           | macOS | ARM64 (Apple Silicon) | `br-${{ github.ref_name }}-darwin_arm64.tar.gz` |
           | Windows | x86_64 | `br-${{ github.ref_name }}-windows_amd64.zip` |

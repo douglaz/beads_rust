@@ -1892,10 +1892,7 @@ impl SqliteStorage {
                 .and_then(SqliteValue::as_text)
                 .unwrap_or("")
                 .to_string();
-            let status = row
-                .get(1)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("");
+            let status = row.get(1).and_then(SqliteValue::as_text).unwrap_or("");
             let entry = counts.entry(epic_id).or_insert((0, 0));
             entry.0 += 1; // total
             if status == "closed" || status == "tombstone" {
@@ -2552,7 +2549,7 @@ impl SqliteStorage {
         issue_id: &str,
     ) -> Result<Vec<IssueWithDependencyMetadata>> {
         let rows = self.conn.query_with_params(
-            "SELECT d.depends_on_id, i.title, i.status, i.priority, d.type
+            "SELECT d.depends_on_id, i.title, i.status, i.priority, d.type, i.created_at
              FROM dependencies d
              LEFT JOIN issues i ON d.depends_on_id = i.id
              WHERE d.issue_id = ?

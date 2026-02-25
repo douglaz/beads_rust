@@ -417,7 +417,10 @@ fn execute_dry_run_inferred(
             let width = ctx.width();
 
             let mut content = Text::new("");
-            content.append_styled("Preview of content that would be added:\n\n", theme.dimmed.clone());
+            content.append_styled(
+                "Preview of content that would be added:\n\n",
+                theme.dimmed.clone(),
+            );
             // Show a truncated preview (first few lines)
             for line in AGENT_BLURB.lines().take(12) {
                 content.append_styled(line, theme.dimmed.clone());
@@ -435,7 +438,10 @@ fn execute_dry_run_inferred(
                 .box_style(theme.box_style);
             console.print_renderable(&panel);
         } else {
-            println!("Dry-run: would create {} with beads workflow instructions", target_path.display());
+            println!(
+                "Dry-run: would create {} with beads workflow instructions",
+                target_path.display()
+            );
             println!("\n--- Preview ---");
             println!("{AGENT_BLURB}");
         }

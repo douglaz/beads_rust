@@ -1028,7 +1028,10 @@ fn execute_import(
             println!("  Tombstone protected: {} issues", result.tombstone_skipped);
         }
         if result.orphans_removed > 0 {
-            println!("  Orphans removed: {} issues (not in JSONL)", result.orphans_removed);
+            println!(
+                "  Orphans removed: {} issues (not in JSONL)",
+                result.orphans_removed
+            );
         }
         println!("  Rebuilt blocked cache");
     }

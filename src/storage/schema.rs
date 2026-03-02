@@ -151,16 +151,22 @@ pub const SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor) WHERE actor != '';
 
     -- Config (Runtime)
+    -- NOTE: Avoid PRIMARY KEY/UNIQUE constraints here because the current
+    -- storage engine does not reliably maintain unique autoindexes.
+    -- Application code enforces key replacement via DELETE + INSERT.
     CREATE TABLE IF NOT EXISTS config (
-        key TEXT PRIMARY KEY,
+        key TEXT NOT NULL,
         value TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_config_key ON config(key);
 
     -- Metadata
+    -- Same rationale as config: keep it as key-value with explicit index.
     CREATE TABLE IF NOT EXISTS metadata (
-        key TEXT PRIMARY KEY,
+        key TEXT NOT NULL,
         value TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_metadata_key ON metadata(key);
 
     -- Dirty Issues (for export)
     CREATE TABLE IF NOT EXISTS dirty_issues (
@@ -272,7 +278,10 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     ("acceptance_criteria", "TEXT NOT NULL DEFAULT ''"),
     ("notes", "TEXT NOT NULL DEFAULT ''"),
     ("status", "TEXT NOT NULL DEFAULT 'open'"),
-    ("priority", "INTEGER NOT NULL DEFAULT 2 CHECK(priority >= 0 AND priority <= 4)"),
+    (
+        "priority",
+        "INTEGER NOT NULL DEFAULT 2 CHECK(priority >= 0 AND priority <= 4)",
+    ),
     ("issue_type", "TEXT NOT NULL DEFAULT 'task'"),
     ("assignee", "TEXT"),
     ("owner", "TEXT DEFAULT ''"),
@@ -474,8 +483,16 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     // This order must match EXPECTED_ISSUE_COLUMN_ORDER and SCHEMA_SQL.
     let all_expected: Vec<(&str, &str)> = std::iter::once(("id", "TEXT PRIMARY KEY"))
         .chain(std::iter::once(("content_hash", "TEXT")))
-        .chain(std::iter::once(("title", "TEXT NOT NULL CHECK(length(title) <= 500)")))
-        .chain(ISSUE_COLUMNS.iter().copied().filter(|(name, _)| *name != "content_hash"))
+        .chain(std::iter::once((
+            "title",
+            "TEXT NOT NULL CHECK(length(title) <= 500)",
+        )))
+        .chain(
+            ISSUE_COLUMNS
+                .iter()
+                .copied()
+                .filter(|(name, _)| *name != "content_hash"),
+        )
         .collect();
 
     let mut create_cols = Vec::new();
@@ -516,11 +533,64 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     Ok(())
 }
 
+fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
+    if !table_exists(conn, table) {
+        return false;
+    }
+
+    let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='key' AND pk=1");
+    conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
+}
+
+fn rebuild_kv_table_without_unique(conn: &Connection, table: &str) -> Result<()> {
+    let tmp_table = format!("{table}_rebuild_tmp");
+
+    conn.execute("BEGIN EXCLUSIVE")?;
+
+    let result = (|| -> Result<()> {
+        conn.execute(&format!("DROP TABLE IF EXISTS {tmp_table}"))?;
+        conn.execute(&format!(
+            "CREATE TABLE {tmp_table} (
+                key TEXT NOT NULL,
+                value TEXT NOT NULL
+            )"
+        ))?;
+
+        conn.execute(&format!(
+            "INSERT INTO {tmp_table} (key, value)
+             SELECT key, value
+             FROM {table}"
+        ))?;
+
+        conn.execute(&format!("DROP TABLE {table}"))?;
+        conn.execute(&format!("ALTER TABLE {tmp_table} RENAME TO {table}"))?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let _ = conn.execute("ROLLBACK");
+        return Err(err);
+    }
+
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
 /// Run pre-schema migrations to fix incompatible old tables.
 ///
 /// This must run BEFORE `execute_batch(SCHEMA_SQL)` because the schema includes
 /// CREATE INDEX statements that will fail if old tables have missing columns.
 fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
+    // Legacy schemas used PRIMARY KEY on config/metadata key columns.
+    // Rebuild to plain key-value tables so standard sqlite integrity checks
+    // are not tripped by unsupported unique-index maintenance behavior.
+    if kv_table_uses_primary_key(conn, "config") {
+        rebuild_kv_table_without_unique(conn, "config")?;
+    }
+    if kv_table_uses_primary_key(conn, "metadata") {
+        rebuild_kv_table_without_unique(conn, "metadata")?;
+    }
+
     // Drop blocked_issues_cache if it exists but lacks required columns.
     // The main schema will recreate it with the correct structure.
     if table_exists(conn, "blocked_issues_cache") {
@@ -599,19 +669,9 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE issues SET compaction_level = 0 WHERE compaction_level IS NULL")?;
     }
 
-    // Migration: ensure source_repo column exists (bd compatibility)
-    let has_source_repo: bool = conn
-        .query("SELECT 1 FROM pragma_table_info('issues') WHERE name='source_repo'")
-        .is_ok_and(|rows| !rows.is_empty());
-
-    if !has_source_repo {
-        conn.execute("ALTER TABLE issues ADD COLUMN source_repo TEXT NOT NULL DEFAULT '.'")?;
-    }
-
-    // Migration: ensure is_template column exists (needed for idx_issues_ready)
-    if !column_exists(conn, "issues", "is_template") {
-        conn.execute("ALTER TABLE issues ADD COLUMN is_template INTEGER DEFAULT 0")?;
-    }
+    // Note: source_repo and is_template column backfills are handled in
+    // run_pre_schema_migrations() via ensure_columns(). Repeating ALTER TABLE
+    // here can create duplicate column definitions on some engines.
 
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
@@ -708,6 +768,7 @@ mod tests {
     use super::*;
     use fsqlite::Connection;
     use std::collections::HashSet;
+    use tempfile::TempDir;
 
     #[test]
     fn test_apply_schema() {
@@ -740,6 +801,34 @@ mod tests {
         let row = conn.query_row("PRAGMA foreign_keys").unwrap();
         let foreign_keys = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn test_apply_schema_file_backed_has_no_duplicate_issues_columns() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        let row = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='issues'")
+            .expect("issues table should exist");
+        let issues_sql = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .expect("issues table SQL should be present");
+
+        assert_eq!(
+            issues_sql.matches("source_repo").count(),
+            1,
+            "issues table SQL should define source_repo exactly once"
+        );
+        assert_eq!(
+            issues_sql.matches("is_template").count(),
+            1,
+            "issues table SQL should define is_template exactly once"
+        );
     }
 
     /// Conformance test: Verify schema matches bd (Go) for interoperability.
@@ -1260,6 +1349,70 @@ mod tests {
                 .filter_map(|row| row.get(1).and_then(|v| v.as_text()).map(String::from))
                 .any(|col| col == "type"),
             "missing dependency type column"
+        );
+    }
+
+    #[test]
+    fn test_migration_rebuilds_legacy_config_metadata_primary_keys() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        execute_batch(
+            &conn,
+            r"
+            CREATE TABLE config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO config (key, value) VALUES ('issue_prefix', 'new');
+            INSERT INTO metadata (key, value) VALUES ('project', 'new');
+        ",
+        )
+        .unwrap();
+
+        apply_schema(&conn).unwrap();
+
+        // key column should no longer be PRIMARY KEY in rebuilt tables.
+        let config_key_pk = conn
+            .query("SELECT pk FROM pragma_table_info('config') WHERE name='key'")
+            .unwrap()
+            .first()
+            .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+            .unwrap_or(0);
+        assert_eq!(config_key_pk, 0);
+
+        let metadata_key_pk = conn
+            .query("SELECT pk FROM pragma_table_info('metadata') WHERE name='key'")
+            .unwrap()
+            .first()
+            .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+            .unwrap_or(0);
+        assert_eq!(metadata_key_pk, 0);
+
+        // Migration should preserve existing values.
+        let config_latest = conn
+            .query_row_with_params(
+                "SELECT value FROM config WHERE key = ?",
+                &[SqliteValue::from("issue_prefix")],
+            )
+            .unwrap();
+        assert_eq!(
+            config_latest.get(0).and_then(SqliteValue::as_text),
+            Some("new")
+        );
+
+        let metadata_latest = conn
+            .query_row_with_params(
+                "SELECT value FROM metadata WHERE key = ?",
+                &[SqliteValue::from("project")],
+            )
+            .unwrap();
+        assert_eq!(
+            metadata_latest.get(0).and_then(SqliteValue::as_text),
+            Some("new")
         );
     }
 }

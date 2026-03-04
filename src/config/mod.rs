@@ -414,6 +414,37 @@ pub fn no_db_from_layer(layer: &ConfigLayer) -> Option<bool> {
     get_startup_value(layer, &["no-db", "no_db", "no.db"]).and_then(|value| parse_bool(value))
 }
 
+/// Check merged config for `no-auto-flush` / `sync.auto_flush` (inverted).
+#[must_use]
+pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    // Direct key: no-auto-flush / no_auto_flush / no.auto.flush
+    if let Some(v) = get_startup_value(layer, &["no-auto-flush", "no_auto_flush", "no.auto.flush"])
+        .and_then(|value| parse_bool(value))
+    {
+        return Some(v);
+    }
+    // Inverted key: sync.auto_flush (false => no_auto_flush = true)
+    get_startup_value(layer, &["sync.auto_flush", "sync.auto-flush"])
+        .and_then(|value| parse_bool(value))
+        .map(|v| !v)
+}
+
+/// Check merged config for `no-auto-import` / `sync.auto_import` (inverted).
+#[must_use]
+pub fn no_auto_import_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    // Direct key: no-auto-import / no_auto_import / no.auto.import
+    if let Some(v) =
+        get_startup_value(layer, &["no-auto-import", "no_auto_import", "no.auto.import"])
+            .and_then(|value| parse_bool(value))
+    {
+        return Some(v);
+    }
+    // Inverted key: sync.auto_import (false => no_auto_import = true)
+    get_startup_value(layer, &["sync.auto_import", "sync.auto-import"])
+        .and_then(|value| parse_bool(value))
+        .map(|v| !v)
+}
+
 fn resolve_no_db_prefix(beads_dir: &Path, jsonl_path: &Path) -> Result<String> {
     let project_layer = load_project_config(beads_dir)?;
     if let Some(prefix) = get_value(&project_layer, &["issue_prefix", "issue-prefix", "prefix"]) {

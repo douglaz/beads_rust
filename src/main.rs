@@ -31,8 +31,7 @@ fn main() {
     let is_mutating = is_mutating_command(&cli.command);
 
     if should_auto_import(&cli.command)
-        && !cli.no_db
-        && let Err(e) = run_auto_import(&overrides, cli.allow_stale, cli.no_auto_import)
+        && let Err(e) = run_auto_import(&overrides, cli.allow_stale)
     {
         handle_error(&e, json_error_mode);
     }
@@ -131,8 +130,8 @@ fn main() {
         handle_error(&e, json_error_mode);
     }
 
-    // Auto-flush after successful mutating commands (unless --no-auto-flush)
-    if is_mutating && !cli.no_auto_flush && !cli.no_db {
+    // Auto-flush after successful mutating commands (unless no-auto-flush or no-db)
+    if is_mutating {
         run_auto_flush(&overrides);
     }
 }
@@ -232,11 +231,7 @@ const fn should_render_errors_as_json(cli: &Cli) -> bool {
 }
 
 /// Run auto-import before read-only commands when JSONL is newer.
-fn run_auto_import(
-    overrides: &config::CliOverrides,
-    allow_stale: bool,
-    no_auto_import: bool,
-) -> Result<()> {
+fn run_auto_import(overrides: &config::CliOverrides, allow_stale: bool) -> Result<()> {
     // If not initialized, skip auto-import (e.g. running 'br init')
     let beads_dir = match config::discover_beads_dir(Some(Path::new("."))) {
         Ok(dir) => dir,
@@ -244,7 +239,7 @@ fn run_auto_import(
         Err(e) => return Err(e),
     };
 
-    // Fast path: skip auto-import for no_db mode to avoid redundant memory DB creation
+    // Fast path: skip auto-import/no_db via merged config (CLI + config file)
     if let Ok(startup_layer) = config::load_startup_config(&beads_dir) {
         let merged_layer =
             config::ConfigLayer::merge_layers(&[startup_layer, overrides.as_layer()]);
@@ -262,6 +257,14 @@ fn run_auto_import(
     if no_db {
         return Ok(());
     }
+
+    // Resolve no_auto_import from merged config (CLI + config file)
+    let no_auto_import = {
+        let startup_layer = config::load_startup_config(&beads_dir).unwrap_or_default();
+        let merged_layer =
+            config::ConfigLayer::merge_layers(&[startup_layer, overrides.as_layer()]);
+        config::no_auto_import_from_layer(&merged_layer).unwrap_or(false)
+    };
 
     let expected_prefix = storage.get_config("issue_prefix")?;
     let outcome = auto_import_if_stale(
@@ -300,10 +303,14 @@ fn run_auto_flush(overrides: &config::CliOverrides) {
         }
     };
 
-    // Fast path: skip auto-flush for no_db mode to avoid overwriting JSONL with empty/stale disk DB
+    // Fast path: skip auto-flush if disabled via config or CLI, or for no_db mode
     if let Ok(startup_layer) = config::load_startup_config(&beads_dir) {
         let merged_layer =
             config::ConfigLayer::merge_layers(&[startup_layer, overrides.as_layer()]);
+        if config::no_auto_flush_from_layer(&merged_layer).unwrap_or(false) {
+            debug!("Auto-flush skipped: disabled by config");
+            return;
+        }
         if config::no_db_from_layer(&merged_layer).unwrap_or(false) {
             return;
         }
@@ -374,8 +381,8 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         quiet: Some(cli.quiet),
         no_db: Some(cli.no_db),
         no_daemon: Some(cli.no_daemon),
-        no_auto_flush: Some(cli.no_auto_flush),
-        no_auto_import: Some(cli.no_auto_import),
+        no_auto_flush: if cli.no_auto_flush { Some(true) } else { None },
+        no_auto_import: if cli.no_auto_import { Some(true) } else { None },
         lock_timeout: cli.lock_timeout,
     }
 }

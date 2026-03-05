@@ -57,22 +57,22 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
 
     // When a parent is specified, generate a child ID (parent.1, parent.2, etc.)
     let id = if let Some(ref parent_id) = args.parent {
-        if !storage.id_exists(parent_id).unwrap_or(false) {
+        if !storage.id_exists(parent_id)? {
             return Err(BeadsError::IssueNotFound {
                 id: parent_id.clone(),
             });
         }
         let next_num = storage.next_child_number(parent_id)?;
         let candidate = child_id(parent_id, next_num);
-        if storage.id_exists(&candidate).unwrap_or(false) {
+        if storage.id_exists(&candidate)? {
             let mut num = next_num + 1;
             loop {
                 let alt = child_id(parent_id, num);
-                if !storage.id_exists(&alt).unwrap_or(false) {
+                if !storage.id_exists(&alt)? {
                     break alt;
                 }
                 num += 1;
-                if num > next_num + 100 {
+                if num > next_num.saturating_add(100) {
                     return Err(BeadsError::validation(
                         "parent",
                         "could not find available child ID",

@@ -939,29 +939,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             ctx.info("Repairing: rebuilding DB from JSONL...");
         }
 
-        // Remove the corrupt DB and its WAL/SHM files
-        for ext in &["", "-wal", "-shm"] {
-            let p = db_path.with_extension(
-                db_path
-                    .extension()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-                    + ext,
-            );
+        // Remove the corrupt DB and its WAL/SHM files.
+        // We use string concatenation (not with_extension) to handle both
+        // extensioned paths (storage.sqlite3-wal) and bare paths (storage-wal).
+        let db_str = db_path.to_string_lossy().to_string();
+        for suffix in &["", "-wal", "-shm"] {
+            let p = PathBuf::from(format!("{db_str}{suffix}"));
             if p.exists() {
                 if let Err(e) = fs::remove_file(&p) {
                     tracing::warn!(path = %p.display(), error = %e, "Failed to remove corrupt DB file");
-                }
-            }
-        }
-        // Also remove exact WAL file pattern (e.g. storage.sqlite3-wal)
-        let db_str = db_path.to_string_lossy().to_string();
-        for suffix in &["-wal", "-shm"] {
-            let wal_path = PathBuf::from(format!("{db_str}{suffix}"));
-            if wal_path.exists() {
-                if let Err(e) = fs::remove_file(&wal_path) {
-                    tracing::warn!(path = %wal_path.display(), error = %e, "Failed to remove WAL/SHM file");
                 }
             }
         }

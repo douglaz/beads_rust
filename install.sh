@@ -1233,10 +1233,23 @@ main() {
         resolve_version
 
         if [ -n "$VERSION" ]; then
-            if download_release "$platform"; then
-                # Success - continue to post-install
-                :
-            else
+            local downloaded=0
+            # On Linux x86_64, prefer the musl (statically linked) binary
+            # for maximum compatibility across glibc versions
+            if [ "$platform" = "linux_amd64" ] && [ -z "$ARTIFACT_URL" ]; then
+                log_step "Trying statically-linked musl binary for maximum compatibility..."
+                if download_release "linux_musl_amd64"; then
+                    downloaded=1
+                else
+                    log_warn "musl binary not available, trying gnu binary..."
+                fi
+            fi
+            if [ "$downloaded" -eq 0 ]; then
+                if download_release "$platform"; then
+                    downloaded=1
+                fi
+            fi
+            if [ "$downloaded" -eq 0 ]; then
                 log_warn "Binary download failed, building from source..."
                 build_from_source
             fi

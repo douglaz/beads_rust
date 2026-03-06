@@ -57,11 +57,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x64 (gnu) — pure-Rust UnixVfs eliminates glibc 2.39 requirement
+          # Linux x64 (gnu)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
             name: linux_amd64
+          # Linux x64 (musl) — statically linked, no glibc dependency
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            name: linux_musl_amd64
           # Linux ARM64 (gnu)
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
@@ -96,6 +101,10 @@ jobs:
 
       - name: Ensure target is installed
         run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl-tools (for musl targets)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
@@ -215,7 +224,7 @@ jobs:
       - name: Validate required artifacts present
         run: |
           MISSING=()
-          for platform in linux_amd64 darwin_amd64 darwin_arm64; do
+          for platform in linux_amd64 linux_musl_amd64 darwin_amd64 darwin_arm64; do
             if ! ls artifacts/br-*-${platform}.* 1>/dev/null 2>&1; then
               MISSING+=("$platform")
             fi
@@ -298,6 +307,7 @@ jobs:
           | Platform | Architecture | File |
           |----------|--------------|------|
           | Linux | x86_64 (gnu) | `br-${{ github.ref_name }}-linux_amd64.tar.gz` |
+          | Linux | x86_64 (musl, static) | `br-${{ github.ref_name }}-linux_musl_amd64.tar.gz` |
           | Linux | ARM64 (gnu) | `br-${{ github.ref_name }}-linux_arm64.tar.gz` |
           | macOS | x86_64 (Intel) | `br-${{ github.ref_name }}-darwin_amd64.tar.gz` |
           | macOS | ARM64 (Apple Silicon) | `br-${{ github.ref_name }}-darwin_arm64.tar.gz` |

@@ -5,7 +5,8 @@ use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, Priority, Status};
 use crate::storage::events::get_events;
 use crate::storage::schema::{
-    CURRENT_SCHEMA_VERSION, apply_runtime_pragmas, apply_schema, runtime_schema_compatible,
+    CURRENT_SCHEMA_VERSION, apply_runtime_compatible_schema, apply_runtime_pragmas, apply_schema,
+    runtime_schema_compatible,
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::Connection;
@@ -122,7 +123,7 @@ impl SqliteStorage {
             .unwrap_or(0) as i32;
         if user_version < CURRENT_SCHEMA_VERSION {
             if runtime_schema_compatible(&conn) {
-                apply_runtime_pragmas(&conn)?;
+                apply_runtime_compatible_schema(&conn)?;
             } else {
                 apply_schema(&conn)?;
             }
@@ -517,10 +518,10 @@ impl SqliteStorage {
 
             let rows = conn.query_with_params(&query, &[SqliteValue::from(current.as_str())])?;
             for row in &rows {
-                if let Some(next_id) = row.get(0).and_then(SqliteValue::as_text) {
-                    if !visited.contains(next_id) {
-                        frontier.push(next_id.to_string());
-                    }
+                if let Some(next_id) = row.get(0).and_then(SqliteValue::as_text)
+                    && !visited.contains(next_id)
+                {
+                    frontier.push(next_id.to_string());
                 }
             }
         }
@@ -858,6 +859,47 @@ impl SqliteStorage {
 
         self.get_issue(id)?
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })
+    }
+
+    /// Physically remove an issue and all related data from the database.
+    ///
+    /// Unlike `delete_issue` (which creates a tombstone), this permanently
+    /// removes the issue row plus its labels, dependencies, comments, and
+    /// events so it will not appear in subsequent JSONL exports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the issue doesn't exist or a database operation fails.
+    pub fn purge_issue(&mut self, id: &str, actor: &str) -> Result<()> {
+        if self.get_issue(id)?.is_none() {
+            return Err(BeadsError::IssueNotFound { id: id.to_string() });
+        }
+
+        self.mutate("purge_issue", actor, |conn, ctx| {
+            conn.execute_with_params(
+                "DELETE FROM comments WHERE issue_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
+            conn.execute_with_params(
+                "DELETE FROM labels WHERE issue_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
+            conn.execute_with_params(
+                "DELETE FROM dependencies WHERE issue_id = ? OR depends_on_id = ?",
+                &[SqliteValue::from(id), SqliteValue::from(id)],
+            )?;
+            conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
+
+            ctx.record_event(
+                EventType::Deleted,
+                id,
+                Some("Hard-deleted (purged from DB and JSONL)".to_string()),
+            );
+            ctx.mark_dirty(id);
+            ctx.invalidate_cache();
+
+            Ok(())
+        })
     }
 
     /// Get an issue by ID.
@@ -5240,7 +5282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_skips_full_schema_for_runtime_compatible_legacy_db() {
+    fn test_open_repairs_runtime_compatible_legacy_db_indexes() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("legacy_runtime_compatible.db");
 
@@ -5248,24 +5290,8 @@ mod tests {
             let storage = SqliteStorage::open(&db_path).unwrap();
             storage
                 .conn
-                .execute("DROP INDEX IF EXISTS idx_config_key")
+                .execute("DROP INDEX IF EXISTS idx_issues_external_ref_unique")
                 .unwrap();
-            storage.conn.execute("DROP TABLE config").unwrap();
-            storage
-                .conn
-                .execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-                .unwrap();
-
-            storage
-                .conn
-                .execute("DROP INDEX IF EXISTS idx_metadata_key")
-                .unwrap();
-            storage.conn.execute("DROP TABLE metadata").unwrap();
-            storage
-                .conn
-                .execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-                .unwrap();
-
             storage.conn.execute("PRAGMA user_version = 0").unwrap();
         }
 
@@ -5278,21 +5304,115 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap();
         assert_eq!(
-            user_version, 0,
-            "runtime-compatible legacy DBs should skip full schema application on open"
+            user_version,
+            i64::from(CURRENT_SCHEMA_VERSION),
+            "runtime-compatible legacy DBs should be repaired and marked current on open"
         );
 
-        let config_columns: Vec<String> = reopened
+        let indexes: HashSet<String> = reopened
             .conn
-            .query("PRAGMA table_info(config)")
+            .query("SELECT name FROM sqlite_master WHERE type='index'")
             .unwrap()
             .iter()
-            .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(str::to_owned))
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
             .collect();
+        assert!(
+            indexes.contains("idx_issues_external_ref_unique"),
+            "runtime-compatible repair path should restore missing canonical indexes"
+        );
+    }
+
+    #[test]
+    fn test_open_repairs_legacy_kv_primary_key_tables() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("legacy_kv_primary_keys.db");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage.set_config("issue_prefix", "legacy").unwrap();
+            storage.set_metadata("project", "legacy-project").unwrap();
+
+            storage
+                .conn
+                .execute("DROP INDEX IF EXISTS idx_config_key")
+                .unwrap();
+            storage.conn.execute("DROP TABLE config").unwrap();
+            storage
+                .conn
+                .execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .unwrap();
+            storage
+                .conn
+                .execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'legacy')")
+                .unwrap();
+
+            storage
+                .conn
+                .execute("DROP INDEX IF EXISTS idx_metadata_key")
+                .unwrap();
+            storage.conn.execute("DROP TABLE metadata").unwrap();
+            storage
+                .conn
+                .execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .unwrap();
+            storage
+                .conn
+                .execute("INSERT INTO metadata (key, value) VALUES ('project', 'legacy-project')")
+                .unwrap();
+
+            storage.conn.execute("PRAGMA user_version = 0").unwrap();
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
         assert_eq!(
-            config_columns,
-            vec!["key".to_string(), "value".to_string()],
-            "open should preserve the legacy config table shape when schema application is skipped"
+            reopened.get_config("issue_prefix").unwrap(),
+            Some("legacy".to_string())
+        );
+        assert_eq!(
+            reopened.get_metadata("project").unwrap(),
+            Some("legacy-project".to_string())
+        );
+
+        let config_sql = reopened
+            .conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='config'")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let metadata_sql = reopened
+            .conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='metadata'")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_ascii_uppercase();
+
+        assert!(
+            !config_sql.contains("PRIMARY KEY"),
+            "legacy config primary key should be rebuilt to the canonical shape"
+        );
+        assert!(
+            !metadata_sql.contains("PRIMARY KEY"),
+            "legacy metadata primary key should be rebuilt to the canonical shape"
+        );
+
+        let indexes: HashSet<String> = reopened
+            .conn
+            .query("SELECT name FROM sqlite_master WHERE type='index'")
+            .unwrap()
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+            .collect();
+        assert!(
+            indexes.contains("idx_config_key"),
+            "legacy config repair should restore the canonical config index"
+        );
+        assert!(
+            indexes.contains("idx_metadata_key"),
+            "legacy metadata repair should restore the canonical metadata index"
         );
     }
 

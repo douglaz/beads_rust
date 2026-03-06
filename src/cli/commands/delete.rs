@@ -188,10 +188,15 @@ pub fn execute(
         result.orphaned_issues.clone_from(&all_dependents);
     }
 
-    // Delete each issue (create tombstone)
+    // Delete each issue (create tombstone, then purge if --hard)
     let final_ids: Vec<String> = final_delete_set.into_iter().collect();
     for id in &final_ids {
-        storage.delete_issue(id, &actor, &args.reason, None)?;
+        if args.hard {
+            // Hard delete: physically remove from DB so it's pruned from JSONL
+            storage.purge_issue(id, &actor)?;
+        } else {
+            storage.delete_issue(id, &actor, &args.reason, None)?;
+        }
         result.deleted.push(id.clone());
     }
     result.deleted_count = result.deleted.len();

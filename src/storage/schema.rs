@@ -3,9 +3,10 @@
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
 /// Schema matches classic bd (Go) for interoperability.
@@ -244,6 +245,16 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
+    // The table layouts are already safe to operate on, so we can skip the
+    // heavier pre-schema rebuilds and just restore any missing canonical DDL.
+    execute_batch(conn, SCHEMA_SQL)?;
+    run_migrations(conn)?;
+    apply_runtime_pragmas(conn)?;
+    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))?;
+    Ok(())
+}
+
 pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
     // Set journal mode to WAL for concurrency
     conn.execute("PRAGMA journal_mode = WAL")?;
@@ -265,6 +276,12 @@ pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
 fn table_exists(conn: &Connection, table: &str) -> bool {
     let escaped_table = table.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='table' AND name='{escaped_table}'");
+    conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
+}
+
+fn index_exists(conn: &Connection, index: &str) -> bool {
+    let escaped_index = index.replace('\'', "''");
+    let sql = format!("SELECT 1 FROM sqlite_master WHERE type='index' AND name='{escaped_index}'");
     conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
 }
 
@@ -511,6 +528,7 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     for (col_name, col_def) in &all_expected {
         create_cols.push(format!("{col_name} {col_def}"));
     }
+    create_cols.push(ISSUES_CLOSED_AT_CHECK.to_string());
 
     let create_sql = format!(
         "CREATE TABLE issues_rebuild_tmp ({})",
@@ -518,23 +536,25 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     );
     conn.execute(&create_sql)?;
 
-    // Build the SELECT column list: use existing columns where available,
-    // NULL (or default) for missing ones
-    let mut select_cols = Vec::new();
+    // Copy only columns that exist in the source table so SQLite can apply
+    // declared defaults for newer columns that are absent in legacy schemas.
+    let mut projected_columns = Vec::new();
     for (col_name, _) in &all_expected {
         if existing_columns.iter().any(|c| c == col_name) {
-            select_cols.push((*col_name).to_string());
-        } else {
-            select_cols.push("NULL".to_string());
+            projected_columns.push((*col_name).to_string());
         }
     }
 
-    let insert_cols: Vec<&str> = all_expected.iter().map(|(name, _)| *name).collect();
+    if projected_columns.is_empty() {
+        return Err(BeadsError::Config(
+            "Cannot rebuild legacy issues table: no canonical issue columns were found".to_string(),
+        ));
+    }
 
     let copy_sql = format!(
         "INSERT INTO issues_rebuild_tmp ({}) SELECT {} FROM issues",
-        insert_cols.join(", "),
-        select_cols.join(", ")
+        projected_columns.join(", "),
+        projected_columns.join(", ")
     );
     conn.execute(&copy_sql)?;
 
@@ -550,13 +570,18 @@ fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
         return false;
     }
 
-    let sql = format!("PRAGMA table_info('{table}')");
-    conn.query(&sql).is_ok_and(|rows| {
-        rows.iter().any(|row| {
-            row.get(1).and_then(SqliteValue::as_text) == Some("key")
-                && row.get(5).and_then(SqliteValue::as_integer) == Some(1)
-        })
-    })
+    let escaped_table = table.replace('\'', "''");
+    let sql =
+        format!("SELECT sql FROM sqlite_master WHERE type='table' AND name='{escaped_table}'");
+    conn.query_row(&sql)
+        .ok()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+        .is_some_and(|ddl| ddl.to_ascii_uppercase().contains("PRIMARY KEY"))
+}
+
+fn kv_table_needs_canonical_rebuild(conn: &Connection, table: &str, expected_index: &str) -> bool {
+    table_exists(conn, table)
+        && (!index_exists(conn, expected_index) || kv_table_uses_primary_key(conn, table))
 }
 
 fn rebuild_kv_table_without_unique(conn: &Connection, table: &str) -> Result<()> {
@@ -601,10 +626,10 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
     // Legacy schemas used PRIMARY KEY on config/metadata key columns.
     // Rebuild to plain key-value tables so standard sqlite integrity checks
     // are not tripped by unsupported unique-index maintenance behavior.
-    if kv_table_uses_primary_key(conn, "config") {
+    if kv_table_needs_canonical_rebuild(conn, "config", "idx_config_key") {
         rebuild_kv_table_without_unique(conn, "config")?;
     }
-    if kv_table_uses_primary_key(conn, "metadata") {
+    if kv_table_needs_canonical_rebuild(conn, "metadata", "idx_metadata_key") {
         rebuild_kv_table_without_unique(conn, "metadata")?;
     }
 
@@ -661,8 +686,10 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         && EVENT_COLUMNS
             .iter()
             .all(|(name, _)| column_exists(conn, "events", name));
-    let config_ok = table_has_columns(conn, "config", &["key", "value"]);
-    let metadata_ok = table_has_columns(conn, "metadata", &["key", "value"]);
+    let config_ok = table_has_columns(conn, "config", &["key", "value"])
+        && index_exists(conn, "idx_config_key");
+    let metadata_ok = table_has_columns(conn, "metadata", &["key", "value"])
+        && index_exists(conn, "idx_metadata_key");
     let dirty_issues_ok = table_has_columns(conn, "dirty_issues", &["issue_id", "marked_at"]);
     let export_hashes_ok = table_has_columns(
         conn,
@@ -839,6 +866,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::BeadsError;
     use fsqlite::Connection;
     use std::collections::HashSet;
     use tempfile::TempDir;
@@ -1392,6 +1420,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_rebuild_issues_table_errors_when_canonical_columns_are_missing() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        execute_batch(
+            &conn,
+            r"
+            CREATE TABLE issues (
+                legacy_only TEXT
+            );
+        ",
+        )
+        .unwrap();
+
+        let err = rebuild_issues_table(&conn).expect_err("rebuild should fail");
+        assert!(matches!(err, BeadsError::Config(_)));
+        assert!(
+            !table_exists(&conn, "issues_rebuild_tmp"),
+            "failed rebuild should roll back the temporary table"
+        );
+    }
+
     /// Migration: add missing dependency type column for older schemas.
     #[test]
     fn test_migration_adds_missing_dependency_type() {
@@ -1490,25 +1540,31 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_schema_compatible_accepts_legacy_kv_primary_keys() {
-        let conn = Connection::open(":memory:").unwrap();
-        apply_schema(&conn).expect("schema");
+    fn test_runtime_schema_compatible_rejects_legacy_kv_primary_keys() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("legacy_kv.db");
+        {
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            apply_schema(&conn).expect("schema");
 
-        conn.execute("DROP INDEX IF EXISTS idx_config_key")
-            .expect("drop config index");
-        conn.execute("DROP TABLE config").expect("drop config");
-        conn.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .expect("recreate legacy config");
+            conn.execute("DROP INDEX IF EXISTS idx_config_key")
+                .expect("drop config index");
+            conn.execute("DROP TABLE config").expect("drop config");
+            conn.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .expect("recreate legacy config");
 
-        conn.execute("DROP INDEX IF EXISTS idx_metadata_key")
-            .expect("drop metadata index");
-        conn.execute("DROP TABLE metadata").expect("drop metadata");
-        conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .expect("recreate legacy metadata");
+            conn.execute("DROP INDEX IF EXISTS idx_metadata_key")
+                .expect("drop metadata index");
+            conn.execute("DROP TABLE metadata").expect("drop metadata");
+            conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .expect("recreate legacy metadata");
+        }
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
 
         assert!(
-            runtime_schema_compatible(&conn),
-            "legacy config/metadata primary keys should still be treated as runtime-compatible"
+            !runtime_schema_compatible(&conn),
+            "legacy config/metadata primary keys should force the full repair path"
         );
     }
 }

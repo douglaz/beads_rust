@@ -16,8 +16,11 @@ use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::{
     ExportConfig, ImportConfig, export_to_jsonl_with_policy, finalize_export, import_from_jsonl,
+    preflight_import,
 };
 use crate::util::id::IdConfig;
+use chrono::Utc;
+use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -33,6 +36,8 @@ const DEFAULT_DB_FILENAME: &str = "beads.db";
 const DEFAULT_JSONL_FILENAME: &str = "issues.jsonl";
 /// Legacy JSONL filename to fall back to.
 const LEGACY_JSONL_FILENAME: &str = "beads.jsonl";
+/// Directory used for automatic database recovery backups.
+const RECOVERY_DIR_NAME: &str = ".br_recovery";
 
 /// JSONL files that should never be treated as the main export file.
 /// Includes merge artifacts, deletion logs, and interaction logs.
@@ -285,6 +290,206 @@ fn derive_beads_dir_from_db_path(db_path: &Path) -> Result<PathBuf> {
     ))
 }
 
+#[derive(Debug)]
+struct RecoveryBackupSet {
+    db_path: PathBuf,
+    recovery_dir: PathBuf,
+    stamp: String,
+    files: Vec<(PathBuf, PathBuf)>,
+}
+
+fn open_sqlite_storage_with_recovery(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+) -> Result<SqliteStorage> {
+    match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
+        Ok(storage) => Ok(storage),
+        Err(open_err) => {
+            if !should_attempt_jsonl_recovery(&open_err, &paths.db_path, &paths.jsonl_path) {
+                return Err(open_err);
+            }
+
+            match rebuild_database_from_jsonl(beads_dir, paths, lock_timeout) {
+                Ok(storage) => Ok(storage),
+                Err(recovery_err) => {
+                    warn!(
+                        db_path = %paths.db_path.display(),
+                        jsonl_path = %paths.jsonl_path.display(),
+                        open_error = %open_err,
+                        recovery_error = %recovery_err,
+                        "Automatic database recovery from JSONL failed"
+                    );
+                    Err(open_err)
+                }
+            }
+        }
+    }
+}
+
+fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_path: &Path) -> bool {
+    if !db_path.is_file() || !jsonl_path.is_file() {
+        return false;
+    }
+
+    match open_err {
+        BeadsError::Database(err) => !matches!(
+            err,
+            FrankenError::Busy
+                | FrankenError::BusyRecovery
+                | FrankenError::BusySnapshot { .. }
+                | FrankenError::DatabaseLocked { .. }
+                | FrankenError::DatabaseNotFound { .. }
+                | FrankenError::Io(_)
+                | FrankenError::IoRead { .. }
+                | FrankenError::IoWrite { .. }
+                | FrankenError::LockFailed { .. }
+                | FrankenError::CannotOpen { .. }
+                | FrankenError::ReadOnly
+        ),
+        _ => false,
+    }
+}
+
+fn rebuild_database_from_jsonl(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+) -> Result<SqliteStorage> {
+    let prefix = resolve_no_db_prefix(beads_dir, &paths.jsonl_path)?;
+    let import_config = ImportConfig {
+        beads_dir: Some(beads_dir.to_path_buf()),
+        allow_external_jsonl: false,
+        show_progress: false,
+        ..Default::default()
+    };
+
+    preflight_import(&paths.jsonl_path, &import_config, Some(&prefix))?.into_result()?;
+
+    warn!(
+        db_path = %paths.db_path.display(),
+        jsonl_path = %paths.jsonl_path.display(),
+        "Database open failed; rebuilding SQLite database from JSONL"
+    );
+
+    let backup_set = backup_database_family_for_recovery(&paths.db_path, beads_dir)?;
+    match rebuild_database_family(
+        &paths.db_path,
+        lock_timeout,
+        &paths.jsonl_path,
+        &import_config,
+        &prefix,
+    ) {
+        Ok(storage) => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                recovery_dir = %backup_set.recovery_dir.display(),
+                "Automatic database recovery from JSONL succeeded"
+            );
+            Ok(storage)
+        }
+        Err(recovery_err) => {
+            if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
+                warn!(
+                    db_path = %paths.db_path.display(),
+                    recovery_dir = %backup_set.recovery_dir.display(),
+                    restore_error = %restore_err,
+                    "Failed to restore original database after unsuccessful rebuild"
+                );
+            }
+            Err(recovery_err)
+        }
+    }
+}
+
+fn rebuild_database_family(
+    db_path: &Path,
+    lock_timeout: Option<u64>,
+    jsonl_path: &Path,
+    import_config: &ImportConfig,
+    prefix: &str,
+) -> Result<SqliteStorage> {
+    let mut storage = SqliteStorage::open_with_timeout(db_path, lock_timeout)?;
+    storage.set_config("issue_prefix", prefix)?;
+    import_from_jsonl(&mut storage, jsonl_path, import_config, Some(prefix))?;
+    Ok(storage)
+}
+
+fn backup_database_family_for_recovery(
+    db_path: &Path,
+    beads_dir: &Path,
+) -> Result<RecoveryBackupSet> {
+    let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
+    fs::create_dir_all(&recovery_dir)?;
+
+    let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+    let mut files = Vec::new();
+
+    for original in database_family_paths(db_path) {
+        if !original.exists() {
+            continue;
+        }
+
+        let backup = recovery_dir.join(recovery_backup_filename(&original, &stamp, "bak"));
+        fs::rename(&original, &backup)?;
+        files.push((original, backup));
+    }
+
+    Ok(RecoveryBackupSet {
+        db_path: db_path.to_path_buf(),
+        recovery_dir,
+        stamp,
+        files,
+    })
+}
+
+fn restore_database_family_after_failed_rebuild(backup_set: &RecoveryBackupSet) -> Result<()> {
+    for rebuilt in database_family_paths(&backup_set.db_path) {
+        if !rebuilt.exists() {
+            continue;
+        }
+
+        let failed_backup = backup_set.recovery_dir.join(recovery_backup_filename(
+            &rebuilt,
+            &backup_set.stamp,
+            "rebuild-failed",
+        ));
+        fs::rename(&rebuilt, &failed_backup)?;
+    }
+
+    for (original, backup) in &backup_set.files {
+        if backup.exists() {
+            fs::rename(backup, original)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn recovery_dir_for_db_path(db_path: &Path, beads_dir: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or(beads_dir)
+        .join(RECOVERY_DIR_NAME)
+}
+
+fn database_family_paths(db_path: &Path) -> Vec<PathBuf> {
+    let db_string = db_path.to_string_lossy();
+    vec![
+        db_path.to_path_buf(),
+        PathBuf::from(format!("{db_string}-wal")),
+        PathBuf::from(format!("{db_string}-shm")),
+    ]
+}
+
+fn recovery_backup_filename(path: &Path, stamp: &str, suffix: &str) -> String {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("beads.db");
+    format!("{filename}.{stamp}.{suffix}")
+}
+
 /// Open storage using resolved config paths, returning the storage and paths used.
 ///
 /// # Errors
@@ -303,7 +508,7 @@ pub fn open_storage(
         .or_else(|| lock_timeout_from_layer(&startup_layer))
         .or(Some(30000));
     let paths = ConfigPaths::resolve(beads_dir, resolved_db_override.as_ref())?;
-    let storage = SqliteStorage::open_with_timeout(&paths.db_path, resolved_lock_timeout)?;
+    let storage = open_sqlite_storage_with_recovery(beads_dir, &paths, resolved_lock_timeout)?;
     Ok((storage, paths))
 }
 
@@ -400,7 +605,7 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             no_db,
         })
     } else {
-        let storage = SqliteStorage::open_with_timeout(&paths.db_path, resolved_lock_timeout)?;
+        let storage = open_sqlite_storage_with_recovery(beads_dir, &paths, resolved_lock_timeout)?;
         Ok(OpenStorageResult {
             storage,
             paths,
@@ -1232,9 +1437,23 @@ fn yaml_scalar_to_string(value: &serde_yml::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{IssueType, Priority};
+    use crate::model::{Issue, IssueType, Priority};
     use crate::storage::SqliteStorage;
+    use chrono::Utc;
     use tempfile::TempDir;
+
+    fn write_single_issue_jsonl(path: &Path, id: &str, title: &str) {
+        let now = Utc::now();
+        let issue = Issue {
+            id: id.to_string(),
+            title: title.to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+        let json = serde_json::to_string(&issue).expect("serialize issue");
+        fs::write(path, format!("{json}\n")).expect("write jsonl");
+    }
 
     #[test]
     fn metadata_defaults_when_missing() {
@@ -2237,5 +2456,85 @@ routing:
 
         // Should pick issues.jsonl (preferred over legacy, ignoring excluded)
         assert_eq!(paths.jsonl_path, beads_dir.join("issues.jsonl"));
+    }
+
+    #[test]
+    fn open_storage_with_cli_recovers_corrupt_db_from_valid_jsonl() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"not a sqlite database").expect("write corrupt db");
+        write_single_issue_jsonl(&jsonl_path, "bd-recover1", "Recovered from JSONL");
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-recover1")
+            .expect("query issue")
+            .expect("issue should exist after recovery");
+
+        assert_eq!(issue.title, "Recovered from JSONL");
+        assert!(!storage_ctx.no_db);
+        assert!(db_path.is_file(), "recovered database should exist");
+
+        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
+        let backups: Vec<_> = fs::read_dir(&recovery_dir)
+            .expect("list recovery dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            backups
+                .iter()
+                .any(|name| name.starts_with("beads.db.") && name.ends_with(".bak")),
+            "original database should be preserved in the recovery directory"
+        );
+
+        drop(storage_ctx);
+
+        let reopened_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("reopen storage");
+        let reopened_issue = reopened_ctx
+            .storage
+            .get_issue("bd-recover1")
+            .expect("query reopened issue")
+            .expect("issue should remain readable after reopening");
+        assert_eq!(reopened_issue.title, "Recovered from JSONL");
+    }
+
+    #[test]
+    fn open_storage_with_cli_does_not_recover_from_invalid_jsonl() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"not a sqlite database").expect("write corrupt db");
+        fs::write(&jsonl_path, "{not valid json\n").expect("write invalid jsonl");
+
+        let err =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect_err("should fail");
+        assert!(
+            matches!(err, BeadsError::Database(_)),
+            "invalid JSONL should preserve the original database open error"
+        );
+        assert!(
+            db_path.is_file(),
+            "original database should remain in place"
+        );
+
+        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
+        let backup_count = fs::read_dir(&recovery_dir)
+            .map(|entries| entries.filter(|entry| entry.is_ok()).count())
+            .unwrap_or(0);
+        assert_eq!(
+            backup_count, 0,
+            "no recovery backup should be created when JSONL preflight fails"
+        );
     }
 }

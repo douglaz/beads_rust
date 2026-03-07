@@ -558,7 +558,7 @@ impl SqliteStorage {
     /// Returns an error if the issue doesn't exist or the update fails.
     #[allow(clippy::too_many_lines)]
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
-        let mut issue = self
+        let issue = self
             .get_issue(id)?
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
 
@@ -567,6 +567,9 @@ impl SqliteStorage {
         }
 
         self.mutate("update_issue", actor, |conn, ctx| {
+            let mut issue = Self::get_issue_from_conn(conn, id)?
+                .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
+
             // Atomic claim guard: check assignee INSIDE the CONCURRENT transaction
             // to prevent TOCTOU races where two agents both see "unassigned".
             if updates.expect_unassigned {
@@ -933,6 +936,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_issue(&self, id: &str) -> Result<Option<Issue>> {
+        Self::get_issue_from_conn(&self.conn, id)
+    }
+
+    fn get_issue_from_conn(conn: &Connection, id: &str) -> Result<Option<Issue>> {
         let sql = r"
             SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                    status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -944,10 +951,7 @@ impl SqliteStorage {
             FROM issues WHERE id = ?
         ";
 
-        match self
-            .conn
-            .query_row_with_params(sql, &[SqliteValue::from(id)])
-        {
+        match conn.query_row_with_params(sql, &[SqliteValue::from(id)]) {
             Ok(row) => Ok(Some(Self::issue_from_row(&row)?)),
             Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
@@ -4779,6 +4783,79 @@ mod tests {
         assert_eq!(updated.priority, Priority::HIGH);
         assert_eq!(updated.assignee.as_deref(), Some("alice"));
         assert_eq!(updated.description.as_deref(), Some("New description"));
+    }
+
+    #[test]
+    fn test_update_issue_recomputes_hash_from_fresh_transaction_state() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+
+        let mut setup = SqliteStorage::open(&db_path).unwrap();
+        let issue = make_issue(
+            "bd-race1",
+            "Original title",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        setup.create_issue(&issue, "tester").unwrap();
+        drop(setup);
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_db_path = db_path.clone();
+
+        let writer = std::thread::spawn(move || {
+            let storage = SqliteStorage::open(&writer_db_path).unwrap();
+            storage.conn.execute("BEGIN IMMEDIATE").unwrap();
+            storage
+                .conn
+                .execute_with_params(
+                    "UPDATE issues SET description = ?, updated_at = ? WHERE id = ?",
+                    &[
+                        SqliteValue::from("Thread description"),
+                        SqliteValue::from(Utc::now().to_rfc3339()),
+                        SqliteValue::from("bd-race1"),
+                    ],
+                )
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            storage.conn.execute("COMMIT").unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+
+        let updater_db_path = db_path.clone();
+        let updater = std::thread::spawn(move || {
+            let mut storage = SqliteStorage::open(&updater_db_path).unwrap();
+            let updates = IssueUpdate {
+                title: Some("Updated title".to_string()),
+                ..IssueUpdate::default()
+            };
+            storage
+                .update_issue("bd-race1", &updates, "tester")
+                .unwrap();
+            storage.get_issue("bd-race1").unwrap().unwrap()
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+
+        writer.join().unwrap();
+        let updated = updater.join().unwrap();
+
+        assert_eq!(updated.description.as_deref(), Some("Thread description"));
+        assert_eq!(
+            updated.content_hash.as_deref(),
+            Some(crate::util::content_hash(&updated).as_str())
+        );
     }
 
     #[test]

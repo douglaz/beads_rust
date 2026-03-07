@@ -11,7 +11,7 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::{Connection, Row};
 use fsqlite_types::SqliteValue;
 
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::model::{Event, EventType};
 
 /// SQL schema for the events table.
@@ -380,34 +380,41 @@ pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec
         )?
     };
 
-    Ok(events.iter().map(event_from_row).collect())
+    events.iter().map(event_from_row).collect()
 }
 
-fn event_from_row(row: &Row) -> Event {
-    let id = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+fn event_from_row(row: &Row) -> Result<Event> {
+    let id = row
+        .get(0)
+        .and_then(SqliteValue::as_integer)
+        .ok_or_else(|| BeadsError::Config("events row missing id".to_string()))?;
     let issue_id = row
         .get(1)
         .and_then(|v| v.as_text())
-        .unwrap_or("")
+        .ok_or_else(|| BeadsError::Config("events row missing issue_id".to_string()))?
         .to_string();
-    let event_type_str = row.get(2).and_then(|v| v.as_text()).unwrap_or("");
+    let event_type_str = row.get(2).and_then(|v| v.as_text()).ok_or_else(|| {
+        BeadsError::Config(format!("events row missing event_type for {issue_id}"))
+    })?;
     let actor = row
         .get(3)
         .and_then(|v| v.as_text())
-        .unwrap_or("")
-        .to_string();
+        .ok_or_else(|| BeadsError::Config(format!("events row missing actor for {issue_id}")))?;
+    let actor = actor.to_string();
     let old_value = row.get(4).and_then(|v| v.as_text()).map(String::from);
     let new_value = row.get(5).and_then(|v| v.as_text()).map(String::from);
     let comment = row.get(6).and_then(|v| v.as_text()).map(String::from);
-    let created_at_str = row.get(7).and_then(|v| v.as_text()).unwrap_or("");
+    let created_at_str = row.get(7).and_then(|v| v.as_text()).ok_or_else(|| {
+        BeadsError::Config(format!("events row missing created_at for {issue_id}"))
+    })?;
 
     // Parse event type
     let event_type = parse_event_type(event_type_str);
 
     // Parse timestamp (support RFC3339 and SQLite default format)
-    let created_at = parse_event_timestamp(created_at_str);
+    let created_at = parse_event_timestamp(created_at_str)?;
 
-    Event {
+    Ok(Event {
         id,
         issue_id,
         event_type,
@@ -416,19 +423,21 @@ fn event_from_row(row: &Row) -> Event {
         new_value,
         comment,
         created_at,
-    }
+    })
 }
 
-fn parse_event_timestamp(value: &str) -> DateTime<Utc> {
+fn parse_event_timestamp(value: &str) -> Result<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
-        return dt.with_timezone(&Utc);
+        return Ok(dt.with_timezone(&Utc));
     }
 
     if let Ok(naive) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-        return Utc.from_utc_datetime(&naive);
+        return Ok(Utc.from_utc_datetime(&naive));
     }
 
-    Utc::now()
+    Err(BeadsError::Config(format!(
+        "Invalid event timestamp: {value}"
+    )))
 }
 
 /// Get all events across all issues, ordered by `created_at` DESC.
@@ -460,7 +469,7 @@ pub fn get_all_events(conn: &Connection, limit: usize) -> Result<Vec<Event>> {
         )?
     };
 
-    Ok(rows.iter().map(event_from_row).collect())
+    rows.iter().map(event_from_row).collect()
 }
 
 /// Get event count for an issue.
@@ -787,5 +796,29 @@ mod tests {
         assert_eq!(events[1].event_type, EventType::Commented);
         assert_eq!(events[2].event_type, EventType::StatusChanged);
         assert_eq!(events[3].event_type, EventType::Created);
+    }
+
+    #[test]
+    fn test_get_events_errors_on_invalid_timestamp() {
+        let conn = setup_test_db();
+
+        conn.execute("BEGIN").expect("Failed to start tx");
+        conn.execute_with_params(
+            "INSERT INTO events (issue_id, event_type, actor, created_at) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                SqliteValue::from("test-001"),
+                SqliteValue::from("created"),
+                SqliteValue::from("alice"),
+                SqliteValue::from("definitely-not-a-timestamp"),
+            ],
+        )
+        .expect("insert malformed event");
+        conn.execute("COMMIT").expect("commit malformed event");
+
+        let err = get_events(&conn, "test-001", 0).unwrap_err();
+        match err {
+            BeadsError::Config(msg) => assert!(msg.contains("Invalid event timestamp")),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

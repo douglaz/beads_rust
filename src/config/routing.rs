@@ -177,8 +177,9 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
     let resolved = if target_path.is_absolute() {
         target_path
     } else {
-        // Resolve relative to the beads directory's parent
-        beads_dir.parent().unwrap_or(beads_dir).join(target_path)
+        // Resolve relative to the .beads directory itself so "." stays within
+        // the workspace storage root instead of escaping to the project root.
+        beads_dir.join(target_path)
     };
 
     debug!(
@@ -220,10 +221,17 @@ pub fn follow_redirects(start: &Path, max_depth: usize) -> Result<PathBuf> {
         }
     }
 
-    // Verify the final directory exists
+    // Verify the final directory exists and still points to a real .beads dir.
     if !current.is_dir() {
         return Err(BeadsError::Config(format!(
             "Redirect target not found: {}",
+            current.display()
+        )));
+    }
+
+    if !current.file_name().is_some_and(|name| name == ".beads") {
+        return Err(BeadsError::Config(format!(
+            "Redirect target must be a .beads directory: {}",
             current.display()
         )));
     }
@@ -426,6 +434,33 @@ mod tests {
         // And starts with the temp dir base
         let result_str = result.to_string_lossy();
         assert!(result_str.contains(".beads"));
+    }
+
+    #[test]
+    fn read_redirect_dot_stays_in_beads_dir() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        fs::write(beads_dir.join("redirect"), ".").unwrap();
+
+        let result = read_redirect(&beads_dir).unwrap().unwrap();
+        assert_eq!(result, beads_dir);
+    }
+
+    #[test]
+    fn follow_redirects_rejects_non_beads_directory_target() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        fs::write(beads_dir.join("redirect"), "..").unwrap();
+
+        let err = follow_redirects(&beads_dir, 10).unwrap_err();
+        match err {
+            BeadsError::Config(msg) => assert!(msg.contains("must be a .beads directory")),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

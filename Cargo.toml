@@ -26,7 +26,6 @@ exclude = [
     "*.db",
     "*.db-wal",
     "*.db-shm",
-    "custom.db",
     "EXISTING_BEADS_STRUCTURE_AND_ARCHITECTURE.md",
     "PLAN_TO_PORT_BEADS_WITH_SQLITE_AND_ISSUES_JSONL_TO_RUST.md",
     "PROPOSED_ARCHITECTURE_FOR_BR_USING_RUST_BEST_PRACTICES.md",

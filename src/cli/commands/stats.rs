@@ -16,7 +16,7 @@ use chrono::Utc;
 use rich_rust::prelude::*;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{debug, info};
 
@@ -33,6 +33,7 @@ pub fn execute(
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let jsonl_path = storage_ctx.paths.jsonl_path.clone();
     let storage = &storage_ctx.storage;
     let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
     let use_color = config::should_use_color(&config_layer);
@@ -76,7 +77,7 @@ pub fn execute(
     let recent_activity = if args.no_activity {
         None
     } else {
-        compute_recent_activity(&beads_dir, args.activity_hours)
+        compute_recent_activity(&jsonl_path, args.activity_hours)
     };
 
     let output = Statistics {
@@ -353,30 +354,21 @@ fn compute_label_breakdown(
     })
 }
 
-/// Compute recent activity from git log on issues.jsonl.
-fn compute_recent_activity(beads_dir: &Path, hours: u32) -> Option<RecentActivity> {
-    let jsonl_path = beads_dir.join("issues.jsonl");
+/// Compute recent activity from git log on the active JSONL file.
+fn compute_recent_activity(jsonl_path: &Path, hours: u32) -> Option<RecentActivity> {
     if !jsonl_path.exists() {
         debug!("No issues.jsonl found for activity tracking");
         return None;
     }
 
     let since = format!("{hours} hours ago");
+    let repo_root = git_repo_root(jsonl_path.parent()?)?;
+    let pathspec = repo_relative_git_path(jsonl_path, &repo_root)?;
+    let pathspec_str = pathspec.to_string_lossy().into_owned();
 
-    // Get the git repo root (parent of .beads)
-    let repo_root = beads_dir.parent().unwrap_or(beads_dir);
-
-    // Get commit count using relative path from repo root
     let mut child = Command::new("git")
-        .args([
-            "log",
-            "--oneline",
-            "--since",
-            &since,
-            "--",
-            ".beads/issues.jsonl",
-        ])
-        .current_dir(repo_root)
+        .args(["log", "--oneline", "--since", &since, "--", &pathspec_str])
+        .current_dir(&repo_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -411,6 +403,34 @@ fn compute_recent_activity(beads_dir: &Path, hours: u32) -> Option<RecentActivit
         issues_reopened: 0,
         total_changes: 0,
     })
+}
+
+fn git_repo_root(start: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(start)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
+}
+
+fn repo_relative_git_path(path: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let canonical_repo_root = dunce::canonicalize(repo_root).ok()?;
+    let canonical_path = dunce::canonicalize(path).ok()?;
+    canonical_path
+        .strip_prefix(&canonical_repo_root)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 /// Print text output for stats.
@@ -694,6 +714,8 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn make_issue(id: &str, status: Status, issue_type: IssueType) -> Issue {
         Issue {
@@ -928,5 +950,55 @@ mod tests {
         assert_eq!(capitalize("priority"), "Priority");
         assert_eq!(capitalize(""), "");
         assert_eq!(capitalize("ALREADY"), "ALREADY");
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    #[test]
+    fn test_compute_recent_activity_uses_resolved_jsonl_path() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "tester@example.com"]);
+        git(temp.path(), &["config", "user.name", "Tester"]);
+
+        let jsonl_dir = temp.path().join("tracking").join("custom");
+        fs::create_dir_all(&jsonl_dir).expect("create jsonl dir");
+        let jsonl_path = jsonl_dir.join("issues.snapshot.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-abc\",\"title\":\"Example\"}\n").expect("write jsonl");
+
+        git(
+            temp.path(),
+            &["add", "tracking/custom/issues.snapshot.jsonl"],
+        );
+        git(
+            temp.path(),
+            &["commit", "-q", "-m", "Track bd-abc in custom issues file"],
+        );
+
+        let activity =
+            compute_recent_activity(&jsonl_path, 24).expect("activity for committed custom jsonl");
+        assert_eq!(activity.commit_count, 1);
+        assert_eq!(activity.hours_tracked, 24);
+    }
+
+    #[test]
+    fn test_repo_relative_git_path_rejects_path_outside_repo() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_root = temp.path().join("repo");
+        let outside_root = temp.path().join("outside");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        fs::create_dir_all(&outside_root).expect("create outside root");
+
+        let outside_path = outside_root.join("issues.jsonl");
+        fs::write(&outside_path, "").expect("write outside jsonl");
+
+        assert!(repo_relative_git_path(&outside_path, &repo_root).is_none());
     }
 }

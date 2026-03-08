@@ -376,8 +376,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
             continue;
         }
 
-        // Skip WAL/SHM files (will be regenerated)
-        if name.ends_with("-wal") || name.ends_with("-shm") {
+        // Skip SQLite sidecars (will be regenerated)
+        if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal") {
             continue;
         }
 

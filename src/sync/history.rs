@@ -6,11 +6,12 @@
 //! - Listing and restoring backups
 
 use crate::error::{BeadsError, Result};
+use crate::sync::path::validate_sync_path_with_external;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Configuration for history backups.
@@ -39,6 +40,39 @@ pub struct BackupEntry {
     pub size: u64,
     pub target_path: PathBuf,
     pub target_key: String,
+}
+
+struct BackupFileGuard {
+    path: PathBuf,
+    persist: bool,
+}
+
+impl BackupFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            persist: false,
+        }
+    }
+
+    fn persist(&mut self) {
+        self.persist = true;
+    }
+}
+
+impl Drop for BackupFileGuard {
+    fn drop(&mut self) {
+        if !self.persist
+            && self.path.exists()
+            && let Err(cleanup_err) = fs::remove_file(&self.path)
+        {
+            tracing::warn!(
+                backup = %self.path.display(),
+                cleanup_error = %cleanup_err,
+                "Failed to remove partially written history backup"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +152,7 @@ pub(crate) fn parse_backup_filename(filename: &str) -> Option<(String, DateTime<
     Some((stem.to_string(), timestamp))
 }
 
-fn next_backup_path(history_dir: &Path, file_stem: &str) -> Result<PathBuf> {
+fn create_backup_file(history_dir: &Path, file_stem: &str) -> Result<(PathBuf, File)> {
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
 
     for collision_idx in 0..1024_u32 {
@@ -128,8 +162,14 @@ fn next_backup_path(history_dir: &Path, file_stem: &str) -> Result<PathBuf> {
             format!("{file_stem}.{timestamp}.{collision_idx}.jsonl")
         };
         let backup_path = history_dir.join(backup_name);
-        if !backup_path.exists() {
-            return Ok(backup_path);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(file) => return Ok((backup_path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -175,7 +215,31 @@ fn write_backup_metadata(beads_dir: &Path, target_path: &Path, backup_path: &Pat
             backup_path.display()
         ))
     })?;
-    fs::write(backup_metadata_path(backup_path), contents).map_err(BeadsError::Io)
+    let metadata_path = backup_metadata_path(backup_path);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&metadata_path)
+        .map_err(BeadsError::Io)?;
+
+    let write_result = (|| -> Result<()> {
+        file.write_all(&contents).map_err(BeadsError::Io)?;
+        file.sync_all().map_err(BeadsError::Io)?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        if let Err(cleanup_err) = fs::remove_file(&metadata_path) {
+            tracing::warn!(
+                metadata = %metadata_path.display(),
+                cleanup_error = %cleanup_err,
+                "Failed to remove partially written history metadata"
+            );
+        }
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 fn legacy_backup_target_path(beads_dir: &Path, backup_name: &str) -> Result<PathBuf> {
@@ -239,20 +303,23 @@ fn target_key_for_path(beads_dir: &Path, target_path: &Path) -> String {
 }
 
 pub(crate) fn resolve_backup_target_path(beads_dir: &Path, backup_path: &Path) -> Result<PathBuf> {
-    if let Some(metadata) = read_backup_metadata(backup_path)? {
-        return Ok(metadata.target.resolve_path(beads_dir));
-    }
+    let target_path = if let Some(metadata) = read_backup_metadata(backup_path)? {
+        metadata.target.resolve_path(beads_dir)
+    } else {
+        let backup_name = backup_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Invalid backup filename format: {}",
+                    backup_path.display()
+                ))
+            })?;
+        legacy_backup_target_path(beads_dir, backup_name)?
+    };
 
-    let backup_name = backup_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            BeadsError::Config(format!(
-                "Invalid backup filename format: {}",
-                backup_path.display()
-            ))
-        })?;
-    legacy_backup_target_path(beads_dir, backup_name)
+    validate_sync_path_with_external(&target_path, beads_dir, true)?;
+    Ok(target_path)
 }
 
 /// Backup the JSONL file before export.
@@ -287,10 +354,6 @@ pub fn backup_before_export(
         .unwrap_or("issues");
     let target_key = target_key_for_path(beads_dir, target_path);
 
-    // Create a timestamped backup name with collision resistance so rapid
-    // exports do not overwrite each other's history entries.
-    let backup_path = next_backup_path(&history_dir, file_stem)?;
-
     // Check if the content is identical to the most recent backup (deduplication)
     // We match by full target identity so similarly named exports do not
     // collapse each other's history.
@@ -304,17 +367,15 @@ pub fn backup_before_export(
         return Ok(());
     }
 
-    fs::copy(target_path, &backup_path).map_err(BeadsError::Io)?;
-    if let Err(err) = write_backup_metadata(beads_dir, target_path, &backup_path) {
-        if let Err(cleanup_err) = fs::remove_file(&backup_path) {
-            tracing::warn!(
-                backup = %backup_path.display(),
-                cleanup_error = %cleanup_err,
-                "Failed to remove partially written history backup after metadata write error"
-            );
-        }
-        return Err(err);
-    }
+    // Create a timestamped backup file with collision resistance and no
+    // overwrite race so pre-existing symlinks or files are never clobbered.
+    let (backup_path, mut backup_file) = create_backup_file(&history_dir, file_stem)?;
+    let mut backup_guard = BackupFileGuard::new(backup_path.clone());
+    let mut source = File::open(target_path).map_err(BeadsError::Io)?;
+    io::copy(&mut source, &mut backup_file).map_err(BeadsError::Io)?;
+    backup_file.sync_all().map_err(BeadsError::Io)?;
+    write_backup_metadata(beads_dir, target_path, &backup_path)?;
+    backup_guard.persist();
     tracing::debug!("Created backup: {}", backup_path.display());
 
     // Rotate history for this specific target
@@ -525,6 +586,8 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
     #[test]
@@ -803,6 +866,35 @@ mod tests {
         assert_eq!(
             list_backups(history_dir, Some("archive.")).unwrap().len(),
             1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_backup_metadata_rejects_existing_symlink() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&history_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::write(&target_path, "issue\n").unwrap();
+
+        let backup_path = history_dir.join("issues.20260307_120000_000000.jsonl");
+        fs::write(&backup_path, "backup\n").unwrap();
+
+        let metadata_target = outside_dir.join("captured.json");
+        fs::write(&metadata_target, "do-not-touch").unwrap();
+        symlink(&metadata_target, backup_metadata_path(&backup_path)).unwrap();
+
+        let err = write_backup_metadata(&beads_dir, &target_path, &backup_path).unwrap_err();
+        assert!(matches!(err, BeadsError::Io(_)), "unexpected error: {err}");
+        assert_eq!(
+            fs::read_to_string(&metadata_target).unwrap(),
+            "do-not-touch",
+            "existing metadata symlink target should not be overwritten"
         );
     }
 }

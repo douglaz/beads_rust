@@ -456,7 +456,7 @@ If you see "database is locked" errors:
 ls -la .beads/*.db-*
 
 # Remove stale lock files (only if br is not running)
-rm .beads/*.db-shm .beads/*.db-wal
+rm .beads/*.db-shm .beads/*.db-wal .beads/*.db-journal
 ```
 
 #### Self-Update Fails

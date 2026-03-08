@@ -649,6 +649,18 @@ fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<C
                     })),
                 );
             }
+            PathValidation::NonRegularFile { path } => {
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Error,
+                    Some("JSONL path is not a regular file".to_string()),
+                    Some(serde_json::json!({
+                        "path": path.display().to_string(),
+                        "remediation": "Replace the path with a regular .jsonl file"
+                    })),
+                );
+            }
             PathValidation::GitPathAttempt { path } => {
                 // Already handled above, but include for completeness
                 push_check(

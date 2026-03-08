@@ -270,42 +270,51 @@ impl SqliteStorage {
 
             match f(&self.conn, &mut ctx) {
                 Ok(result) => {
-                    // Write events
-                    for event in &ctx.events {
-                        self.conn.execute_with_params(
-                            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-                             VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            &[
-                                SqliteValue::from(event.issue_id.as_str()),
-                                SqliteValue::from(event.event_type.as_str()),
-                                SqliteValue::from(event.actor.as_str()),
-                                event.old_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                                event.new_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                                event.comment.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                                SqliteValue::from(event.created_at.to_rfc3339()),
-                            ],
-                        )?;
-                    }
+                    let side_effects: Result<()> = (|| {
+                        // Write events
+                        for event in &ctx.events {
+                            self.conn.execute_with_params(
+                                "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                &[
+                                    SqliteValue::from(event.issue_id.as_str()),
+                                    SqliteValue::from(event.event_type.as_str()),
+                                    SqliteValue::from(event.actor.as_str()),
+                                    event.old_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                                    event.new_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                                    event.comment.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                                    SqliteValue::from(event.created_at.to_rfc3339()),
+                                ],
+                            )?;
+                        }
 
-                    // Mark dirty — DELETE + INSERT instead of INSERT OR
-                    // REPLACE because fsqlite lacks UNIQUE enforcement.
-                    for id in &ctx.dirty_ids {
-                        self.conn.execute_with_params(
-                            "DELETE FROM dirty_issues WHERE issue_id = ?",
-                            &[SqliteValue::from(id.as_str())],
-                        )?;
-                        self.conn.execute_with_params(
-                            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
-                            &[
-                                SqliteValue::from(id.as_str()),
-                                SqliteValue::from(Utc::now().to_rfc3339()),
-                            ],
-                        )?;
-                    }
+                        // Mark dirty — DELETE + INSERT instead of INSERT OR
+                        // REPLACE because fsqlite lacks UNIQUE enforcement.
+                        for id in &ctx.dirty_ids {
+                            self.conn.execute_with_params(
+                                "DELETE FROM dirty_issues WHERE issue_id = ?",
+                                &[SqliteValue::from(id.as_str())],
+                            )?;
+                            self.conn.execute_with_params(
+                                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                                &[
+                                    SqliteValue::from(id.as_str()),
+                                    SqliteValue::from(Utc::now().to_rfc3339()),
+                                ],
+                            )?;
+                        }
 
-                    // Rebuild blocked cache inside the transaction if needed
-                    if ctx.invalidate_blocked_cache {
-                        Self::rebuild_blocked_cache_impl(&self.conn)?;
+                        // Rebuild blocked cache inside the transaction if needed
+                        if ctx.invalidate_blocked_cache {
+                            Self::rebuild_blocked_cache_impl(&self.conn)?;
+                        }
+
+                        Ok(())
+                    })();
+
+                    if let Err(err) = side_effects {
+                        let _ = self.conn.execute("ROLLBACK");
+                        return Err(err);
                     }
 
                     // Try to commit
@@ -2733,36 +2742,13 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.depends_on_id = i.id
              WHERE d.issue_id = ?
-             ORDER BY i.priority ASC, i.created_at DESC",
+            ORDER BY i.priority ASC, i.created_at DESC",
             &[SqliteValue::from(issue_id)],
         )?;
 
-        Ok(
-            rows.iter()
-                .map(|row| IssueWithDependencyMetadata {
-                    id: row
-                        .get(0)
-                        .and_then(SqliteValue::as_text)
-                        .unwrap_or("")
-                        .to_string(),
-                    title: row
-                        .get(1)
-                        .and_then(SqliteValue::as_text)
-                        .unwrap_or("")
-                        .to_string(),
-                    status: parse_status(row.get(2).and_then(SqliteValue::as_text)),
-                    #[allow(clippy::cast_possible_truncation)]
-                    priority: Priority(
-                        row.get(3).and_then(SqliteValue::as_integer).unwrap_or(2) as i32
-                    ),
-                    dep_type: row
-                        .get(4)
-                        .and_then(SqliteValue::as_text)
-                        .unwrap_or("blocks")
-                        .to_string(),
-                })
-                .collect(),
-        )
+        rows.iter()
+            .map(|row| dependency_metadata_from_row(row, "dependency target", true))
+            .collect()
     }
 
     /// Get dependents with metadata.
@@ -2779,36 +2765,13 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
              WHERE d.depends_on_id = ?
-             ORDER BY i.priority ASC, i.created_at DESC",
+            ORDER BY i.priority ASC, i.created_at DESC",
             &[SqliteValue::from(issue_id)],
         )?;
 
-        Ok(
-            rows.iter()
-                .map(|row| IssueWithDependencyMetadata {
-                    id: row
-                        .get(0)
-                        .and_then(SqliteValue::as_text)
-                        .unwrap_or("")
-                        .to_string(),
-                    title: row
-                        .get(1)
-                        .and_then(SqliteValue::as_text)
-                        .unwrap_or("")
-                        .to_string(),
-                    status: parse_status(row.get(2).and_then(SqliteValue::as_text)),
-                    #[allow(clippy::cast_possible_truncation)]
-                    priority: Priority(
-                        row.get(3).and_then(SqliteValue::as_integer).unwrap_or(2) as i32
-                    ),
-                    dep_type: row
-                        .get(4)
-                        .and_then(SqliteValue::as_text)
-                        .unwrap_or("blocks")
-                        .to_string(),
-                })
-                .collect(),
-        )
+        rows.iter()
+            .map(|row| dependency_metadata_from_row(row, "dependent issue", false))
+            .collect()
     }
 
     /// Get parent issue ID.
@@ -3827,6 +3790,58 @@ fn parse_issue_type(s: Option<&str>) -> IssueType {
     s.and_then(|s| s.parse().ok()).unwrap_or_default()
 }
 
+fn dependency_metadata_from_row(
+    row: &fsqlite::Row,
+    row_role: &str,
+    allow_external_placeholder: bool,
+) -> Result<IssueWithDependencyMetadata> {
+    let id = row
+        .get(0)
+        .and_then(SqliteValue::as_text)
+        .ok_or_else(|| BeadsError::Config(format!("{row_role} row missing id")))?;
+    let dep_type = row
+        .get(4)
+        .and_then(SqliteValue::as_text)
+        .ok_or_else(|| {
+            BeadsError::Config(format!("{row_role} row missing dependency type for {id}"))
+        })?
+        .to_string();
+
+    let title = row.get(1).and_then(SqliteValue::as_text);
+    let status = row.get(2).and_then(SqliteValue::as_text);
+    let priority = row.get(3).and_then(SqliteValue::as_integer);
+
+    let (title, status, priority) = match (title, status, priority) {
+        (Some(title), Some(status), Some(priority)) => (title, status, priority),
+        _ if allow_external_placeholder && id.starts_with("external:") => {
+            return Ok(IssueWithDependencyMetadata {
+                id: id.to_string(),
+                title: id.strip_prefix("external:").unwrap_or(id).to_string(),
+                status: Status::Blocked,
+                priority: Priority::MEDIUM,
+                dep_type,
+            });
+        }
+        _ => {
+            return Err(BeadsError::Config(format!(
+                "{row_role} row references missing issue {id}"
+            )));
+        }
+    };
+
+    let priority = i32::try_from(priority).map_err(|_| {
+        BeadsError::Config(format!("{row_role} row priority out of range for {id}"))
+    })?;
+
+    Ok(IssueWithDependencyMetadata {
+        id: id.to_string(),
+        title: title.to_string(),
+        status: parse_status(Some(status)),
+        priority: Priority(priority),
+        dep_type,
+    })
+}
+
 fn parse_blocked_by_json(issue_id: &str, blockers_json: Option<&str>) -> Result<Vec<String>> {
     let blockers_json = blockers_json.ok_or_else(|| {
         BeadsError::Config(format!(
@@ -4740,6 +4755,50 @@ mod tests {
     }
 
     #[test]
+    fn test_transaction_rolls_back_post_body_side_effect_failures() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-tx-side-effect",
+            "Tx Side Effect Test",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let result: Result<()> = storage.mutate("fail_event_insert", "tester", |_tx, ctx| {
+            ctx.record_event(
+                EventType::Updated,
+                "bd-missing",
+                Some("Should fail after closure succeeds".to_string()),
+            );
+            Ok(())
+        });
+
+        assert!(
+            result.is_err(),
+            "event insert should fail on missing issue FK"
+        );
+
+        let follow_up = make_issue(
+            "bd-tx-side-effect-2",
+            "Follow Up",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&follow_up, "tester").unwrap();
+        assert!(
+            storage.get_issue("bd-tx-side-effect-2").unwrap().is_some(),
+            "subsequent writes should succeed after rollback"
+        );
+    }
+
+    #[test]
     fn test_external_dependency_blocks_and_propagates_to_children() {
         let temp = TempDir::new().unwrap();
         let external_root = temp.path().join("extproj");
@@ -5108,6 +5167,74 @@ mod tests {
         assert!(removed);
         let deps = storage.get_dependencies("bd-a1").unwrap();
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_get_dependencies_with_metadata_external_placeholder() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage
+            .add_dependency("bd-a1", "external:proj:capability", "blocks", "tester")
+            .unwrap();
+
+        let deps = storage.get_dependencies_with_metadata("bd-a1").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].id, "external:proj:capability");
+        assert_eq!(deps[0].title, "proj:capability");
+        assert_eq!(deps[0].status, Status::Blocked);
+        assert_eq!(deps[0].priority, Priority::MEDIUM);
+        assert_eq!(deps[0].dep_type, "blocks");
+    }
+
+    #[test]
+    fn test_get_dependencies_with_metadata_errors_on_missing_internal_target() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+
+        let created_at = Utc::now().to_rfc3339();
+        storage
+            .execute_test_sql(&format!(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-a1', 'bd-missing', 'blocks', '{created_at}', 'tester')"
+            ))
+            .unwrap();
+
+        let err = storage
+            .get_dependencies_with_metadata("bd-a1")
+            .expect_err("missing internal dependency target should error");
+        assert!(
+            matches!(err, BeadsError::Config(message) if message.contains("missing issue bd-missing"))
+        );
+    }
+
+    #[test]
+    fn test_get_dependents_with_metadata_errors_on_missing_dependent_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_b = make_issue("bd-b1", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        let created_at = Utc::now().to_rfc3339();
+        storage
+            .execute_test_sql(&format!(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-missing', 'bd-b1', 'blocks', '{created_at}', 'tester')"
+            ))
+            .unwrap();
+
+        let err = storage
+            .get_dependents_with_metadata("bd-b1")
+            .expect_err("missing dependent issue should error");
+        assert!(
+            matches!(err, BeadsError::Config(message) if message.contains("missing issue bd-missing"))
+        );
     }
 
     #[test]

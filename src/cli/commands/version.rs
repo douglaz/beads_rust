@@ -34,7 +34,9 @@ pub fn execute(args: &VersionArgs, ctx: &OutputContext) -> Result<()> {
 
     // Handle --short flag: output only version number
     if args.short {
-        println!("{version}");
+        if !ctx.is_quiet() {
+            println!("{version}");
+        }
         return Ok(());
     }
 
@@ -72,6 +74,10 @@ pub fn execute(args: &VersionArgs, ctx: &OutputContext) -> Result<()> {
             features,
         };
         ctx.json(&output);
+        return Ok(());
+    }
+
+    if ctx.is_quiet() {
         return Ok(());
     }
 
@@ -204,7 +210,7 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) {
                     "update_available": null,
                     "error": e.to_string()
                 }));
-            } else {
+            } else if !ctx.is_quiet() {
                 eprintln!("Error checking for updates: {e}");
             }
             process::exit(2);
@@ -225,6 +231,7 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) {
             "latest": latest,
             "update_available": update_available
         }));
+    } else if ctx.is_quiet() {
     } else if update_available {
         println!("Update available: {current_version} → {latest}");
         println!("Run `br upgrade` to update.");

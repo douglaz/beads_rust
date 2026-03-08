@@ -407,6 +407,39 @@ fn export_rejects_symlink_escape() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn export_rejects_existing_temp_symlink_and_preserves_live_jsonl() {
+    let _log = common::test_log("export_rejects_existing_temp_symlink_and_preserves_live_jsonl");
+
+    let storage = setup_storage_with_issues(1);
+    let temp = TempDir::new().unwrap();
+    let beads_dir = setup_beads_dir(&temp);
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let temp_path = beads_dir.join("issues.jsonl.tmp");
+    fs::write(&jsonl_path, "{\"id\":\"old\",\"title\":\"Old\"}\n").unwrap();
+
+    let outside = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(outside.path().join("captured.jsonl"), &temp_path).unwrap();
+
+    let config = default_config(&beads_dir);
+    let result = export_to_jsonl(&storage, &jsonl_path, &config);
+    assert!(
+        result.is_err(),
+        "Export should reject an existing temp symlink"
+    );
+
+    assert_eq!(
+        fs::read_to_string(&jsonl_path).unwrap(),
+        "{\"id\":\"old\",\"title\":\"Old\"}\n",
+        "Live JSONL should remain untouched when staged export is rejected"
+    );
+    assert!(
+        !outside.path().join("captured.jsonl").exists(),
+        "Temp symlink should not receive exported data"
+    );
+}
+
 // ===========================================================================
 // 10. Export with allow_external_jsonl to outside path works
 // ===========================================================================

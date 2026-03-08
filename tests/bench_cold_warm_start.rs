@@ -267,6 +267,7 @@ fn copy_workspace_for_bd(br_root: &Path, bd_path: &Path) -> std::io::Result<(Tem
     // Also remove WAL and SHM files if present
     let _ = fs::remove_file(root.join(".beads").join("beads.db-wal"));
     let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
+    let _ = fs::remove_file(root.join(".beads").join("beads.db-journal"));
 
     // Import into bd's database
     let import_output = Command::new(bd_path)

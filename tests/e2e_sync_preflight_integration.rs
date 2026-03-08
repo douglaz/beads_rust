@@ -78,7 +78,11 @@ fn assert_directory_unchanged(before: &HashMap<String, Vec<u8>>, dir: &Path, con
     for (path, old_content) in before {
         if let Some(new_content) = after.get(path) {
             // Allow database files to change (they track state)
-            if path.ends_with(".db") || path.ends_with(".db-journal") || path.ends_with(".db-wal") {
+            if path.ends_with(".db")
+                || path.ends_with(".db-journal")
+                || path.ends_with(".db-wal")
+                || path.ends_with(".db-shm")
+            {
                 continue;
             }
             if old_content != new_content {
@@ -217,7 +221,11 @@ fn preflight_import_rejects_conflict_markers() {
             continue;
         }
         // Skip database files (allowed to track state)
-        if path.ends_with(".db") || path.ends_with(".db-journal") || path.ends_with(".db-wal") {
+        if path.ends_with(".db")
+            || path.ends_with(".db-journal")
+            || path.ends_with(".db-wal")
+            || path.ends_with(".db-shm")
+        {
             continue;
         }
         if let Some(new_content) = snapshot_after.get(path) {

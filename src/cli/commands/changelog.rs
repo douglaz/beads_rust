@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::debug;
 
@@ -67,9 +68,12 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let config::OpenStorageResult { storage, .. } = config::open_storage_with_cli(&beads_dir, cli)?;
+    let config::OpenStorageResult { storage, paths, .. } =
+        config::open_storage_with_cli(&beads_dir, cli)?;
+    let repo_root =
+        git_repo_root_for_path(&paths.jsonl_path).or_else(|| git_repo_root_for_path(&beads_dir));
 
-    let (since_dt, since_label) = resolve_since(args)?;
+    let (since_dt, since_label) = resolve_since(args, repo_root.as_deref())?;
     let until = Utc::now();
 
     debug!(since = %since_label, "Filtering closed issues for changelog");
@@ -267,13 +271,16 @@ fn type_icon(issue_type: &str) -> &'static str {
     }
 }
 
-fn resolve_since(args: &ChangelogArgs) -> Result<(Option<DateTime<Utc>>, String)> {
+fn resolve_since(
+    args: &ChangelogArgs,
+    repo_root: Option<&Path>,
+) -> Result<(Option<DateTime<Utc>>, String)> {
     if let Some(tag) = args.since_tag.as_deref() {
-        let dt = git_ref_date(tag)?;
+        let dt = git_ref_date(tag, repo_root)?;
         return Ok((Some(dt), dt.to_rfc3339()));
     }
     if let Some(commit) = args.since_commit.as_deref() {
-        let dt = git_ref_date(commit)?;
+        let dt = git_ref_date(commit, repo_root)?;
         return Ok((Some(dt), dt.to_rfc3339()));
     }
     if let Some(since) = args.since.as_deref() {
@@ -286,9 +293,15 @@ fn resolve_since(args: &ChangelogArgs) -> Result<(Option<DateTime<Utc>>, String)
     Ok((None, "all".to_string()))
 }
 
-fn git_ref_date(reference: &str) -> Result<DateTime<Utc>> {
+fn git_ref_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Utc>> {
+    let repo_root = repo_root.ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Cannot resolve git reference '{reference}' without a git repository for the targeted project"
+        ))
+    })?;
     let output = Command::new("git")
         .args(["show", "-s", "--format=%cI", reference])
+        .current_dir(repo_root)
         .output()
         .map_err(|e| BeadsError::Config(format!("Failed to run git: {e}")))?;
 
@@ -306,6 +319,26 @@ fn git_ref_date(reference: &str) -> Result<DateTime<Utc>> {
     Ok(dt)
 }
 
+fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
+    let start = if path.is_dir() { path } else { path.parent()? };
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(start)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,7 +350,7 @@ mod tests {
             since: Some("2023-01-01T00:00:00Z".to_string()),
             ..Default::default()
         };
-        let (dt, label) = resolve_since(&args).unwrap();
+        let (dt, label) = resolve_since(&args, None).unwrap();
         assert_eq!(
             dt.unwrap(),
             Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap()
@@ -331,7 +364,7 @@ mod tests {
             since: Some("-1d".to_string()),
             ..Default::default()
         };
-        let (dt, _) = resolve_since(&args).unwrap();
+        let (dt, _) = resolve_since(&args, None).unwrap();
         let expected = Utc::now() - Duration::days(1);
         let actual = dt.unwrap();
         // Allow small delta
@@ -342,9 +375,66 @@ mod tests {
     #[test]
     fn test_resolve_since_none() {
         let args = ChangelogArgs::default();
-        let (dt, label) = resolve_since(&args).unwrap();
+        let (dt, label) = resolve_since(&args, None).unwrap();
         assert!(dt.is_none());
         assert_eq!(label, "all");
+    }
+
+    #[test]
+    fn test_git_ref_date_uses_target_repo_root() {
+        use std::fs;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo_root = temp.path().join("target-repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init failed");
+
+        let config_name = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(config_name.success(), "git config user.name failed");
+        let config_email = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(config_email.success(), "git config user.email failed");
+
+        fs::write(repo_root.join("README.md"), "hello\n").unwrap();
+        let add = Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "git add failed");
+        let commit = Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed");
+
+        let head = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo_root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        let dt = git_ref_date(&head, Some(&repo_root)).unwrap();
+        assert!(dt <= Utc::now());
     }
 
     #[test]

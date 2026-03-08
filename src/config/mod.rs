@@ -11,7 +11,7 @@
 
 pub mod routing;
 
-use crate::error::{BeadsError, Result};
+use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::{
@@ -239,22 +239,21 @@ fn discover_beads_dir_with_env(
 
 /// Discover beads directory, using `--db` path if provided.
 ///
-/// When `--db` is explicitly provided, derives the beads_dir from that path
-/// (e.g., `/path/to/.beads/beads.db` → `/path/to/.beads/`), allowing br to work
-/// from any directory. Falls back to normal discovery when `--db` is not set.
+/// When `--db` is explicitly provided and the path itself lives under `.beads/`,
+/// derives the beads_dir from that path (e.g., `/path/to/.beads/beads.db` →
+/// `/path/to/.beads/`), allowing br to work from any directory.
+///
+/// For external database overrides that live outside `.beads/`, falls back to
+/// normal workspace discovery so commands can still use the current project's
+/// metadata/config while targeting the explicit database file.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - `--db` path doesn't contain `.beads/` component
+/// - `--db` path is external and no workspace can be discovered from CWD/BEADS_DIR
 /// - No beads directory found (when `--db` not provided)
 pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
-    cli.db.as_ref().map_or_else(
-        // Fall back to normal discovery when --db is not set
-        || discover_beads_dir(None),
-        // Derive beads_dir from explicit --db path
-        |db_path| derive_beads_dir_from_db_path(db_path),
-    )
+    discover_beads_dir_with_cli_from(None, cli, None)
 }
 
 /// Discover the active `.beads` directory, but allow "no workspace" when no
@@ -270,44 +269,70 @@ pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
 /// - An explicit `--db` path is invalid
 /// - Discovery fails for reasons other than `NotInitialized`
 pub fn discover_optional_beads_dir_with_cli(cli: &CliOverrides) -> Result<Option<PathBuf>> {
-    match discover_beads_dir_with_cli(cli) {
+    match discover_beads_dir_with_cli_from(None, cli, None) {
         Ok(path) => Ok(Some(path)),
         Err(BeadsError::NotInitialized) if cli.db.is_none() => Ok(None),
         Err(err) => Err(err),
     }
 }
 
+fn discover_beads_dir_with_cli_from(
+    start: Option<&Path>,
+    cli: &CliOverrides,
+    env_override: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(db_path) = cli.db.as_deref()
+        && let Ok(beads_dir) = derive_beads_dir_from_db_path(db_path)
+    {
+        return Ok(beads_dir);
+    }
+
+    discover_beads_dir_with_env(start, env_override).map_err(|err| match (err, cli.db.as_deref())
+    {
+        (BeadsError::NotInitialized, Some(db_path)) => BeadsError::WithContext {
+            context: format!(
+                "Cannot resolve the project .beads directory for database override '{}'; run from the target workspace or set BEADS_DIR",
+                db_path.display()
+            ),
+            source: Box::new(BeadsError::NotInitialized),
+        },
+        (err, _) => err,
+    })
+}
+
 /// Extract the `.beads/` directory from a database path.
 ///
 /// E.g., `/path/to/.beads/beads.db` → `/path/to/.beads/`
 fn derive_beads_dir_from_db_path(db_path: &Path) -> Result<PathBuf> {
-    // Walk up the path looking for a component named ".beads"
+    beads_dir_from_db_path(db_path).ok_or_else(|| {
+        BeadsError::validation(
+            "db",
+            format!(
+                "Cannot derive beads directory from path '{}': expected path to contain '.beads/' component",
+                db_path.display()
+            ),
+        )
+    })
+}
+
+fn beads_dir_from_db_path(db_path: &Path) -> Option<PathBuf> {
     let mut current = db_path.to_path_buf();
 
-    // If the path points to a file, start from its parent
+    if current.file_name().is_some_and(|n| n == ".beads") {
+        return Some(current);
+    }
+
     if current.is_file() {
         current.pop();
-    }
-
-    // Check if current directory is .beads
-    if current.file_name().is_some_and(|n| n == ".beads") {
-        return Ok(current);
-    }
-
-    // Walk up looking for .beads
-    for ancestor in db_path.ancestors() {
-        if ancestor.file_name().is_some_and(|n| n == ".beads") {
-            return Ok(ancestor.to_path_buf());
+        if current.file_name().is_some_and(|n| n == ".beads") {
+            return Some(current);
         }
     }
 
-    Err(BeadsError::validation(
-        "db",
-        format!(
-            "Cannot derive beads directory from path '{}': expected path to contain '.beads/' component",
-            db_path.display()
-        ),
-    ))
+    db_path
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|n| n == ".beads"))
+        .map(Path::to_path_buf)
 }
 
 #[derive(Debug)]
@@ -436,6 +461,105 @@ fn recovery_restore_failure(
     }
 }
 
+fn rollback_renamed_paths(renamed_paths: &[(PathBuf, PathBuf)], operation: &str) -> Result<()> {
+    for (original, renamed) in renamed_paths.iter().rev() {
+        fs::rename(renamed, original).with_context(|| {
+            format!(
+                "Failed to roll back {operation}: restore '{}' from '{}'",
+                original.display(),
+                renamed.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingRenameSourcePolicy {
+    Skip,
+    Error,
+}
+
+fn rename_existing_paths<I>(
+    paths: I,
+    operation: &str,
+    missing_source_policy: MissingRenameSourcePolicy,
+) -> Result<Vec<(PathBuf, PathBuf)>>
+where
+    I: IntoIterator<Item = (PathBuf, PathBuf)>,
+{
+    let mut renamed_paths = Vec::new();
+
+    for (original, renamed) in paths {
+        match fs::symlink_metadata(&original) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if matches!(missing_source_policy, MissingRenameSourcePolicy::Skip) {
+                    continue;
+                }
+
+                let rename_err = BeadsError::WithContext {
+                    context: format!("Failed to {operation}"),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("expected '{}' to exist", original.display()),
+                    )),
+                };
+                if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Failed to {operation} ({rename_err}); rollback also failed"
+                        ),
+                        source: Box::new(rollback_err),
+                    });
+                }
+
+                return Err(rename_err);
+            }
+            Err(err) => {
+                let rename_err = BeadsError::WithContext {
+                    context: format!(
+                        "Failed to inspect '{}' before attempting to {operation}",
+                        original.display()
+                    ),
+                    source: Box::new(err),
+                };
+                if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Failed to {operation} ({rename_err}); rollback also failed"
+                        ),
+                        source: Box::new(rollback_err),
+                    });
+                }
+
+                return Err(rename_err);
+            }
+        }
+
+        if let Err(rename_err) = fs::rename(&original, &renamed) {
+            if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
+                warn!(
+                    operation,
+                    rollback_error = %rollback_err,
+                    "Failed to roll back partially completed file rename batch"
+                );
+                return Err(BeadsError::WithContext {
+                    context: format!("Failed to {operation} ({rename_err}); rollback also failed"),
+                    source: Box::new(rollback_err),
+                });
+            }
+
+            return Err(rename_err.into());
+        }
+
+        renamed_paths.push((original, renamed));
+    }
+
+    Ok(renamed_paths)
+}
+
 fn rebuild_database_family(
     db_path: &Path,
     lock_timeout: Option<u64>,
@@ -496,30 +620,14 @@ fn move_database_family_to_recovery(
 ) -> Result<RecoveryBackupSet> {
     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
     fs::create_dir_all(&recovery_dir)?;
-
-    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
-
-    for original in database_family_paths(db_path) {
-        if !original.exists() {
-            continue;
-        }
-
-        let backup = recovery_dir.join(recovery_backup_filename(&original, stamp, "bak"));
-        if let Err(err) = fs::rename(&original, &backup) {
-            for (restored_original, restored_backup) in files.iter().rev() {
-                if let Err(rollback_err) = fs::rename(restored_backup, restored_original) {
-                    warn!(
-                        original = %restored_original.display(),
-                        backup = %restored_backup.display(),
-                        rollback_error = %rollback_err,
-                        "Failed to roll back partially completed recovery backup"
-                    );
-                }
-            }
-            return Err(err.into());
-        }
-        files.push((original, backup));
-    }
+    let files = rename_existing_paths(
+        database_family_paths(db_path).into_iter().map(|original| {
+            let backup = recovery_dir.join(recovery_backup_filename(&original, stamp, "bak"));
+            (original, backup)
+        }),
+        "move the database family into recovery",
+        MissingRenameSourcePolicy::Skip,
+    )?;
 
     Ok(RecoveryBackupSet {
         db_path: db_path.to_path_buf(),
@@ -530,23 +638,43 @@ fn move_database_family_to_recovery(
 }
 
 fn restore_database_family_after_failed_rebuild(backup_set: &RecoveryBackupSet) -> Result<()> {
-    for rebuilt in database_family_paths(&backup_set.db_path) {
-        if !rebuilt.exists() {
-            continue;
+    let rebuilt_backups = rename_existing_paths(
+        database_family_paths(&backup_set.db_path)
+            .into_iter()
+            .map(|rebuilt| {
+                let failed_backup = backup_set.recovery_dir.join(recovery_backup_filename(
+                    &rebuilt,
+                    &backup_set.stamp,
+                    "rebuild-failed",
+                ));
+                (rebuilt, failed_backup)
+            }),
+        "stage rebuilt database files after failed recovery",
+        MissingRenameSourcePolicy::Skip,
+    )?;
+
+    if let Err(restore_err) = rename_existing_paths(
+        backup_set
+            .files
+            .iter()
+            .map(|(original, backup)| (backup.clone(), original.clone())),
+        "restore the original database family after failed recovery",
+        MissingRenameSourcePolicy::Error,
+    ) {
+        if let Err(rollback_err) = rollback_renamed_paths(
+            &rebuilt_backups,
+            "restore the original database family after failed recovery",
+        ) {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Failed to restore the original database family ({restore_err}); \
+                     rolling staged rebuilt files back into place also failed"
+                ),
+                source: Box::new(rollback_err),
+            });
         }
 
-        let failed_backup = backup_set.recovery_dir.join(recovery_backup_filename(
-            &rebuilt,
-            &backup_set.stamp,
-            "rebuild-failed",
-        ));
-        fs::rename(&rebuilt, &failed_backup)?;
-    }
-
-    for (original, backup) in &backup_set.files {
-        if backup.exists() {
-            fs::rename(backup, original)?;
-        }
+        return Err(restore_err);
     }
 
     Ok(())
@@ -565,6 +693,7 @@ fn database_family_paths(db_path: &Path) -> Vec<PathBuf> {
         db_path.to_path_buf(),
         PathBuf::from(format!("{db_string}-wal")),
         PathBuf::from(format!("{db_string}-shm")),
+        PathBuf::from(format!("{db_string}-journal")),
     ]
 }
 
@@ -2059,15 +2188,37 @@ labels:
     }
 
     #[test]
-    fn discover_optional_beads_dir_with_cli_surfaces_invalid_db_override() {
+    fn discover_beads_dir_with_cli_from_falls_back_to_workspace_for_external_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let start = temp.path().join("nested").join("dir");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&start).expect("create nested dir");
+
+        let cli = CliOverrides {
+            db: Some(temp.path().join("cache").join("beads.db")),
+            ..CliOverrides::default()
+        };
+
+        let discovered =
+            discover_beads_dir_with_cli_from(Some(&start), &cli, None).expect("discover");
+        assert_eq!(discovered, beads_dir);
+    }
+
+    #[test]
+    fn discover_optional_beads_dir_with_cli_surfaces_missing_workspace_for_external_db_override() {
         let cli = CliOverrides {
             db: Some(PathBuf::from("/tmp/not-a-beads-db")),
             ..CliOverrides::default()
         };
 
         let err = discover_optional_beads_dir_with_cli(&cli)
-            .expect_err("invalid explicit db should error");
-        assert!(matches!(err, BeadsError::Validation { .. }));
+            .expect_err("external explicit db without workspace should error");
+        assert!(matches!(err, BeadsError::WithContext { .. }));
+        assert!(
+            err.to_string().contains("BEADS_DIR") || err.to_string().contains("workspace"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2978,6 +3129,61 @@ routing:
     }
 
     #[test]
+    fn open_storage_with_cli_backs_up_rollback_journal_sidecars_during_recovery() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let journal_dir = beads_dir.join("beads.db-journal");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&journal_dir).expect("create fake journal dir");
+
+        fs::write(&db_path, b"not a sqlite database").expect("write corrupt db");
+        write_single_issue_jsonl(&jsonl_path, "bd-recover-journal", "Recovered with journal");
+        fs::write(journal_dir.join("sentinel.txt"), "keep me").expect("write sentinel");
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-recover-journal")
+            .expect("query issue")
+            .expect("issue should exist after recovery");
+
+        assert_eq!(issue.title, "Recovered with journal");
+        assert!(
+            !journal_dir.join("sentinel.txt").exists(),
+            "the original rollback journal sidecar should be moved out of the way during recovery"
+        );
+
+        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
+        let journal_backups: Vec<_> = fs::read_dir(&recovery_dir)
+            .expect("list recovery dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("beads.db-journal.")
+                            && Path::new(name)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+                    })
+            })
+            .collect();
+        assert_eq!(
+            journal_backups.len(),
+            1,
+            "rollback journal should be backed up once"
+        );
+        assert_eq!(
+            fs::read_to_string(journal_backups[0].join("sentinel.txt"))
+                .expect("read backed-up sentinel"),
+            "keep me"
+        );
+    }
+
+    #[test]
     fn open_storage_with_cli_does_not_recover_from_invalid_jsonl() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -3042,6 +3248,233 @@ routing:
         assert!(
             conflicting_wal_backup.is_dir(),
             "the pre-existing conflicting path should be untouched"
+        );
+    }
+
+    #[test]
+    fn restore_database_family_after_failed_rebuild_rolls_back_partial_rebuild_staging() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"original-db").expect("write original db");
+        fs::write(&wal_path, b"original-wal").expect("write original wal");
+
+        let stamp = "fixed-stamp";
+        let backup_set =
+            move_database_family_to_recovery(&db_path, &beads_dir, stamp).expect("backup set");
+
+        fs::write(&db_path, b"rebuilt-db").expect("write rebuilt db");
+        fs::write(&wal_path, b"rebuilt-wal").expect("write rebuilt wal");
+
+        let conflicting_wal_failed_backup = backup_set.recovery_dir.join(recovery_backup_filename(
+            &wal_path,
+            stamp,
+            "rebuild-failed",
+        ));
+        fs::create_dir_all(&conflicting_wal_failed_backup)
+            .expect("create conflicting wal rebuild-failed dir");
+
+        let err = restore_database_family_after_failed_rebuild(&backup_set).expect_err("fail");
+        assert!(matches!(err, BeadsError::Io(_)), "unexpected error: {err}");
+
+        assert_eq!(
+            fs::read(&db_path).expect("read rebuilt db"),
+            b"rebuilt-db",
+            "db should roll back to the rebuilt file after staging failure"
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("read rebuilt wal"),
+            b"rebuilt-wal",
+            "wal should remain in place after staging failure"
+        );
+
+        let db_failed_backup = backup_set.recovery_dir.join(recovery_backup_filename(
+            &db_path,
+            stamp,
+            "rebuild-failed",
+        ));
+        assert!(
+            !db_failed_backup.exists(),
+            "partially staged rebuild backup should be removed by rollback"
+        );
+
+        let db_backup = backup_set
+            .recovery_dir
+            .join(recovery_backup_filename(&db_path, stamp, "bak"));
+        assert_eq!(
+            fs::read(&db_backup).expect("read original db backup"),
+            b"original-db"
+        );
+    }
+
+    #[test]
+    fn restore_database_family_after_failed_rebuild_rolls_back_partial_original_restore() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = beads_dir.join("missing-parent").join("beads.db-wal");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let stamp = "fixed-stamp";
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        fs::create_dir_all(&recovery_dir).expect("create recovery dir");
+
+        let db_backup = recovery_dir.join(recovery_backup_filename(&db_path, stamp, "bak"));
+        let wal_backup = recovery_dir.join(recovery_backup_filename(&wal_path, stamp, "bak"));
+        fs::write(&db_backup, b"original-db").expect("write original db backup");
+        fs::write(&wal_backup, b"original-wal").expect("write original wal backup");
+
+        let backup_set = RecoveryBackupSet {
+            db_path: db_path.clone(),
+            recovery_dir,
+            stamp: stamp.to_string(),
+            files: vec![
+                (db_path.clone(), db_backup.clone()),
+                (wal_path.clone(), wal_backup.clone()),
+            ],
+        };
+
+        fs::write(&db_path, b"rebuilt-db").expect("write rebuilt db");
+
+        let err = restore_database_family_after_failed_rebuild(&backup_set).expect_err("fail");
+        assert!(matches!(err, BeadsError::Io(_)), "unexpected error: {err}");
+
+        assert_eq!(
+            fs::read(&db_path).expect("read rebuilt db"),
+            b"rebuilt-db",
+            "rebuilt db should be restored when original restore fails"
+        );
+        assert!(
+            !wal_path.exists(),
+            "missing parent path should remain absent after rollback"
+        );
+
+        assert_eq!(
+            fs::read(&db_backup).expect("read original db backup"),
+            b"original-db",
+            "original db backup should remain preserved after rollback"
+        );
+        assert_eq!(
+            fs::read(&wal_backup).expect("read original wal backup"),
+            b"original-wal",
+            "original wal backup should remain preserved after rollback"
+        );
+
+        let db_failed_backup = backup_set.recovery_dir.join(recovery_backup_filename(
+            &db_path,
+            stamp,
+            "rebuild-failed",
+        ));
+        assert!(
+            !db_failed_backup.exists(),
+            "staged rebuilt db backup should be rolled back when restore fails"
+        );
+    }
+
+    #[test]
+    fn restore_database_family_after_failed_rebuild_errors_when_backup_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"original-db").expect("write original db");
+        fs::write(&wal_path, b"original-wal").expect("write original wal");
+
+        let stamp = "fixed-stamp";
+        let backup_set =
+            move_database_family_to_recovery(&db_path, &beads_dir, stamp).expect("backup set");
+
+        fs::write(&db_path, b"rebuilt-db").expect("write rebuilt db");
+        fs::write(&wal_path, b"rebuilt-wal").expect("write rebuilt wal");
+        let wal_backup = backup_set
+            .recovery_dir
+            .join(recovery_backup_filename(&wal_path, stamp, "bak"));
+        fs::rename(
+            &wal_backup,
+            backup_set
+                .recovery_dir
+                .join(recovery_backup_filename(&wal_path, stamp, "tampered")),
+        )
+        .expect("remove wal backup from expected location");
+
+        let err = restore_database_family_after_failed_rebuild(&backup_set)
+            .expect_err("missing backup should fail restore");
+        assert!(
+            matches!(err, BeadsError::WithContext { .. }),
+            "missing backup should surface a contextual recovery error"
+        );
+        assert!(
+            should_surface_recovery_error(&err),
+            "missing backup during restore should not be hidden behind the original open error"
+        );
+        assert!(
+            err.to_string().contains("expected")
+                && err.to_string().contains(&wal_backup.display().to_string()),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read rebuilt db"),
+            b"rebuilt-db",
+            "rebuilt db should remain in place after rollback"
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("read rebuilt wal"),
+            b"rebuilt-wal",
+            "rebuilt wal should remain in place after rollback"
+        );
+        let db_backup = backup_set
+            .recovery_dir
+            .join(recovery_backup_filename(&db_path, stamp, "bak"));
+        assert_eq!(
+            fs::read(&db_backup).expect("read original db backup"),
+            b"original-db",
+            "db backup should be restored to recovery after rollback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_database_family_to_recovery_backs_up_dangling_symlink_sidecars() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"db").expect("write db");
+        symlink("missing-wal-target", &wal_path).expect("create dangling wal symlink");
+
+        let stamp = "fixed-stamp";
+        let backup_set =
+            move_database_family_to_recovery(&db_path, &beads_dir, stamp).expect("backup set");
+
+        assert!(
+            fs::symlink_metadata(&wal_path).is_err(),
+            "dangling wal symlink should be moved out of the live database family"
+        );
+        let wal_backup = backup_set
+            .files
+            .iter()
+            .find(|(original, _)| original == &wal_path)
+            .map(|(_, backup)| backup)
+            .expect("wal sidecar should be included in backup set");
+        assert!(
+            fs::symlink_metadata(wal_backup)
+                .expect("wal backup metadata")
+                .file_type()
+                .is_symlink(),
+            "dangling wal sidecar should remain a symlink in recovery"
+        );
+        assert_eq!(
+            fs::read_link(wal_backup).expect("read wal backup symlink"),
+            PathBuf::from("missing-wal-target")
         );
     }
 }

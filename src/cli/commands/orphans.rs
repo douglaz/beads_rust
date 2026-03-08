@@ -16,6 +16,7 @@ use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{debug, trace};
 
@@ -57,18 +58,15 @@ pub fn execute(
     // Get issue prefix from config
     let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
     let prefix = config::id_config_from_layer(&config_layer).prefix;
-
-    // Check if we're in a git repo by running git rev-parse
-    if !is_git_repo() {
-        output_empty(ctx.is_json() || args.robot, ctx);
-        return Ok(());
-    }
-
-    // Get git log and extract issue references
-    let Ok(commit_refs) = get_git_commit_refs(&prefix) else {
+    let Some(repo_root) = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
+        .or_else(|| git_repo_root_for_path(&beads_dir))
+    else {
         output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());
     };
+
+    // Get git log and extract issue references
+    let commit_refs = get_git_commit_refs(&prefix, &repo_root)?;
 
     trace!(
         commit_refs = commit_refs.len(),
@@ -225,37 +223,49 @@ pub fn execute(
     Ok(())
 }
 
-/// Check if the current directory is inside a git repository.
-fn is_git_repo() -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--git-dir"])
+fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
+    let start = if path.is_dir() { path } else { path.parent()? };
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(start)
         .output()
-        .is_ok_and(|o| o.status.success())
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
 }
 
 /// Get git commit references containing issue IDs.
 ///
 /// Returns Vec of (`commit_hash`, `commit_message`, `issue_id`) tuples.
 /// The list is ordered from most recent to oldest commit.
-fn get_git_commit_refs(prefix: &str) -> Result<Vec<(String, String, String)>> {
-    let mut child = Command::new("git")
-        .args(["log", "--oneline", "HEAD"])
+fn get_git_commit_refs(prefix: &str, repo_root: &Path) -> Result<Vec<(String, String, String)>> {
+    let output = Command::new("git")
+        .args(["log", "--oneline", "--all"])
+        .current_dir(repo_root)
         .stdout(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped())
+        .output()?;
 
-    let stdout = child.stdout.take().ok_or_else(|| {
-        crate::error::BeadsError::Config("Failed to capture git stdout".to_string())
-    })?;
-
-    let reader = BufReader::new(stdout);
-    let refs = parse_git_log(reader, prefix)?;
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Ok(Vec::new());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            "git log failed".to_string()
+        } else {
+            format!("git log failed: {stderr}")
+        };
+        return Err(crate::error::BeadsError::Config(detail));
     }
 
-    Ok(refs)
+    parse_git_log(BufReader::new(std::io::Cursor::new(output.stdout)), prefix)
 }
 
 /// Parse git log output and extract issue ID references.
@@ -329,7 +339,9 @@ fn output_empty(json: bool, ctx: &OutputContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Cursor;
+    use tempfile::TempDir;
 
     #[test]
     fn test_parse_git_log_extracts_issue_ids() {
@@ -399,5 +411,39 @@ ccc Oldest (bd-1)";
         let log = "abc1234 Fix bug (BD-ABC)";
         let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
         assert_eq!(refs[0].2, "bd-abc");
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    #[test]
+    fn test_get_git_commit_refs_empty_repo_returns_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "-q"]);
+
+        let refs = get_git_commit_refs("bd", temp.path()).expect("empty repo refs");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_get_git_commit_refs_uses_target_repo_root() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "tester@example.com"]);
+        git(temp.path(), &["config", "user.name", "Tester"]);
+
+        fs::write(temp.path().join("README.md"), "hello\n").expect("write readme");
+        git(temp.path(), &["add", "README.md"]);
+        git(temp.path(), &["commit", "-q", "-m", "Implement bd-xyz123"]);
+
+        let refs = get_git_commit_refs("bd", temp.path()).expect("refs");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].2, "bd-xyz123");
     }
 }

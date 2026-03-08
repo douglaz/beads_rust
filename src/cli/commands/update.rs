@@ -135,6 +135,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         if let Some(issue) = issue_after {
             if ctx.is_json() {
                 updated_issues.push(UpdatedIssueOutput::from(&issue));
+            } else if ctx.is_quiet() {
             } else if has_updates {
                 print_update_summary(id, &issue.title, issue_before.as_ref(), &issue);
             } else {

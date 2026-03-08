@@ -17,6 +17,7 @@
 //! | `.beads/*.db` | `SQLite` database files |
 //! | `.beads/*.db-wal` | `SQLite` WAL files |
 //! | `.beads/*.db-shm` | `SQLite` shared memory files |
+//! | `.beads/*.db-journal` | `SQLite` rollback journals |
 //! | `.beads/*.jsonl` | `JSONL` export files |
 //! | `.beads/*.jsonl.tmp` | Temp files for atomic writes |
 //! | `.beads/.manifest.json` | Export manifest |
@@ -46,11 +47,12 @@ use tracing::{debug, warn};
 ///
 /// This list is exhaustive - any file not matching these patterns is rejected.
 pub const ALLOWED_EXTENSIONS: &[&str] = &[
-    "db",        // SQLite database
-    "db-wal",    // SQLite WAL
-    "db-shm",    // SQLite shared memory
-    "jsonl",     // JSONL export
-    "jsonl.tmp", // Atomic write temp files
+    "db",         // SQLite database
+    "db-wal",     // SQLite WAL
+    "db-shm",     // SQLite shared memory
+    "db-journal", // SQLite rollback journal
+    "jsonl",      // JSONL export
+    "jsonl.tmp",  // Atomic write temp files
 ];
 
 /// Files explicitly allowed by exact name within `.beads/`.
@@ -71,6 +73,8 @@ pub enum PathValidation {
     SymlinkEscape { path: PathBuf, target: PathBuf },
     /// Path failed canonicalization.
     CanonicalizationFailed { path: PathBuf, error: String },
+    /// Path exists but is not a regular file.
+    NonRegularFile { path: PathBuf },
     /// Path targets git internals (.git directory).
     GitPathAttempt { path: PathBuf },
 }
@@ -112,6 +116,9 @@ impl PathValidation {
                 path.display(),
                 error
             )),
+            Self::NonRegularFile { path } => {
+                Some(format!("Path '{}' must be a regular file", path.display()))
+            }
             Self::GitPathAttempt { path } => Some(format!(
                 "Path '{}' targets git internals - sync never accesses .git/ (safety invariant NGI-3)",
                 path.display()
@@ -309,6 +316,35 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
                 "Symlink escape detected"
             );
             return result;
+        }
+    }
+
+    if path.exists() {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_file() => {
+                let result = PathValidation::NonRegularFile {
+                    path: path.to_path_buf(),
+                };
+                warn!(
+                    path = %path.display(),
+                    reason = %result.rejection_reason().unwrap_or_default(),
+                    "Path validation rejected"
+                );
+                return result;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let result = PathValidation::CanonicalizationFailed {
+                    path: path.to_path_buf(),
+                    error: e.to_string(),
+                };
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Path metadata lookup failed"
+                );
+                return result;
+            }
         }
     }
 
@@ -639,27 +675,7 @@ pub fn validate_temp_file_path(
         )));
     }
 
-    // If external is allowed for the target, it's allowed for the temp file too
-    if allow_external {
-        return Ok(());
-    }
-
-    // For internal paths, validate containment
-    let canonical_beads =
-        dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
-
-    if let Some(parent) = temp_parent {
-        let canonical_parent = dunce::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-        if !canonical_parent.starts_with(&canonical_beads) {
-            return Err(BeadsError::Config(format!(
-                "Temp file '{}' is outside allowed directory '{}'",
-                temp_path.display(),
-                beads_dir.display()
-            )));
-        }
-    }
-
-    Ok(())
+    validate_sync_path_with_external(temp_path, beads_dir, allow_external)
 }
 
 #[cfg(test)]
@@ -702,6 +718,16 @@ mod tests {
 
         let result = validate_sync_path(&path, &beads_dir);
         assert!(result.is_allowed(), "DB-WAL files should be allowed");
+    }
+
+    #[test]
+    fn test_allowed_db_journal_file() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("beads.db-journal");
+        std::fs::write(&path, "").expect("write");
+
+        let result = validate_sync_path(&path, &beads_dir);
+        assert!(result.is_allowed(), "DB journal files should be allowed");
     }
 
     #[test]
@@ -782,6 +808,19 @@ mod tests {
         assert!(
             matches!(result, PathValidation::DisallowedExtension { .. }),
             "Source files should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rejected_directory_named_like_jsonl() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("issues.jsonl");
+        std::fs::create_dir_all(&path).expect("create directory");
+
+        let result = validate_sync_path(&path, &beads_dir);
+        assert!(
+            matches!(result, PathValidation::NonRegularFile { .. }),
+            "Directories named like JSONL files should be rejected"
         );
     }
 
@@ -1116,6 +1155,25 @@ mod tests {
         assert!(
             result.is_ok(),
             "Temp file in nested .beads subdir should be valid"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_temp_file_rejects_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (temp_dir, beads_dir) = setup_test_beads_dir();
+        let external_dir = temp_dir.path().join("external");
+        std::fs::create_dir_all(&external_dir).expect("create external dir");
+        let target = beads_dir.join("issues.jsonl");
+        let temp = beads_dir.join("issues.jsonl.tmp");
+        symlink(external_dir.join("capture.jsonl"), &temp).expect("create symlink");
+
+        let result = validate_temp_file_path(&temp, &target, &beads_dir, false);
+        assert!(
+            result.is_err(),
+            "Existing symlink temp paths should be rejected"
         );
     }
 }

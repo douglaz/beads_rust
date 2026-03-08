@@ -654,11 +654,12 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
 
     // Check extension matches
     const ALLOWED_EXTENSIONS: &[&str] = &[
-        "db",        // SQLite database
-        "db-wal",    // SQLite WAL
-        "db-shm",    // SQLite shared memory
-        "jsonl",     // JSONL export
-        "jsonl.tmp", // Atomic write temp files
+        "db",         // SQLite database
+        "db-journal", // SQLite rollback journal
+        "db-wal",     // SQLite WAL
+        "db-shm",     // SQLite shared memory
+        "jsonl",      // JSONL export
+        "jsonl.tmp",  // Atomic write temp files
     ];
 
     for ext in ALLOWED_EXTENSIONS {

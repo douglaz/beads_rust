@@ -197,6 +197,37 @@ fn e2e_config_json_output() {
         serde_json::from_str(&payload).expect("config list should output valid JSON");
 }
 
+#[test]
+fn e2e_update_quiet_suppresses_success_output() {
+    let _log = common::test_log("e2e_update_quiet_suppresses_success_output");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Quiet update test", "--json"],
+        "create_quiet_update",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let payload = extract_json_payload(&create.stdout);
+    let issue: Value = serde_json::from_str(&payload).expect("parse create json");
+    let id = issue["id"].as_str().expect("issue id");
+
+    let update = run_br(
+        &workspace,
+        ["--quiet", "update", id, "--status", "in_progress"],
+        "update_quiet",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+    assert!(
+        update.stdout.trim().is_empty(),
+        "quiet update should suppress success output: {}",
+        update.stdout
+    );
+}
+
 #[cfg(not(windows))]
 #[test]
 fn e2e_config_edit_creates_user_config() {

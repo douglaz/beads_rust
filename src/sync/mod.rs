@@ -26,9 +26,35 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+struct TempFileGuard {
+    path: PathBuf,
+    persist: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            persist: false,
+        }
+    }
+
+    fn persist(&mut self) {
+        self.persist = true;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if !self.persist {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 
 /// Configuration for JSONL export.
 #[derive(Debug, Clone, Default)]
@@ -1404,7 +1430,21 @@ pub fn export_to_jsonl_with_policy(
         );
     }
 
-    let temp_file = File::create(&temp_path)?;
+    let temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                BeadsError::Config(format!(
+                    "Temporary export file already exists: {}",
+                    temp_path.display()
+                ))
+            } else {
+                err.into()
+            }
+        })?;
+    let mut temp_guard = TempFileGuard::new(temp_path.clone());
     let mut writer = BufWriter::new(temp_file);
 
     // Write JSONL and compute hash
@@ -1471,6 +1511,19 @@ pub fn export_to_jsonl_with_policy(
         .map_err(|e| BeadsError::Io(e.into_error()))?
         .sync_all()?;
 
+    // Compute final hash
+    let content_hash = format!("{:x}", hasher.finalize());
+
+    // Verify staged export integrity before replacing the live JSONL.
+    let actual_count = count_issues_in_jsonl(&temp_path)?;
+    if actual_count != exported_ids.len() {
+        return Err(BeadsError::Config(format!(
+            "Export verification failed: expected {} issues, JSONL has {} lines",
+            exported_ids.len(),
+            actual_count
+        )));
+    }
+
     if let Some(ref beads_dir) = config.beads_dir {
         require_safe_sync_overwrite_path(
             &temp_path,
@@ -1488,6 +1541,7 @@ pub fn export_to_jsonl_with_policy(
 
     // Atomic rename
     fs::rename(&temp_path, output_path)?;
+    temp_guard.persist();
 
     // Set file permissions (0600)
     #[cfg(unix)]
@@ -1495,19 +1549,6 @@ pub fn export_to_jsonl_with_policy(
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
         let _ = fs::set_permissions(output_path, perms);
-    }
-
-    // Compute final hash
-    let content_hash = format!("{:x}", hasher.finalize());
-
-    // Verify export integrity
-    let actual_count = count_issues_in_jsonl(output_path)?;
-    if actual_count != exported_ids.len() {
-        return Err(BeadsError::Config(format!(
-            "Export verification failed: expected {} issues, JSONL has {} lines",
-            exported_ids.len(),
-            actual_count
-        )));
     }
 
     let result = ExportResult {
@@ -2971,16 +3012,44 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
     jsonl_dir: &Path,
 ) -> Result<()> {
     let snapshot_path = jsonl_dir.join("beads.base.jsonl");
-    let file = File::create(&snapshot_path)?;
-    let mut writer = BufWriter::new(file);
+    let temp_path = snapshot_path.with_extension("jsonl.tmp");
+    validate_temp_file_path(&temp_path, &snapshot_path, jsonl_dir, false)?;
 
-    for issue in issues.values() {
+    let temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                BeadsError::Config(format!(
+                    "Temporary base snapshot file already exists: {}",
+                    temp_path.display()
+                ))
+            } else {
+                err.into()
+            }
+        })?;
+    let mut temp_guard = TempFileGuard::new(temp_path.clone());
+    let mut writer = BufWriter::new(temp_file);
+
+    let mut ordered_issues: Vec<_> = issues.values().collect();
+    ordered_issues.sort_by(|left, right| left.id.cmp(&right.id));
+
+    for issue in ordered_issues {
         let json = serde_json::to_string(issue).map_err(|e| {
             BeadsError::Config(format!("Failed to serialize issue {}: {}", issue.id, e))
         })?;
         writeln!(writer, "{json}")?;
     }
     writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| BeadsError::Io(e.into_error()))?
+        .sync_all()?;
+    require_safe_sync_overwrite_path(&temp_path, jsonl_dir, false, "rename base snapshot")?;
+    require_safe_sync_overwrite_path(&snapshot_path, jsonl_dir, false, "overwrite base snapshot")?;
+    fs::rename(&temp_path, &snapshot_path)?;
+    temp_guard.persist();
     Ok(())
 }
 
@@ -2999,6 +3068,7 @@ pub fn load_base_snapshot(jsonl_dir: &Path) -> Result<std::collections::HashMap<
         return Ok(base);
     }
 
+    require_valid_sync_path(&snapshot_path, jsonl_dir)?;
     let file = File::open(&snapshot_path)?;
     let reader = BufReader::new(file);
 
@@ -3027,7 +3097,10 @@ mod tests {
     use chrono::Utc;
     use fsqlite_types::SqliteValue;
     use indicatif::{ProgressBar, ProgressStyle};
+    use std::collections::HashMap;
     use std::io::{self, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
     fn make_test_issue(id: &str, title: &str) -> Issue {
@@ -3215,6 +3288,113 @@ mod tests {
         assert_eq!(result.exported_count, 0);
         assert!(result.exported_ids.is_empty());
         assert!(output_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_base_snapshot_rejects_existing_temp_symlink() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let snapshot_path = beads_dir.join("beads.base.jsonl");
+        fs::write(&snapshot_path, "old-snapshot\n").unwrap();
+
+        let temp_target = outside_dir.join("captured.txt");
+        fs::write(&temp_target, "do-not-touch").unwrap();
+        symlink(&temp_target, beads_dir.join("beads.base.jsonl.tmp")).unwrap();
+
+        let mut issues = HashMap::new();
+        issues.insert(
+            "bd-base".to_string(),
+            Issue {
+                id: "bd-base".to_string(),
+                title: "New base snapshot".to_string(),
+                ..Issue::default()
+            },
+        );
+
+        let err = save_base_snapshot(&issues, &beads_dir).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("regular file")
+                || message.contains("Temporary base snapshot file")
+                || message.contains("Symlink")
+                || message.contains("Path"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&snapshot_path).unwrap(),
+            "old-snapshot\n",
+            "existing base snapshot should remain unchanged on failure"
+        );
+        assert_eq!(
+            fs::read_to_string(&temp_target).unwrap(),
+            "do-not-touch",
+            "symlink target should not be overwritten"
+        );
+    }
+
+    #[test]
+    fn test_save_base_snapshot_sorts_issues_deterministically() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let mut issues = HashMap::new();
+        issues.insert(
+            "bd-z".to_string(),
+            Issue {
+                id: "bd-z".to_string(),
+                title: "Last".to_string(),
+                ..Issue::default()
+            },
+        );
+        issues.insert(
+            "bd-a".to_string(),
+            Issue {
+                id: "bd-a".to_string(),
+                title: "First".to_string(),
+                ..Issue::default()
+            },
+        );
+
+        save_base_snapshot(&issues, &beads_dir).unwrap();
+
+        let lines: Vec<_> = fs::read_to_string(beads_dir.join("beads.base.jsonl"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2);
+
+        let first: Issue = serde_json::from_str(&lines[0]).unwrap();
+        let second: Issue = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(first.id, "bd-a");
+        assert_eq!(second.id, "bd-z");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_base_snapshot_rejects_symlink_escape() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let outside_snapshot = outside_dir.join("beads.base.jsonl");
+        fs::write(&outside_snapshot, "{\"id\":\"bd-outside\"}\n").unwrap();
+        symlink(&outside_snapshot, beads_dir.join("beads.base.jsonl")).unwrap();
+
+        let err = load_base_snapshot(&beads_dir).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("symlink") || message.contains("Path"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]

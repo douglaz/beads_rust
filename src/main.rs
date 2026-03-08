@@ -252,6 +252,12 @@ fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
             | beads_rust::cli::DepCommands::Remove(_)
             | beads_rust::cli::DepCommands::Cycles(_) => None,
         },
+        Commands::Query { command } => match command {
+            beads_rust::cli::QueryCommands::Run(args) => args.filters.format,
+            beads_rust::cli::QueryCommands::Save(_)
+            | beads_rust::cli::QueryCommands::List
+            | beads_rust::cli::QueryCommands::Delete(_) => None,
+        },
         _ => None,
     }
 }
@@ -539,6 +545,12 @@ mod tests {
     #[test]
     fn should_render_errors_as_json_when_command_requests_json_format() {
         let cli = Cli::parse_from(["br", "list", "--format", "json"]);
+        assert!(should_render_errors_as_json_with_env(&cli, None));
+    }
+
+    #[test]
+    fn should_render_errors_as_json_for_query_run_json_format() {
+        let cli = Cli::parse_from(["br", "query", "run", "saved", "--format", "json"]);
         assert!(should_render_errors_as_json_with_env(&cli, None));
     }
 

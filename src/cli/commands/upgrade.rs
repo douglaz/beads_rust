@@ -82,6 +82,7 @@ fn execute_check(current_version: &str, ctx: &OutputContext) -> Result<()> {
 
     if ctx.is_json() {
         ctx.json_pretty(&result);
+    } else if ctx.is_quiet() {
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_check_rich(&result, ctx);
     } else {
@@ -125,6 +126,7 @@ fn execute_dry_run(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
             "would_update": would_update,
         });
         ctx.json_pretty(&result);
+    } else if ctx.is_quiet() {
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_dry_run_rich(
             current_version,
@@ -157,9 +159,10 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     tracing::info!(current = %current_version, "Starting upgrade...");
 
     let is_json = ctx.is_json();
+    let is_quiet = ctx.is_quiet();
     let is_rich = matches!(ctx.mode(), OutputMode::Rich);
 
-    if !is_json && !is_rich {
+    if !is_json && !is_quiet && !is_rich {
         println!("Checking for updates...");
         println!("Current version: {current_version}");
     } else if is_rich {
@@ -178,7 +181,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     let latest = updater.get_latest_release().map_err(map_update_error)?;
     let latest_version = &latest.version;
 
-    if !is_json && !is_rich {
+    if !is_json && !is_quiet && !is_rich {
         println!("Latest version:  {latest_version}");
     }
 
@@ -194,6 +197,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
 
         if is_json {
             ctx.json_pretty(&result);
+        } else if is_quiet {
         } else if is_rich {
             render_up_to_date_rich(current_version, latest_version, ctx);
         } else {
@@ -202,7 +206,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
         return Ok(());
     }
 
-    if !is_json && !is_rich {
+    if !is_json && !is_quiet && !is_rich {
         println!("\nDownloading {latest_version}...");
     } else if is_rich {
         ctx.info(&format!("Downloading {latest_version}..."));
@@ -224,6 +228,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
 
     if is_json {
         ctx.json_pretty(&result);
+    } else if is_quiet {
     } else if is_rich {
         render_upgrade_result_rich(&result, current_version, ctx);
     } else if status.updated() {

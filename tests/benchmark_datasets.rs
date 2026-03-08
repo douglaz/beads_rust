@@ -241,6 +241,7 @@ fn copy_beads_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
         if name.ends_with(".sock")
             || name.ends_with("-wal")
             || name.ends_with("-shm")
+            || name.ends_with("-journal")
             || name == ".sync.lock"
             || name == "history"
         {

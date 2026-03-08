@@ -8,10 +8,12 @@
 //! - Clear errors for missing/invalid routes
 
 use std::fs;
+use std::process::Command;
 
 mod common;
 
-use common::cli::{BrWorkspace, run_br, run_br_with_env};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use serde_json::Value;
 
 /// Helper to create a routes.jsonl file with given entries.
 fn create_routes_file(workspace: &BrWorkspace, entries: &[(&str, &str)]) {
@@ -28,6 +30,53 @@ fn create_routes_file(workspace: &BrWorkspace, entries: &[(&str, &str)]) {
 fn create_redirect_file(beads_dir: &std::path::Path, target: &str) {
     let redirect_path = beads_dir.join("redirect");
     fs::write(&redirect_path, target).expect("write redirect");
+}
+
+fn init_test_git_repo(repo_root: &std::path::Path) -> String {
+    let init_git = Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo_root)
+        .output()
+        .expect("git init");
+    assert!(init_git.status.success(), "git init failed");
+    let config_name = Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(repo_root)
+        .output()
+        .expect("git config user.name");
+    assert!(config_name.status.success(), "git config user.name failed");
+    let config_email = Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(repo_root)
+        .output()
+        .expect("git config user.email");
+    assert!(
+        config_email.status.success(),
+        "git config user.email failed"
+    );
+    fs::write(repo_root.join("README.md"), "hello\n").expect("write readme");
+    let add = Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(repo_root)
+        .output()
+        .expect("git add");
+    assert!(add.status.success(), "git add failed");
+    let commit = Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(repo_root)
+        .output()
+        .expect("git commit");
+    assert!(commit.status.success(), "git commit failed");
+    String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_root)
+            .output()
+            .expect("git rev-parse")
+            .stdout,
+    )
+    .trim()
+    .to_string()
 }
 
 // =============================================================================
@@ -423,30 +472,183 @@ fn e2e_routing_db_flag_external_path() {
 }
 
 #[test]
-fn e2e_routing_db_flag_requires_beads_component() {
-    let _log = common::test_log("e2e_routing_db_flag_requires_beads_component");
+fn e2e_routing_db_flag_external_db_uses_workspace_beads_dir() {
+    let _log = common::test_log("e2e_routing_db_flag_external_db_uses_workspace_beads_dir");
     let workspace = BrWorkspace::new();
 
-    // Create a database outside of .beads directory
-    let bad_db_path = workspace.root.join("some_dir").join("beads.db");
-    fs::create_dir_all(bad_db_path.parent().unwrap()).expect("create dir");
+    let init = run_br(&workspace, ["init"], "init_workspace");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // --db flag without .beads component should fail with clear error
+    let create = run_br(
+        &workspace,
+        [
+            "create",
+            "Workspace issue",
+            "--priority",
+            "2",
+            "--type",
+            "task",
+        ],
+        "create_workspace_issue",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let external_db = workspace.root.join("cache").join("beads.db");
+    fs::create_dir_all(external_db.parent().unwrap()).expect("create cache dir");
+    fs::copy(workspace.root.join(".beads").join("beads.db"), &external_db).expect("copy db");
+
     let list = run_br(
         &workspace,
-        ["--db", bad_db_path.to_str().unwrap(), "list", "--json"],
-        "list_bad_db",
+        ["--db", external_db.to_str().unwrap(), "list", "--json"],
+        "list_external_db_outside_beads",
     );
     assert!(
-        !list.status.success(),
-        "Expected failure for db path without .beads component"
-    );
-    assert!(
-        list.stderr.contains(".beads")
-            || list.stderr.contains("beads directory")
-            || list.stderr.contains("Cannot derive"),
-        "Expected clear error about .beads requirement, got: {}",
+        list.status.success(),
+        "commands should still discover the workspace when --db points outside .beads: {}",
         list.stderr
+    );
+    assert!(list.stdout.contains("Workspace issue"));
+}
+
+#[test]
+fn e2e_config_get_db_flag_invalid_target_fails_instead_of_falling_back() {
+    let _log =
+        common::test_log("e2e_config_get_db_flag_invalid_target_fails_instead_of_falling_back");
+    let workspace = BrWorkspace::new();
+
+    let external_beads = workspace.root.join("broken").join(".beads");
+    fs::create_dir_all(&external_beads).expect("create external beads dir");
+    let external_db = external_beads.join("beads.db");
+    fs::write(&external_db, "not a sqlite database").expect("write corrupt db");
+    fs::write(
+        external_beads.join("config.yaml"),
+        "issue_prefix: PROJECT\n",
+    )
+    .expect("write config");
+
+    let get = run_br(
+        &workspace,
+        [
+            "--db",
+            external_db.to_str().unwrap(),
+            "config",
+            "get",
+            "issue_prefix",
+        ],
+        "config_get_invalid_db_target",
+    );
+    assert!(
+        !get.status.success(),
+        "config get should fail for an explicitly targeted broken DB"
+    );
+    assert!(
+        !get.stdout.contains("PROJECT"),
+        "config get should not silently fall back to YAML layers on explicit DB failure"
+    );
+}
+
+#[test]
+fn e2e_config_delete_db_flag_invalid_target_preserves_yaml() {
+    let _log = common::test_log("e2e_config_delete_db_flag_invalid_target_preserves_yaml");
+    let workspace = BrWorkspace::new();
+
+    let external_beads = workspace.root.join("broken-delete").join(".beads");
+    fs::create_dir_all(&external_beads).expect("create external beads dir");
+    let external_db = external_beads.join("beads.db");
+    let project_config = external_beads.join("config.yaml");
+    fs::write(&external_db, "not a sqlite database").expect("write corrupt db");
+    fs::write(&project_config, "issue_prefix: PROJECT\n").expect("write config");
+
+    let delete = run_br(
+        &workspace,
+        [
+            "--db",
+            external_db.to_str().unwrap(),
+            "config",
+            "delete",
+            "issue_prefix",
+        ],
+        "config_delete_invalid_db_target",
+    );
+    assert!(
+        !delete.status.success(),
+        "config delete should fail for an explicitly targeted broken DB"
+    );
+    assert_eq!(
+        fs::read_to_string(&project_config).unwrap(),
+        "issue_prefix: PROJECT\n",
+        "project YAML should remain untouched when explicit DB open fails"
+    );
+}
+
+#[test]
+fn e2e_changelog_since_commit_uses_target_repo_root() {
+    let _log = common::test_log("e2e_changelog_since_commit_uses_target_repo_root");
+    let workspace = BrWorkspace::new();
+
+    let external_root = workspace.root.join("external-repo");
+    let external_beads = external_root.join(".beads");
+    fs::create_dir_all(&external_beads).expect("create external beads dir");
+    let head = init_test_git_repo(&external_root);
+
+    let init = run_br_with_env(
+        &workspace,
+        ["init"],
+        [("BEADS_DIR", external_beads.to_str().unwrap())],
+        "init_external_repo",
+    );
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        [
+            "--db",
+            external_beads.join("beads.db").to_str().unwrap(),
+            "create",
+            "External closed issue",
+            "--type",
+            "task",
+            "--priority",
+            "2",
+            "--json",
+        ],
+        "create_external_closed_issue",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let payload = extract_json_payload(&create.stdout);
+    let issue: Value = serde_json::from_str(&payload).expect("parse create json");
+    let id = issue["id"].as_str().expect("issue id").to_string();
+
+    let close = run_br(
+        &workspace,
+        [
+            "--db",
+            external_beads.join("beads.db").to_str().unwrap(),
+            "close",
+            &id,
+            "--reason",
+            "done",
+        ],
+        "close_external_closed_issue",
+    );
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    let changelog = run_br(
+        &workspace,
+        [
+            "--db",
+            external_beads.join("beads.db").to_str().unwrap(),
+            "changelog",
+            "--since-commit",
+            &head,
+            "--json",
+        ],
+        "changelog_external_since_commit",
+    );
+    assert!(
+        changelog.status.success(),
+        "changelog should resolve git references in the targeted repo: {}",
+        changelog.stderr
     );
 }
 

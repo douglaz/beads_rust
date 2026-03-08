@@ -77,6 +77,22 @@ fn e2e_version_no_workspace_required() {
     );
 }
 
+#[test]
+fn e2e_version_quiet_suppresses_output() {
+    let workspace = BrWorkspace::new();
+
+    let version = run_br(&workspace, ["--quiet", "version"], "version_quiet");
+    assert!(
+        version.status.success(),
+        "quiet version command failed: {}",
+        version.stderr
+    );
+    assert!(
+        version.stdout.trim().is_empty(),
+        "quiet version should not print"
+    );
+}
+
 // =============================================================================
 // Upgrade --check Tests
 // =============================================================================
@@ -179,6 +195,40 @@ fn e2e_upgrade_dry_run_json() {
             "output should be valid JSON, got: {json_str}"
         );
     }
+}
+
+#[cfg(feature = "self_update")]
+#[test]
+fn e2e_upgrade_check_quiet_suppresses_output() {
+    let workspace = BrWorkspace::new();
+
+    let upgrade = run_br(
+        &workspace,
+        ["--quiet", "upgrade", "--check"],
+        "upgrade_check_quiet",
+    );
+    assert!(
+        upgrade.stdout.trim().is_empty(),
+        "quiet upgrade --check should not print stdout: {}",
+        upgrade.stdout
+    );
+}
+
+#[cfg(feature = "self_update")]
+#[test]
+fn e2e_upgrade_dry_run_quiet_suppresses_output() {
+    let workspace = BrWorkspace::new();
+
+    let upgrade = run_br(
+        &workspace,
+        ["--quiet", "upgrade", "--dry-run"],
+        "upgrade_dry_run_quiet",
+    );
+    assert!(
+        upgrade.stdout.trim().is_empty(),
+        "quiet upgrade --dry-run should not print stdout: {}",
+        upgrade.stdout
+    );
 }
 
 // =============================================================================

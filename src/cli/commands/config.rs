@@ -115,14 +115,8 @@ fn build_layers(
     let defaults = default_config_layer();
 
     let db_layer = if let Some(dir) = beads_dir {
-        let storage = config::open_storage_with_cli(dir, overrides)
-            .ok()
-            .map(|ctx| ctx.storage);
-        if let Some(storage) = storage {
-            ConfigLayer::from_db(&storage)?
-        } else {
-            ConfigLayer::default()
-        }
+        let storage_ctx = config::open_storage_with_cli(dir, overrides)?;
+        ConfigLayer::from_db(&storage_ctx.storage)?
     } else {
         ConfigLayer::default()
     };
@@ -592,17 +586,9 @@ fn delete_config_value(
     let mut db_deleted = false;
 
     if let Some(dir) = &beads_dir {
-        // Only try to open DB if we have a beads dir
-        if let Ok(mut storage_ctx) = config::open_storage_with_cli(dir, overrides) {
-            // We ignore is_startup_key check here to allow deleting from YAML even if not in DB
-            match storage_ctx.storage.delete_config(key) {
-                Ok(deleted) => db_deleted = deleted,
-                Err(e) => {
-                    tracing::warn!(key, error = %e, "Failed to delete config key from DB");
-                    eprintln!("Warning: failed to delete '{key}' from DB: {e}");
-                }
-            }
-        }
+        let mut storage_ctx = config::open_storage_with_cli(dir, overrides)?;
+        db_deleted = storage_ctx.storage.delete_config(key)?;
+        storage_ctx.flush_no_db_if_dirty()?;
     }
 
     // 2. Delete from Project YAML

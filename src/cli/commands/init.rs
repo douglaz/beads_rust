@@ -98,6 +98,7 @@ pub fn execute(
     if !gitignore_existed {
         let gitignore = r"# Database
 *.db
+*.db-journal
 *.db-shm
 *.db-wal
 
@@ -430,6 +431,7 @@ mod tests {
         let content = fs::read_to_string(gitignore_path).unwrap();
 
         assert!(content.contains("*.db"));
+        assert!(content.contains("*.db-journal"));
         assert!(content.contains("*.db-wal"));
         assert!(content.contains("*.db-shm"));
         assert!(content.contains("*.lock"));

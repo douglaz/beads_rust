@@ -106,12 +106,11 @@ fn graph_single(
         let issue = if current_id == root_id {
             root_issue.clone()
         } else {
-            storage.get_issue(&current_id)?.unwrap_or_else(|| {
-                let mut i = root_issue.clone();
-                i.id.clone_from(&current_id);
-                i.title = "Unknown".to_string();
-                i
-            })
+            storage.get_issue(&current_id)?.ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "dependency graph references missing issue {current_id}"
+                ))
+            })?
         };
 
         nodes.push(GraphNode {
@@ -295,18 +294,15 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
         // Calculate depths using longest path from roots
         // Roots are issues with no unsatisfied dependencies within the component
         let component_set: HashSet<&String> = component_nodes.iter().collect();
-        let mut depths = calculate_depths(&all_dependencies, &component_nodes, &component_set);
+        let (mut depths, mut roots) =
+            calculate_depths(&all_dependencies, &component_nodes, &component_set);
 
         // Build component output
         let mut nodes: Vec<GraphNode> = Vec::new();
-        let mut roots: Vec<String> = Vec::new();
 
         for node_id in &component_nodes {
             if let Some(issue) = issue_map.get(node_id) {
                 let depth = depths.remove(node_id).unwrap_or(0);
-                if depth == 0 {
-                    roots.push(node_id.clone());
-                }
                 nodes.push(GraphNode {
                     id: node_id.clone(),
                     title: issue.title.clone(),
@@ -372,17 +368,26 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
                 let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
                 println!("Component {}: {}", i + 1, ids.join(", "));
             } else {
+                let roots = if component.roots.is_empty() {
+                    "none".to_string()
+                } else {
+                    component.roots.join(", ")
+                };
                 // Detailed view
                 println!(
                     "Component {} ({} issues, roots: {}):",
                     i + 1,
                     component.nodes.len(),
-                    component.roots.join(", ")
+                    roots
                 );
 
                 for node in &component.nodes {
                     let indent = "  ".repeat(node.depth + 1);
-                    let root_marker = if node.depth == 0 { " (root)" } else { "" };
+                    let root_marker = if component.roots.contains(&node.id) {
+                        " (root)"
+                    } else {
+                        ""
+                    };
                     println!(
                         "{}{}: {} [P{}] [{}]{}",
                         indent, node.id, node.title, node.priority, node.status, root_marker
@@ -398,13 +403,14 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
 
 // Calculate depths for nodes using longest path from roots.
 ///
-/// Roots are issues with no dependencies within the component.
-/// Depth is the longest path from any root to the node.
+/// Returns both the computed depths and the component roots. Roots are issues
+/// with no dependencies within the component. Depth is the longest path from
+/// any root to the node.
 fn calculate_depths(
     all_dependencies: &HashMap<String, Vec<crate::model::Dependency>>,
     nodes: &[String],
     component_set: &HashSet<&String>,
-) -> HashMap<String, usize> {
+) -> (HashMap<String, usize>, Vec<String>) {
     let mut depths: HashMap<String, usize> = HashMap::new();
 
     // Get dependencies for each node (filtered to component)
@@ -435,9 +441,10 @@ fn calculate_depths(
     }
 
     // Find roots (nodes with no dependencies in component)
-    let roots: Vec<&String> = nodes
+    let roots: Vec<String> = nodes
         .iter()
         .filter(|n| deps_map.get(*n).is_none_or(Vec::is_empty))
+        .cloned()
         .collect();
 
     // Max depth to prevent infinite loops in cycles
@@ -474,7 +481,7 @@ fn calculate_depths(
         depths.entry(node_id.clone()).or_insert(0);
     }
 
-    depths
+    (depths, roots)
 }
 
 fn resolve_issue_id(
@@ -617,12 +624,17 @@ fn render_all_graph_rich(
 
         // Component header
         content.append_styled(&format!("Component {}", i + 1), theme.emphasis.clone());
+        let roots = if component.roots.is_empty() {
+            "none".to_string()
+        } else {
+            component.roots.join(", ")
+        };
         content.append_styled(
             &format!(
                 " ({} issue{}, roots: {})\n",
                 component.nodes.len(),
                 if component.nodes.len() == 1 { "" } else { "s" },
-                component.roots.join(", ")
+                roots
             ),
             theme.dimmed.clone(),
         );
@@ -654,7 +666,7 @@ fn render_all_graph_rich(
             let status_style = status_style(&node.status, theme);
             content.append_styled(&format!("[{}]", node.status), status_style);
 
-            if node.depth == 0 {
+            if component.roots.contains(&node.id) {
                 content.append_styled(" (root)", theme.dimmed.clone());
             }
             content.append("\n");
@@ -1071,6 +1083,54 @@ mod tests {
             let json = serde_json::to_string(&node).unwrap();
             assert!(json.contains(&format!("\"status\":\"{status}\"")));
         }
+    }
+
+    #[test]
+    fn test_calculate_depths_cycle_has_no_roots() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = chrono::Utc::now();
+
+        let a = Issue {
+            id: "bd-a".to_string(),
+            title: "A".to_string(),
+            status: Status::Open,
+            priority: crate::model::Priority::MEDIUM,
+            issue_type: crate::model::IssueType::Task,
+            created_at: t1,
+            updated_at: t1,
+            ..Default::default()
+        };
+        let b = Issue {
+            id: "bd-b".to_string(),
+            title: "B".to_string(),
+            status: Status::Open,
+            priority: crate::model::Priority::MEDIUM,
+            issue_type: crate::model::IssueType::Task,
+            created_at: t1,
+            updated_at: t1,
+            ..Default::default()
+        };
+
+        storage.create_issue(&a, "test").unwrap();
+        storage.create_issue(&b, "test").unwrap();
+        let created_at = t1.to_rfc3339();
+        storage
+            .execute_test_sql(&format!(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-a', 'bd-b', 'waits-for', '{created_at}', 'test');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-b', 'bd-a', 'waits-for', '{created_at}', 'test');"
+            ))
+            .unwrap();
+
+        let all_dependencies = storage.get_all_dependency_records().unwrap();
+        let nodes = vec!["bd-a".to_string(), "bd-b".to_string()];
+        let component_set: HashSet<&String> = nodes.iter().collect();
+
+        let (depths, roots) = calculate_depths(&all_dependencies, &nodes, &component_set);
+        assert!(roots.is_empty());
+        assert_eq!(depths.get("bd-a"), Some(&0));
+        assert_eq!(depths.get("bd-b"), Some(&0));
     }
 
     #[test]

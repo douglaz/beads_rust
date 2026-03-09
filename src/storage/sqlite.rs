@@ -1306,9 +1306,7 @@ impl SqliteStorage {
         if let Some(limit) = filters.limit
             && limit > 0
         {
-            sql.push_str(" LIMIT ?");
-            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-            params.push(SqliteValue::from(limit_i64));
+            let _ = write!(sql, " LIMIT {limit}");
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
@@ -1467,9 +1465,7 @@ impl SqliteStorage {
         if let Some(limit) = filters.limit
             && limit > 0
         {
-            sql.push_str(" LIMIT ?");
-            #[allow(clippy::cast_possible_wrap)]
-            params.push(SqliteValue::from(limit as i64));
+            let _ = write!(sql, " LIMIT {limit}");
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
@@ -1642,9 +1638,7 @@ impl SqliteStorage {
         if let Some(limit) = filters.limit
             && limit > 0
         {
-            sql.push_str(" LIMIT ?");
-            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-            params.push(SqliteValue::from(limit_i64));
+            let _ = write!(sql, " LIMIT {limit}");
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;

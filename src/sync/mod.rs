@@ -2547,7 +2547,11 @@ pub fn import_from_jsonl(
             ];
             let mut orphans_cleaned = 0usize;
             for (table, col) in orphan_tables {
-                let sql = format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)");
+                let sql = if *table == "dependencies" && *col == "depends_on_id" {
+                    format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues) AND {col} NOT LIKE 'external:%'")
+                } else {
+                    format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)")
+                };
                 orphans_cleaned += storage.execute_raw_count(&sql)?;
             }
             if orphans_cleaned > 0 {

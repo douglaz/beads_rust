@@ -84,7 +84,7 @@ pub const SCHEMA_SQL: &str = r"
     -- Ready work composite index (most important for performance)
     CREATE INDEX IF NOT EXISTS idx_issues_ready
         ON issues(status, priority, created_at)
-        WHERE status IN ('open', 'in_progress')
+        WHERE (status = 'open' OR status = 'in_progress')
         AND ephemeral = 0
         AND pinned = 0
         AND is_template = 0;
@@ -110,7 +110,7 @@ pub const SCHEMA_SQL: &str = r"
     -- Composite for blocking lookups
     CREATE INDEX IF NOT EXISTS idx_dependencies_blocking
         ON dependencies(depends_on_id, issue_id)
-        WHERE type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for');
+        WHERE (type = 'blocks' OR type = 'parent-child' OR type = 'conditional-blocks' OR type = 'waits-for');
 
     -- Labels
     CREATE TABLE IF NOT EXISTS labels (
@@ -917,7 +917,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE INDEX idx_issues_ready
              ON issues(status, priority, created_at)
-             WHERE status IN ('open', 'in_progress')
+             WHERE (status = 'open' OR status = 'in_progress')
              AND ephemeral = 0
              AND pinned = 0
              AND is_template = 0",
@@ -950,7 +950,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         -- Ready work composite index (most important for performance)
         CREATE INDEX IF NOT EXISTS idx_issues_ready
             ON issues(status, priority, created_at)
-            WHERE status IN ('open', 'in_progress')
+            WHERE (status = 'open' OR status = 'in_progress')
             AND ephemeral = 0
             AND pinned = 0
             AND is_template = 0;
@@ -979,7 +979,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
             CREATE INDEX IF NOT EXISTS idx_dependencies_blocking
                 ON dependencies(depends_on_id, issue_id)
-                WHERE type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for');
+                WHERE (type = 'blocks' OR type = 'parent-child' OR type = 'conditional-blocks' OR type = 'waits-for');
         ",
         )?;
 

@@ -286,8 +286,6 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
 
 fn needs_client_filters(args: &ListArgs) -> bool {
     !args.id.is_empty()
-        || !args.label.is_empty()
-        || !args.label_any.is_empty()
         || args.priority_min.is_some()
         || args.priority_max.is_some()
         || args.desc_contains.is_some()
@@ -476,9 +474,16 @@ mod tests {
             label: vec!["backend".to_string()],
             ..Default::default()
         };
+        assert!(!needs_client_filters(&args));
+
+        let args = cli::ListArgs {
+            desc_contains: Some("needle".to_string()),
+            ..Default::default()
+        };
         assert!(needs_client_filters(&args));
 
         let args = cli::ListArgs {
+            label: vec!["backend".to_string()],
             desc_contains: Some("needle".to_string()),
             ..Default::default()
         };

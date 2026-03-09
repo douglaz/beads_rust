@@ -374,10 +374,10 @@ fn restore_backup(
             true,
             "overwrite history restore target",
         )?;
-        if let Err(err) = fs::remove_file(&target_path) {
-            if err.kind() != io::ErrorKind::NotFound {
-                return Err(err.into());
-            }
+        if let Err(err) = fs::remove_file(&target_path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            return Err(err.into());
         }
     }
     fs::rename(&temp_path, &target_path)?;

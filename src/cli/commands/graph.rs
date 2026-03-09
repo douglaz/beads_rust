@@ -16,6 +16,7 @@ use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::debug;
+use unicode_width::UnicodeWidthStr;
 
 /// JSON output for a single node in the graph.
 #[derive(Debug, Clone, Serialize)]
@@ -964,9 +965,10 @@ fn render_all_graph_rich(
             content.append_styled(&node.id, theme.issue_id.clone());
             content.append(" ");
 
-            // Title (truncate if too long)
-            let title = if node.title.len() > 40 {
-                format!("{}...", &node.title[..37])
+            // Title (truncate if too long for all-graph view to avoid messy panels)
+            // Use visual width for the check to be consistent with truncate_title
+            let title = if UnicodeWidthStr::width(node.title.as_str()) > 40 {
+                crate::format::truncate_title(&node.title, 40)
             } else {
                 node.title.clone()
             };

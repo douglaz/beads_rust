@@ -165,8 +165,8 @@ pub fn create_issue_impl(
 
         let id_input = NewIdInput {
             title,
-            description: None,
-            creator: None,
+            description: args.description.as_deref(),
+            creator: Some(&config.actor),
             now,
             issue_count: count,
             id_config: &config.id_config,
@@ -250,7 +250,6 @@ pub fn create_issue_impl(
                 }
                 retries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(10 * retries));
-                continue;
             }
             Err(e) => return Err(e),
         }
@@ -634,9 +633,7 @@ fn execute_import(
                     continue;
                 }
 
-                let dep_type = type_str
-                    .parse()
-                    .unwrap_or_else(|_| DependencyType::Custom(type_str.clone()));
+                let dep_type: DependencyType = type_str.parse().expect("from_str is infallible");
 
                 issue.dependencies.push(Dependency {
                     issue_id: id.clone(),
@@ -662,7 +659,6 @@ fn execute_import(
                     }
                     retries += 1;
                     std::thread::sleep(std::time::Duration::from_millis(10 * retries));
-                    continue;
                 }
                 Err(err) => {
                     eprintln!("✗ Failed to create {title}: {err}");

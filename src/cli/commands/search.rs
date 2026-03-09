@@ -61,53 +61,28 @@ pub fn execute(
     let client_filters = needs_client_filters(&args.filters);
 
     let issues = storage.search_issues(query, &filters)?;
-    let issues = if client_filters {
+    let mut issues = if client_filters {
         apply_client_filters(storage, issues, &args.filters)?
     } else {
         issues
     };
+
+    apply_issue_sort(&mut issues, args.filters.sort.as_deref())?;
+    if args.filters.reverse {
+        issues.reverse();
+    }
+    if let Some(limit) = limit
+        && limit > 0
+        && issues.len() > limit
+    {
+        issues.truncate(limit);
+    }
 
     let output_format = resolve_output_format_with_outer_mode(
         args.filters.format,
         outer_ctx.inherited_output_mode(),
         false,
     );
-    let needs_counts = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);
-
-    // Batch count dependencies/dependents (JSON/TOON output only).
-    let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-    let (dep_counts, dependent_counts) = if needs_counts {
-        (
-            storage.count_dependencies_for_issues(&issue_ids)?,
-            storage.count_dependents_for_issues(&issue_ids)?,
-        )
-    } else {
-        (HashMap::new(), HashMap::new())
-    };
-
-    let mut issues_with_counts: Vec<IssueWithCounts> = issues
-        .into_iter()
-        .map(|issue| {
-            let dependency_count = *dep_counts.get(&issue.id).unwrap_or(&0);
-            let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
-            IssueWithCounts {
-                issue,
-                dependency_count,
-                dependent_count,
-            }
-        })
-        .collect();
-
-    apply_sort(&mut issues_with_counts, args.filters.sort.as_deref())?;
-    if args.filters.reverse {
-        issues_with_counts.reverse();
-    }
-    if let Some(limit) = limit
-        && limit > 0
-        && issues_with_counts.len() > limit
-    {
-        issues_with_counts.truncate(limit);
-    }
 
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
@@ -118,18 +93,16 @@ pub fn execute(
 
     match output_format {
         OutputFormat::Json => {
+            let issues_with_counts = attach_counts(storage, issues)?;
             ctx.json_pretty(&issues_with_counts);
             return Ok(());
         }
         OutputFormat::Toon => {
+            let issues_with_counts = attach_counts(storage, issues)?;
             ctx.toon_with_stats(&issues_with_counts, args.filters.stats);
             return Ok(());
         }
         OutputFormat::Csv => {
-            let issues: Vec<_> = issues_with_counts
-                .iter()
-                .map(|iwc| iwc.issue.clone())
-                .collect();
             let fields = csv::parse_fields(args.filters.fields.as_deref());
             let csv_output = csv::format_csv(&issues, &fields);
             print!("{csv_output}");
@@ -139,10 +112,6 @@ pub fn execute(
     }
 
     if matches!(ctx.mode(), OutputMode::Rich) {
-        let issues: Vec<_> = issues_with_counts
-            .iter()
-            .map(|iwc| iwc.issue.clone())
-            .collect();
         let context_snippets = build_context_snippets(&issues, query);
         let show_context = !context_snippets.is_empty();
         let columns = IssueTableColumns {
@@ -177,15 +146,41 @@ pub fn execute(
 
     ctx.info(&format!(
         "Found {} issue(s) matching '{}'",
-        issues_with_counts.len(),
+        issues.len(),
         query
     ));
-    for iwc in &issues_with_counts {
-        let line = format_issue_line_with(&iwc.issue, format_options);
+    for issue in &issues {
+        let line = format_issue_line_with(issue, format_options);
         ctx.print(&line);
     }
 
     Ok(())
+}
+
+fn attach_counts(
+    storage: &SqliteStorage,
+    issues: Vec<crate::model::Issue>,
+) -> Result<Vec<IssueWithCounts>> {
+    if issues.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let dep_counts = storage.count_dependencies_for_issues(&issue_ids)?;
+    let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;
+
+    Ok(issues
+        .into_iter()
+        .map(|issue| {
+            let dependency_count = *dep_counts.get(&issue.id).unwrap_or(&0);
+            let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
+            IssueWithCounts {
+                issue,
+                dependency_count,
+                dependent_count,
+            }
+        })
+        .collect())
 }
 
 fn build_context_snippets(issues: &[crate::model::Issue], query: &str) -> HashMap<String, String> {
@@ -456,20 +451,24 @@ fn apply_client_filters(
     Ok(filtered)
 }
 
-fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> {
+fn apply_sort_by_issue<T>(
+    items: &mut [T],
+    sort: Option<&str>,
+    mut issue_of: impl FnMut(&T) -> &crate::model::Issue,
+) -> Result<()> {
     let Some(sort_key) = sort else {
         return Ok(());
     };
 
     match sort_key {
-        "priority" => issues.sort_by_key(|iwc| iwc.issue.priority),
+        "priority" => items.sort_by_key(|item| issue_of(item).priority),
         "created_at" | "created" => {
-            issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.created_at));
+            items.sort_by_key(|item| std::cmp::Reverse(issue_of(item).created_at));
         }
         "updated_at" | "updated" => {
-            issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.updated_at));
+            items.sort_by_key(|item| std::cmp::Reverse(issue_of(item).updated_at));
         }
-        "title" => issues.sort_by_cached_key(|iwc| iwc.issue.title.to_lowercase()),
+        "title" => items.sort_by_cached_key(|item| issue_of(item).title.to_lowercase()),
         _ => {
             return Err(BeadsError::Validation {
                 field: "sort".to_string(),
@@ -479,6 +478,14 @@ fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> {
+    apply_sort_by_issue(issues, sort, |issue| &issue.issue)
+}
+
+fn apply_issue_sort(issues: &mut [crate::model::Issue], sort: Option<&str>) -> Result<()> {
+    apply_sort_by_issue(issues, sort, |issue| issue)
 }
 
 #[cfg(test)]
@@ -574,22 +581,11 @@ mod tests {
         let mut older_created_but_newer_updated = make_issue("bd-b", "Beta", None, t1);
         older_created_but_newer_updated.updated_at = t3;
 
-        let mut items = vec![
-            IssueWithCounts {
-                issue: newer_created_but_older_updated,
-                dependency_count: 0,
-                dependent_count: 0,
-            },
-            IssueWithCounts {
-                issue: older_created_but_newer_updated,
-                dependency_count: 0,
-                dependent_count: 0,
-            },
-        ];
+        let mut items = vec![newer_created_but_older_updated, older_created_but_newer_updated];
 
-        apply_sort(&mut items, Some("updated")).expect("sort");
+        apply_issue_sort(&mut items, Some("updated")).expect("sort");
         items.truncate(1);
-        assert_eq!(items[0].issue.id, "bd-b");
+        assert_eq!(items[0].id, "bd-b");
     }
 
     #[test]
@@ -647,27 +643,20 @@ mod tests {
         filters.sort = None;
         filters.reverse = false;
 
-        let mut issues_with_counts: Vec<IssueWithCounts> = storage
+        let mut issues = storage
             .search_issues("match", &filters)
-            .expect("search")
-            .into_iter()
-            .map(|issue| IssueWithCounts {
-                issue,
-                dependency_count: 0,
-                dependent_count: 0,
-            })
-            .collect();
+            .expect("search");
 
-        apply_sort(&mut issues_with_counts, args.sort.as_deref()).expect("sort");
+        apply_issue_sort(&mut issues, args.sort.as_deref()).expect("sort");
         if args.reverse {
-            issues_with_counts.reverse();
+            issues.reverse();
         }
         if let Some(limit) = limit {
-            issues_with_counts.truncate(limit);
+            issues.truncate(limit);
         }
 
-        assert_eq!(issues_with_counts[0].issue.id, "bd-old");
-        assert_eq!(issues_with_counts[1].issue.id, "bd-new");
+        assert_eq!(issues[0].id, "bd-old");
+        assert_eq!(issues[1].id, "bd-new");
     }
 
     #[test]

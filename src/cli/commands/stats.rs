@@ -50,6 +50,7 @@ pub fn execute(
     let all_filters = ListFilters {
         include_closed: true,
         include_templates: true,
+        include_deferred: true,
         ..Default::default()
     };
     let all_issues = storage.list_issues(&all_filters)?;

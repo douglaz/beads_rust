@@ -607,16 +607,20 @@ fn resolve_dep_tree_node_metadata(
         return Ok((title, 2, status.to_string()));
     }
 
-    let issue = storage.get_issue(node_id)?.ok_or_else(|| {
-        BeadsError::Config(format!(
-            "dependency tree references missing issue {node_id}"
-        ))
-    })?;
+    let issue_opt = storage.get_issue(node_id)?;
+    if let Some(issue) = issue_opt {
+        return Ok((
+            issue.title.clone(),
+            issue.priority.0,
+            issue.status.as_str().to_string(),
+        ));
+    }
 
+    // Handle missing/deleted issues gracefully instead of failing the whole tree
     Ok((
-        issue.title.clone(),
-        issue.priority.0,
-        issue.status.as_str().to_string(),
+        format!("[missing issue: {node_id}]"),
+        2,
+        "deleted".to_string(),
     ))
 }
 
@@ -1390,7 +1394,6 @@ mod tests {
             status: "open".to_string(),
             priority: 2,
         }];
-
         let mut statuses = HashMap::new();
         statuses.insert("external:proj:cap".to_string(), false);
 
@@ -1415,7 +1418,6 @@ mod tests {
             status: "open".to_string(),
             priority: 2,
         }];
-
         let mut statuses = HashMap::new();
         statuses.insert("external:proj:cap".to_string(), false);
 
@@ -1440,7 +1442,6 @@ mod tests {
             status: "open".to_string(),
             priority: 2,
         }];
-
         let mut statuses = HashMap::new();
         statuses.insert("external:proj:cap".to_string(), true);
 

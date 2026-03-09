@@ -268,6 +268,10 @@ impl OutputContext {
         }
     }
 
+    const fn should_emit_toon_stats(show_stats: bool, env_enabled: bool) -> bool {
+        show_stats || env_enabled
+    }
+
     /// Output value as TOON format with optional stats on stderr.
     ///
     /// # Panics
@@ -277,8 +281,17 @@ impl OutputContext {
         if self.is_toon() {
             let json_value = serde_json::to_value(value)
                 .expect("JSON conversion failed - value is not serializable");
-            let json_str =
-                serde_json::to_string_pretty(&json_value).expect("JSON serialization failed");
+            let emit_stats =
+                Self::should_emit_toon_stats(show_stats, std::env::var("TOON_STATS").is_ok());
+            let json_chars = if emit_stats {
+                Some(
+                    serde_json::to_string_pretty(&json_value)
+                        .expect("JSON serialization failed")
+                        .len(),
+                )
+            } else {
+                None
+            };
             let toon_value: JsonValue = json_value.into();
             let options = Some(EncodeOptions {
                 indent: Some(2),
@@ -289,8 +302,8 @@ impl OutputContext {
             });
             let toon_output = encode(toon_value, options);
 
-            if show_stats || std::env::var("TOON_STATS").is_ok() {
-                let json_chars = json_str.len();
+            if emit_stats {
+                let json_chars = json_chars.expect("stats must compute JSON length");
                 let toon_chars = toon_output.len();
                 let savings = if json_chars > 0 {
                     let diff = json_chars.saturating_sub(toon_chars);
@@ -437,5 +450,20 @@ mod tests {
             OutputContext::detect_mode_with_env(&cli, Some(OutputFormat::Toon)),
             OutputMode::Json
         );
+    }
+
+    #[test]
+    fn should_emit_toon_stats_when_flag_is_set() {
+        assert!(OutputContext::should_emit_toon_stats(true, false));
+    }
+
+    #[test]
+    fn should_emit_toon_stats_when_env_is_set() {
+        assert!(OutputContext::should_emit_toon_stats(false, true));
+    }
+
+    #[test]
+    fn should_not_emit_toon_stats_when_flag_and_env_are_absent() {
+        assert!(!OutputContext::should_emit_toon_stats(false, false));
     }
 }

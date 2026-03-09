@@ -574,8 +574,7 @@ fn issues_column_order_matches(conn: &Connection) -> bool {
 ///   3. Drop old table
 ///   4. Rename new table
 fn rebuild_issues_table(conn: &Connection) -> Result<()> {
-    // Build column list from what currently exists in the table
-    let existing_rows = conn.query("PRAGMA table_info(issues)")?;
+    let existing_rows = conn.query("PRAGMA table_info('issues')")?;
     let existing_columns: Vec<String> = existing_rows
         .iter()
         .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(String::from))
@@ -585,16 +584,26 @@ fn rebuild_issues_table(conn: &Connection) -> Result<()> {
         return Ok(()); // Table is empty or doesn't exist
     }
 
+    // Disable foreign keys during the rebuild because we'll be dropping
+    // and recreating the issues table which is referenced by other tables.
+    // This property is connection-scoped.
+    conn.execute("PRAGMA foreign_keys = OFF")?;
+
     // Wrap the entire rebuild in a transaction so a crash between DROP TABLE
     // and RENAME cannot lose data.
     conn.execute("BEGIN EXCLUSIVE")?;
 
     if let Err(e) = rebuild_issues_table_inner(conn, &existing_columns) {
         let _ = conn.execute("ROLLBACK");
+        let _ = conn.execute("PRAGMA foreign_keys = ON");
         return Err(e);
     }
 
     conn.execute("COMMIT")?;
+
+    // Restore foreign key enforcement
+    conn.execute("PRAGMA foreign_keys = ON")?;
+
     Ok(())
 }
 
@@ -802,9 +811,11 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
             .iter()
             .all(|(name, _)| column_exists(conn, "events", name));
     let config_ok = table_has_columns(conn, "config", &["key", "value"])
-        && index_exists(conn, "idx_config_key");
+        && index_exists(conn, "idx_config_key")
+        && !kv_table_uses_primary_key(conn, "config");
     let metadata_ok = table_has_columns(conn, "metadata", &["key", "value"])
-        && index_exists(conn, "idx_metadata_key");
+        && index_exists(conn, "idx_metadata_key")
+        && !kv_table_uses_primary_key(conn, "metadata");
     let dirty_issues_ok = table_has_columns(conn, "dirty_issues", &["issue_id", "marked_at"]);
     let export_hashes_ok = table_has_columns(
         conn,
@@ -1386,13 +1397,20 @@ mod tests {
             );
             CREATE TABLE comments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                issue_id TEXT NOT NULL
+                issue_id TEXT NOT NULL,
+                author TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 issue_id TEXT NOT NULL,
                 event_type TEXT NOT NULL,
-                actor TEXT NOT NULL DEFAULT ''
+                actor TEXT NOT NULL DEFAULT '',
+                old_value TEXT,
+                new_value TEXT,
+                comment TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,

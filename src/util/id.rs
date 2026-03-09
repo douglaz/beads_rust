@@ -163,7 +163,7 @@ impl IdGenerator {
 
                     // Hard stop at 2000 to prevent infinite loop if exists() is broken
                     if nonce > 2000 {
-                        return format!("{}-{hash_str}{nonce}-FINAL", self.config.prefix);
+                        return format!("{}-{hash_str}{nonce}final", self.config.prefix);
                     }
                 }
             }

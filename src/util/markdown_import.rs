@@ -257,21 +257,23 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
 
 /// Split content on commas or whitespace for labels/deps.
 fn split_list_content(content: &str) -> Vec<String> {
-    // First try splitting on commas
-    if content.contains(',') {
-        content
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        // Otherwise split on whitespace
-        content
-            .split_whitespace()
-            .map(str::to_string)
-            .filter(|s| !s.is_empty())
-            .collect()
+    let mut result = Vec::new();
+    for line in content.lines() {
+        if line.contains(',') {
+            result.extend(
+                line.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            );
+        } else {
+            result.extend(
+                line.split_whitespace()
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+            );
+        }
     }
+    result
 }
 
 /// Validate a dependency type string.

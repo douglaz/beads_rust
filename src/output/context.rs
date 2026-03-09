@@ -2,6 +2,7 @@ use super::Theme;
 use crate::cli::{Cli, InheritedOutputMode, OutputFormat};
 use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
+use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
 use toon_rust::options::KeyFoldingMode;
@@ -34,6 +35,28 @@ pub enum OutputMode {
     Toon,
     /// Minimal output (quiet mode)
     Quiet,
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl CountingWriter {
+    const fn len(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl OutputContext {
@@ -272,6 +295,15 @@ impl OutputContext {
         show_stats || env_enabled
     }
 
+    fn pretty_json_len(value: &serde_json::Value) -> usize {
+        let mut writer = CountingWriter::default();
+        let mut serializer = serde_json::Serializer::pretty(&mut writer);
+        value
+            .serialize(&mut serializer)
+            .expect("JSON serialization failed");
+        writer.len()
+    }
+
     /// Output value as TOON format with optional stats on stderr.
     ///
     /// # Panics
@@ -284,11 +316,7 @@ impl OutputContext {
             let emit_stats =
                 Self::should_emit_toon_stats(show_stats, std::env::var("TOON_STATS").is_ok());
             let json_chars = if emit_stats {
-                Some(
-                    serde_json::to_string_pretty(&json_value)
-                        .expect("JSON serialization failed")
-                        .len(),
-                )
+                Some(Self::pretty_json_len(&json_value))
             } else {
                 None
             };
@@ -415,6 +443,7 @@ impl OutputContext {
 mod tests {
     use super::*;
     use clap::Parser;
+    use serde_json::json;
 
     #[test]
     fn detect_mode_uses_env_json_default_when_no_explicit_format_requested() {
@@ -465,5 +494,21 @@ mod tests {
     #[test]
     fn should_not_emit_toon_stats_when_flag_and_env_are_absent() {
         assert!(!OutputContext::should_emit_toon_stats(false, false));
+    }
+
+    #[test]
+    fn pretty_json_len_matches_pretty_serializer_output() {
+        let value = json!({
+            "title": "CLI issue",
+            "labels": ["cli", "perf"],
+            "nested": { "priority": 2, "status": "open" }
+        });
+
+        assert_eq!(
+            OutputContext::pretty_json_len(&value),
+            serde_json::to_string_pretty(&value)
+                .expect("JSON serialization failed")
+                .len()
+        );
     }
 }

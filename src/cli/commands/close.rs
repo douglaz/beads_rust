@@ -205,13 +205,9 @@ pub fn execute_with_args(
 
         // Check if blocked (unless --force)
         if !args.force && storage.is_blocked(id)? {
-            let mut blocker_ids = storage
-                .get_blocked_issues()?
-                .into_iter()
-                .find(|(issue, _)| issue.id == *id)
-                .map(|(_, blockers)| blockers)
-                .unwrap_or_default();
+            let mut blocker_ids = storage.get_blockers(id)?;
             if blocker_ids.is_empty() {
+                // Fallback in case of cache inconsistency or implicit blocking
                 blocker_ids = storage.get_dependencies(id)?;
             }
             tracing::debug!(blocked_by = ?blocker_ids, "Issue is blocked");

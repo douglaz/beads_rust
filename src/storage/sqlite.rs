@@ -1848,7 +1848,7 @@ impl SqliteStorage {
                 r"SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
                   FROM dependencies d
                   LEFT JOIN issues i ON d.depends_on_id = i.id
-                  WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+                  WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child')
                     AND (
                       i.status NOT IN ('closed', 'tombstone')
                       OR (i.id IS NULL AND d.depends_on_id NOT LIKE 'external:%')
@@ -1889,48 +1889,6 @@ impl SqliteStorage {
                 ],
             )?;
             count += 1;
-        }
-
-        // Mark children of deferred epics as blocked.
-        // A deferred parent effectively blocks all of its children, even though
-        // there is no explicit blocks/waits-for dependency.  We find every
-        // issue whose parent (via a parent-child dependency) has status = 'deferred'
-        // and insert it into the blocked cache so it won't appear as "ready."
-        {
-            let rows = conn.query(
-                r"SELECT DISTINCT d.issue_id, d.depends_on_id
-                  FROM dependencies d
-                  INNER JOIN issues i ON d.depends_on_id = i.id
-                  WHERE d.type = 'parent-child'
-                    AND i.status = 'deferred'
-                    AND d.issue_id NOT IN (
-                        SELECT issue_id FROM blocked_issues_cache
-                    )",
-            )?;
-
-            for row in &rows {
-                let issue_id = row
-                    .get(0)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
-                let parent_id = row
-                    .get(1)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
-                let blockers = vec![format!("{parent_id}:deferred")];
-                let blockers_json =
-                    serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
-                conn.execute_with_params(
-                    "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-                    &[
-                        SqliteValue::from(issue_id),
-                        SqliteValue::from(blockers_json),
-                    ],
-                )?;
-                count += 1;
-            }
         }
 
         // Now handle transitive blocking via parent-child relationships

@@ -365,13 +365,23 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
 }
 
 fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
-    let result: String = conn
-        .query_row("PRAGMA integrity_check")?
-        .get(0)
-        .and_then(SqliteValue::as_text)
-        .unwrap_or("error")
-        .to_string();
-    if result.trim().eq_ignore_ascii_case("ok") {
+    let rows = match conn.query("PRAGMA integrity_check") {
+        Ok(rows) => rows,
+        Err(err) => {
+            push_check(
+                checks,
+                "sqlite.integrity_check",
+                CheckStatus::Error,
+                Some(err.to_string()),
+                None,
+            );
+            return Ok(());
+        }
+    };
+
+    let row_values: Vec<Vec<SqliteValue>> = rows.iter().map(|row| row.values().to_vec()).collect();
+    let messages = integrity_check_messages(&row_values);
+    if messages.len() == 1 && messages[0].trim().eq_ignore_ascii_case("ok") {
         push_check(
             checks,
             "sqlite.integrity_check",
@@ -384,11 +394,31 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<(
             checks,
             "sqlite.integrity_check",
             CheckStatus::Error,
-            Some(result),
-            None,
+            Some(messages.join("; ")),
+            (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
         );
     }
     Ok(())
+}
+
+fn integrity_check_messages(rows: &[Vec<SqliteValue>]) -> Vec<String> {
+    let mut messages = Vec::new();
+    for row in rows {
+        for value in row {
+            if let Some(text) = value.as_text() {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    messages.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    if messages.is_empty() {
+        messages.push("integrity_check returned no diagnostic rows".to_string());
+    }
+
+    messages
 }
 
 fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Result<()> {
@@ -1087,6 +1117,22 @@ mod tests {
 
         let tables = find_check(&checks, "schema.tables").expect("tables check");
         assert!(matches!(tables.status, CheckStatus::Error));
+    }
+
+    #[test]
+    fn test_integrity_check_messages_collects_all_rows() {
+        let messages = integrity_check_messages(&[
+            vec![SqliteValue::Text("row 1 missing from index idx_a".to_string())],
+            vec![SqliteValue::Text("row 2 missing from index idx_a".to_string())],
+        ]);
+
+        assert_eq!(
+            messages,
+            vec![
+                "row 1 missing from index idx_a".to_string(),
+                "row 2 missing from index idx_a".to_string(),
+            ]
+        );
     }
 
     #[test]

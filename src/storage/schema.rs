@@ -371,8 +371,16 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
 }
 
 pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
-    // Set journal mode to WAL for concurrency
-    conn.execute("PRAGMA journal_mode = WAL")?;
+    // New databases should opt into WAL, but steady-state opens should not
+    // reassert the current mode and turn a read path into a write-like one.
+    let journal_mode = conn
+        .query_row("PRAGMA journal_mode")
+        .ok()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+        .unwrap_or_default();
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        conn.execute("PRAGMA journal_mode = WAL")?;
+    }
 
     // Enable foreign keys
     conn.execute("PRAGMA foreign_keys = ON")?;

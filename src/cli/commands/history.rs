@@ -113,57 +113,13 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
     let backups = history::list_backups(history_dir, None)?;
 
     if ctx.is_json() {
-        let items: Vec<_> = backups
-            .iter()
-            .map(|entry| {
-                let filename = entry
-                    .path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                json!({
-                    "filename": filename,
-                    "target": entry.target_path.display().to_string(),
-                    "size_bytes": entry.size,
-                    "size": format_size(entry.size),
-                    "timestamp": entry.timestamp.to_rfc3339(),
-                })
-            })
-            .collect();
-        let output = json!({
-            "directory": history_dir.display().to_string(),
-            "count": backups.len(),
-            "backups": items,
-        });
+        let output = history_backup_list_payload(history_dir, &backups);
         ctx.json_pretty(&output);
         return Ok(());
     }
 
     if ctx.is_toon() {
-        let items: Vec<_> = backups
-            .iter()
-            .map(|entry| {
-                let filename = entry
-                    .path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                json!({
-                    "filename": filename,
-                    "target": entry.target_path.display().to_string(),
-                    "size_bytes": entry.size,
-                    "size": format_size(entry.size),
-                    "timestamp": entry.timestamp.to_rfc3339(),
-                })
-            })
-            .collect();
-        let output = json!({
-            "directory": history_dir.display().to_string(),
-            "count": backups.len(),
-            "backups": items,
-        });
+        let output = history_backup_list_payload(history_dir, &backups);
         ctx.toon(&output);
         return Ok(());
     }
@@ -237,6 +193,36 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn history_backup_list_payload(
+    history_dir: &Path,
+    backups: &[history::BackupEntry],
+) -> serde_json::Value {
+    let items: Vec<_> = backups
+        .iter()
+        .map(|entry| {
+            let filename = entry
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            json!({
+                "filename": filename,
+                "target": entry.target_path.display().to_string(),
+                "size_bytes": entry.size,
+                "size": format_size(entry.size),
+                "timestamp": entry.timestamp.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    json!({
+        "directory": history_dir.display().to_string(),
+        "count": backups.len(),
+        "backups": items,
+    })
 }
 
 /// Show diff between current state and a backup.

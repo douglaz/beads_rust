@@ -104,7 +104,9 @@ fn test_rebuild_blocked_cache_crash_with_multiple_parents() {
         .expect("incremental rebuild after C -> E should not crash");
 
     // Make A child of B AND C (diamond dependency / multiple inheritance).
-    // `br dep add` rebuilds the cache after each write, so exercise that exact path.
+    // This intentionally stress-tests repeated incremental blocked-cache rebuilds
+    // around the same mutations that `br dep add` triggers through storage-owned
+    // cache invalidation.
     storage
         .add_dependency("bd-A", "bd-B", "parent-child", "test")
         .unwrap();

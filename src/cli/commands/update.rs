@@ -95,88 +95,87 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
 
-    let (updated_issues, render_items, ordered_resolved_ids) =
-        if routed_batches.iter().any(|batch| batch.is_external) {
-            let normalized_local_beads_dir =
-                dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
-            let mut prepared_routes = Vec::new();
-            let mut routed_updated_issues = Vec::new();
-            let mut routed_render_items = Vec::new();
-            let mut routed_resolved_ids = Vec::new();
-            for batch in routed_batches {
-                let mut batch_args = args.clone();
-                batch_args.ids.clone_from(&batch.issue_inputs);
+    let (updated_issues, render_items, ordered_resolved_ids) = if routed_batches
+        .iter()
+        .any(|batch| batch.is_external)
+    {
+        let normalized_local_beads_dir =
+            dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
+        let mut prepared_routes = Vec::new();
+        let mut routed_updated_issues = Vec::new();
+        let mut routed_render_items = Vec::new();
+        let mut routed_resolved_ids = Vec::new();
+        for batch in routed_batches {
+            let mut batch_args = args.clone();
+            batch_args.ids.clone_from(&batch.issue_inputs);
 
-                let normalized_batch_beads_dir = dunce::canonicalize(&batch.beads_dir)
-                    .unwrap_or_else(|_| batch.beads_dir.clone());
-                let mut batch_cli = cli.clone();
-                // Routed projects must resolve their own metadata-defined DB path
-                // instead of being forced back to the local override. Preserve the
-                // caller's explicit DB only for the local batch.
-                batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
-                    cli.db.clone()
-                } else {
-                    None
-                };
-                prepared_routes.push((
-                    batch.issue_inputs.clone(),
-                    prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir)?,
-                ));
-            }
-
-            let all_resolved_ids = prepared_routes
-                .iter()
-                .flat_map(|(_, route)| route.resolved_ids.iter().cloned())
-                .collect::<Vec<_>>();
-            validate_multi_issue_external_ref_update(
-                args.external_ref.as_deref(),
-                &all_resolved_ids,
-            )?;
-
-            for (issue_inputs, prepared_route) in prepared_routes {
-                let route_output = execute_prepared_route(prepared_route, ctx)?;
-
-                if ctx.is_json() || ctx.is_toon() {
-                    routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
-                } else if !ctx.is_quiet() {
-                    routed_render_items.push((issue_inputs.clone(), route_output.render_items));
-                }
-                routed_resolved_ids.push((issue_inputs, route_output.resolved_ids));
-            }
-
-            let updated_issues = if ctx.is_json() || ctx.is_toon() {
-                reorder_routed_items_by_requested_inputs(
-                    &target_inputs,
-                    routed_updated_issues,
-                    "update routing",
-                )?
+            let normalized_batch_beads_dir =
+                dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
+            let mut batch_cli = cli.clone();
+            // Routed projects must resolve their own metadata-defined DB path
+            // instead of being forced back to the local override. Preserve the
+            // caller's explicit DB only for the local batch.
+            batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
+                cli.db.clone()
             } else {
-                Vec::new()
+                None
             };
-            let render_items = if !ctx.is_quiet() && !ctx.is_json() && !ctx.is_toon() {
-                reorder_routed_items_by_requested_inputs(
-                    &target_inputs,
-                    routed_render_items,
-                    "update routing",
-                )?
-            } else {
-                Vec::new()
-            };
-            let ordered_resolved_ids = reorder_routed_items_by_requested_inputs(
+            prepared_routes.push((
+                batch.issue_inputs.clone(),
+                prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir)?,
+            ));
+        }
+
+        let all_resolved_ids = prepared_routes
+            .iter()
+            .flat_map(|(_, route)| route.resolved_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        validate_multi_issue_external_ref_update(args.external_ref.as_deref(), &all_resolved_ids)?;
+
+        for (issue_inputs, prepared_route) in prepared_routes {
+            let route_output = execute_prepared_route(prepared_route, ctx)?;
+
+            if ctx.is_json() || ctx.is_toon() {
+                routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
+            } else if !ctx.is_quiet() {
+                routed_render_items.push((issue_inputs.clone(), route_output.render_items));
+            }
+            routed_resolved_ids.push((issue_inputs, route_output.resolved_ids));
+        }
+
+        let updated_issues = if ctx.is_json() || ctx.is_toon() {
+            reorder_routed_items_by_requested_inputs(
                 &target_inputs,
-                routed_resolved_ids,
+                routed_updated_issues,
                 "update routing",
-            )?;
-            (updated_issues, render_items, ordered_resolved_ids)
+            )?
         } else {
-            let route_output =
-                execute_prepared_route(prepare_single_route(args, cli, &beads_dir)?, ctx)?;
-            (
-                route_output.updated_issues,
-                route_output.render_items,
-                route_output.resolved_ids,
-            )
+            Vec::new()
         };
+        let render_items = if !ctx.is_quiet() && !ctx.is_json() && !ctx.is_toon() {
+            reorder_routed_items_by_requested_inputs(
+                &target_inputs,
+                routed_render_items,
+                "update routing",
+            )?
+        } else {
+            Vec::new()
+        };
+        let ordered_resolved_ids = reorder_routed_items_by_requested_inputs(
+            &target_inputs,
+            routed_resolved_ids,
+            "update routing",
+        )?;
+        (updated_issues, render_items, ordered_resolved_ids)
+    } else {
+        let route_output =
+            execute_prepared_route(prepare_single_route(args, cli, &beads_dir)?, ctx)?;
+        (
+            route_output.updated_issues,
+            route_output.render_items,
+            route_output.resolved_ids,
+        )
+    };
 
     if let Some(last_id) = ordered_resolved_ids.last() {
         crate::util::set_last_touched_id(&beads_dir, last_id);
@@ -331,11 +330,16 @@ fn validate_multi_issue_external_ref_update(
         return Ok(());
     };
 
-    let distinct_ids = resolved_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    let distinct_ids = resolved_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     if distinct_ids.len() > 1 {
         return Err(BeadsError::validation(
             "external_ref",
-            format!("cannot set external_ref '{external_ref}' on multiple issues in a single update"),
+            format!(
+                "cannot set external_ref '{external_ref}' on multiple issues in a single update"
+            ),
         ));
     }
 
@@ -373,7 +377,10 @@ fn validate_route_runtime_guards(
     }
 
     validate_multi_issue_external_ref_update(
-        update.external_ref.as_ref().and_then(|value| value.as_deref()),
+        update
+            .external_ref
+            .as_ref()
+            .and_then(|value| value.as_deref()),
         resolved_ids,
     )?;
 
@@ -994,26 +1001,34 @@ mod tests {
             ..IssueUpdate::default()
         };
 
-        let err =
-            validate_route_runtime_guards(&storage, &["bd-claimed".to_string()], &update)
-                .unwrap_err();
+        let err = validate_route_runtime_guards(&storage, &["bd-claimed".to_string()], &update)
+            .unwrap_err();
         assert!(err.to_string().contains("already assigned to bob"));
 
-        info!("test_validate_route_runtime_guards_rejects_assigned_claim_target: assertions passed");
+        info!(
+            "test_validate_route_runtime_guards_rejects_assigned_claim_target: assertions passed"
+        );
     }
 
     #[test]
     fn test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids() {
         init_test_logging();
-        info!("test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: starting");
+        info!(
+            "test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: starting"
+        );
 
         let err = validate_multi_issue_external_ref_update(
             Some("EXT-123"),
             &["bd-1".to_string(), "bd-2".to_string()],
         )
         .unwrap_err();
-        assert!(err.to_string().contains("cannot set external_ref 'EXT-123'"));
+        assert!(
+            err.to_string()
+                .contains("cannot set external_ref 'EXT-123'")
+        );
 
-        info!("test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: assertions passed");
+        info!(
+            "test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: assertions passed"
+        );
     }
 }

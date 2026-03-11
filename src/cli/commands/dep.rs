@@ -175,7 +175,13 @@ fn dep_add(
         });
     }
 
-    let added = storage.add_dependency(&issue_id, &depends_on_id, dep_type.as_str(), actor)?;
+    let added = storage.add_dependency_with_metadata(
+        &issue_id,
+        &depends_on_id,
+        dep_type.as_str(),
+        actor,
+        args.metadata.as_deref(),
+    )?;
 
     // Refresh blocked-issues cache so `br ready` reflects the new dependency
     if added {
@@ -250,6 +256,8 @@ fn dep_remove(
         resolve_issue_id(storage, resolver, all_ids, &args.depends_on)?
     };
 
+    let dep_type = dependency_type_for_pair(storage, &issue_id, &depends_on_id)?
+        .unwrap_or_else(|| "unknown".to_string());
     let removed = storage.remove_dependency(&issue_id, &depends_on_id, actor)?;
 
     // Refresh blocked-issues cache so `br ready` reflects the removed dependency
@@ -262,7 +270,7 @@ fn dep_remove(
             status: if removed { "ok" } else { "not_found" }.to_string(),
             issue_id: issue_id.clone(),
             depends_on_id: depends_on_id.clone(),
-            dep_type: "unknown".to_string(),
+            dep_type,
             action: if removed { "removed" } else { "not_found" }.to_string(),
         };
         if ctx.is_toon() {
@@ -294,6 +302,18 @@ fn dep_remove(
     }
 
     Ok(())
+}
+
+fn dependency_type_for_pair(
+    storage: &SqliteStorage,
+    issue_id: &str,
+    depends_on_id: &str,
+) -> Result<Option<String>> {
+    Ok(storage
+        .get_dependencies_full(issue_id)?
+        .into_iter()
+        .find(|dep| dep.depends_on_id == depends_on_id)
+        .map(|dep| dep.dep_type.as_str().to_string()))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -690,7 +710,18 @@ fn dep_tree(
         let truncated = if item.id.starts_with("external:") {
             false
         } else {
-            dependencies = storage.get_dependencies(&item.id)?;
+            dependencies = match args.direction {
+                DepDirection::Down => storage.get_blocker_ids(&item.id)?,
+                DepDirection::Up => storage.get_blocked_issue_ids(&item.id)?,
+                DepDirection::Both => {
+                    let mut all = storage.get_blocker_ids(&item.id)?;
+                    let mut up = storage.get_blocked_issue_ids(&item.id)?;
+                    all.append(&mut up);
+                    all.sort();
+                    all.dedup();
+                    all
+                }
+            };
             dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
         };
 

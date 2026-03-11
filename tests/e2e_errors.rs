@@ -1221,6 +1221,104 @@ fn e2e_dependency_idempotent_duplicate() {
 }
 
 #[test]
+fn e2e_dependency_metadata_flag_persists_to_jsonl() {
+    let _log = common::test_log("e2e_dependency_metadata_flag_persists_to_jsonl");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    let create_a = run_br(&workspace, ["create", "Issue A"], "create_a");
+    assert!(create_a.status.success());
+    let id_a = parse_created_id(&create_a.stdout);
+
+    let create_b = run_br(&workspace, ["create", "Issue B"], "create_b");
+    assert!(create_b.status.success());
+    let id_b = parse_created_id(&create_b.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        [
+            "dep",
+            "add",
+            &id_a,
+            &id_b,
+            "--metadata",
+            r#"{"source":"cli","reason":"gate"}"#,
+        ],
+        "dep_add_metadata",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(sync.status.success(), "sync failed: {}", sync.stderr);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let contents = fs::read_to_string(&jsonl_path).expect("read issues jsonl");
+    let issue = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid issue json"))
+        .find(|value| value["id"] == id_a)
+        .expect("issue A exported");
+
+    let deps = issue["dependencies"]
+        .as_array()
+        .expect("dependencies array");
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0]["depends_on_id"], id_b);
+    assert_eq!(deps[0]["metadata"], r#"{"source":"cli","reason":"gate"}"#);
+}
+
+#[test]
+fn e2e_dependency_remove_json_reports_removed_type() {
+    let _log = common::test_log("e2e_dependency_remove_json_reports_removed_type");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    let create_a = run_br(&workspace, ["create", "Issue A"], "create_a");
+    assert!(create_a.status.success());
+    let id_a = parse_created_id(&create_a.stdout);
+
+    let create_b = run_br(&workspace, ["create", "Issue B"], "create_b");
+    assert!(create_b.status.success());
+    let id_b = parse_created_id(&create_b.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &id_a, &id_b, "--type", "waits-for"],
+        "dep_add_waits_for",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let result = run_br(
+        &workspace,
+        ["dep", "remove", &id_a, &id_b, "--json"],
+        "dep_remove_json",
+    );
+    assert!(
+        result.status.success(),
+        "dep remove failed: {}",
+        result.stderr
+    );
+
+    let json: Value = serde_json::from_str(&result.stdout).expect("should be valid JSON");
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["action"], "removed");
+    assert_eq!(json["type"], "waits-for");
+}
+
+#[test]
 fn e2e_delete_with_dependents_preview() {
     let _log = common::test_log("e2e_delete_with_dependents_preview");
     let workspace = BrWorkspace::new();

@@ -495,7 +495,9 @@ fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) 
 
     // Determine cutoff time
     let now = Utc::now();
-    let cutoff = now - chrono::Duration::days(i64::from(config.max_age_days));
+    let max_safe_days = 365_i64 * 1000;
+    let days_i64 = i64::from(config.max_age_days).min(max_safe_days);
+    let cutoff = now - chrono::Duration::days(days_i64);
 
     let mut deleted_count = 0;
 
@@ -648,7 +650,11 @@ pub fn prune_backups(
     keep: usize,
     older_than_days: Option<u32>,
 ) -> Result<usize> {
-    let cutoff = older_than_days.map(|days| Utc::now() - chrono::Duration::days(i64::from(days)));
+    let cutoff = older_than_days.map(|days| {
+        let max_safe_days = 365_i64 * 1000;
+        let days_i64 = i64::from(days).min(max_safe_days);
+        Utc::now() - chrono::Duration::days(days_i64)
+    });
     let mut backups_by_target: HashMap<String, Vec<BackupEntry>> = HashMap::new();
 
     for entry in list_backups(history_dir, None)? {

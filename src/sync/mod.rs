@@ -2023,8 +2023,32 @@ pub fn finalize_export(
 
 fn normalize_issue_for_export(issue: &mut Issue) {
     if !issue.labels.is_empty() {
-        issue.labels.sort();
+        issue.labels.sort_unstable();
         issue.labels.dedup();
+    }
+
+    if !issue.dependencies.is_empty() {
+        issue.dependencies.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.depends_on_id.cmp(&right.depends_on_id))
+                .then_with(|| left.dep_type.as_str().cmp(right.dep_type.as_str()))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.created_by.cmp(&right.created_by))
+                .then_with(|| left.metadata.cmp(&right.metadata))
+                .then_with(|| left.thread_id.cmp(&right.thread_id))
+        });
+    }
+
+    if !issue.comments.is_empty() {
+        issue.comments.sort_by(|left, right| {
+            left.issue_id
+                .cmp(&right.issue_id)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.author.cmp(&right.author))
+                .then_with(|| left.body.cmp(&right.body))
+                .then_with(|| left.id.cmp(&right.id))
+        });
     }
 }
 
@@ -2953,13 +2977,16 @@ pub fn import_from_jsonl(
     // other issues (in dependencies/comments) that haven't been inserted yet.
     // FK integrity is validated after all data is loaded.
     storage.execute_raw("PRAGMA foreign_keys = OFF")?;
+
     let progress = create_progress_bar(
         import_ops.len() as u64,
         "Importing issues",
         config.show_progress,
     );
+
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
         let mut tx_result = result.clone();
+        progress.set_position(0);
         // Keep export-hash state transactional so failed imports do not
         // erase incremental export bookkeeping.
         storage.clear_all_export_hashes_in_tx()?;
@@ -3014,32 +3041,27 @@ pub fn import_from_jsonl(
         Ok(tx_result)
     });
 
-    let fk_restore_result = storage.execute_raw("PRAGMA foreign_keys = ON");
-    match (apply_result, fk_restore_result) {
-        (Ok(import_result), Ok(())) => {
+    // Re-enable FKs before checking them
+    if let Err(e) = storage.execute_raw("PRAGMA foreign_keys = ON") {
+        tracing::error!(error = %e, "Failed to re-enable foreign keys after import");
+    }
+
+    match apply_result {
+        Ok(import_result) => {
+            // Final check for any dangling foreign key violations not caught by manual orphan cleanup
+            let fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
+            if fk_violations > 0 {
+                tracing::warn!(
+                    violations = fk_violations,
+                    "Import finished with dangling foreign key violations"
+                );
+            }
             progress.finish_with_message("Import complete");
             Ok(import_result)
         }
-        (Err(import_err), Ok(())) => {
+        Err(import_err) => {
             progress.finish_and_clear();
             Err(import_err)
-        }
-        (Ok(_), Err(fk_err)) => {
-            progress.finish_and_clear();
-            Err(BeadsError::WithContext {
-                context: "Import committed but failed to re-enable foreign key enforcement"
-                    .to_string(),
-                source: Box::new(fk_err),
-            })
-        }
-        (Err(import_err), Err(fk_err)) => {
-            progress.finish_and_clear();
-            Err(BeadsError::WithContext {
-                context: format!(
-                    "Import failed ({import_err}) and foreign key enforcement could not be restored"
-                ),
-                source: Box::new(fk_err),
-            })
         }
     }
 }

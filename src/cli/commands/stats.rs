@@ -528,8 +528,11 @@ fn git_recent_activity(
     pathspec: &Path,
     since: &str,
 ) -> Option<GitActivitySummary> {
+    use std::io::BufReader;
+    use std::process::Stdio;
+
     let pathspec_str = pathspec.to_string_lossy().into_owned();
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .args([
             "log",
             "--format=__BR_ACTIVITY_COMMIT__:%H",
@@ -543,27 +546,39 @@ fn git_recent_activity(
             &pathspec_str,
         ])
         .current_dir(repo_root)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .ok()?;
 
-    if !output.status.success() {
-        let err_msg = String::from_utf8_lossy(&output.stderr);
-        debug!(stderr = %err_msg, "Git log failed for activity diff");
+    let stdout = child.stdout.take().expect("Failed to open git log stdout");
+    let reader = BufReader::new(stdout);
+
+    let summary = parse_issue_activity_stream(reader);
+
+    let status = child.wait().ok()?;
+    if !status.success() {
+        let mut err_msg = String::new();
+        if let Some(mut err_stream) = child.stderr.take() {
+            use std::io::Read;
+            let _ = err_stream.read_to_string(&mut err_msg);
+        }
+        debug!(stderr = %err_msg.trim(), "Git log failed for activity diff");
         return None;
     }
 
-    Some(parse_issue_activity_log(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    Some(summary)
 }
 
-fn parse_issue_activity_log(log: &str) -> GitActivitySummary {
+fn parse_issue_activity_stream<R: std::io::BufRead>(reader: R) -> GitActivitySummary {
     let mut summary = GitActivitySummary::default();
     let mut removed = BTreeMap::new();
     let mut added = BTreeMap::new();
     let mut in_commit = false;
 
-    for line in log.lines() {
+    for line_result in reader.lines() {
+        let Ok(line) = line_result else { continue };
+
         if line.starts_with(GIT_ACTIVITY_COMMIT_MARKER) {
             if in_commit {
                 summary
@@ -578,7 +593,7 @@ fn parse_issue_activity_log(log: &str) -> GitActivitySummary {
             continue;
         }
 
-        record_issue_activity_patch_line(line, &mut removed, &mut added);
+        record_issue_activity_patch_line(&line, &mut removed, &mut added);
     }
 
     if in_commit {
@@ -1359,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_issue_activity_log_keeps_commit_boundaries_separate() {
+    fn test_parse_issue_activity_stream_keeps_commit_boundaries_separate() {
         let base_time = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
         let mut original = make_issue("bd-activity", Status::Open, IssueType::Task);
         original.title = "Track recent activity".to_string();
@@ -1384,7 +1399,7 @@ mod tests {
             closed = serde_json::to_string(&closed).expect("serialize closed issue"),
         );
 
-        let activity = parse_issue_activity_log(&log);
+        let activity = parse_issue_activity_stream(std::io::BufReader::new(log.as_bytes()));
         assert_eq!(activity.commit_count, 2);
         assert_eq!(activity.counts.created, 0);
         assert_eq!(activity.counts.updated, 1);

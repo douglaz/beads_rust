@@ -23,6 +23,24 @@ fn br_binary_path() -> PathBuf {
     assert_cmd::cargo::cargo_bin!("br").to_path_buf()
 }
 
+fn should_clear_inherited_br_env(key: &OsStr) -> bool {
+    let key = key.to_string_lossy();
+    key.starts_with("BD_")
+        || key.starts_with("BEADS_")
+        || matches!(
+            key.as_ref(),
+            "BR_OUTPUT_FORMAT" | "TOON_DEFAULT_FORMAT" | "TOON_STATS"
+        )
+}
+
+fn clear_inherited_br_env(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if should_clear_inherited_br_env(&key) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
 /// Get the path to the bd (Go beads) binary.
 /// Checks `BD_BINARY` environment variable first, falls back to "bd" for PATH lookup.
 fn bd_binary_path() -> String {
@@ -797,6 +815,7 @@ impl TestWorkspace {
             .collect();
         cmd.args(&args_vec);
 
+        clear_inherited_br_env(&mut cmd);
         cmd.envs(env_vars);
         cmd.env("NO_COLOR", "1");
         cmd.env("RUST_LOG", "beads_rust=debug");
@@ -1167,6 +1186,7 @@ impl ConformanceWorkspace {
             .collect();
         cmd.args(&args_vec);
 
+        clear_inherited_br_env(&mut cmd);
         cmd.env("NO_COLOR", "1");
         cmd.env("RUST_LOG", "beads_rust=debug");
         cmd.env("RUST_BACKTRACE", "1");
@@ -1239,6 +1259,7 @@ impl ConformanceWorkspace {
             .collect();
         cmd.args(&args_vec);
 
+        clear_inherited_br_env(&mut cmd);
         cmd.envs(env_vars);
         cmd.env("NO_COLOR", "1");
         cmd.env("RUST_LOG", "beads_rust=debug");

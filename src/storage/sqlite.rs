@@ -18,33 +18,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// RAII guard to safely toggle `PRAGMA foreign_keys`.
-///
-/// Ensures that foreign keys are re-enabled even if an operation fails or panics.
-pub struct ForeignKeyGuard<'a> {
-    conn: &'a Connection,
-}
-
-impl<'a> ForeignKeyGuard<'a> {
-    /// Disables foreign keys on the given connection and returns a guard.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the PRAGMA execution fails.
-    pub fn disable(conn: &'a Connection) -> Result<Self> {
-        conn.execute("PRAGMA foreign_keys = OFF")?;
-        Ok(Self { conn })
-    }
-}
-
-impl Drop for ForeignKeyGuard<'_> {
-    fn drop(&mut self) {
-        if let Err(e) = self.conn.execute("PRAGMA foreign_keys = ON") {
-            tracing::error!(error = %e, "Failed to re-enable foreign keys on guard drop");
-        }
-    }
-}
-
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;

@@ -1147,6 +1147,12 @@ fn e2e_quiet_flag_count_and_where() {
     );
     assert_quiet_command(
         &workspace,
+        ["--quiet", "stale", "0"],
+        "stale_quiet",
+        "stale --quiet",
+    );
+    assert_quiet_command(
+        &workspace,
         ["--quiet", "where"],
         "where_quiet",
         "where --quiet",

@@ -5,6 +5,24 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
+fn should_clear_inherited_br_env(key: &OsStr) -> bool {
+    let key = key.to_string_lossy();
+    key.starts_with("BD_")
+        || key.starts_with("BEADS_")
+        || matches!(
+            key.as_ref(),
+            "BR_OUTPUT_FORMAT" | "TOON_DEFAULT_FORMAT" | "TOON_STATS"
+        )
+}
+
+fn clear_inherited_br_env(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if should_clear_inherited_br_env(&key) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct BrRun {
     pub stdout: String,
@@ -95,6 +113,7 @@ where
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("br"));
     cmd.current_dir(&workspace.root);
     cmd.args(args);
+    clear_inherited_br_env(&mut cmd);
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "beads_rust=debug");
@@ -144,4 +163,37 @@ pub fn extract_json_payload(stdout: &str) -> String {
         }
     }
     stdout.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_clear_inherited_br_env;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn inherited_beads_and_toon_env_are_cleared() {
+        for key in [
+            "BD_ACTOR",
+            "BEADS_CACHE_DIR",
+            "BEADS_JSONL",
+            "BR_OUTPUT_FORMAT",
+            "TOON_DEFAULT_FORMAT",
+            "TOON_STATS",
+        ] {
+            assert!(
+                should_clear_inherited_br_env(OsStr::new(key)),
+                "{key} should be cleared for hermetic br tests"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_env_are_preserved() {
+        for key in ["HOME", "PATH", "RUST_LOG", "NO_COLOR"] {
+            assert!(
+                !should_clear_inherited_br_env(OsStr::new(key)),
+                "{key} should not be blanket-cleared"
+            );
+        }
+    }
 }

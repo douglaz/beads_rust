@@ -12,7 +12,7 @@ use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// JSON output structure for updated issues.
@@ -123,6 +123,15 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir)?,
                 ));
             }
+
+            let all_resolved_ids = prepared_routes
+                .iter()
+                .flat_map(|(_, route)| route.resolved_ids.iter().cloned())
+                .collect::<Vec<_>>();
+            validate_multi_issue_external_ref_update(
+                args.external_ref.as_deref(),
+                &all_resolved_ids,
+            )?;
 
             for (issue_inputs, prepared_route) in prepared_routes {
                 let route_output = execute_prepared_route(prepared_route, ctx)?;
@@ -236,6 +245,7 @@ fn prepare_single_route(
     validate_parent_updates(&storage_ctx.storage, &resolved_ids, &resolved_parent)?;
 
     validate_transition_to_in_progress(&storage_ctx.storage, &resolved_ids, args)?;
+    validate_route_runtime_guards(&storage_ctx.storage, &resolved_ids, &update)?;
 
     Ok(PreparedUpdateRoute {
         storage_ctx,
@@ -311,6 +321,73 @@ fn execute_prepared_route(
         render_items,
         resolved_ids,
     })
+}
+
+fn validate_multi_issue_external_ref_update(
+    external_ref: Option<&str>,
+    resolved_ids: &[String],
+) -> Result<()> {
+    let Some(external_ref) = external_ref.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+
+    let distinct_ids = resolved_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    if distinct_ids.len() > 1 {
+        return Err(BeadsError::validation(
+            "external_ref",
+            format!("cannot set external_ref '{external_ref}' on multiple issues in a single update"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_route_runtime_guards(
+    storage: &SqliteStorage,
+    resolved_ids: &[String],
+    update: &IssueUpdate,
+) -> Result<()> {
+    if update.expect_unassigned {
+        let claim_actor = update.claim_actor.as_deref().unwrap_or("");
+        for id in resolved_ids {
+            let issue = storage
+                .get_issue(id)?
+                .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
+            let trimmed = issue
+                .assignee
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+
+            match trimmed {
+                None => {}
+                Some(current) if !update.claim_exclusive && current == claim_actor => {}
+                Some(current) => {
+                    return Err(BeadsError::validation(
+                        "claim",
+                        format!("issue {id} already assigned to {current}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    validate_multi_issue_external_ref_update(
+        update.external_ref.as_ref().and_then(|value| value.as_deref()),
+        resolved_ids,
+    )?;
+
+    if let Some(Some(external_ref)) = &update.external_ref
+        && let Some(existing_issue) = storage.find_by_external_ref(external_ref)?
+        && existing_issue.id != resolved_ids.first().map_or("", String::as_str)
+    {
+        return Err(BeadsError::Config(format!(
+            "External reference '{external_ref}' already exists on issue {}",
+            existing_issue.id
+        )));
+    }
+
+    Ok(())
 }
 
 fn validate_transition_to_in_progress(
@@ -888,5 +965,55 @@ mod tests {
         validate_mutable_target_issues(&storage, &["bd-open".to_string()], true).unwrap();
 
         info!("test_validate_mutable_target_issues_allows_open_issue: assertions passed");
+    }
+
+    #[test]
+    fn test_validate_route_runtime_guards_rejects_assigned_claim_target() {
+        init_test_logging();
+        info!("test_validate_route_runtime_guards_rejects_assigned_claim_target: starting");
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-claimed".to_string(),
+            title: "Claimed issue".to_string(),
+            assignee: Some("bob".to_string()),
+            status: Status::InProgress,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let update = IssueUpdate {
+            expect_unassigned: true,
+            claim_actor: Some("alice".to_string()),
+            assignee: Some(Some("alice".to_string())),
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+
+        let err =
+            validate_route_runtime_guards(&storage, &["bd-claimed".to_string()], &update)
+                .unwrap_err();
+        assert!(err.to_string().contains("already assigned to bob"));
+
+        info!("test_validate_route_runtime_guards_rejects_assigned_claim_target: assertions passed");
+    }
+
+    #[test]
+    fn test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids() {
+        init_test_logging();
+        info!("test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: starting");
+
+        let err = validate_multi_issue_external_ref_update(
+            Some("EXT-123"),
+            &["bd-1".to_string(), "bd-2".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot set external_ref 'EXT-123'"));
+
+        info!("test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: assertions passed");
     }
 }

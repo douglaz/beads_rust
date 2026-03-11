@@ -8,6 +8,8 @@ mod common;
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use toon_rust::try_decode;
 
 // ============================================================================
@@ -993,6 +995,220 @@ fn e2e_q_honors_toon_env_mode() {
 }
 
 #[test]
+fn e2e_update_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_update_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_update_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON update target", "--json"],
+        "create_update",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = issue["id"].as_str().expect("issue id").to_string();
+
+    let update = run_br_with_env(
+        &workspace,
+        ["update", &issue_id, "--status", "in_progress"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "update_toon_env",
+    );
+    assert!(
+        update.status.success(),
+        "update toon failed: {}",
+        update.stderr
+    );
+
+    let decoded = try_decode(update.stdout.trim(), None).expect("valid update TOON");
+    let json = Value::from(decoded);
+    let results = json.as_array().expect("update array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["id"].as_str(), Some(issue_id.as_str()));
+    assert_eq!(results[0]["status"].as_str(), Some("in_progress"));
+}
+
+#[test]
+fn e2e_count_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_count_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_count_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON count target"],
+        "create_count_toon",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let count = run_br_with_env(
+        &workspace,
+        ["count"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "count_toon_env",
+    );
+    assert!(
+        count.status.success(),
+        "count toon failed: {}",
+        count.stderr
+    );
+
+    let decoded = try_decode(count.stdout.trim(), None).expect("valid count TOON");
+    let json = Value::from(decoded);
+    assert_eq!(json["count"].as_u64(), Some(1));
+}
+
+#[test]
+fn e2e_stale_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_stale_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_stale_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON stale target", "--json"],
+        "create_stale_toon",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = issue["id"].as_str().expect("issue id").to_string();
+
+    let stale = run_br_with_env(
+        &workspace,
+        ["stale", "0"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "stale_toon_env",
+    );
+    assert!(
+        stale.status.success(),
+        "stale toon failed: {}",
+        stale.stderr
+    );
+
+    let decoded = try_decode(stale.stdout.trim(), None).expect("valid stale TOON");
+    let json = Value::from(decoded);
+    let stale_items = json.as_array().expect("stale array");
+    assert_eq!(stale_items.len(), 1);
+    assert_eq!(stale_items[0]["id"].as_str(), Some(issue_id.as_str()));
+}
+
+#[test]
+fn e2e_epic_status_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_epic_status_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_epic_status_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON epic target", "--type", "epic", "--json"],
+        "create_epic_status_toon",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let epic_id = issue["id"].as_str().expect("epic id").to_string();
+
+    let status = run_br_with_env(
+        &workspace,
+        ["epic", "status"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "epic_status_toon_env",
+    );
+    assert!(
+        status.status.success(),
+        "epic status toon failed: {}",
+        status.stderr
+    );
+
+    let decoded = try_decode(status.stdout.trim(), None).expect("valid epic status TOON");
+    let json = Value::from(decoded);
+    let epics = json.as_array().expect("epics array");
+    assert_eq!(epics.len(), 1);
+    assert_eq!(epics[0]["epic"]["id"].as_str(), Some(epic_id.as_str()));
+}
+
+#[test]
+fn e2e_epic_close_eligible_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_epic_close_eligible_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_epic_close_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let epic = run_br(
+        &workspace,
+        ["create", "TOON closeable epic", "--type", "epic", "--json"],
+        "create_epic_close_toon",
+    );
+    assert!(epic.status.success(), "create epic failed: {}", epic.stderr);
+    let epic_value: Value =
+        serde_json::from_str(&extract_json_payload(&epic.stdout)).expect("epic json");
+    let epic_id = epic_value["id"].as_str().expect("epic id").to_string();
+
+    let child = run_br(
+        &workspace,
+        ["create", "TOON epic child", "--type", "task", "--json"],
+        "create_epic_child_toon",
+    );
+    assert!(
+        child.status.success(),
+        "create child failed: {}",
+        child.stderr
+    );
+    let child_value: Value =
+        serde_json::from_str(&extract_json_payload(&child.stdout)).expect("child json");
+    let child_id = child_value["id"].as_str().expect("child id").to_string();
+
+    let dep = run_br(
+        &workspace,
+        ["dep", "add", &child_id, &epic_id, "--type", "parent-child"],
+        "dep_epic_child_toon",
+    );
+    assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+
+    let close_child = run_br(
+        &workspace,
+        ["close", &child_id, "--force"],
+        "close_epic_child_toon",
+    );
+    assert!(
+        close_child.status.success(),
+        "close child failed: {}",
+        close_child.stderr
+    );
+
+    let close_eligible = run_br_with_env(
+        &workspace,
+        ["epic", "close-eligible"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "epic_close_eligible_toon_env",
+    );
+    assert!(
+        close_eligible.status.success(),
+        "epic close-eligible toon failed: {}",
+        close_eligible.stderr
+    );
+
+    let decoded = try_decode(close_eligible.stdout.trim(), None).expect("valid epic close TOON");
+    let json = Value::from(decoded);
+    assert_eq!(json["count"].as_u64(), Some(1));
+    let closed = json["closed"].as_array().expect("closed array");
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].as_str(), Some(epic_id.as_str()));
+}
+
+#[test]
 fn e2e_label_add_honors_toon_env_mode() {
     let _log = common::test_log("e2e_label_add_honors_toon_env_mode");
     let workspace = BrWorkspace::new();
@@ -1067,6 +1283,93 @@ fn e2e_comments_add_honors_toon_env_mode() {
 }
 
 #[test]
+fn e2e_orphans_honors_toon_env_mode_when_empty() {
+    let _log = common::test_log("e2e_orphans_honors_toon_env_mode_when_empty");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_orphans_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let orphans = run_br_with_env(
+        &workspace,
+        ["orphans"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "orphans_toon_env",
+    );
+    assert!(
+        orphans.status.success(),
+        "orphans toon failed: {}",
+        orphans.stderr
+    );
+
+    let decoded = try_decode(orphans.stdout.trim(), None).expect("valid empty orphans TOON");
+    let json = Value::from(decoded);
+    assert_eq!(json.as_array().map(Vec::len), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_comments_add_does_not_invoke_git_for_author_fallback() {
+    let _log = common::test_log("e2e_comments_add_does_not_invoke_git_for_author_fallback");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_comments_author_env");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Comment author target", "--json"],
+        "create_comments_author_target",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = issue["id"].as_str().expect("issue id").to_string();
+
+    let fake_bin = workspace.root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).expect("create fake bin");
+    let marker_path = workspace.root.join("git-was-called");
+    let fake_git_path = fake_bin.join("git");
+    fs::write(
+        &fake_git_path,
+        format!(
+            "#!/bin/sh\nprintf called > \"{}\"\nexit 99\n",
+            marker_path.display()
+        ),
+    )
+    .expect("write fake git");
+    let mut permissions = fs::metadata(&fake_git_path)
+        .expect("fake git metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_git_path, permissions).expect("chmod fake git");
+
+    let comment_add = run_br_with_env(
+        &workspace,
+        ["comments", "add", &issue_id, "Author via env", "--json"],
+        vec![
+            ("PATH".to_string(), fake_bin.display().to_string()),
+            ("USER".to_string(), "env-author".to_string()),
+        ],
+        "comments_add_author_env_no_git",
+    );
+    assert!(
+        comment_add.status.success(),
+        "comments add failed: {}",
+        comment_add.stderr
+    );
+
+    let added: Value =
+        serde_json::from_str(&extract_json_payload(&comment_add.stdout)).expect("comment add json");
+    assert_eq!(added["issue_id"].as_str(), Some(issue_id.as_str()));
+    assert_eq!(added["author"].as_str(), Some("env-author"));
+    assert!(
+        !marker_path.exists(),
+        "comments add should not invoke git while resolving author"
+    );
+}
+
+#[test]
 fn e2e_where_honors_toon_env_mode() {
     let _log = common::test_log("e2e_where_honors_toon_env_mode");
     let workspace = BrWorkspace::new();
@@ -1100,6 +1403,146 @@ fn e2e_where_honors_toon_env_mode() {
             .is_some_and(|path| path.contains("beads.db")),
         "TOON where output should include the database path: {json}"
     );
+}
+
+#[test]
+fn e2e_query_save_list_delete_honor_toon_env_mode() {
+    let _log = common::test_log("e2e_query_save_list_delete_honor_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "query_toon_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let save = run_br_with_env(
+        &workspace,
+        ["query", "save", "toon-open", "--status", "open"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "query_save_toon_env",
+    );
+    assert!(save.status.success(), "query save failed: {}", save.stderr);
+    let save_json = Value::from(try_decode(save.stdout.trim(), None).expect("valid save TOON"));
+    assert_eq!(save_json["status"].as_str(), Some("ok"));
+    assert_eq!(save_json["action"].as_str(), Some("saved"));
+    assert_eq!(save_json["name"].as_str(), Some("toon-open"));
+
+    let list = run_br_with_env(
+        &workspace,
+        ["query", "list"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "query_list_toon_env",
+    );
+    assert!(list.status.success(), "query list failed: {}", list.stderr);
+    let list_json = Value::from(try_decode(list.stdout.trim(), None).expect("valid list TOON"));
+    assert_eq!(list_json["count"].as_u64(), Some(1));
+    assert_eq!(list_json["queries"][0]["name"].as_str(), Some("toon-open"));
+
+    let delete = run_br_with_env(
+        &workspace,
+        ["query", "delete", "toon-open"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "query_delete_toon_env",
+    );
+    assert!(
+        delete.status.success(),
+        "query delete failed: {}",
+        delete.stderr
+    );
+    let delete_json =
+        Value::from(try_decode(delete.stdout.trim(), None).expect("valid delete TOON"));
+    assert_eq!(delete_json["status"].as_str(), Some("ok"));
+    assert_eq!(delete_json["action"].as_str(), Some("deleted"));
+    assert_eq!(delete_json["name"].as_str(), Some("toon-open"));
+}
+
+#[test]
+fn e2e_history_list_and_prune_honor_toon_env_mode() {
+    let _log = common::test_log("e2e_history_list_and_prune_honor_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "history_toon_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create_initial = run_br(
+        &workspace,
+        ["--no-auto-flush", "create", "History TOON seed"],
+        "history_toon_create_initial",
+    );
+    assert!(
+        create_initial.status.success(),
+        "initial create failed: {}",
+        create_initial.stderr
+    );
+
+    let initial_sync = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "history_toon_initial_sync",
+    );
+    assert!(
+        initial_sync.status.success(),
+        "initial sync failed: {}",
+        initial_sync.stderr
+    );
+
+    let create_second = run_br(
+        &workspace,
+        ["--no-auto-flush", "create", "History TOON second"],
+        "history_toon_create_second",
+    );
+    assert!(
+        create_second.status.success(),
+        "second create failed: {}",
+        create_second.stderr
+    );
+
+    let second_sync = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "history_toon_second_sync",
+    );
+    assert!(
+        second_sync.status.success(),
+        "second sync failed: {}",
+        second_sync.stderr
+    );
+
+    let list = run_br_with_env(
+        &workspace,
+        ["history", "list"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "history_list_toon_env",
+    );
+    assert!(
+        list.status.success(),
+        "history list failed: {}",
+        list.stderr
+    );
+    let list_json = Value::from(try_decode(list.stdout.trim(), None).expect("valid list TOON"));
+    assert!(
+        list_json["count"].as_u64().is_some_and(|count| count >= 1),
+        "TOON history list should report at least one backup: {list_json}"
+    );
+    assert!(
+        list_json["backups"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "TOON history list should include backups: {list_json}"
+    );
+
+    let prune = run_br_with_env(
+        &workspace,
+        ["history", "prune", "--keep", "10"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "history_prune_toon_env",
+    );
+    assert!(
+        prune.status.success(),
+        "history prune failed: {}",
+        prune.stderr
+    );
+    let prune_json = Value::from(try_decode(prune.stdout.trim(), None).expect("valid prune TOON"));
+    assert_eq!(prune_json["action"].as_str(), Some("prune"));
+    assert_eq!(prune_json["keep"].as_u64(), Some(10));
 }
 
 #[test]

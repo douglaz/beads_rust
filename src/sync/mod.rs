@@ -24,6 +24,7 @@ use crate::util::id::parse_id;
 use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::IssueValidator;
 use chrono::Utc;
+use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, hash_map::RandomState};
@@ -2052,6 +2053,59 @@ fn normalize_issue_for_export(issue: &mut Issue) {
     }
 }
 
+fn restore_foreign_keys_after_import(
+    storage: &SqliteStorage,
+    validate_integrity: bool,
+) -> Result<()> {
+    storage
+        .execute_raw("PRAGMA foreign_keys = ON")
+        .map_err(|source| BeadsError::WithContext {
+            context: "Failed to re-enable foreign key enforcement after import".to_string(),
+            source: Box::new(source),
+        })?;
+
+    let foreign_keys_enabled = storage
+        .execute_raw_query("PRAGMA foreign_keys")
+        .map_err(|source| BeadsError::WithContext {
+            context: "Failed to verify foreign key enforcement state after import".to_string(),
+            source: Box::new(source),
+        })?
+        .first()
+        .and_then(|row| row.first())
+        .and_then(SqliteValue::as_integer)
+        .unwrap_or(0);
+
+    if foreign_keys_enabled != 1 {
+        return Err(BeadsError::Other(anyhow::anyhow!(
+            "Import completed with foreign key enforcement still disabled"
+        )));
+    }
+
+    if !validate_integrity {
+        return Ok(());
+    }
+
+    let fk_violations = storage
+        .execute_raw_query("PRAGMA foreign_key_check")
+        .map_err(|source| BeadsError::WithContext {
+            context: "Failed to verify foreign key integrity after import".to_string(),
+            source: Box::new(source),
+        })?;
+
+    if let Some(first_violation) = fk_violations.first() {
+        let first_table = first_violation
+            .first()
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("unknown");
+        return Err(BeadsError::Other(anyhow::anyhow!(
+            "Import finished with {} foreign key violation(s); first violation table: {first_table}",
+            fk_violations.len()
+        )));
+    }
+
+    Ok(())
+}
+
 fn is_issue_exportable(issue: &Issue, retention_days: Option<u64>) -> bool {
     !issue.ephemeral && !issue.id.contains("-wisp-") && !issue.is_expired_tombstone(retention_days)
 }
@@ -2975,8 +3029,13 @@ pub fn import_from_jsonl(
     //
     // Disable FK constraints during bulk import so that issues can reference
     // other issues (in dependencies/comments) that haven't been inserted yet.
-    // FK integrity is validated after all data is loaded.
-    storage.execute_raw("PRAGMA foreign_keys = OFF")?;
+    // FK integrity is restored and validated after all data is loaded.
+    storage
+        .execute_raw("PRAGMA foreign_keys = OFF")
+        .map_err(|source| BeadsError::WithContext {
+            context: "Failed to disable foreign key enforcement before import".to_string(),
+            source: Box::new(source),
+        })?;
 
     let progress = create_progress_bar(
         import_ops.len() as u64,
@@ -3041,25 +3100,27 @@ pub fn import_from_jsonl(
         Ok(tx_result)
     });
 
-    // Re-enable FKs before checking them
-    if let Err(e) = storage.execute_raw("PRAGMA foreign_keys = ON") {
-        tracing::error!(error = %e, "Failed to re-enable foreign keys after import");
-    }
+    let validate_foreign_keys = apply_result.is_ok();
+    let fk_restore_result = restore_foreign_keys_after_import(storage, validate_foreign_keys);
 
-    match apply_result {
-        Ok(import_result) => {
-            // Final check for any dangling foreign key violations not caught by manual orphan cleanup
-            let fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
-            if fk_violations > 0 {
-                tracing::warn!(
-                    violations = fk_violations,
-                    "Import finished with dangling foreign key violations"
-                );
-            }
+    match (apply_result, fk_restore_result) {
+        (Ok(import_result), Ok(())) => {
             progress.finish_with_message("Import complete");
             Ok(import_result)
         }
-        Err(import_err) => {
+        (Ok(_), Err(fk_err)) => {
+            progress.finish_and_clear();
+            Err(fk_err)
+        }
+        (Err(import_err), Ok(())) => {
+            progress.finish_and_clear();
+            Err(import_err)
+        }
+        (Err(import_err), Err(fk_err)) => {
+            tracing::error!(
+                error = %fk_err,
+                "Failed to restore foreign key enforcement after failed import"
+            );
             progress.finish_and_clear();
             Err(import_err)
         }
@@ -3619,7 +3680,7 @@ pub fn load_base_snapshot(jsonl_dir: &Path) -> Result<std::collections::HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::model::{Comment, Issue, IssueType, Priority, Status};
     use chrono::Utc;
     use fsqlite_types::SqliteValue;
     use indicatif::{ProgressBar, ProgressStyle};
@@ -4608,6 +4669,34 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_foreign_keys_after_import_errors_on_dangling_rows() {
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('missing-issue', 'tester', 'dangling', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+
+        let err = restore_foreign_keys_after_import(&storage, true).unwrap_err();
+        assert!(
+            err.to_string().contains("foreign key violation"),
+            "unexpected error: {err}"
+        );
+
+        let fk_enabled = storage
+            .execute_raw_query("PRAGMA foreign_keys")
+            .unwrap()
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        assert_eq!(fk_enabled, 1, "foreign key enforcement should be restored");
+    }
+
+    #[test]
     fn test_import_rolls_back_partial_changes_after_relation_sync_failure() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -4985,6 +5074,37 @@ mod tests {
             .map(|issue| issue.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["bd-a", "bd-m", "bd-z"]);
+    }
+
+    #[test]
+    fn test_normalize_issue_for_export_orders_identical_comments_by_id() {
+        let timestamp = fixed_time(100);
+        let mut issue = make_test_issue("bd-1", "Ordering");
+        issue.comments = vec![
+            Comment {
+                id: 9,
+                issue_id: issue.id.clone(),
+                author: "tester".to_string(),
+                body: "same".to_string(),
+                created_at: timestamp,
+            },
+            Comment {
+                id: 2,
+                issue_id: issue.id.clone(),
+                author: "tester".to_string(),
+                body: "same".to_string(),
+                created_at: timestamp,
+            },
+        ];
+
+        normalize_issue_for_export(&mut issue);
+
+        let ids = issue
+            .comments
+            .into_iter()
+            .map(|comment| comment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![2, 9]);
     }
 
     #[test]

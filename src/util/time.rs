@@ -211,6 +211,9 @@ pub fn format_relative_time(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
         #[allow(clippy::cast_possible_truncation)]
         let months = (days as f64 / 30.44).round() as i64;
         let months = months.max(1);
+        if months >= 12 {
+            return format!("1 year {suffix}");
+        }
         return format!(
             "{} month{} {}",
             months,
@@ -318,5 +321,19 @@ mod tests {
     fn test_parse_relative_time_invalid() {
         assert!(parse_relative_time("invalid").is_none());
         assert!(parse_relative_time("2025-01-15").is_none());
+    }
+
+    #[test]
+    fn test_format_relative_time_normalizes_twelve_months_to_year() {
+        let now = Utc::now();
+        let dt = now - Duration::days(364);
+        assert_eq!(format_relative_time(dt, now), "1 year ago");
+    }
+
+    #[test]
+    fn test_format_relative_time_keeps_midrange_months() {
+        let now = Utc::now();
+        let dt = now - Duration::days(330);
+        assert_eq!(format_relative_time(dt, now), "11 months ago");
     }
 }

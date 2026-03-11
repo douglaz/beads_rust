@@ -99,19 +99,23 @@ impl FromStr for Status {
             "closed" => Ok(Self::Closed),
             "tombstone" => Ok(Self::Tombstone),
             "pinned" => Ok(Self::Pinned),
-            other => Err(crate::error::BeadsError::InvalidStatus {
-                status: other.to_string(),
-            }),
+            other => Ok(Self::Custom(other.to_string())),
         }
     }
 }
 
 /// Issue priority (0=Critical, 4=Backlog).
 #[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default, JsonSchema,
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, JsonSchema,
 )]
 #[serde(transparent)]
 pub struct Priority(pub i32);
+
+impl Default for Priority {
+    fn default() -> Self {
+        Self::MEDIUM
+    }
+}
 
 impl Priority {
     pub const CRITICAL: Self = Self(0);
@@ -1010,7 +1014,7 @@ mod tests {
     #[test]
     fn test_priority_default() {
         let p = Priority::default();
-        assert_eq!(p, Priority(0));
+        assert_eq!(p, Priority(2));
     }
 
     // ========================================================================

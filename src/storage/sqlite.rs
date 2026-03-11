@@ -284,16 +284,20 @@ impl SqliteStorage {
             self.conn.execute_with_params(&sql, &params)?;
 
             // Insert new hashes
-            for (issue_id, content_hash) in chunk {
-                self.conn.execute_with_params(
-                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
-                    &[
-                        SqliteValue::from(issue_id.as_str()),
-                        SqliteValue::from(content_hash.as_str()),
-                        SqliteValue::from(now.as_str()),
-                    ],
-                )?;
-                count += 1;
+            for insert_chunk in chunk.chunks(300) {
+                let placeholders: Vec<&str> = insert_chunk.iter().map(|_| "(?, ?, ?)").collect();
+                let insert_sql = format!(
+                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES {}",
+                    placeholders.join(", ")
+                );
+                let mut insert_params = Vec::with_capacity(insert_chunk.len() * 3);
+                for (issue_id, content_hash) in insert_chunk {
+                    insert_params.push(SqliteValue::from(issue_id.as_str()));
+                    insert_params.push(SqliteValue::from(content_hash.as_str()));
+                    insert_params.push(SqliteValue::from(now.as_str()));
+                    count += 1;
+                }
+                self.conn.execute_with_params(&insert_sql, &insert_params)?;
             }
         }
 
@@ -396,20 +400,23 @@ impl SqliteStorage {
                     let side_effects: Result<()> = (|| {
                         // Write events
                         if !ctx.events.is_empty() {
-                            for event in &ctx.events {
-                                self.conn.execute_with_params(
-                                    "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-                                     VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                    &[
-                                        SqliteValue::from(event.issue_id.as_str()),
-                                        SqliteValue::from(event.event_type.as_str()),
-                                        SqliteValue::from(event.actor.as_str()),
-                                        event.old_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                                        event.new_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                                        event.comment.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                                        SqliteValue::from(event.created_at.to_rfc3339()),
-                                    ],
-                                )?;
+                            for event_chunk in ctx.events.chunks(140) {
+                                let placeholders: Vec<&str> = event_chunk.iter().map(|_| "(?, ?, ?, ?, ?, ?, ?)").collect();
+                                let sql = format!(
+                                    "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES {}",
+                                    placeholders.join(", ")
+                                );
+                                let mut params = Vec::with_capacity(event_chunk.len() * 7);
+                                for event in event_chunk {
+                                    params.push(SqliteValue::from(event.issue_id.as_str()));
+                                    params.push(SqliteValue::from(event.event_type.as_str()));
+                                    params.push(SqliteValue::from(event.actor.as_str()));
+                                    params.push(event.old_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from));
+                                    params.push(event.new_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from));
+                                    params.push(event.comment.as_deref().map_or(SqliteValue::Null, SqliteValue::from));
+                                    params.push(SqliteValue::from(event.created_at.to_rfc3339()));
+                                }
+                                self.conn.execute_with_params(&sql, &params)?;
                             }
                         }
 
@@ -417,7 +424,7 @@ impl SqliteStorage {
                         // REPLACE because fsqlite lacks UNIQUE enforcement.
                         if !ctx.dirty_ids.is_empty() {
                             let now_str = Utc::now().to_rfc3339();
-                            let dirty_vec: Vec<String> = ctx.dirty_ids.iter().cloned().collect();
+                            let dirty_vec: Vec<String> = ctx.dirty_ids.drain().collect();
 
                             for chunk in dirty_vec.chunks(DIRTY_ISSUE_CHUNK_SIZE) {
                                 // Bulk delete existing dirty flags for this chunk
@@ -433,14 +440,18 @@ impl SqliteStorage {
                                 self.conn.execute_with_params(&sql, &params)?;
 
                                 // Insert new dirty flags
-                                for id in chunk {
-                                    self.conn.execute_with_params(
-                                        "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
-                                        &[
-                                            SqliteValue::from(id.as_str()),
-                                            SqliteValue::from(now_str.as_str()),
-                                        ],
-                                    )?;
+                                for insert_chunk in chunk.chunks(400) {
+                                    let placeholders: Vec<&str> = insert_chunk.iter().map(|_| "(?, ?)").collect();
+                                    let insert_sql = format!(
+                                        "INSERT INTO dirty_issues (issue_id, marked_at) VALUES {}",
+                                        placeholders.join(", ")
+                                    );
+                                    let mut insert_params = Vec::with_capacity(insert_chunk.len() * 2);
+                                    for id in insert_chunk {
+                                        insert_params.push(SqliteValue::from(id.as_str()));
+                                        insert_params.push(SqliteValue::from(now_str.as_str()));
+                                    }
+                                    self.conn.execute_with_params(&insert_sql, &insert_params)?;
                                 }
                             }
                         }
@@ -728,15 +739,6 @@ impl SqliteStorage {
         depends_on_id: &str,
         blocking_only: bool,
     ) -> Result<bool> {
-        let type_filter = if blocking_only {
-            "AND type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')"
-        } else {
-            ""
-        };
-
-        let query =
-            format!("SELECT depends_on_id FROM dependencies WHERE issue_id = ? {type_filter}");
-
         let mut visited: HashSet<String> = HashSet::new();
         let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
 
@@ -748,11 +750,28 @@ impl SqliteStorage {
                 continue; // already visited
             }
 
-            let rows = conn.query_with_params(&query, &[SqliteValue::from(current.as_str())])?;
+            // Get next nodes in the blocker graph
+            // 1. Standard dependencies where 'current' is the blocked issue
+            let mut sql = String::from(
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type != 'parent-child'",
+            );
+            if blocking_only {
+                sql.push_str(" AND type IN ('blocks', 'conditional-blocks', 'waits-for')");
+            }
+            let rows = conn.query_with_params(&sql, &[SqliteValue::from(current.as_str())])?;
             for row in &rows {
-                if let Some(next_id) = row.get(0).and_then(SqliteValue::as_text)
-                    && !visited.contains(next_id)
-                {
+                if let Some(next_id) = row.get(0).and_then(SqliteValue::as_text) {
+                    frontier.push(next_id.to_string());
+                }
+            }
+
+            // 2. Parent-child dependencies where 'current' is the parent
+            let rows = conn.query_with_params(
+                "SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type = 'parent-child'",
+                &[SqliteValue::from(current.as_str())],
+            )?;
+            for row in &rows {
+                if let Some(next_id) = row.get(0).and_then(SqliteValue::as_text) {
                     frontier.push(next_id.to_string());
                 }
             }
@@ -1332,7 +1351,8 @@ impl SqliteStorage {
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
                      sender, ephemeral, pinned, is_template
-            FROM issues WHERE 1=1",
+              FROM issues
+              WHERE 1=1",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -1403,6 +1423,10 @@ impl SqliteStorage {
             } else {
                 sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
             }
+        } else if filters.statuses.as_ref().is_none_or(Vec::is_empty) {
+            // When including closed issues, still exclude tombstones (deleted issues) by default
+            // unless specific statuses were requested.
+            sql.push_str(" AND status != 'tombstone'");
         }
 
         if !filters.include_templates {
@@ -1468,7 +1492,7 @@ impl SqliteStorage {
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
-        let mut issues = Vec::new();
+        let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
         }
@@ -1577,6 +1601,10 @@ impl SqliteStorage {
             } else {
                 sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
             }
+        } else if filters.statuses.as_ref().is_none_or(Vec::is_empty) {
+            // When including closed issues, still exclude tombstones (deleted issues) by default
+            // unless specific statuses were requested.
+            sql.push_str(" AND status != 'tombstone'");
         }
 
         if !filters.include_templates {
@@ -1627,7 +1655,7 @@ impl SqliteStorage {
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
-        let mut issues = Vec::new();
+        let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
         }
@@ -1674,7 +1702,8 @@ impl SqliteStorage {
         }
 
         if !filters.labels_or.is_empty() {
-            let placeholders: Vec<String> = filters.labels_or.iter().map(|_| "?".to_string()).collect();
+            let placeholders: Vec<String> =
+                filters.labels_or.iter().map(|_| "?".to_string()).collect();
             let _ = write!(
                 sql,
                 " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
@@ -1702,15 +1731,17 @@ impl SqliteStorage {
             sql.push_str(" AND (defer_until IS NULL OR datetime(defer_until) <= datetime('now'))");
         }
 
-        // Ready condition 4: not pinned
-        sql.push_str(" AND pinned = 0");
+        // Ready condition 4: not pinned. Legacy rows may still store NULL,
+        // which the rest of the storage layer treats as false.
+        sql.push_str(" AND (pinned = 0 OR pinned IS NULL)");
 
-        // Ready condition 5: not ephemeral and not wisp
-        sql.push_str(" AND ephemeral = 0");
+        // Ready condition 5: not ephemeral and not wisp. Legacy rows may
+        // still store NULL, which should behave the same as false.
+        sql.push_str(" AND (ephemeral = 0 OR ephemeral IS NULL)");
         sql.push_str(" AND id NOT LIKE '%-wisp-%'");
 
         // Exclude templates
-        sql.push_str(" AND is_template = 0");
+        sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
 
         // Filter by types
         if let Some(ref types) = filters.types
@@ -1780,10 +1811,12 @@ impl SqliteStorage {
         // Sorting
         match sort {
             ReadySortPolicy::Hybrid => {
-                sql.push_str(" ORDER BY CASE WHEN priority <= 1 THEN 0 ELSE 1 END, created_at ASC");
+                sql.push_str(
+                    " ORDER BY CASE WHEN priority <= 1 THEN 0 ELSE 1 END, created_at DESC",
+                );
             }
             ReadySortPolicy::Priority => {
-                sql.push_str(" ORDER BY priority ASC, created_at ASC");
+                sql.push_str(" ORDER BY priority ASC, created_at DESC");
             }
             ReadySortPolicy::Oldest => {
                 sql.push_str(" ORDER BY created_at ASC");
@@ -1798,7 +1831,7 @@ impl SqliteStorage {
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
-        let mut issues = Vec::new();
+        let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
         }
@@ -2100,7 +2133,7 @@ impl SqliteStorage {
               FROM issues i
               INNER JOIN blocked_issues_cache bc ON i.id = bc.issue_id
               WHERE i.status IN ('open', 'in_progress')
-              ORDER BY i.priority ASC, i.created_at ASC",
+              ORDER BY i.priority ASC, i.created_at DESC",
         )?;
 
         let mut blocked_issues = Vec::new();
@@ -2121,9 +2154,18 @@ impl SqliteStorage {
     /// Returns an error if the dependency probe query fails.
     pub fn has_external_dependencies(&self, blocking_only: bool) -> Result<bool> {
         let sql = if blocking_only {
-            "SELECT 1 FROM dependencies WHERE depends_on_id LIKE 'external:%' AND type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child') LIMIT 1"
+            "SELECT 1
+             FROM dependencies
+             WHERE (depends_on_id LIKE 'external:%'
+                    AND type IN ('blocks', 'conditional-blocks', 'waits-for'))
+                OR (issue_id LIKE 'external:%' AND type = 'parent-child')
+             LIMIT 1"
         } else {
-            "SELECT 1 FROM dependencies WHERE depends_on_id LIKE 'external:%' LIMIT 1"
+            "SELECT 1
+             FROM dependencies
+             WHERE depends_on_id LIKE 'external:%'
+                OR (issue_id LIKE 'external:%' AND type = 'parent-child')
+             LIMIT 1"
         };
         let rows = self.conn.query(sql)?;
         Ok(!rows.is_empty())
@@ -2224,38 +2266,52 @@ impl SqliteStorage {
     ) -> Result<HashMap<String, Vec<String>>> {
         let mut blockers: HashMap<String, Vec<String>> = HashMap::new();
 
-        // Direct external blockers (blocking dependency types only).
+        // Direct external blockers.
+        // 1. Local issues blocked by external targets (standard blocking types)
         let rows = self.conn.query(
             "SELECT issue_id, depends_on_id
              FROM dependencies
              WHERE depends_on_id LIKE 'external:%'
-               AND type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')",
+               AND type IN ('blocks', 'conditional-blocks', 'waits-for')",
         )?;
 
         for row in &rows {
-            let issue_id = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
-            let depends_on_id = row
-                .get(1)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
+            let issue_id = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
+            let depends_on_id = row.get(1).and_then(SqliteValue::as_text).unwrap_or("");
             let satisfied = external_statuses
-                .get(&depends_on_id)
+                .get(depends_on_id)
                 .copied()
                 .unwrap_or(false);
             if !satisfied {
                 blockers
-                    .entry(issue_id)
+                    .entry(issue_id.to_string())
                     .or_default()
                     .push(format!("{depends_on_id}:blocked"));
             }
         }
 
-        // Propagate external blocking through parent-child relationships.
+        // 2. Local parents blocked by external children
+        let rows = self.conn.query(
+            "SELECT depends_on_id, issue_id
+             FROM dependencies
+             WHERE issue_id LIKE 'external:%'
+               AND type = 'parent-child'",
+        )?;
+
+        for row in &rows {
+            let parent_id = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
+            let child_id = row.get(1).and_then(SqliteValue::as_text).unwrap_or("");
+            let satisfied = external_statuses.get(child_id).copied().unwrap_or(false);
+            if !satisfied {
+                blockers
+                    .entry(parent_id.to_string())
+                    .or_default()
+                    .push(format!("{child_id}:child-blocked"));
+            }
+        }
+
+        // Propagate external blocking UP through parent-child relationships.
+        // If a child is blocked, its parent is also blocked.
         let edge_rows = self.conn.query(
             "SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'parent-child'",
         )?;
@@ -2269,30 +2325,30 @@ impl SqliteStorage {
             .collect();
 
         if !edges.is_empty() && !blockers.is_empty() {
-            let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+            let mut parents_by_child: HashMap<String, Vec<String>> = HashMap::new();
             for (child, parent) in &edges {
-                children_by_parent
-                    .entry(parent.clone())
+                parents_by_child
+                    .entry(child.clone())
                     .or_default()
-                    .push(child.clone());
+                    .push(parent.clone());
             }
 
             let mut queue: Vec<String> = blockers.keys().cloned().collect();
             let mut seen: HashSet<String> = HashSet::new();
 
-            while let Some(parent_id) = queue.pop() {
-                if !seen.insert(parent_id.clone()) {
+            while let Some(child_id) = queue.pop() {
+                if !seen.insert(child_id.clone()) {
                     continue;
                 }
-                if let Some(children) = children_by_parent.get(&parent_id) {
-                    for child in children {
-                        let entry = blockers.entry(child.clone()).or_default();
-                        let marker = format!("{parent_id}:parent-blocked");
+                if let Some(parents) = parents_by_child.get(&child_id) {
+                    for parent in parents {
+                        let entry = blockers.entry(parent.clone()).or_default();
+                        let marker = format!("{child_id}:child-blocked");
                         if entry.contains(&marker) {
                             continue;
                         }
                         entry.push(marker);
-                        queue.push(child.clone());
+                        queue.push(parent.clone());
                     }
                 }
             }
@@ -2310,11 +2366,20 @@ impl SqliteStorage {
             "SELECT DISTINCT depends_on_id
              FROM dependencies
              WHERE depends_on_id LIKE 'external:%'
-               AND type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')"
+               AND type IN ('blocks', 'conditional-blocks', 'waits-for')
+             UNION
+             SELECT DISTINCT issue_id
+             FROM dependencies
+             WHERE issue_id LIKE 'external:%'
+               AND type = 'parent-child'"
         } else {
             "SELECT DISTINCT depends_on_id
              FROM dependencies
-             WHERE depends_on_id LIKE 'external:%'"
+             WHERE depends_on_id LIKE 'external:%'
+             UNION
+             SELECT DISTINCT issue_id
+             FROM dependencies
+             WHERE issue_id LIKE 'external:%'"
         };
 
         let rows = self.conn.query(sql)?;
@@ -2323,7 +2388,6 @@ impl SqliteStorage {
                 ids.insert(id.to_string());
             }
         }
-
         Ok(ids)
     }
 
@@ -2453,11 +2517,40 @@ impl SqliteStorage {
         dep_type: &str,
         actor: &str,
     ) -> Result<bool> {
+        self.add_dependency_with_metadata(issue_id, depends_on_id, dep_type, actor, None)
+    }
+
+    /// Add a dependency link with optional JSON metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dependency is invalid, the metadata is not valid JSON,
+    /// or the database update fails.
+    pub fn add_dependency_with_metadata(
+        &mut self,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: &str,
+        actor: &str,
+        metadata: Option<&str>,
+    ) -> Result<bool> {
         if issue_id == depends_on_id {
             return Err(BeadsError::SelfDependency {
                 id: issue_id.to_string(),
             });
         }
+
+        let metadata = if let Some(metadata) = metadata {
+            serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
+                BeadsError::Validation {
+                    field: "metadata".to_string(),
+                    reason: format!("dependency metadata must be valid JSON: {err}"),
+                }
+            })?;
+            metadata
+        } else {
+            "{}"
+        };
 
         self.mutate("add_dependency", actor, |conn, ctx| {
             match Self::issue_status_in_tx(conn, issue_id)? {
@@ -2504,14 +2597,15 @@ impl SqliteStorage {
             }
 
             conn.execute_with_params(
-                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata)
+                 VALUES (?, ?, ?, ?, ?, ?)",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
                     SqliteValue::from(dep_type),
                     SqliteValue::from(Utc::now().to_rfc3339()),
                     SqliteValue::from(actor),
+                    SqliteValue::from(metadata),
                 ],
             )?;
 
@@ -2611,14 +2705,18 @@ impl SqliteStorage {
                     &[SqliteValue::from(now.as_str()), SqliteValue::from(issue_id)],
                 )?;
 
-                for affected_id in &affected {
-                    conn.execute_with_params(
-                        "UPDATE issues SET updated_at = ? WHERE id = ?",
-                        &[
-                            SqliteValue::from(now.as_str()),
-                            SqliteValue::from(affected_id.as_str()),
-                        ],
-                    )?;
+                for chunk in affected.chunks(400) {
+                    let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                    let sql = format!(
+                        "UPDATE issues SET updated_at = ? WHERE id IN ({})",
+                        placeholders.join(", ")
+                    );
+                    let mut params = Vec::with_capacity(chunk.len() + 1);
+                    params.push(SqliteValue::from(now.as_str()));
+                    for id in chunk {
+                        params.push(SqliteValue::from(id.as_str()));
+                    }
+                    conn.execute_with_params(&sql, &params)?;
                 }
 
                 ctx.record_event(
@@ -3314,6 +3412,46 @@ impl SqliteStorage {
             .collect())
     }
 
+    /// Get IDs of issues that block this one (respects parent-child direction).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocker_ids(&self, issue_id: &str) -> Result<Vec<String>> {
+        let rows = self.conn.query_with_params(
+            r"
+            SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type != 'parent-child'
+            UNION
+            SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type = 'parent-child'
+            ",
+            &[SqliteValue::from(issue_id), SqliteValue::from(issue_id)],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect())
+    }
+
+    /// Get IDs of issues that are blocked by this one (respects parent-child direction).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocked_issue_ids(&self, issue_id: &str) -> Result<Vec<String>> {
+        let rows = self.conn.query_with_params(
+            r"
+            SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type != 'parent-child'
+            UNION
+            SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child'
+            ",
+            &[SqliteValue::from(issue_id), SqliteValue::from(issue_id)],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect())
+    }
+
     /// Get IDs of issues that this one depends on.
     ///
     /// # Errors
@@ -3748,7 +3886,7 @@ impl SqliteStorage {
                     ORDER BY id ASC";
 
         let rows = self.conn.query(sql)?;
-        let mut issues = Vec::new();
+        let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
         }
@@ -3843,6 +3981,8 @@ impl SqliteStorage {
     }
 
     /// Get the IDs and timestamps of dirty issues.
+    ///
+    /// # Errors
     ///
     /// Returns an error if the database query fails.
     pub fn get_dirty_issue_metadata(&self) -> Result<Vec<(String, String)>> {
@@ -4025,30 +4165,10 @@ impl SqliteStorage {
         if exports.is_empty() {
             return Ok(0);
         }
-        let now = Utc::now().to_rfc3339();
-        // Wrap the entire batch in a single transaction for atomicity and
-        // performance (avoids per-row journal sync on bulk imports).
+        
+        // Wrap the entire batch in a single transaction for atomicity and performance
         self.conn.execute("BEGIN IMMEDIATE")?;
-        match (|| -> Result<usize> {
-            let mut count = 0;
-            for (issue_id, content_hash) in exports {
-                // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
-                self.conn.execute_with_params(
-                    "DELETE FROM export_hashes WHERE issue_id = ?",
-                    &[SqliteValue::from(issue_id.as_str())],
-                )?;
-                self.conn.execute_with_params(
-                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
-                    &[
-                        SqliteValue::from(issue_id.as_str()),
-                        SqliteValue::from(content_hash.as_str()),
-                        SqliteValue::from(now.as_str()),
-                    ],
-                )?;
-                count += 1;
-            }
-            Ok(count)
-        })() {
+        match self.set_export_hashes_in_tx(exports) {
             Ok(count) => {
                 self.conn.execute("COMMIT")?;
                 Ok(count)
@@ -4264,11 +4384,8 @@ impl SqliteStorage {
                 .unwrap_or("")
                 .to_string()
         };
-        let get_str_ref = |idx: usize| -> &str {
-            row.get(idx)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-        };
+        let get_str_ref =
+            |idx: usize| -> &str { row.get(idx).and_then(SqliteValue::as_text).unwrap_or("") };
         let get_opt_str = |idx: usize| -> Option<String> {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -4306,7 +4423,7 @@ impl SqliteStorage {
             acceptance_criteria: get_non_empty_str(5),
             notes: get_non_empty_str(6),
             status: parse_status(row.get(7).and_then(SqliteValue::as_text)),
-            priority: Priority(get_opt_i32(8).unwrap_or(2)),
+            priority: Priority(get_opt_i32(8).unwrap_or_else(|| Priority::default().0)),
             issue_type: parse_issue_type(row.get(9).and_then(SqliteValue::as_text)),
             assignee: get_non_empty_str(10),
             owner: get_non_empty_str(11),
@@ -4761,7 +4878,7 @@ impl SqliteStorage {
 
         let rows = stmt.query_with_params(&[SqliteValue::from(issue_id)])?;
 
-        let mut deps = Vec::new();
+        let mut deps = Vec::with_capacity(rows.len());
         for row in &rows {
             let created_at_str = row
                 .get(3)
@@ -4908,11 +5025,15 @@ impl SqliteStorage {
     pub fn detect_all_cycles(&self) -> Result<Vec<Vec<String>>> {
         use std::collections::{HashMap, HashSet};
 
-        // Get all dependencies
+        // Get all dependencies, respecting parent-child direction (parent depends on child)
         let mut graph: HashMap<String, Vec<String>> = HashMap::new();
-        let stmt = self
-            .conn
-            .prepare("SELECT issue_id, depends_on_id FROM dependencies")?;
+        let stmt = self.conn.prepare(
+            r"
+                SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'
+                UNION
+                SELECT depends_on_id, issue_id FROM dependencies WHERE type = 'parent-child'
+            ",
+        )?;
 
         let rows = stmt.query()?;
 
@@ -5782,6 +5903,31 @@ mod tests {
     }
 
     #[test]
+    fn test_has_external_dependencies_detects_external_parent_child_children() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
+        let parent = make_issue("bd-p1", "Parent", Status::Open, 2, None, t1, None);
+        storage.create_issue(&parent, "tester").unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES (?, ?, 'parent-child', ?, ?)",
+                &[
+                    SqliteValue::from("external:extproj:child"),
+                    SqliteValue::from("bd-p1"),
+                    SqliteValue::from(t1.to_rfc3339()),
+                    SqliteValue::from("tester"),
+                ],
+            )
+            .unwrap();
+
+        assert!(storage.has_external_dependencies(true).unwrap());
+        assert!(storage.has_external_dependencies(false).unwrap());
+    }
+
+    #[test]
     fn test_update_issue_changes_fields() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
@@ -6119,6 +6265,51 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, BeadsError::IssueNotFound { id } if id == "bd-missing"));
+    }
+
+    #[test]
+    fn test_add_dependency_with_metadata_persists_json() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-b1", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        storage
+            .add_dependency_with_metadata(
+                "bd-a1",
+                "bd-b1",
+                "blocks",
+                "tester",
+                Some(r#"{"source":"cli","reason":"gate"}"#),
+            )
+            .unwrap();
+
+        let deps = storage.get_dependencies_full("bd-a1").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            deps[0].metadata.as_deref(),
+            Some(r#"{"source":"cli","reason":"gate"}"#)
+        );
+    }
+
+    #[test]
+    fn test_add_dependency_with_metadata_rejects_invalid_json() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-b1", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        let err = storage
+            .add_dependency_with_metadata("bd-a1", "bd-b1", "blocks", "tester", Some("{not-json"))
+            .unwrap_err();
+
+        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "metadata"));
     }
 
     #[test]
@@ -8213,6 +8404,94 @@ mod tests {
             .get_ready_issues(&filters_nonexistent, ReadySortPolicy::Oldest)
             .unwrap();
         assert_eq!(res.len(), 0, "Non-existent parent should return empty");
+    }
+
+    #[test]
+    fn test_get_ready_issues_treats_null_legacy_flags_as_false() {
+        let conn = Connection::open(":memory:").unwrap();
+        crate::storage::schema::execute_batch(
+            &conn,
+            r"
+            CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                title TEXT NOT NULL,
+                description TEXT,
+                design TEXT,
+                acceptance_criteria TEXT,
+                notes TEXT,
+                status TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                issue_type TEXT NOT NULL,
+                assignee TEXT,
+                owner TEXT,
+                estimated_minutes INTEGER,
+                created_at DATETIME NOT NULL,
+                created_by TEXT,
+                updated_at DATETIME NOT NULL,
+                closed_at DATETIME,
+                close_reason TEXT,
+                closed_by_session TEXT,
+                due_at DATETIME,
+                defer_until DATETIME,
+                external_ref TEXT,
+                source_system TEXT,
+                source_repo TEXT,
+                deleted_at DATETIME,
+                deleted_by TEXT,
+                delete_reason TEXT,
+                original_type TEXT,
+                compaction_level INTEGER,
+                compacted_at DATETIME,
+                compacted_at_commit TEXT,
+                original_size INTEGER,
+                sender TEXT,
+                ephemeral INTEGER,
+                pinned INTEGER,
+                is_template INTEGER
+            );
+            CREATE TABLE blocked_issues_cache (
+                issue_id TEXT PRIMARY KEY,
+                blocked_by TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+
+        let storage = SqliteStorage {
+            conn,
+            mutation_count: 0,
+        };
+        let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
+        let stamp = timestamp.to_rfc3339();
+
+        storage
+            .conn
+            .execute_with_params(
+                r"
+                INSERT INTO issues (
+                    id, title, status, priority, issue_type, created_at, updated_at,
+                    ephemeral, pinned, is_template
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                ",
+                &[
+                    SqliteValue::from("bd-legacy-ready"),
+                    SqliteValue::from("Legacy ready issue"),
+                    SqliteValue::from("open"),
+                    SqliteValue::from(2_i64),
+                    SqliteValue::from("task"),
+                    SqliteValue::from(stamp.as_str()),
+                    SqliteValue::from(stamp.as_str()),
+                ],
+            )
+            .unwrap();
+
+        let ready = storage
+            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Priority)
+            .unwrap();
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "bd-legacy-ready");
     }
 
     #[test]

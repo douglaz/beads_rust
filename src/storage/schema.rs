@@ -89,6 +89,12 @@ pub const SCHEMA_SQL: &str = r"
         AND pinned = 0
         AND is_template = 0;
 
+    -- Common active list path: non-terminal issues sorted by priority/created_at
+    CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
+        ON issues(priority, created_at DESC)
+        WHERE status NOT IN ('closed', 'tombstone')
+        AND (is_template = 0 OR is_template IS NULL);
+
     -- Dependencies
     CREATE TABLE IF NOT EXISTS dependencies (
         issue_id TEXT NOT NULL,
@@ -1041,6 +1047,12 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             AND pinned = 0
             AND is_template = 0;
 
+        -- Common active list path: non-terminal issues sorted by priority/created_at
+        CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
+            ON issues(priority, created_at DESC)
+            WHERE status NOT IN ('closed', 'tombstone')
+            AND (is_template = 0 OR is_template IS NULL);
+
     ",
     )?;
 
@@ -1316,6 +1328,10 @@ mod tests {
         assert!(
             indexes.contains("idx_issues_ready"),
             "missing idx_issues_ready composite index"
+        );
+        assert!(
+            indexes.contains("idx_issues_list_active_order"),
+            "missing idx_issues_list_active_order composite index"
         );
 
         // === DEPENDENCIES TABLE ===
@@ -1809,6 +1825,36 @@ mod tests {
         assert!(
             !runtime_schema_compatible(&conn),
             "legacy config/metadata primary keys should force the full repair path"
+        );
+    }
+
+    #[test]
+    fn test_active_list_query_plan_uses_composite_index() {
+        let conn = Connection::open(":memory:").unwrap();
+        apply_schema(&conn).expect("schema");
+
+        let plan_rows = conn
+            .query(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, priority, created_at
+                 FROM issues
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND (is_template = 0 OR is_template IS NULL)
+                 ORDER BY priority ASC, created_at DESC
+                 LIMIT 1",
+            )
+            .expect("query plan");
+
+        let details: Vec<String> = plan_rows
+            .iter()
+            .filter_map(|row| row.get(3).and_then(|v| v.as_text()).map(String::from))
+            .collect();
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_issues_list_active_order")),
+            "expected planner to use idx_issues_list_active_order, got: {details:?}"
         );
     }
 

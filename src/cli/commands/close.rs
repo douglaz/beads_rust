@@ -250,6 +250,10 @@ pub fn execute_with_args(
         |hash| find_matching_ids(&all_ids, hash),
     )?;
 
+    // Optimization: fetch epic counts if any issues might be epics
+    // to warn about open children.
+    let epic_counts = storage.get_epic_counts()?;
+
     // Track blocked issues before closing (for suggest-next)
     let blocked_before: Vec<String> = if args.suggest_next {
         storage
@@ -294,6 +298,23 @@ pub fn execute_with_args(
                 reason: format!("already {}", issue.status.as_str()),
             });
             continue;
+        }
+
+        // Epic safeguard: warn if closing an epic with open children
+        if !args.force && issue.issue_type == crate::model::IssueType::Epic {
+            if let Some(&(total, closed)) = epic_counts.get(id) {
+                if closed < total {
+                    skipped_issues.push(SkippedIssue {
+                        id: id.clone(),
+                        reason: format!(
+                            "epic has {}/{} open children (use --force to close anyway)",
+                            total - closed,
+                            total
+                        ),
+                    });
+                    continue;
+                }
+            }
         }
 
         if args.force {
@@ -484,7 +505,7 @@ pub fn execute_with_args(
             ctx.newline();
             ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
             for issue in &unblocked_issues {
-                ctx.print(&format!("  {}: {}", issue.id, issue.title));
+                ctx.print_line(&format!("  {}: {}", issue.id, issue.title));
             }
         }
     }

@@ -214,7 +214,7 @@ fn dep_add(
                 }
                 _ => format!("  Relationship: {}", dep_type.as_str()),
             };
-            ctx.print(&relationship);
+            ctx.print_line(&relationship);
         } else {
             ctx.success(&format!(
                 "Added dependency: {} -> {} ({})",
@@ -278,7 +278,7 @@ fn dep_remove(
                 "Removed dependency: {} → {}",
                 issue_id, depends_on_id
             ));
-            ctx.print(&format!(
+            ctx.print_line(&format!(
                 "  {} no longer depends on {}",
                 issue_id, depends_on_id
             ));
@@ -415,7 +415,7 @@ fn dep_list(
             } else {
                 format!("  <- {} ({})", item.issue_id, item.dep_type)
             };
-            ctx.print(&format!(
+            ctx.print_line(&format!(
                 "{}: {} [P{}] [{}]",
                 arrow, item.title, item.priority, item.status
             ));
@@ -773,7 +773,7 @@ fn dep_tree(
             } else {
                 "├── "
             };
-            ctx.print(&format!(
+            ctx.print_line(&format!(
                 "{}{}{}: {} [P{}] [{}]",
                 indent, prefix, node.id, node.title, node.priority, node.status
             ));
@@ -815,9 +815,18 @@ fn render_dep_tree_rich(ctx: &OutputContext, nodes: &[TreeNode]) {
 
     let theme = ctx.theme();
 
+    // Group nodes by parent_key for O(1) lookups
+    let mut children_map: std::collections::HashMap<Option<&str>, Vec<&TreeNode>> =
+        std::collections::HashMap::new();
+    for node in nodes {
+        children_map
+            .entry(node.parent_key.as_deref())
+            .or_default()
+            .push(node);
+    }
+
     // Build tree structure from flat nodes list
-    // The nodes are in DFS order with parent_id references
-    let root = build_tree_node_rich(&nodes[0], nodes);
+    let root = build_tree_node_rich(&nodes[0], &children_map);
     let tree = Tree::new(root)
         .guides(TreeGuides::Rounded)
         .guide_style(theme.dimmed.clone());
@@ -826,9 +835,9 @@ fn render_dep_tree_rich(ctx: &OutputContext, nodes: &[TreeNode]) {
 }
 
 /// Recursively build a tree node for rich rendering
-fn build_tree_node_rich(
-    node: &TreeNode,
-    all_nodes: &[TreeNode],
+fn build_tree_node_rich<'a>(
+    node: &'a TreeNode,
+    children_map: &std::collections::HashMap<Option<&'a str>, Vec<&'a TreeNode>>,
 ) -> rich_rust::renderables::TreeNode {
     // Format the node label with status styling
     let status_style = match node.status.as_str() {
@@ -870,13 +879,12 @@ fn build_tree_node_rich(
 
     let mut tree_node = rich_rust::renderables::TreeNode::new(Text::new(label));
 
-    // Find and add children by instance key so duplicate issue IDs stay distinct.
-    for child in all_nodes
-        .iter()
-        .filter(|n| n.parent_key.as_ref() == Some(&node.node_key))
-    {
-        let child_node = build_tree_node_rich(child, all_nodes);
-        tree_node = tree_node.child(child_node);
+    // Find and add children using the pre-computed map
+    if let Some(children) = children_map.get(&Some(node.node_key.as_str())) {
+        for child in children {
+            let child_node = build_tree_node_rich(child, children_map);
+            tree_node = tree_node.child(child_node);
+        }
     }
 
     tree_node
@@ -928,7 +936,7 @@ fn dep_cycles(
         // Plain mode: Simple text output
         ctx.warning(&format!("Found {count} dependency cycle(s):"));
         for (i, cycle) in cycles.iter().enumerate() {
-            ctx.print(&format!("  {}. {}", i + 1, cycle.join(" -> ")));
+            ctx.print_line(&format!("  {}. {}", i + 1, cycle.join(" -> ")));
         }
     }
 

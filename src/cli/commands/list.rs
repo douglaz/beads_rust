@@ -10,7 +10,7 @@ use crate::format::csv;
 use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
 use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
-use crate::storage::{ListFilters, SqliteStorage};
+use crate::storage::ListFilters;
 use chrono::Utc;
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -54,12 +54,10 @@ pub fn execute(
     validate_sort_key(args.sort.as_deref())?;
 
     // Query issues
-    let issues = storage.list_issues(&filters)?;
-    let mut issues = if client_filters {
-        apply_client_filters(storage, issues, args)?
-    } else {
-        issues
-    };
+    let mut issues = storage.list_issues(&filters)?;
+    if client_filters {
+        issues = apply_client_filters(issues, args)?;
+    }
 
     // Detect and apply truncation.
     // For client-filter path we know the exact pre-truncation count.
@@ -297,7 +295,6 @@ fn needs_client_filters(args: &ListArgs) -> bool {
 }
 
 fn apply_client_filters(
-    storage: &SqliteStorage,
     issues: Vec<crate::model::Issue>,
     args: &ListArgs,
 ) -> Result<Vec<crate::model::Issue>> {
@@ -305,16 +302,6 @@ fn apply_client_filters(
         None
     } else {
         Some(args.id.iter().map(String::as_str).collect())
-    };
-
-    let label_filters = !args.label.is_empty() || !args.label_any.is_empty();
-
-    // Pre-fetch labels if needed to avoid N+1
-    let labels_map = if label_filters {
-        let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-        storage.get_labels_for_issues(&issue_ids)?
-    } else {
-        std::collections::HashMap::new()
     };
 
     let mut filtered = Vec::new();
@@ -385,19 +372,6 @@ fn apply_client_filters(
             }
         }
 
-        if label_filters {
-            let default_labels = Vec::new();
-            let labels = labels_map.get(&issue.id).unwrap_or(&default_labels);
-            if !args.label.is_empty() && !args.label.iter().all(|label| labels.contains(label)) {
-                continue;
-            }
-            if !args.label_any.is_empty()
-                && !args.label_any.iter().any(|label| labels.contains(label))
-            {
-                continue;
-            }
-        }
-
         filtered.push(issue);
     }
 
@@ -422,6 +396,8 @@ fn validate_sort_key(sort: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cli;
+    use crate::model::Issue;
+    use chrono::Duration;
     use tracing::info;
 
     fn init_logging() {
@@ -491,5 +467,97 @@ mod tests {
         };
         assert!(needs_client_filters(&args));
         info!("test_needs_client_filters_detects_fields: assertions passed");
+    }
+
+    fn issue_with_id(id: &str, title: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            title: title.to_string(),
+            ..Issue::default()
+        }
+    }
+
+    #[test]
+    fn test_apply_client_filters_honors_id_priority_and_text_filters() {
+        init_logging();
+        let mut matching = issue_with_id("bd-2", "matching issue");
+        matching.priority = Priority(2);
+        matching.description = Some("Contains a unique NEEDLE".to_string());
+        matching.notes = Some("Tracker note with token".to_string());
+
+        let mut wrong_id = issue_with_id("bd-1", "wrong id");
+        wrong_id.priority = Priority(2);
+        wrong_id.description = Some("Contains a unique needle".to_string());
+        wrong_id.notes = Some("Tracker note with token".to_string());
+
+        let mut wrong_priority = issue_with_id("bd-3", "wrong priority");
+        wrong_priority.priority = Priority(4);
+        wrong_priority.description = Some("Contains a unique needle".to_string());
+        wrong_priority.notes = Some("Tracker note with token".to_string());
+
+        let args = ListArgs {
+            id: vec!["bd-2".to_string()],
+            priority_min: Some(2),
+            priority_max: Some(2),
+            desc_contains: Some("needle".to_string()),
+            notes_contains: Some("token".to_string()),
+            ..Default::default()
+        };
+
+        let filtered = apply_client_filters(vec![wrong_id, wrong_priority, matching], &args)
+            .expect("apply client filters");
+        let ids: Vec<_> = filtered.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-2"]);
+    }
+
+    #[test]
+    fn test_apply_client_filters_excludes_deferred_from_overdue_unless_requested() {
+        init_logging();
+        let now = Utc::now();
+
+        let mut overdue_open = issue_with_id("bd-1", "overdue open");
+        overdue_open.due_at = Some(now - Duration::days(1));
+
+        let mut overdue_deferred = issue_with_id("bd-2", "overdue deferred");
+        overdue_deferred.status = Status::Deferred;
+        overdue_deferred.due_at = Some(now - Duration::days(1));
+
+        let mut future_open = issue_with_id("bd-3", "future open");
+        future_open.due_at = Some(now + Duration::days(1));
+
+        let mut overdue_closed = issue_with_id("bd-4", "overdue closed");
+        overdue_closed.status = Status::Closed;
+        overdue_closed.due_at = Some(now - Duration::days(1));
+
+        let overdue_only = apply_client_filters(
+            vec![
+                overdue_open.clone(),
+                overdue_deferred.clone(),
+                future_open,
+                overdue_closed,
+            ],
+            &ListArgs {
+                overdue: true,
+                ..Default::default()
+            },
+        )
+        .expect("overdue filter");
+        let overdue_only_ids: Vec<_> = overdue_only.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(overdue_only_ids, vec!["bd-1"]);
+
+        let overdue_with_deferred = apply_client_filters(
+            vec![overdue_open, overdue_deferred],
+            &ListArgs {
+                overdue: true,
+                deferred: true,
+                ..Default::default()
+            },
+        )
+        .expect("overdue with deferred filter");
+        let overdue_with_deferred_ids: Vec<_> = overdue_with_deferred
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect();
+        assert_eq!(overdue_with_deferred_ids, vec!["bd-1", "bd-2"]);
     }
 }

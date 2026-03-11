@@ -10,7 +10,6 @@ use chrono::Utc;
 use crossterm::style::Stylize;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::cmp::Ordering;
 
 /// Execute the epic command.
 ///
@@ -164,19 +163,11 @@ fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
         ..Default::default()
     };
     let epics = storage.list_issues(&filters)?;
+    let counts = storage.get_epic_counts()?;
 
     let mut statuses = Vec::new();
     for epic in epics {
-        let children = storage.get_dependents_with_metadata(&epic.id)?;
-        let parent_children: Vec<_> = children
-            .into_iter()
-            .filter(|c| c.dep_type == "parent-child")
-            .collect();
-        let total_children = parent_children.len();
-        let closed_children = parent_children
-            .iter()
-            .filter(|c| matches!(c.status, Status::Closed | Status::Tombstone))
-            .count();
+        let (total_children, closed_children) = counts.get(&epic.id).copied().unwrap_or((0, 0));
         let eligible_for_close = total_children > 0 && closed_children == total_children;
 
         statuses.push(EpicStatus {
@@ -186,15 +177,6 @@ fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
             eligible_for_close,
         });
     }
-
-    statuses.sort_by(|a, b| {
-        let primary = a.epic.priority.cmp(&b.epic.priority);
-        if primary == Ordering::Equal {
-            a.epic.created_at.cmp(&b.epic.created_at)
-        } else {
-            primary
-        }
-    });
 
     Ok(statuses)
 }

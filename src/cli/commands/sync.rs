@@ -523,60 +523,17 @@ fn execute_flush(
     if dirty_ids.is_empty() && !args.force {
         // Guard against empty DB overwriting a non-empty JSONL.
         let existing_count = count_issues_in_jsonl(jsonl_path)?;
-        if existing_count > 0 {
-            let issues = storage.get_all_issues_for_export()?;
-            if issues.is_empty() {
-                warn!(
-                    jsonl_count = existing_count,
-                    "Refusing export of empty DB over non-empty JSONL"
-                );
-                return Err(BeadsError::Config(format!(
-                    "Refusing to export empty database over non-empty JSONL file.\n\
+        if existing_count > 0 && storage.count_issues()? == 0 {
+            warn!(
+                jsonl_count = existing_count,
+                "Refusing export of empty DB over non-empty JSONL"
+            );
+            return Err(BeadsError::Config(format!(
+                "Refusing to export empty database over non-empty JSONL file.\n\
                      Database has 0 issues, JSONL has {existing_count} issues.\n\
                      This would result in data loss!\n\
                      Hint: Use --force to override this safety check."
-                )));
-            }
-
-            let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
-            if !jsonl_ids.is_empty() {
-                let db_ids: HashSet<String> = issues.iter().map(|i| i.id.clone()).collect();
-                let missing: Vec<_> = jsonl_ids.difference(&db_ids).collect();
-
-                if !missing.is_empty() {
-                    warn!(
-                        jsonl_count = jsonl_ids.len(),
-                        db_count = issues.len(),
-                        missing_count = missing.len(),
-                        "Refusing export because DB is stale relative to JSONL"
-                    );
-                    let mut missing_list = missing.into_iter().cloned().collect::<Vec<_>>();
-                    missing_list.sort();
-                    let display_count = missing_list.len().min(10);
-                    let preview: Vec<_> = missing_list.iter().take(display_count).collect();
-                    let more = if missing_list.len() > 10 {
-                        format!(" ... and {} more", missing_list.len() - 10)
-                    } else {
-                        String::new()
-                    };
-
-                    return Err(BeadsError::Config(format!(
-                        "Refusing to export stale database that would lose issues.\n\
-                         Database has {} issues, JSONL has {} issues.\n\
-                         Export would lose {} issue(s): {}{}\n\
-                         Hint: Run import first, or use --force to override.",
-                        issues.len(),
-                        jsonl_ids.len(),
-                        missing_list.len(),
-                        preview
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        more
-                    )));
-                }
-            }
+            )));
         }
 
         if use_json {

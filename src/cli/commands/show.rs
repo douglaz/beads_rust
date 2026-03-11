@@ -200,8 +200,10 @@ fn load_issue_details_from_jsonl(
 
     let external_ids = collect_external_dependency_ids(&details_list);
     if !external_ids.is_empty() {
-        let statuses =
-            SqliteStorage::resolve_external_dependency_statuses_for_ids(&external_ids, external_db_paths);
+        let statuses = SqliteStorage::resolve_external_dependency_statuses_for_ids(
+            &external_ids,
+            external_db_paths,
+        );
         for details in &mut details_list {
             apply_external_dependency_metadata(&mut details.dependencies, &statuses);
             apply_external_dependency_metadata(&mut details.dependents, &statuses);
@@ -323,7 +325,10 @@ fn dependency_metadata_from_jsonl(
     )))
 }
 
-fn find_ids_by_hash_in_memory(issues_by_id: &HashMap<String, Issue>, hash_suffix: &str) -> Vec<String> {
+fn find_ids_by_hash_in_memory(
+    issues_by_id: &HashMap<String, Issue>,
+    hash_suffix: &str,
+) -> Vec<String> {
     issues_by_id
         .keys()
         .filter(|id| {
@@ -871,6 +876,8 @@ mod tests {
         assert_eq!(parent_details.dependents.len(), 1);
         assert_eq!(parent_details.dependents[0].id, "bd-child");
         assert_eq!(parent_details.dependents[0].dep_type, "parent-child");
-        info!("test_build_issue_details_from_jsonl_derives_parent_and_dependents: assertions passed");
+        info!(
+            "test_build_issue_details_from_jsonl_derives_parent_and_dependents: assertions passed"
+        );
     }
 }

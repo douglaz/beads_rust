@@ -161,7 +161,7 @@ pub fn execute(
     ));
     for issue in &issues {
         let line = format_issue_line_with(issue, format_options);
-        ctx.print(&line);
+        ctx.print_line(&line);
     }
 
     Ok(())

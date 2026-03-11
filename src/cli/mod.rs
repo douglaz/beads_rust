@@ -29,9 +29,9 @@ enum IssueCompletionFilter {
 impl IssueCompletionFilter {
     fn matches(self, status: &Status) -> bool {
         match self {
-            Self::Any => true,
+            Self::Any => !matches!(status, Status::Tombstone),
             Self::Open => !status.is_terminal(),
-            Self::Closed => status.is_terminal(),
+            Self::Closed => matches!(status, Status::Closed),
         }
     }
 }
@@ -844,6 +844,9 @@ pub enum Commands {
     Reopen(ReopenArgs),
 
     /// Emit JSON Schemas for br output types (for agent/tooling integration)
+    ///
+    /// IMPORTANT: br schema is not a stable API and is subject to change.
+    /// Use at your own risk.
     Schema(SchemaArgs),
 
     /// Search issues
@@ -1989,7 +1992,7 @@ pub struct ReadyArgs {
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
     pub type_: Vec<String>,
 
-    /// Filter by priority (can be repeated, 0-4 or P0-P4)
+    /// Filter by priority (can be repeated, 0-4)
     #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
     pub priority: Vec<String>,
 

@@ -4,7 +4,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use crate::util::id::{IdGenerator, child_id};
+use crate::util::id::{IdGenerator, IdResolver, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
@@ -91,17 +91,17 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     } else if args.dry_run {
         ctx.info(&format!("Dry run: would create issue {}", issue.id));
-        ctx.print(&format!("Title: {}", issue.title));
-        ctx.print(&format!("Type: {}", issue.issue_type));
-        ctx.print(&format!("Priority: {}", issue.priority));
+        ctx.print_line(&format!("Title: {}", issue.title));
+        ctx.print_line(&format!("Type: {}", issue.issue_type));
+        ctx.print_line(&format!("Priority: {}", issue.priority));
         if !args.labels.is_empty() {
-            ctx.print(&format!("Labels: {}", args.labels.join(", ")));
+            ctx.print_line(&format!("Labels: {}", args.labels.join(", ")));
         }
         if let Some(parent) = &args.parent {
-            ctx.print(&format!("Parent: {parent}"));
+            ctx.print_line(&format!("Parent: {parent}"));
         }
         if !args.deps.is_empty() {
-            ctx.print(&format!("Dependencies: {}", args.deps.join(", ")));
+            ctx.print_line(&format!("Dependencies: {}", args.deps.join(", ")));
         }
     } else {
         ctx.success(&format!("Created {}: {}", issue.id, issue.title));
@@ -155,6 +155,12 @@ pub fn create_issue_impl(
 
     let due_at = parse_optional_date(args.due.as_deref())?;
     let defer_until = parse_optional_date(args.defer.as_deref())?;
+    let id_resolver = IdResolver::new(config.id_config.prefix.clone(), true);
+    let resolved_parent = args
+        .parent
+        .as_deref()
+        .map(|parent| resolve_issue_id(&id_resolver, storage, parent))
+        .transpose()?;
 
     // Parse status (default to Open if not provided)
     let status = if let Some(s) = &args.status {
@@ -177,7 +183,7 @@ pub fn create_issue_impl(
             issue_count: count,
             id_config: &config.id_config,
         };
-        let id = generate_new_id(storage, args.parent.as_deref(), &id_input)?;
+        let id = generate_new_id(storage, resolved_parent.as_deref(), &id_input)?;
 
         // Set closed_at if status is Closed or Tombstone
         let closed_at = if matches!(status, Status::Closed | Status::Tombstone) {
@@ -240,7 +246,15 @@ pub fn create_issue_impl(
         validate_relations(args, &id)?;
 
         // 6. Populate Relations (labels & dependencies)
-        populate_relations(&mut issue, args, &config.actor, now);
+        populate_relations(
+            &mut issue,
+            args,
+            &config.actor,
+            now,
+            resolved_parent.as_deref(),
+            storage,
+            &config.id_config.prefix,
+        );
 
         // 7. Dry Run check - return early
         if args.dry_run {
@@ -326,7 +340,17 @@ fn generate_new_id(
     }
 }
 
-fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
+fn resolve_issue_id(resolver: &IdResolver, storage: &SqliteStorage, input: &str) -> Result<String> {
+    resolver
+        .resolve_fallible(
+            input,
+            |id| storage.id_exists(id),
+            |hash| storage.find_ids_by_hash(hash),
+        )
+        .map(|resolved| resolved.id)
+}
+
+fn validate_relations(args: &CreateArgs, issue_id: &str) -> Result<()> {
     // Validate Labels
     for label in &args.labels {
         let trimmed = label.trim();
@@ -338,7 +362,7 @@ fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
 
     // Validate Parent
     if let Some(parent_id) = &args.parent
-        && parent_id == id
+        && parent_id == issue_id
     {
         return Err(BeadsError::validation(
             "parent",
@@ -356,7 +380,7 @@ fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
             ("blocks", dep_str.as_str())
         };
 
-        if dep_id == id {
+        if dep_id == issue_id {
             return Err(BeadsError::validation("deps", "cannot depend on itself"));
         }
 
@@ -388,7 +412,17 @@ fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn populate_relations(issue: &mut Issue, args: &CreateArgs, actor: &str, now: DateTime<Utc>) {
+fn populate_relations(
+    issue: &mut Issue,
+    args: &CreateArgs,
+    actor: &str,
+    now: DateTime<Utc>,
+    resolved_parent: Option<&str>,
+    storage: &crate::storage::SqliteStorage,
+    prefix: &str,
+) {
+    let resolver = IdResolver::new(prefix.to_string(), true);
+
     // Labels
     for label in &args.labels {
         let label = label.trim();
@@ -398,10 +432,10 @@ fn populate_relations(issue: &mut Issue, args: &CreateArgs, actor: &str, now: Da
     }
 
     // Parent
-    if let Some(parent_id) = &args.parent {
+    if let Some(parent_id) = resolved_parent {
         issue.dependencies.push(Dependency {
             issue_id: issue.id.clone(),
-            depends_on_id: parent_id.clone(),
+            depends_on_id: parent_id.to_string(),
             dep_type: DependencyType::ParentChild,
             created_at: now,
             created_by: Some(actor.to_string()),
@@ -427,11 +461,17 @@ fn populate_relations(issue: &mut Issue, args: &CreateArgs, actor: &str, now: Da
             type_str
         };
 
+        let resolved_dep_id = if dep_id.starts_with("external:") {
+            dep_id.to_string()
+        } else {
+            resolve_issue_id(&resolver, storage, dep_id).unwrap_or_else(|_| dep_id.to_string())
+        };
+
         // from_str is infallible - Custom types are rejected by validate_relations above
         let dep_type: DependencyType = normalized_type.parse().expect("validated above");
         issue.dependencies.push(Dependency {
             issue_id: issue.id.clone(),
-            depends_on_id: dep_id.to_string(),
+            depends_on_id: resolved_dep_id,
             dep_type,
             created_at: now,
             created_by: Some(actor.to_string()),
@@ -623,6 +663,7 @@ fn execute_import(
             // Populate Dependencies (with validation)
             let mut deps = parsed.dependencies.clone();
             deps.extend(args.deps.clone());
+            let resolver = IdResolver::new(id_config.prefix.clone(), true);
             for dep_str in deps {
                 let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
                 if !valid {
@@ -634,12 +675,21 @@ fn execute_import(
                 if type_str.eq_ignore_ascii_case("blocked-by") {
                     type_str = "blocks".to_string();
                 }
-                if dep_id == id {
+
+                let resolved_dep_id = if dep_id.starts_with("external:") {
+                    dep_id.clone()
+                } else {
+                    resolve_issue_id(&resolver, storage, &dep_id).unwrap_or_else(|_| dep_id.clone())
+                };
+
+                if resolved_dep_id == id {
                     eprintln!("warning: skipping self-dependency for issue {id}");
                     continue;
                 }
-                if is_marker_only_dependency(&dep_id) {
-                    eprintln!("warning: skipping invalid dependency '{dep_id}' for issue {id}");
+                if is_marker_only_dependency(&resolved_dep_id) {
+                    eprintln!(
+                        "warning: skipping invalid dependency '{resolved_dep_id}' for issue {id}"
+                    );
                     continue;
                 }
 
@@ -647,7 +697,7 @@ fn execute_import(
 
                 issue.dependencies.push(Dependency {
                     issue_id: id.clone(),
-                    depends_on_id: dep_id,
+                    depends_on_id: resolved_dep_id,
                     dep_type,
                     created_at: now,
                     created_by: Some(actor.clone()),
@@ -705,7 +755,7 @@ fn execute_import(
             path.display()
         ));
         for (id, title) in created_ids {
-            ctx.print(&format!("  {id}: {title}"));
+            ctx.print_line(&format!("  {id}: {title}"));
         }
     }
 

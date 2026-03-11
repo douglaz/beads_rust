@@ -1229,6 +1229,15 @@ fn execute_merge(
         storage.sync_comments_for_import(&issue.id, &issue.comments)?;
     }
 
+    // Add merge notes as comments
+    for (id, note) in &report.notes {
+        if let Err(e) = storage.add_comment(id, "br-sync", note) {
+            tracing::warn!(issue_id = %id, error = %e, "Failed to add merge note to issue");
+        } else {
+            tracing::info!(issue_id = %id, note = %note, "Added merge resolution note");
+        }
+    }
+
     // Rebuild cache
     storage.rebuild_blocked_cache(true)?;
     // Merge can introduce hierarchical IDs via upsert; refresh counters before

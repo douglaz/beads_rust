@@ -3232,7 +3232,7 @@ pub fn merge_issue(
         // Case 4: In base and left only (deleted in right/external)
         (Some(b), Some(l), None) => {
             // Was it modified locally after base?
-            if l.updated_at > b.updated_at {
+            if !l.sync_equals(b) {
                 // Local modified but external deleted - conflict
                 match strategy {
                     ConflictResolution::PreferLocal => MergeResult::KeepWithNote(
@@ -3260,7 +3260,7 @@ pub fn merge_issue(
         // Case 5: In base and right only (deleted locally)
         (Some(b), None, Some(r)) => {
             // Was it modified externally after base?
-            if r.updated_at > b.updated_at {
+            if !r.sync_equals(b) {
                 // External modified but local deleted - conflict
                 match strategy {
                     ConflictResolution::PreferLocal => MergeResult::Delete,
@@ -3288,12 +3288,12 @@ pub fn merge_issue(
 
         // Case 6: In all three (potentially modified in one or both)
         (Some(b), Some(l), Some(r)) => {
-            if l.content_hash == r.content_hash {
+            if l.sync_equals(r) {
                 return MergeResult::Keep(l.clone());
             }
 
-            let left_changed = l.content_hash != b.content_hash;
-            let right_changed = r.content_hash != b.content_hash;
+            let left_changed = !l.sync_equals(b);
+            let right_changed = !r.sync_equals(b);
 
             match (left_changed, right_changed) {
                 // Neither changed OR only left changed - keep left
@@ -3345,8 +3345,8 @@ pub fn merge_issue(
 
         // Case 7: In left and right but not base (convergent creation)
         (None, Some(l), Some(r)) => {
-            // Same content hash? Keep one (use left by convention)
-            if l.content_hash == r.content_hash {
+            // Same content? Keep one (use left by convention)
+            if l.sync_equals(r) {
                 MergeResult::Keep(l.clone())
             } else {
                 // Different content - both created independently

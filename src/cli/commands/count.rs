@@ -240,8 +240,12 @@ fn group_counts(
 
             for issue in issues {
                 if let Some(labels) = labels_map.remove(&issue.id) {
-                    for label in labels {
-                        *counts.entry(label).or_insert(0) += 1;
+                    if labels.is_empty() {
+                        *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
+                    } else {
+                        for label in labels {
+                            *counts.entry(label).or_insert(0) += 1;
+                        }
                     }
                 } else {
                     *counts.entry("(no labels)".to_string()).or_insert(0) += 1;

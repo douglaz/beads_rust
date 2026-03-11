@@ -184,8 +184,7 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
         // Collect content for current section
         if current_issue.is_some() {
             if current_section == Section::BeforeH3 {
-                if !captured_implicit_desc && !line.trim().is_empty() {
-                    section_lines.clear();
+                if !line.trim().is_empty() || captured_implicit_desc {
                     section_lines.push(line.to_string());
                     captured_implicit_desc = true;
                 }
@@ -345,6 +344,8 @@ pub fn parse_dependency(dep_str: &str) -> (String, String, bool) {
     if dep_str.starts_with("external:") {
         ("blocks".to_string(), dep_str.to_string(), true)
     } else if let Some((type_part, id_part)) = dep_str.split_once(':') {
+        let type_part = type_part.trim();
+        let id_part = id_part.trim();
         let is_valid = validate_dependency_type(type_part).is_some();
         (type_part.to_string(), id_part.to_string(), is_valid)
     } else {
@@ -518,6 +519,11 @@ This is the actual description.
         let (t, id, valid) = parse_dependency("blocks:bd-123");
         assert_eq!(t, "blocks");
         assert_eq!(id, "bd-123");
+        assert!(valid);
+
+        let (t, id, valid) = parse_dependency("blocks: bd-456 ");
+        assert_eq!(t, "blocks");
+        assert_eq!(id, "bd-456");
         assert!(valid);
 
         let (t, id, valid) = parse_dependency("bd-456");

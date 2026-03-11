@@ -66,13 +66,18 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
     filters.reverse = true; // updated_at default is DESC, so reverse gets ASC
 
     let stale = storage.list_issues(&filters)?;
+    let stale_output: Vec<StaleIssue> = stale.iter().cloned().map(StaleIssue::from).collect();
 
     // Output based on mode
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
     if matches!(ctx.mode(), OutputMode::Rich) {
         render_stale_rich(&stale, now, args.days, ctx);
+    } else if ctx.is_toon() {
+        ctx.toon(&stale_output);
     } else if ctx.is_json() {
-        // Convert to StaleIssue for bd-compatible JSON output
-        let stale_output: Vec<StaleIssue> = stale.into_iter().map(StaleIssue::from).collect();
         ctx.json(&stale_output);
     } else {
         println!(

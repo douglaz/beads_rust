@@ -317,6 +317,13 @@ fn query_save(
             action: "saved".to_string(),
         };
         ctx.json_pretty(&output);
+    } else if ctx.is_toon() {
+        let output = QueryActionOutput {
+            status: "ok".to_string(),
+            name: name.to_string(),
+            action: "saved".to_string(),
+        };
+        ctx.toon(&output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_save_rich(name, args.description.as_deref(), ctx);
     } else {
@@ -391,6 +398,12 @@ fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> R
             queries,
         };
         ctx.json_pretty(&output);
+    } else if ctx.is_toon() {
+        let output = QueryListOutput {
+            count: queries.len(),
+            queries,
+        };
+        ctx.toon(&output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_list_rich(&queries, ctx);
     } else if queries.is_empty() {
@@ -441,6 +454,13 @@ fn query_delete(
             action: "deleted".to_string(),
         };
         ctx.json_pretty(&output);
+    } else if ctx.is_toon() {
+        let output = QueryActionOutput {
+            status: "ok".to_string(),
+            name: name.to_string(),
+            action: "deleted".to_string(),
+        };
+        ctx.toon(&output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_delete_rich(name, ctx);
     } else {

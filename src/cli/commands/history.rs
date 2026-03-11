@@ -140,6 +140,34 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
         return Ok(());
     }
 
+    if ctx.is_toon() {
+        let items: Vec<_> = backups
+            .iter()
+            .map(|entry| {
+                let filename = entry
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                json!({
+                    "filename": filename,
+                    "target": entry.target_path.display().to_string(),
+                    "size_bytes": entry.size,
+                    "size": format_size(entry.size),
+                    "timestamp": entry.timestamp.to_rfc3339(),
+                })
+            })
+            .collect();
+        let output = json!({
+            "directory": history_dir.display().to_string(),
+            "count": backups.len(),
+            "backups": items,
+        });
+        ctx.toon(&output);
+        return Ok(());
+    }
+
     if ctx.is_quiet() {
         return Ok(());
     }
@@ -248,6 +276,22 @@ fn diff_backup(
             "backup_size_bytes": size_fallback.map(|sizes| sizes.1),
         });
         ctx.json_pretty(&output);
+        return Ok(());
+    }
+
+    if ctx.is_toon() {
+        let (status_label, diff_available, size_fallback) =
+            diff_status_for_json(&current_path, &backup_path)?;
+        let output = json!({
+            "action": "diff",
+            "backup": backup_name,
+            "current": current_path.display().to_string(),
+            "status": status_label,
+            "diff_available": diff_available,
+            "current_size_bytes": size_fallback.map(|sizes| sizes.0),
+            "backup_size_bytes": size_fallback.map(|sizes| sizes.1),
+        });
+        ctx.toon(&output);
         return Ok(());
     }
 
@@ -394,6 +438,18 @@ fn restore_backup(
         return Ok(());
     }
 
+    if ctx.is_toon() {
+        let output = json!({
+            "action": "restore",
+            "backup": backup_name,
+            "target": target_path.display().to_string(),
+            "restored": true,
+            "next_step": "br sync --import-only --force",
+        });
+        ctx.toon(&output);
+        return Ok(());
+    }
+
     if ctx.is_quiet() {
         return Ok(());
     }
@@ -433,6 +489,17 @@ fn prune_backups(
             "older_than_days": older_than_days,
         });
         ctx.json_pretty(&output);
+        return Ok(());
+    }
+
+    if ctx.is_toon() {
+        let output = json!({
+            "action": "prune",
+            "deleted": deleted,
+            "keep": keep,
+            "older_than_days": older_than_days,
+        });
+        ctx.toon(&output);
         return Ok(());
     }
 

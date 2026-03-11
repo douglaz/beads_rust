@@ -15,7 +15,7 @@ use regex::Regex;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{debug, trace};
@@ -48,7 +48,7 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
-        output_empty(ctx.is_json() || args.robot, ctx);
+        output_empty(ctx.is_json() || ctx.is_toon() || args.robot, ctx);
         return Ok(());
     };
 
@@ -95,7 +95,7 @@ fn execute_inner(
     let Some(repo_root) = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
         .or_else(|| git_repo_root_for_path(beads_dir))
     else {
-        output_empty(ctx.is_json() || args.robot, ctx);
+        output_empty(ctx.is_json() || ctx.is_toon() || args.robot, ctx);
         return Ok(());
     };
 
@@ -108,7 +108,7 @@ fn execute_inner(
     );
 
     if commit_refs.is_empty() {
-        output_empty(ctx.is_json() || args.robot, ctx);
+        output_empty(ctx.is_json() || ctx.is_toon() || args.robot, ctx);
         return Ok(());
     }
 
@@ -160,16 +160,21 @@ fn execute_inner(
     orphan_issues.sort_by(|a, b| a.id.cmp(&b.id));
     debug!(orphan_count = orphans.len(), "Scanning for orphaned issues");
 
-    if ctx.is_json() || args.robot {
-        let json = serde_json::to_string_pretty(&orphans).map_err(|e| {
-            crate::error::BeadsError::Config(format!("JSON serialization error: {e}"))
-        })?;
-        println!("{json}");
+    if ctx.is_json() || ctx.is_toon() || args.robot {
+        if ctx.is_toon() {
+            ctx.toon(&orphans);
+        } else {
+            ctx.json_pretty(&orphans);
+        }
         return Ok(());
     }
 
     if orphans.is_empty() {
-        output_empty(ctx.is_json() || args.robot, ctx);
+        output_empty(ctx.is_json() || ctx.is_toon() || args.robot, ctx);
+        return Ok(());
+    }
+
+    if ctx.is_quiet() {
         return Ok(());
     }
 
@@ -282,15 +287,26 @@ fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
 /// Returns Vec of (`commit_hash`, `commit_message`, `issue_id`) tuples.
 /// The list is ordered from most recent to oldest commit.
 fn get_git_commit_refs(prefix: &str, repo_root: &Path) -> Result<Vec<(String, String, String)>> {
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .args(["log", "--oneline", "--all"])
         .current_dir(repo_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()?;
+        .spawn()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = child.stdout.take().expect("Failed to open git log stdout");
+
+    // Parse the stream as it comes in
+    let refs_result = parse_git_log(BufReader::new(stdout), prefix);
+
+    // Wait for the process to finish and check status
+    let status = child.wait()?;
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut err_stream) = child.stderr.take() {
+            let _ = err_stream.read_to_string(&mut stderr);
+        }
+        let stderr = stderr.trim();
         let detail = if stderr.is_empty() {
             "git log failed".to_string()
         } else {
@@ -299,7 +315,7 @@ fn get_git_commit_refs(prefix: &str, repo_root: &Path) -> Result<Vec<(String, St
         return Err(crate::error::BeadsError::Config(detail));
     }
 
-    parse_git_log(BufReader::new(std::io::Cursor::new(output.stdout)), prefix)
+    refs_result
 }
 
 /// Parse git log output and extract issue ID references.
@@ -349,8 +365,13 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
 
 /// Output empty result in appropriate format.
 fn output_empty(json: bool, ctx: &OutputContext) {
-    if json || ctx.is_json() {
-        println!("[]");
+    if json || ctx.is_json() || ctx.is_toon() {
+        let empty: Vec<OrphanIssue> = Vec::new();
+        if ctx.is_toon() {
+            ctx.toon(&empty);
+        } else {
+            ctx.json_pretty(&empty);
+        }
         return;
     }
     if ctx.is_quiet() {

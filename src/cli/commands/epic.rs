@@ -46,6 +46,11 @@ fn execute_status(
         epics.retain(|e| e.eligible_for_close);
     }
 
+    if ctx.is_toon() {
+        ctx.toon(&epics);
+        return Ok(());
+    }
+
     if ctx.is_json() {
         ctx.json_pretty(&epics);
         return Ok(());
@@ -97,7 +102,9 @@ fn execute_close_eligible(
     epics.retain(|e| e.eligible_for_close);
 
     if args.dry_run {
-        if ctx.is_json() {
+        if ctx.is_toon() {
+            ctx.toon(&epics);
+        } else if ctx.is_json() {
             ctx.json_pretty(&epics);
         } else if ctx.is_quiet() {
             return Ok(());
@@ -113,7 +120,13 @@ fn execute_close_eligible(
     }
 
     if epics.is_empty() {
-        if ctx.is_json() {
+        if ctx.is_toon() {
+            let result = CloseEligibleResult {
+                closed: Vec::new(),
+                count: 0,
+            };
+            ctx.toon(&result);
+        } else if ctx.is_json() {
             let result = CloseEligibleResult {
                 closed: Vec::new(),
                 count: 0,
@@ -161,7 +174,13 @@ fn execute_close_eligible(
 
     storage_ctx.flush_no_db_if_dirty()?;
 
-    if ctx.is_json() {
+    if ctx.is_toon() {
+        let result = CloseEligibleResult {
+            closed: closed_ids.clone(),
+            count: closed_ids.len(),
+        };
+        ctx.toon(&result);
+    } else if ctx.is_json() {
         let result = CloseEligibleResult {
             closed: closed_ids.clone(),
             count: closed_ids.len(),

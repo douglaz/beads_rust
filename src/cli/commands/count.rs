@@ -102,7 +102,9 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
 
     match by {
         None => {
-            if ctx.is_json() {
+            if ctx.is_toon() {
+                ctx.toon(&CountOutput { count: total });
+            } else if ctx.is_json() {
                 ctx.json_pretty(&CountOutput { count: total });
             } else if matches!(ctx.mode(), OutputMode::Rich) {
                 render_count_simple_rich(total, ctx);
@@ -112,7 +114,9 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
         }
         Some(by) => {
             let groups = group_counts(storage, &issues, by)?;
-            if ctx.is_json() {
+            if ctx.is_toon() {
+                ctx.toon(&CountGroupedOutput { total, groups });
+            } else if ctx.is_json() {
                 ctx.json_pretty(&CountGroupedOutput { total, groups });
             } else if matches!(ctx.mode(), OutputMode::Rich) {
                 render_count_grouped_rich(total, &groups, by, ctx);

@@ -15,14 +15,15 @@ use crate::config::{
     discover_optional_beads_dir_with_cli, id_config_from_layer, load_legacy_user_config,
     load_project_config, load_user_config, resolve_actor,
 };
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use rich_rust::prelude::*;
 use serde_json::json;
+use shell_words::split as split_shell_words;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, trace};
 
@@ -328,15 +329,30 @@ fn edit_config() -> Result<()> {
     let editor = env::var("EDITOR")
         .or_else(|_| env::var("VISUAL"))
         .unwrap_or_else(|_| "vi".to_string());
+    let (program, editor_args) = parse_editor_command(&editor)?;
 
     // Open editor
-    let status = Command::new(&editor).arg(&config_path).status()?;
+    let status = Command::new(&program)
+        .args(&editor_args)
+        .arg(&config_path)
+        .status()?;
 
     if !status.success() {
         eprintln!("Editor exited with status: {status}");
     }
 
     Ok(())
+}
+
+fn parse_editor_command(editor: &str) -> Result<(String, Vec<String>)> {
+    let parts = split_shell_words(editor)
+        .map_err(|e| BeadsError::Config(format!("Invalid EDITOR/VISUAL command: {e}")))?;
+    let Some((program, args)) = parts.split_first() else {
+        return Err(BeadsError::Config(
+            "EDITOR/VISUAL command cannot be empty".to_string(),
+        ));
+    };
+    Ok((program.clone(), args.to_vec()))
 }
 
 /// Get a specific config value.
@@ -448,23 +464,7 @@ fn set_config_value(
     // Set the value
     let parts: Vec<&str> = key.split('.').collect();
     let old_value = get_yaml_value(&config, &parts);
-    let parsed_value = if let Ok(b) = value.parse::<bool>() {
-        serde_yml::Value::Bool(b)
-    } else if let Ok(i) = value.parse::<i64>() {
-        serde_yml::Value::Number(i.into())
-    } else if let Ok(f) = value.parse::<f64>() {
-        serde_yml::Value::Number(f.into())
-    } else if value == "null" {
-        serde_yml::Value::Null
-    } else {
-        serde_yml::Value::String(value.to_string())
-    };
-    
-    set_yaml_value(
-        &mut config,
-        &parts,
-        parsed_value,
-    );
+    set_yaml_value(&mut config, &parts, parse_scalar_config_value(value));
 
     // Write back
     let yaml_str = serde_yml::to_string(&config)?;
@@ -526,6 +526,22 @@ fn set_config_value(
     }
 
     Ok(())
+}
+
+fn parse_scalar_config_value(value: &str) -> serde_yml::Value {
+    value.parse::<bool>().map_or_else(
+        |_| {
+            value.parse::<i64>().map_or_else(
+                |_| match value.parse::<f64>() {
+                    Ok(parsed) => serde_yml::Value::Number(parsed.into()),
+                    Err(_) if value == "null" => serde_yml::Value::Null,
+                    Err(_) => serde_yml::Value::String(value.to_string()),
+                },
+                |parsed| serde_yml::Value::Number(parsed.into()),
+            )
+        },
+        serde_yml::Value::Bool,
+    )
 }
 
 fn set_yaml_value(config: &mut serde_yml::Value, parts: &[&str], value: serde_yml::Value) {
@@ -607,47 +623,28 @@ fn delete_config_value(
     // 2. Delete from Project YAML
     let mut project_deleted = false;
     if let Some(dir) = &beads_dir {
-        let config_path = dir.join("config.yaml");
-        if config_path.exists() {
-            let contents = fs::read_to_string(&config_path)?;
-            let mut config: serde_yml::Value = serde_yml::from_str(&contents)
-                .unwrap_or(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
-
-            if delete_from_yaml(&mut config, key) {
-                let yaml_str = serde_yml::to_string(&config)?;
-                fs::write(&config_path, yaml_str)?;
-                project_deleted = true;
-            }
-        }
+        project_deleted = delete_config_key_from_yaml_file(&dir.join("config.yaml"), key)?;
     }
 
     // 3. Delete from User YAML
-    let mut user_deleted = false;
-    if let Some(config_path) = get_user_config_path()
-        && config_path.exists()
-    {
-        let contents = fs::read_to_string(&config_path)?;
-        let mut config: serde_yml::Value = serde_yml::from_str(&contents)
-            .unwrap_or(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
-
-        if delete_from_yaml(&mut config, key) {
-            let yaml_str = serde_yml::to_string(&config)?;
-            fs::write(&config_path, yaml_str)?;
-            user_deleted = true;
-        }
-    }
+    let user_deleted = get_user_config_path().map_or(Ok(false), |path| {
+        delete_config_key_from_yaml_file(&path, key)
+    })?;
+    let legacy_user_deleted = get_legacy_user_config_path().map_or(Ok(false), |path| {
+        delete_config_key_from_yaml_file(&path, key)
+    })?;
 
     if ctx.is_json() {
         let output = json!({
             "key": key,
             "deleted_from_db": db_deleted,
             "deleted_from_project": project_deleted,
-            "deleted_from_user": user_deleted,
+            "deleted_from_user": user_deleted || legacy_user_deleted,
         });
         ctx.json_pretty(&output);
     } else if ctx.is_quiet() {
         return Ok(());
-    } else if db_deleted || project_deleted || user_deleted {
+    } else if db_deleted || project_deleted || user_deleted || legacy_user_deleted {
         let mut sources = Vec::new();
         if db_deleted {
             sources.push("DB");
@@ -655,7 +652,7 @@ fn delete_config_value(
         if project_deleted {
             sources.push("Project");
         }
-        if user_deleted {
+        if user_deleted || legacy_user_deleted {
             sources.push("User");
         }
         if ctx.is_rich() {
@@ -692,6 +689,25 @@ fn delete_config_value(
 
     Ok(())
 }
+
+fn delete_config_key_from_yaml_file(config_path: &Path, key: &str) -> Result<bool> {
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let contents = fs::read_to_string(config_path)?;
+    let mut config: serde_yml::Value = serde_yml::from_str(&contents)
+        .unwrap_or(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
+
+    if !delete_from_yaml(&mut config, key) {
+        return Ok(false);
+    }
+
+    let yaml_str = serde_yml::to_string(&config)?;
+    fs::write(config_path, yaml_str)?;
+    Ok(true)
+}
+
 fn delete_from_yaml(value: &mut serde_yml::Value, key: &str) -> bool {
     let parts: Vec<&str> = key.split('.').collect();
     delete_nested(value, &parts)
@@ -988,6 +1004,33 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0], "display");
         assert_eq!(parts[1], "color");
+    }
+
+    #[test]
+    fn test_parse_editor_command_splits_flags() {
+        let (program, args) = parse_editor_command("code --wait").unwrap();
+        assert_eq!(program, "code");
+        assert_eq!(args, vec!["--wait"]);
+    }
+
+    #[test]
+    fn test_parse_editor_command_respects_quotes() {
+        let (program, args) = parse_editor_command("\"my editor\" --flag").unwrap();
+        assert_eq!(program, "my editor");
+        assert_eq!(args, vec!["--flag"]);
+    }
+
+    #[test]
+    fn test_delete_config_key_from_yaml_file_removes_value() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        fs::write(&config_path, "display:\n  color: true\n").unwrap();
+
+        let deleted = delete_config_key_from_yaml_file(&config_path, "display.color").unwrap();
+        assert!(deleted);
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("color"));
     }
 
     #[test]

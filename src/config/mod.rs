@@ -1149,14 +1149,14 @@ fn resolve_jsonl_path(
         };
     }
 
-    // Priority 3: DB override derives sibling JSONL path
+    // Priority 3: DB override uses a sibling JSONL file. Prefer an existing
+    // issues.jsonl/beads.jsonl next to the overridden DB before falling back
+    // to the default issues.jsonl path.
     if db_override.is_some() {
-        return db_override
-            .and_then(|path| {
-                path.parent()
-                    .map(|parent| parent.join(DEFAULT_JSONL_FILENAME))
-            })
-            .unwrap_or_else(|| beads_dir.join(DEFAULT_JSONL_FILENAME));
+        return db_override.and_then(|path| path.parent()).map_or_else(
+            || beads_dir.join(DEFAULT_JSONL_FILENAME),
+            |parent| discover_jsonl(parent).unwrap_or_else(|| parent.join(DEFAULT_JSONL_FILENAME)),
+        );
     }
 
     // Priority 4: File discovery (prefer issues.jsonl, fall back to beads.jsonl)
@@ -2542,6 +2542,19 @@ labels:
 
         let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override));
         assert_eq!(resolved, PathBuf::from("/some/path/issues.jsonl"));
+    }
+
+    #[test]
+    fn resolve_jsonl_path_db_override_prefers_existing_legacy_sibling() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let db_override = beads_dir.join("custom.db");
+        fs::write(beads_dir.join("beads.jsonl"), "{}\n").expect("write legacy jsonl");
+
+        let resolved = resolve_jsonl_path(&beads_dir, &Metadata::default(), Some(&db_override));
+        assert_eq!(resolved, beads_dir.join("beads.jsonl"));
     }
 
     #[test]

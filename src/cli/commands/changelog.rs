@@ -52,6 +52,15 @@ pub struct ChangelogEntry {
     pub closed_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangelogRenderMode {
+    Quiet,
+    Json,
+    Toon,
+    Rich,
+    Plain,
+}
+
 /// Execute changelog generation.
 ///
 /// # Errors
@@ -136,24 +145,43 @@ pub fn execute(
         "Generated changelog"
     );
 
-    if json {
-        if args.robot || !ctx.is_json() {
-            // Print JSON directly when robot mode bypasses the top-level
-            // OutputContext JSON detection.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).expect("Failed to serialize JSON output")
-            );
-        } else {
-            ctx.json_pretty(&output);
+    match resolve_render_mode(json, ctx.mode()) {
+        ChangelogRenderMode::Quiet => {}
+        ChangelogRenderMode::Json => {
+            if ctx.is_json() {
+                ctx.json_pretty(&output);
+            } else {
+                // Robot mode requests JSON even though the shared output context only
+                // sees global flags.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output).expect("Failed to serialize JSON output")
+                );
+            }
         }
-    } else if matches!(ctx.mode(), OutputMode::Rich) {
-        render_changelog_rich(&output, ctx);
-    } else {
-        print_text_output(&output);
+        ChangelogRenderMode::Toon => {
+            ctx.toon(&output);
+        }
+        ChangelogRenderMode::Rich => {
+            render_changelog_rich(&output, ctx);
+        }
+        ChangelogRenderMode::Plain => {
+            print_text_output(&output);
+        }
     }
 
     Ok(())
+}
+
+const fn resolve_render_mode(json: bool, output_mode: OutputMode) -> ChangelogRenderMode {
+    match output_mode {
+        OutputMode::Quiet => ChangelogRenderMode::Quiet,
+        _ if json => ChangelogRenderMode::Json,
+        OutputMode::Json => ChangelogRenderMode::Json,
+        OutputMode::Toon => ChangelogRenderMode::Toon,
+        OutputMode::Rich => ChangelogRenderMode::Rich,
+        OutputMode::Plain => ChangelogRenderMode::Plain,
+    }
 }
 
 /// Convert issue type to human-readable changelog header.
@@ -280,11 +308,11 @@ fn resolve_since(
     repo_root: Option<&Path>,
 ) -> Result<(Option<DateTime<Utc>>, String)> {
     if let Some(tag) = args.since_tag.as_deref() {
-        let dt = git_ref_date(tag, repo_root)?;
+        let dt = git_tag_date(tag, repo_root)?;
         return Ok((Some(dt), dt.to_rfc3339()));
     }
     if let Some(commit) = args.since_commit.as_deref() {
-        let dt = git_ref_date(commit, repo_root)?;
+        let dt = git_commit_date(commit, repo_root)?;
         return Ok((Some(dt), dt.to_rfc3339()));
     }
     if let Some(since) = args.since.as_deref() {
@@ -297,7 +325,13 @@ fn resolve_since(
     Ok((None, "all".to_string()))
 }
 
-fn git_ref_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Utc>> {
+fn git_commit_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Utc>> {
+    if reference.starts_with('-') {
+        return Err(BeadsError::Config(
+            "Invalid git reference: cannot start with '-'".to_string(),
+        ));
+    }
+
     let repo_root = repo_root.ok_or_else(|| {
         BeadsError::Config(format!(
             "Cannot resolve git reference '{reference}' without a git repository for the targeted project"
@@ -321,6 +355,48 @@ fn git_ref_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
         .map_err(|e| BeadsError::Config(format!("Invalid git date: {e}")))?
         .with_timezone(&Utc);
     Ok(dt)
+}
+
+fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Utc>> {
+    if reference.starts_with('-') {
+        return Err(BeadsError::Config(
+            "Invalid git tag reference: cannot start with '-'".to_string(),
+        ));
+    }
+
+    let repo_root = repo_root.ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Cannot resolve git tag '{reference}' without a git repository for the targeted project"
+        ))
+    })?;
+
+    // Annotated tags carry their own timestamp, which is what --since-tag promises.
+    // Lightweight tags have no tagger date, so we fall back to the referenced commit.
+    let output = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(taggerdate:iso-strict)",
+            &format!("refs/tags/{reference}"),
+        ])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| BeadsError::Config(format!("Failed to run git: {e}")))?;
+
+    if !output.status.success() {
+        return Err(BeadsError::Config(format!(
+            "Failed to resolve git tag: {reference}"
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stamp = stdout.trim();
+    if stamp.is_empty() {
+        return git_commit_date(reference, Some(repo_root));
+    }
+
+    DateTime::parse_from_rfc3339(stamp)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| BeadsError::Config(format!("Invalid git tag date: {e}")))
 }
 
 fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
@@ -385,46 +461,97 @@ mod tests {
     }
 
     #[test]
-    fn test_git_ref_date_uses_target_repo_root() {
-        use std::fs;
+    fn test_resolve_render_mode_prefers_context_structured_modes() {
+        assert_eq!(
+            resolve_render_mode(false, OutputMode::Json),
+            ChangelogRenderMode::Json
+        );
+        assert_eq!(
+            resolve_render_mode(false, OutputMode::Toon),
+            ChangelogRenderMode::Toon
+        );
+    }
 
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo_root = temp.path().join("target-repo");
-        fs::create_dir_all(&repo_root).unwrap();
+    #[test]
+    fn test_resolve_render_mode_respects_robot_json_requests() {
+        assert_eq!(
+            resolve_render_mode(true, OutputMode::Plain),
+            ChangelogRenderMode::Json
+        );
+        assert_eq!(
+            resolve_render_mode(true, OutputMode::Rich),
+            ChangelogRenderMode::Json
+        );
+    }
 
+    #[test]
+    fn test_resolve_render_mode_robot_overrides_inherited_toon() {
+        assert_eq!(
+            resolve_render_mode(true, OutputMode::Toon),
+            ChangelogRenderMode::Json
+        );
+    }
+
+    #[test]
+    fn test_resolve_render_mode_respects_quiet_mode() {
+        assert_eq!(
+            resolve_render_mode(false, OutputMode::Quiet),
+            ChangelogRenderMode::Quiet
+        );
+    }
+
+    fn init_git_repo(repo_root: &Path) {
         let init = Command::new("git")
             .args(["init", "-b", "main"])
-            .current_dir(&repo_root)
+            .current_dir(repo_root)
             .output()
             .unwrap();
         assert!(init.status.success(), "git init failed");
 
         let config_name = Command::new("git")
             .args(["config", "user.name", "Test User"])
-            .current_dir(&repo_root)
+            .current_dir(repo_root)
             .status()
             .unwrap();
         assert!(config_name.success(), "git config user.name failed");
         let config_email = Command::new("git")
             .args(["config", "user.email", "test@example.com"])
-            .current_dir(&repo_root)
+            .current_dir(repo_root)
             .status()
             .unwrap();
         assert!(config_email.success(), "git config user.email failed");
+    }
 
-        fs::write(repo_root.join("README.md"), "hello\n").unwrap();
+    fn commit_file(repo_root: &Path, message: &str, stamp: &str) {
+        use std::fs;
+
+        fs::write(repo_root.join("README.md"), format!("{message}\n")).unwrap();
         let add = Command::new("git")
             .args(["add", "README.md"])
-            .current_dir(&repo_root)
+            .current_dir(repo_root)
             .output()
             .unwrap();
         assert!(add.status.success(), "git add failed");
         let commit = Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(&repo_root)
+            .args(["commit", "-m", message])
+            .env("GIT_AUTHOR_DATE", stamp)
+            .env("GIT_COMMITTER_DATE", stamp)
+            .current_dir(repo_root)
             .output()
             .unwrap();
         assert!(commit.status.success(), "git commit failed");
+    }
+
+    #[test]
+    fn test_git_commit_date_uses_target_repo_root() {
+        use std::fs;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo_root = temp.path().join("target-repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        init_git_repo(&repo_root);
+        commit_file(&repo_root, "initial", "2024-01-01T00:00:00Z");
 
         let head = String::from_utf8_lossy(
             &Command::new("git")
@@ -437,8 +564,53 @@ mod tests {
         .trim()
         .to_string();
 
-        let dt = git_ref_date(&head, Some(&repo_root)).unwrap();
+        let dt = git_commit_date(&head, Some(&repo_root)).unwrap();
         assert!(dt <= Utc::now());
+    }
+
+    #[test]
+    fn test_git_tag_date_prefers_annotated_tag_timestamp() {
+        use std::fs;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo_root = temp.path().join("annotated-tag-repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        init_git_repo(&repo_root);
+        commit_file(&repo_root, "initial", "2024-01-01T00:00:00Z");
+
+        let tag = Command::new("git")
+            .args(["tag", "-a", "v1", "-m", "release"])
+            .env("GIT_COMMITTER_DATE", "2024-02-01T00:00:00Z")
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        assert!(tag.status.success(), "git tag failed");
+
+        let dt = git_tag_date("v1", Some(&repo_root)).unwrap();
+        assert_eq!(dt, Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_git_tag_date_falls_back_for_lightweight_tags() {
+        use std::fs;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo_root = temp.path().join("lightweight-tag-repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        init_git_repo(&repo_root);
+        commit_file(&repo_root, "initial", "2024-03-01T00:00:00Z");
+
+        let tag = Command::new("git")
+            .args(["tag", "v1"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        assert!(tag.status.success(), "git tag failed");
+
+        let dt = git_tag_date("v1", Some(&repo_root)).unwrap();
+        assert_eq!(dt, Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap());
     }
 
     #[test]

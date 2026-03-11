@@ -241,6 +241,9 @@ fn e2e_routing_routes_jsonl_external_route() {
         "create_external",
     );
     assert!(create.status.success(), "create failed: {}", create.stderr);
+    let create_payload = extract_json_payload(&create.stdout);
+    let created_issue: Value = serde_json::from_str(&create_payload).expect("create json");
+    let external_id = created_issue["id"].as_str().expect("external id").to_string();
 
     // Verify the issue exists in external project
     let list = run_br(&external_workspace, ["list", "--json"], "list_external");
@@ -249,6 +252,84 @@ fn e2e_routing_routes_jsonl_external_route() {
         list.stdout.contains("External issue"),
         "Expected issue in external project"
     );
+
+    // Show the external issue from the main workspace via routing
+    let show = run_br(
+        &main_workspace,
+        ["show", &external_id, "--json"],
+        "show_external_via_route",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let show_payload = extract_json_payload(&show.stdout);
+    let shown: Value = serde_json::from_str(&show_payload).expect("show json");
+    assert_eq!(shown["issue"]["id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(shown["issue"]["title"].as_str(), Some("External issue"));
+}
+
+#[test]
+fn e2e_routing_update_external_issue_via_main_workspace() {
+    let _log = common::test_log("e2e_routing_update_external_issue_via_main_workspace");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    let init = run_br(&main_workspace, ["init"], "init_main");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let init_external = run_br(&external_workspace, ["init"], "init_external");
+    assert!(
+        init_external.status.success(),
+        "external init failed: {}",
+        init_external.stderr
+    );
+
+    fs::write(
+        external_workspace.root.join(".beads").join("config.yaml"),
+        "issue_prefix: ext\n",
+    )
+    .expect("write external config");
+
+    create_routes_file(
+        &main_workspace,
+        &[("ext-", external_workspace.root.to_string_lossy().as_ref())],
+    );
+
+    let create = run_br(
+        &external_workspace,
+        ["create", "External update target", "--json"],
+        "create_external_update_target",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let create_payload = extract_json_payload(&create.stdout);
+    let created_issue: Value = serde_json::from_str(&create_payload).expect("create json");
+    let external_id = created_issue["id"].as_str().expect("external id").to_string();
+
+    let update = run_br(
+        &main_workspace,
+        ["update", &external_id, "--status", "in_progress", "--json"],
+        "update_external_via_route",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+    let update_payload = extract_json_payload(&update.stdout);
+    let updated: Value = serde_json::from_str(&update_payload).expect("update json");
+    let updated_array = updated.as_array().expect("update array");
+    assert_eq!(updated_array.len(), 1);
+    assert_eq!(updated_array[0]["id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(updated_array[0]["status"].as_str(), Some("in_progress"));
+
+    let show_external = run_br(
+        &external_workspace,
+        ["show", &external_id, "--json"],
+        "show_external_after_routed_update",
+    );
+    assert!(
+        show_external.status.success(),
+        "external show failed: {}",
+        show_external.stderr
+    );
+    let show_payload = extract_json_payload(&show_external.stdout);
+    let shown: Value = serde_json::from_str(&show_payload).expect("show json");
+    assert_eq!(shown["issue"]["status"].as_str(), Some("in_progress"));
 }
 
 // =============================================================================

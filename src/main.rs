@@ -3,7 +3,6 @@ use beads_rust::cli::{Cli, Commands, OutputFormat};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
 use beads_rust::output::OutputContext;
-use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{auto_flush, auto_import_if_stale};
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
@@ -97,7 +96,13 @@ fn main() {
         Commands::Delete(args) => {
             commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
         }
-        Commands::List(args) => commands::list::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::List(args) => {
+            if let Some(res) = storage_result.as_ref() {
+                commands::list::execute_with_storage(&args, &overrides, &output_ctx, res)
+            } else {
+                commands::list::execute(&args, cli.json, &overrides, &output_ctx)
+            }
+        }
         Commands::Comments(args) => {
             commands::comments::execute(&args, cli.json, &overrides, &output_ctx)
         }
@@ -107,12 +112,12 @@ fn main() {
         Commands::Show(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
-                commands::show::execute_with_storage(
+                commands::show::execute_with_storage_ctx(
                     &args,
                     &overrides,
                     &output_ctx,
                     beads_dir,
-                    &res.storage,
+                    res,
                 )
             } else {
                 commands::show::execute(&args, cli.json, &overrides, &output_ctx)
@@ -134,25 +139,42 @@ fn main() {
         Commands::Label { command } => {
             commands::label::execute(&command, cli.json, &overrides, &output_ctx)
         }
-        Commands::Count(args) => commands::count::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Count(args) => {
+            if let Some(res) = storage_result.as_ref() {
+                commands::count::execute_with_storage(&args, &output_ctx, &res.storage)
+            } else {
+                commands::count::execute(&args, cli.json, &overrides, &output_ctx)
+            }
+        }
         Commands::Stale(args) => commands::stale::execute(&args, &overrides, &output_ctx),
         Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Ready(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
-                commands::ready::execute_with_storage(
+                commands::ready::execute_with_storage_ctx(
                     &args,
                     &overrides,
                     &output_ctx,
                     beads_dir,
-                    &res.storage,
+                    res,
                 )
             } else {
                 commands::ready::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
         Commands::Blocked(args) => {
-            commands::blocked::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
+                commands::blocked::execute_with_storage_ctx(
+                    &args,
+                    &overrides,
+                    &output_ctx,
+                    beads_dir,
+                    res,
+                )
+            } else {
+                commands::blocked::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
+            }
         }
         Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
@@ -168,7 +190,18 @@ fn main() {
             commands::audit::execute(&command, cli.json, &overrides, &output_ctx)
         }
         Commands::Stats(args) | Commands::Status(args) => {
-            commands::stats::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
+                commands::stats::execute_with_storage_ctx(
+                    &args,
+                    &overrides,
+                    &output_ctx,
+                    beads_dir,
+                    res,
+                )
+            } else {
+                commands::stats::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
+            }
         }
         Commands::Config { command } => {
             commands::config::execute(&command, cli.json, &overrides, &output_ctx)
@@ -181,7 +214,18 @@ fn main() {
             commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Orphans(args) => {
-            commands::orphans::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
+                commands::orphans::execute_with_storage_ctx(
+                    &args,
+                    &overrides,
+                    &output_ctx,
+                    beads_dir,
+                    res,
+                )
+            } else {
+                commands::orphans::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
+            }
         }
         Commands::Changelog(args) => {
             commands::changelog::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
@@ -275,19 +319,9 @@ impl StartupContext {
     }
 }
 
-struct OpenStorageContext {
-    storage: SqliteStorage,
-}
-
-fn open_storage_from_ctx(ctx: &StartupContext) -> Result<OpenStorageContext> {
+fn open_storage_from_ctx(ctx: &StartupContext) -> Result<config::OpenStorageResult> {
     let beads_dir = ctx.beads_dir.as_ref().ok_or(BeadsError::NotInitialized)?;
-    let (storage, _) = config::open_storage(
-        beads_dir,
-        ctx.overrides.db.as_ref(),
-        ctx.overrides.lock_timeout,
-    )?;
-
-    Ok(OpenStorageContext { storage })
+    config::open_storage_with_cli(beads_dir, &ctx.overrides)
 }
 
 const fn should_preopen_storage(

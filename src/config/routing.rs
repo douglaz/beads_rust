@@ -45,6 +45,19 @@ pub struct RoutingResult {
     pub project_path: Option<String>,
 }
 
+/// A batch of issue inputs that resolve to the same beads directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedIssueBatch {
+    /// The resolved beads directory for this batch.
+    pub beads_dir: PathBuf,
+    /// Whether this batch targets an external project.
+    pub is_external: bool,
+    /// The routed project path, if any.
+    pub project_path: Option<String>,
+    /// The original issue inputs assigned to this route, in input order.
+    pub issue_inputs: Vec<String>,
+}
+
 impl RoutingResult {
     /// Create a result for the local beads directory.
     #[must_use]
@@ -290,6 +303,38 @@ pub fn resolve_route(issue_id: &str, local_beads_dir: &Path) -> Result<RoutingRe
 
     // No route found, use local
     Ok(RoutingResult::local(local_beads_dir.to_path_buf()))
+}
+
+/// Group issue inputs by their resolved route, preserving first-seen batch order.
+///
+/// # Errors
+///
+/// Returns an error if any route file cannot be read or a routed target is invalid.
+pub fn group_issue_inputs_by_route(
+    issue_inputs: &[String],
+    local_beads_dir: &Path,
+) -> Result<Vec<RoutedIssueBatch>> {
+    let mut batches: Vec<RoutedIssueBatch> = Vec::new();
+
+    for issue_input in issue_inputs {
+        let route = resolve_route(issue_input, local_beads_dir)?;
+        if let Some(existing) = batches
+            .iter_mut()
+            .find(|batch| batch.beads_dir == route.beads_dir)
+        {
+            existing.issue_inputs.push(issue_input.clone());
+            continue;
+        }
+
+        batches.push(RoutedIssueBatch {
+            beads_dir: route.beads_dir,
+            is_external: route.is_external,
+            project_path: route.project_path,
+            issue_inputs: vec![issue_input.clone()],
+        });
+    }
+
+    Ok(batches)
 }
 
 /// Resolve a route entry to a beads directory.
@@ -542,6 +587,44 @@ mod tests {
         assert_eq!(result_canonical, target_canonical);
         assert!(result.is_external);
         assert_eq!(result.project_path, Some("../frontend".to_string()));
+    }
+
+    #[test]
+    fn group_issue_inputs_by_route_preserves_first_seen_batch_order() {
+        let dir = TempDir::new().unwrap();
+        let local_beads = dir.path().join("current/.beads");
+        let external_beads = dir.path().join("external/.beads");
+        fs::create_dir_all(&local_beads).unwrap();
+        fs::create_dir_all(&external_beads).unwrap();
+        fs::write(
+            local_beads.join("routes.jsonl"),
+            r#"{"prefix":"ext-","path":"../external"}"#,
+        )
+        .unwrap();
+
+        let batches = group_issue_inputs_by_route(
+            &[
+                "current-1".to_string(),
+                "ext-1".to_string(),
+                "current-2".to_string(),
+                "ext-2".to_string(),
+            ],
+            &local_beads,
+        )
+        .unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].beads_dir, local_beads);
+        assert_eq!(
+            batches[0].issue_inputs,
+            vec!["current-1".to_string(), "current-2".to_string()]
+        );
+        assert!(batches[1].beads_dir.ends_with("external/.beads"));
+        assert!(batches[1].is_external);
+        assert_eq!(
+            batches[1].issue_inputs,
+            vec!["ext-1".to_string(), "ext-2".to_string()]
+        );
     }
 
     #[test]

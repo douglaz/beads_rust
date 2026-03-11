@@ -1878,10 +1878,10 @@ pub fn auto_import_if_stale(
                 "JSONL is newer ({}), but the database also has {} unsaved change(s).\n\
                  A silent auto-import would risk overwriting local changes.\n\
                  Hint: run `br sync` to perform a safe 3-way merge, or `br sync --export-only` to push your changes first.",
-                staleness
-                    .jsonl_mtime
-                    .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339())
-                    .unwrap_or_else(|| "unknown".to_string()),
+                staleness.jsonl_mtime.map_or_else(
+                    || "unknown".to_string(),
+                    |t| chrono::DateTime::<Utc>::from(t).to_rfc3339(),
+                ),
                 staleness.dirty_count
             ),
         });
@@ -3075,7 +3075,11 @@ pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
             break;
         }
 
-        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        let trimmed = line_buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
         hasher.update(trimmed.as_bytes());
         hasher.update(b"\n");
     }
@@ -3232,7 +3236,10 @@ pub fn merge_issue(
         // Case 4: In base and left only (deleted in right/external)
         (Some(b), Some(l), None) => {
             // Was it modified locally after base?
-            if !l.sync_equals(b) {
+            if l.sync_equals(b) {
+                // Local unchanged since base, external deleted -> delete
+                MergeResult::Delete
+            } else {
                 // Local modified but external deleted - conflict
                 match strategy {
                     ConflictResolution::PreferLocal => MergeResult::KeepWithNote(
@@ -3251,16 +3258,16 @@ pub fn merge_issue(
                         MergeResult::Conflict(ConflictType::DeleteVsModify)
                     }
                 }
-            } else {
-                // Local unchanged since base, external deleted -> delete
-                MergeResult::Delete
             }
         }
 
         // Case 5: In base and right only (deleted locally)
         (Some(b), None, Some(r)) => {
             // Was it modified externally after base?
-            if !r.sync_equals(b) {
+            if r.sync_equals(b) {
+                // External unchanged since base, local deleted -> delete
+                MergeResult::Delete
+            } else {
                 // External modified but local deleted - conflict
                 match strategy {
                     ConflictResolution::PreferLocal => MergeResult::Delete,
@@ -3280,9 +3287,6 @@ pub fn merge_issue(
                         MergeResult::Conflict(ConflictType::DeleteVsModify)
                     }
                 }
-            } else {
-                // External unchanged since base, local deleted -> delete
-                MergeResult::Delete
             }
         }
 
@@ -6103,5 +6107,27 @@ mod tests {
         pb.set_message(message.to_string());
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
         pb
+    }
+
+    #[test]
+    fn test_compute_jsonl_hash_ignores_empty_lines_and_whitespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("file1.jsonl");
+        let path2 = temp_dir.path().join("file2.jsonl");
+
+        let content1 = "{\"id\":\"bd-1\"}\n{\"id\":\"bd-2\"}\n";
+        // content2 has extra empty lines, different line endings, and extra whitespace
+        let content2 = "\n{\"id\":\"bd-1\"}\r\n  \n{\"id\":\"bd-2\"}  \n\n";
+
+        fs::write(&path1, content1).unwrap();
+        fs::write(&path2, content2).unwrap();
+
+        let hash1 = compute_jsonl_hash(&path1).unwrap();
+        let hash2 = compute_jsonl_hash(&path2).unwrap();
+
+        assert_eq!(
+            hash1, hash2,
+            "Hashes should be identical regardless of empty lines or whitespace"
+        );
     }
 }

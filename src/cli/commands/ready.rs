@@ -48,6 +48,7 @@ pub fn execute_with_storage(
     execute_inner(args, cli, outer_ctx, beads_dir, Some(storage))
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_inner(
     args: &ReadyArgs,
     cli: &config::CliOverrides,

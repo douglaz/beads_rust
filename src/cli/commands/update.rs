@@ -357,33 +357,13 @@ fn apply_parent_update(
     };
 
     if parent_value.is_empty() {
-        storage.remove_parent(issue_id, actor)?;
+        storage.set_parent(issue_id, None, actor)?;
         return Ok(());
     }
 
     // Use immutable reference to storage for resolution
     let parent_id = resolve_issue_id(resolver, storage, parent_value)?;
-    if parent_id == issue_id {
-        return Err(BeadsError::validation(
-            "parent",
-            "issue cannot be its own parent",
-        ));
-    }
-
-    // Pre-check for cycle to prevent partial update (orphaning the issue if add_dependency fails)
-    if storage.would_create_cycle(issue_id, &parent_id, true)? {
-        return Err(BeadsError::DependencyCycle {
-            path: format!("Setting parent of {issue_id} to {parent_id} would create a cycle"),
-        });
-    }
-
-    storage.remove_parent(issue_id, actor)?;
-    storage.add_dependency(
-        issue_id,
-        &parent_id,
-        DependencyType::ParentChild.as_str(),
-        actor,
-    )?;
+    storage.set_parent(issue_id, Some(&parent_id), actor)?;
     Ok(())
 }
 

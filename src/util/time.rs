@@ -34,26 +34,7 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
         let naive_dt = date.and_time(time);
-
-        // Handle DST transitions smoothly
-        use chrono::LocalResult;
-        let local_dt = match Local.from_local_datetime(&naive_dt) {
-            LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
-            LocalResult::None => {
-                // Time doesn't exist (DST gap), push forward by 1 hour
-                let shifted = naive_dt + Duration::hours(1);
-                match Local.from_local_datetime(&shifted) {
-                    LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
-                    LocalResult::None => {
-                        return Err(BeadsError::validation(
-                            field_name,
-                            "invalid local time around DST transition",
-                        ));
-                    }
-                }
-            }
-        };
-        return Ok(local_dt.with_timezone(&Utc));
+        return local_to_utc(&naive_dt, field_name);
     }
 
     // Try relative duration (+1h, +2d, +1w, +30m, -7d)
@@ -98,47 +79,13 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
             let tomorrow = now.date_naive() + Duration::days(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
             let naive_dt = tomorrow.and_time(time);
-
-            use chrono::LocalResult;
-            let local_dt = match Local.from_local_datetime(&naive_dt) {
-                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
-                LocalResult::None => {
-                    let shifted = naive_dt + Duration::hours(1);
-                    match Local.from_local_datetime(&shifted) {
-                        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
-                        LocalResult::None => {
-                            return Err(BeadsError::validation(
-                                field_name,
-                                "invalid local time around DST transition",
-                            ));
-                        }
-                    }
-                }
-            };
-            Ok(local_dt.with_timezone(&Utc))
+            Ok(local_to_utc(&naive_dt, field_name)?)
         }
         "next-week" | "nextweek" => {
             let next_week = now.date_naive() + Duration::weeks(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
             let naive_dt = next_week.and_time(time);
-
-            use chrono::LocalResult;
-            let local_dt = match Local.from_local_datetime(&naive_dt) {
-                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
-                LocalResult::None => {
-                    let shifted = naive_dt + Duration::hours(1);
-                    match Local.from_local_datetime(&shifted) {
-                        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
-                        LocalResult::None => {
-                            return Err(BeadsError::validation(
-                                field_name,
-                                "invalid local time around DST transition",
-                            ));
-                        }
-                    }
-                }
-            };
-            Ok(local_dt.with_timezone(&Utc))
+            Ok(local_to_utc(&naive_dt, field_name)?)
         }
         _ => Err(BeadsError::validation(
             field_name,
@@ -195,45 +142,51 @@ pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
             let tomorrow = now.date_naive() + Duration::days(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0)?;
             let naive_dt = tomorrow.and_time(time);
-
-            use chrono::LocalResult;
-            match Local.from_local_datetime(&naive_dt) {
-                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
-                    Some(dt.with_timezone(&Utc))
-                }
-                LocalResult::None => {
-                    let shifted = naive_dt + Duration::hours(1);
-                    match Local.from_local_datetime(&shifted) {
-                        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
-                            Some(dt.with_timezone(&Utc))
-                        }
-                        LocalResult::None => None,
-                    }
-                }
-            }
+            local_to_utc_opt(&naive_dt)
         }
         "next-week" | "nextweek" => {
             let next_week = now.date_naive() + Duration::weeks(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0)?;
             let naive_dt = next_week.and_time(time);
+            local_to_utc_opt(&naive_dt)
+        }
+        _ => None,
+    }
+}
 
-            use chrono::LocalResult;
-            match Local.from_local_datetime(&naive_dt) {
+fn local_to_utc(naive_dt: &chrono::NaiveDateTime, field_name: &str) -> Result<DateTime<Utc>> {
+    use chrono::LocalResult;
+    match Local.from_local_datetime(naive_dt) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => Ok(dt.with_timezone(&Utc)),
+        LocalResult::None => {
+            // Time doesn't exist (DST gap), push forward by 1 hour
+            let shifted = *naive_dt + Duration::hours(1);
+            match Local.from_local_datetime(&shifted) {
+                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
+                    Ok(dt.with_timezone(&Utc))
+                }
+                LocalResult::None => Err(BeadsError::validation(
+                    field_name,
+                    "invalid local time around DST transition",
+                )),
+            }
+        }
+    }
+}
+
+fn local_to_utc_opt(naive_dt: &chrono::NaiveDateTime) -> Option<DateTime<Utc>> {
+    use chrono::LocalResult;
+    match Local.from_local_datetime(naive_dt) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => Some(dt.with_timezone(&Utc)),
+        LocalResult::None => {
+            let shifted = *naive_dt + Duration::hours(1);
+            match Local.from_local_datetime(&shifted) {
                 LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
                     Some(dt.with_timezone(&Utc))
                 }
-                LocalResult::None => {
-                    let shifted = naive_dt + Duration::hours(1);
-                    match Local.from_local_datetime(&shifted) {
-                        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
-                            Some(dt.with_timezone(&Utc))
-                        }
-                        LocalResult::None => None,
-                    }
-                }
+                LocalResult::None => None,
             }
         }
-        _ => None,
     }
 }
 
@@ -284,41 +237,5 @@ mod tests {
     fn test_parse_relative_time_invalid() {
         assert!(parse_relative_time("invalid").is_none());
         assert!(parse_relative_time("2025-01-15").is_none());
-    }
-}
-
-fn local_to_utc(naive_dt: &chrono::NaiveDateTime, field_name: &str) -> Result<DateTime<Utc>> {
-    use chrono::LocalResult;
-    match Local.from_local_datetime(naive_dt) {
-        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => Ok(dt.with_timezone(&Utc)),
-        LocalResult::None => {
-            // Time doesn't exist (DST gap), push forward by 1 hour
-            let shifted = *naive_dt + Duration::hours(1);
-            match Local.from_local_datetime(&shifted) {
-                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
-                    Ok(dt.with_timezone(&Utc))
-                }
-                LocalResult::None => Err(BeadsError::validation(
-                    field_name,
-                    "invalid local time around DST transition",
-                )),
-            }
-        }
-    }
-}
-
-fn local_to_utc_opt(naive_dt: &chrono::NaiveDateTime) -> Option<DateTime<Utc>> {
-    use chrono::LocalResult;
-    match Local.from_local_datetime(naive_dt) {
-        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => Some(dt.with_timezone(&Utc)),
-        LocalResult::None => {
-            let shifted = *naive_dt + Duration::hours(1);
-            match Local.from_local_datetime(&shifted) {
-                LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => {
-                    Some(dt.with_timezone(&Utc))
-                }
-                LocalResult::None => None,
-            }
-        }
     }
 }

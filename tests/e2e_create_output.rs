@@ -1,5 +1,7 @@
-use assert_cmd::prelude::*;
+use assert_cmd::assert::OutputAssertExt;
+use std::collections::BTreeSet;
 use std::process::Command;
+use toon_rust::try_decode;
 
 /// Test that the --title flag works as an alternative to positional argument
 /// This was added to fix GitHub issue #7 where --title-flag was used instead of --title
@@ -152,4 +154,115 @@ fn test_create_json_output_includes_labels_and_deps() {
             .any(|d| d["depends_on_id"].as_str() == Some(blocker_id)),
         "Dependencies should contain blocker ID"
     );
+}
+
+#[test]
+fn test_create_toon_output_decodes_single_issue() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path();
+
+    let bin = assert_cmd::cargo::cargo_bin!("br");
+
+    Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("init")
+        .assert()
+        .success();
+
+    let output = Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("create")
+        .arg("TOON issue")
+        .env("BR_OUTPUT_FORMAT", "toon")
+        .output()
+        .expect("create with toon output");
+
+    assert!(
+        output.status.success(),
+        "create --format toon failed: {output:?}"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let decoded = try_decode(stdout.trim(), None).expect("valid TOON");
+    let decoded_json: serde_json::Value = decoded.into();
+
+    assert_eq!(decoded_json["title"].as_str(), Some("TOON issue"));
+    assert!(decoded_json["id"].as_str().is_some());
+}
+
+#[test]
+fn test_create_file_silent_outputs_only_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path();
+    let markdown_path = path.join("issues.md");
+
+    let bin = assert_cmd::cargo::cargo_bin!("br");
+
+    Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("init")
+        .assert()
+        .success();
+
+    std::fs::write(
+        &markdown_path,
+        "## First imported issue\n\n## Second imported issue\n",
+    )
+    .expect("write markdown import");
+
+    let output = Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("create")
+        .arg("--file")
+        .arg("issues.md")
+        .arg("--silent")
+        .output()
+        .expect("create --file --silent");
+
+    assert!(
+        output.status.success(),
+        "create --file --silent failed: {output:?}"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert_eq!(lines.len(), 2, "silent import should print one ID per line");
+    let list_output = Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("list")
+        .arg("--json")
+        .output()
+        .expect("list issues after silent import");
+
+    assert!(
+        list_output.status.success(),
+        "list after silent import failed: {list_output:?}"
+    );
+
+    let issues_json: serde_json::Value =
+        serde_json::from_slice(&list_output.stdout).expect("list output json");
+    let expected_ids: BTreeSet<String> = issues_json
+        .as_array()
+        .expect("list output array")
+        .iter()
+        .map(|issue| issue["id"].as_str().expect("issue id present").to_string())
+        .collect();
+    let actual_ids: BTreeSet<String> = lines.iter().map(|line| (*line).to_string()).collect();
+
+    assert_eq!(
+        actual_ids, expected_ids,
+        "silent import should print the raw created IDs exactly"
+    );
+
+    for line in lines {
+        assert!(
+            line.trim() == line,
+            "silent import should not add surrounding whitespace: {line:?}"
+        );
+        assert!(
+            !line.contains(':'),
+            "silent import should not include titles or status text: {line}"
+        );
+    }
 }

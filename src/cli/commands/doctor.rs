@@ -364,7 +364,7 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
     Ok(())
 }
 
-fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
+fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
     let rows = match conn.query("PRAGMA integrity_check") {
         Ok(rows) => rows,
         Err(err) => {
@@ -375,7 +375,7 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<(
                 Some(err.to_string()),
                 None,
             );
-            return Ok(());
+            return;
         }
     };
 
@@ -398,7 +398,6 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<(
             (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
         );
     }
-    Ok(())
 }
 
 fn integrity_check_messages(rows: &[Vec<SqliteValue>]) -> Vec<String> {
@@ -997,7 +996,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         match Connection::open(db_path.to_string_lossy().into_owned()) {
             Ok(conn) => {
                 required_schema_checks(&conn, &mut checks)?;
-                check_integrity(&conn, &mut checks)?;
+                check_integrity(&conn, &mut checks);
                 check_db_count(&conn, jsonl_count, &mut checks)?;
 
                 // SYNC SAFETY CHECK: metadata consistency (beads_rust-0v1.2.6)

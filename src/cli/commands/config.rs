@@ -384,8 +384,9 @@ fn get_config_value(
             println!("{v}");
         }
     } else {
-        eprintln!("Config key not found: {key}");
-        std::process::exit(1);
+        return Err(crate::error::BeadsError::Config(format!(
+            "Config key not found: {key}"
+        )));
     }
 
     Ok(())

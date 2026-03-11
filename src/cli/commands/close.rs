@@ -301,20 +301,20 @@ pub fn execute_with_args(
         }
 
         // Epic safeguard: warn if closing an epic with open children
-        if !args.force && issue.issue_type == crate::model::IssueType::Epic {
-            if let Some(&(total, closed)) = epic_counts.get(id) {
-                if closed < total {
-                    skipped_issues.push(SkippedIssue {
-                        id: id.clone(),
-                        reason: format!(
-                            "epic has {}/{} open children (use --force to close anyway)",
-                            total - closed,
-                            total
-                        ),
-                    });
-                    continue;
-                }
-            }
+        if !args.force
+            && issue.issue_type == crate::model::IssueType::Epic
+            && let Some(&(total, closed)) = epic_counts.get(id)
+            && closed < total
+        {
+            skipped_issues.push(SkippedIssue {
+                id: id.clone(),
+                reason: format!(
+                    "epic has {}/{} open children (use --force to close anyway)",
+                    total - closed,
+                    total
+                ),
+            });
+            continue;
         }
 
         if args.force {

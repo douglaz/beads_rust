@@ -700,7 +700,7 @@ fn execute_import(
                 }
 
                 let resolved_dep_id = match resolve_dependency_id(&resolver, storage, &dep_id) {
-                    Ok(resolved) => resolved,
+                    Ok(resolved_dep) => resolved_dep,
                     Err(err) => {
                         dependency_error = Some(format!(
                             "unresolved dependency '{dep_id}' for issue {id}: {err}"

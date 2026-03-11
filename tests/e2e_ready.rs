@@ -215,6 +215,36 @@ fn ready_cli_filters_by_assignee() {
 }
 
 #[test]
+fn ready_cli_assignee_flag_without_value_uses_actor() {
+    let _log = common::test_log("ready_cli_assignee_flag_without_value_uses_actor");
+    let (workspace, ids) = setup_workspace_with_issues();
+
+    let result = run_br(
+        &workspace,
+        ["--actor", "alice", "ready", "--assignee", "--json"],
+        "ready_assignee_actor_default",
+    );
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+
+    let payload = extract_json_payload(&result.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
+
+    assert_eq!(issues.len(), 2);
+    assert!(
+        issues
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .any(|id| id == ids[0].as_str())
+    );
+    assert!(
+        issues
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .any(|id| id == ids[4].as_str())
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn ready_respects_external_dependencies() {
     let _log = common::test_log("ready_respects_external_dependencies");

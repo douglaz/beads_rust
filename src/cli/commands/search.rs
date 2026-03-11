@@ -176,7 +176,7 @@ fn attach_counts(
     }
 
     let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
-    let labels_map = storage.get_labels_for_issues(&issue_ids)?;
+    let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
     let (dep_counts, dependent_counts) = storage.count_relation_counts_for_issues(&issue_ids)?;
 
     Ok(issues
@@ -184,7 +184,9 @@ fn attach_counts(
         .map(|mut issue| {
             let dependency_count = *dep_counts.get(&issue.id).unwrap_or(&0);
             let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
-            issue.labels = labels_map.get(&issue.id).cloned().unwrap_or_default();
+            if let Some(labels) = labels_map.remove(&issue.id) {
+                issue.labels = labels;
+            }
             IssueWithCounts {
                 issue,
                 dependency_count,

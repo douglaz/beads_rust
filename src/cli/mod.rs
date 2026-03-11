@@ -1638,6 +1638,10 @@ pub struct DepTreeArgs {
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub issue: String,
 
+    /// Tree direction (default: down)
+    #[arg(long, short = 'd', default_value = "down", value_enum)]
+    pub direction: DepDirection,
+
     /// Maximum depth (default: 10)
     #[arg(long, default_value_t = 10)]
     pub max_depth: usize,
@@ -1973,7 +1977,12 @@ pub struct ReadyArgs {
     pub limit: usize,
 
     /// Filter by assignee (no value = current actor)
-    #[arg(long, add = ArgValueCompleter::new(assignee_completer))]
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "",
+        add = ArgValueCompleter::new(assignee_completer)
+    )]
     pub assignee: Option<String>,
 
     /// Show only unassigned issues
@@ -2525,6 +2534,15 @@ mod tests {
         match cli.command {
             Commands::List(args) => assert_eq!(args.limit, Some(0)),
             _ => panic!("expected list command"),
+        }
+    }
+
+    #[test]
+    fn test_ready_assignee_flag_accepts_missing_value() {
+        let cli = Cli::parse_from(["br", "ready", "--assignee"]);
+        match cli.command {
+            Commands::Ready(args) => assert_eq!(args.assignee.as_deref(), Some("")),
+            _ => panic!("expected ready command"),
         }
     }
 

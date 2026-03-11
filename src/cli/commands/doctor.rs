@@ -237,7 +237,7 @@ fn render_doctor_rich(report: &DoctorReport, ctx: &OutputContext) {
 
 fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let rows = conn.query(&format!("PRAGMA table_info({table})"))?;
-    let mut columns = Vec::new();
+    let mut columns = Vec::with_capacity(rows.len());
     for row in &rows {
         if let Some(name) = row.get(1).and_then(SqliteValue::as_text) {
             columns.push(name.to_string());
@@ -250,7 +250,7 @@ fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> 
 fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
     let rows = conn
         .query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
-    let mut tables = Vec::new();
+    let mut tables = Vec::with_capacity(rows.len());
     for row in &rows {
         if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
             tables.push(name.to_string());

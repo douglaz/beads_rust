@@ -99,6 +99,8 @@ pub struct AgentFileDetection {
     pub file_path: Option<PathBuf>,
     /// Type of file found ("AGENTS.md", "CLAUDE.md", etc.).
     pub file_type: Option<String>,
+    /// Whether the file exists but was unreadable.
+    pub read_error: Option<String>,
     /// Whether the file contains our blurb (current or legacy).
     pub has_blurb: bool,
     /// Whether the file has the legacy (bv) blurb format.
@@ -194,17 +196,31 @@ pub fn detect_agent_file(work_dir: &Path) -> AgentFileDetection {
 
 /// Check a specific file path for agent configuration.
 fn check_agent_file(file_path: &Path, file_type: &str) -> Option<AgentFileDetection> {
+    check_agent_file_with_reader(file_path, file_type, |path| fs::read_to_string(path))
+}
+
+fn check_agent_file_with_reader<R>(
+    file_path: &Path,
+    file_type: &str,
+    read_to_string: R,
+) -> Option<AgentFileDetection>
+where
+    R: for<'a> Fn(&'a Path) -> io::Result<String>,
+{
     if !file_path.exists() || file_path.is_dir() {
         return None;
     }
 
-    let Ok(content) = fs::read_to_string(file_path) else {
-        // File exists but not readable
-        return Some(AgentFileDetection {
-            file_path: Some(file_path.to_path_buf()),
-            file_type: Some(file_type.to_string()),
-            ..Default::default()
-        });
+    let content = match read_to_string(file_path) {
+        Ok(content) => content,
+        Err(err) => {
+            return Some(AgentFileDetection {
+                file_path: Some(file_path.to_path_buf()),
+                file_type: Some(file_type.to_string()),
+                read_error: Some(err.to_string()),
+                ..Default::default()
+            });
+        }
     };
 
     let has_legacy = contains_legacy_blurb(&content);
@@ -217,6 +233,7 @@ fn check_agent_file(file_path: &Path, file_type: &str) -> Option<AgentFileDetect
         has_legacy_blurb: has_legacy,
         blurb_version: get_blurb_version(&content),
         content: Some(content),
+        read_error: None,
     })
 }
 
@@ -624,6 +641,13 @@ fn execute_add(
     }
 
     let (file_path, content) = if detection.found() {
+        if let Some(ref err) = detection.read_error {
+            return Err(BeadsError::Config(format!(
+                "Cannot add instructions: {} exists but is unreadable: {}",
+                detection.file_type.as_ref().unwrap(),
+                err
+            )));
+        }
         let path = detection.file_path.clone().unwrap();
         let content = detection.content.clone().unwrap_or_default();
         (path, content)
@@ -711,6 +735,14 @@ fn execute_remove(
         });
     }
 
+    if let Some(ref err) = detection.read_error {
+        return Err(BeadsError::Config(format!(
+            "Cannot remove instructions: {} exists but is unreadable: {}",
+            detection.file_type.as_ref().unwrap(),
+            err
+        )));
+    }
+
     if !detection.has_blurb && !detection.has_legacy_blurb {
         if matches!(ctx.mode(), OutputMode::Rich) {
             render_nothing_to_remove_rich(ctx);
@@ -793,6 +825,14 @@ fn execute_update(
             field: "AGENTS.md".to_string(),
             reason: "not found in current directory or parents".to_string(),
         });
+    }
+
+    if let Some(ref err) = detection.read_error {
+        return Err(BeadsError::Config(format!(
+            "Cannot update instructions: {} exists but is unreadable: {}",
+            detection.file_type.as_ref().unwrap(),
+            err
+        )));
     }
 
     if !detection.needs_upgrade() {
@@ -1146,6 +1186,29 @@ mod tests {
         assert_eq!(detection.blurb_version, 1);
         assert!(!detection.needs_blurb());
         assert!(!detection.needs_upgrade());
+    }
+
+    #[test]
+    fn test_check_agent_file_reads_unreadable_path_once() {
+        let temp_dir = TempDir::new().unwrap();
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        fs::write(&agents_path, "# Agents\n").unwrap();
+
+        let read_count = std::cell::Cell::new(0_usize);
+        let detection = check_agent_file_with_reader(&agents_path, "AGENTS.md", |_| {
+            read_count.set(read_count.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "permission denied",
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(read_count.get(), 1);
+        assert!(detection.found());
+        assert_eq!(detection.file_type.as_deref(), Some("AGENTS.md"));
+        assert_eq!(detection.read_error.as_deref(), Some("permission denied"));
+        assert!(detection.content.is_none());
     }
 
     #[test]

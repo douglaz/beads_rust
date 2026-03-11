@@ -47,7 +47,7 @@ pub fn execute(args: &StaleArgs, cli: &config::CliOverrides, ctx: &OutputContext
         render_stale_rich(&stale, now, args.days, ctx);
     } else if ctx.is_json() {
         // Convert to StaleIssue for bd-compatible JSON output
-        let stale_output: Vec<StaleIssue> = stale.iter().map(StaleIssue::from).collect();
+        let stale_output: Vec<StaleIssue> = stale.into_iter().map(StaleIssue::from).collect();
         ctx.json(&stale_output);
     } else {
         println!(

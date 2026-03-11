@@ -14,6 +14,8 @@ pub struct StaleIssue {
     pub status: Status,
     pub title: String,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
 }
 
 /// Minimal issue output for ready command (bd parity).
@@ -45,22 +47,22 @@ pub struct ReadyIssue {
     pub updated_at: DateTime<Utc>,
 }
 
-impl From<&Issue> for ReadyIssue {
-    fn from(issue: &Issue) -> Self {
+impl From<Issue> for ReadyIssue {
+    fn from(issue: Issue) -> Self {
         Self {
-            acceptance_criteria: issue.acceptance_criteria.clone(),
-            assignee: issue.assignee.clone(),
+            acceptance_criteria: issue.acceptance_criteria,
+            assignee: issue.assignee,
             created_at: issue.created_at,
-            created_by: issue.created_by.clone(),
-            description: issue.description.clone(),
+            created_by: issue.created_by,
+            description: issue.description,
             estimated_minutes: issue.estimated_minutes,
-            id: issue.id.clone(),
-            issue_type: issue.issue_type.clone(),
-            notes: issue.notes.clone(),
-            owner: issue.owner.clone(),
+            id: issue.id,
+            issue_type: issue.issue_type,
+            notes: issue.notes,
+            owner: issue.owner,
             priority: issue.priority,
-            status: issue.status.clone(),
-            title: issue.title.clone(),
+            status: issue.status,
+            title: issue.title,
             updated_at: issue.updated_at,
         }
     }
@@ -87,16 +89,17 @@ pub struct BlockedIssueOutput {
     pub updated_at: DateTime<Utc>,
 }
 
-impl From<&Issue> for StaleIssue {
-    fn from(issue: &Issue) -> Self {
+impl From<Issue> for StaleIssue {
+    fn from(issue: Issue) -> Self {
         Self {
             created_at: issue.created_at,
-            id: issue.id.clone(),
-            issue_type: issue.issue_type.clone(),
+            id: issue.id,
+            issue_type: issue.issue_type,
             priority: issue.priority,
-            status: issue.status.clone(),
-            title: issue.title.clone(),
+            status: issue.status,
+            title: issue.title,
             updated_at: issue.updated_at,
+            assignee: issue.assignee,
         }
     }
 }

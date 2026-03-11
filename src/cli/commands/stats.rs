@@ -3,11 +3,11 @@
 //! Shows project statistics including issue counts by status, type, priority,
 //! assignee, and label. Also supports recent activity tracking via git.
 
-use crate::cli::{resolve_output_format_basic_with_outer_mode, OutputFormat, StatsArgs};
+use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::Result;
 use crate::format::{
-    truncate_title, Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary,
+    Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary, truncate_title,
 };
 use crate::model::{Issue, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
@@ -59,7 +59,16 @@ pub fn execute(
     debug!(total = all_issues.len(), "Loaded all issues for stats");
 
     // Compute summary counts
-    let summary = compute_summary(storage, &all_issues)?;
+    let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
+    let external_blockers = if storage.has_external_dependencies(true)? {
+        let external_statuses =
+            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+        Some(storage.external_blockers(&external_statuses)?)
+    } else {
+        None
+    };
+
+    let summary = compute_summary(storage, &all_issues, external_blockers.as_ref())?;
 
     // Compute breakdowns if requested
     let mut breakdowns = Vec::new();
@@ -119,60 +128,69 @@ const fn should_include_activity(args: &StatsArgs) -> bool {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ActivityCounts {
-    issues_created: usize,
-    issues_closed: usize,
-    issues_updated: usize,
-    issues_reopened: usize,
+    created: usize,
+    closed: usize,
+    updated: usize,
+    reopened: usize,
 }
 
 impl ActivityCounts {
     const fn total_changes(self) -> usize {
-        self.issues_created + self.issues_closed + self.issues_updated + self.issues_reopened
+        self.created + self.closed + self.updated + self.reopened
     }
 
     fn merge(&mut self, other: Self) {
-        self.issues_created += other.issues_created;
-        self.issues_closed += other.issues_closed;
-        self.issues_updated += other.issues_updated;
-        self.issues_reopened += other.issues_reopened;
+        self.created += other.created;
+        self.closed += other.closed;
+        self.updated += other.updated;
+        self.reopened += other.reopened;
     }
 
     fn record_transition(&mut self, previous: Option<&Issue>, current: Option<&Issue>) {
         match (previous, current) {
             (None, Some(issue)) => {
                 if issue.status != Status::Tombstone {
-                    self.issues_created += 1;
+                    self.created += 1;
                 }
             }
             (Some(before), Some(after)) => {
                 if !matches!(before.status, Status::Closed | Status::Tombstone)
                     && after.status == Status::Closed
                 {
-                    self.issues_closed += 1;
+                    self.closed += 1;
                     return;
                 }
 
                 if before.status == Status::Closed
                     && !matches!(after.status, Status::Closed | Status::Tombstone)
                 {
-                    self.issues_reopened += 1;
+                    self.reopened += 1;
                     return;
                 }
 
                 if !before.sync_equals(after) {
-                    self.issues_updated += 1;
+                    self.updated += 1;
                 }
             }
-            (Some(_) | None, None) => {}
+            (_, None) => {}
         }
     }
 }
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GitActivitySummary {
+    commit_count: usize,
+    counts: ActivityCounts,
+}
+
+const GIT_ACTIVITY_COMMIT_MARKER: &str = "__BR_ACTIVITY_COMMIT__:";
 
 /// Compute summary statistics.
 #[allow(clippy::cast_precision_loss)]
 fn compute_summary(
     storage: &SqliteStorage,
     issues: &[crate::model::Issue],
+    external_blockers: Option<&std::collections::HashMap<String, Vec<String>>>,
 ) -> Result<StatsSummary> {
     let mut open = 0;
     let mut in_progress = 0;
@@ -245,8 +263,10 @@ fn compute_summary(
         .filter(|i| {
             i.status == Status::Open
                 && !all_blocked_ids.contains(&i.id)
+                && external_blockers.is_none_or(|eb| !eb.contains_key(&i.id))
                 && !i.ephemeral
                 && !i.pinned
+                && !i.is_template
                 && i.defer_until.is_none_or(|d| d <= now)
         })
         .count();
@@ -300,10 +320,11 @@ fn count_epics_eligible_for_closure(storage: &SqliteStorage, epic_ids: &[String]
     let counts = storage.get_epic_counts()?;
 
     for epic_id in epic_ids {
-        if let Some(&(total, closed)) = counts.get(epic_id) {
-            if total > 0 && total == closed {
-                eligible += 1;
-            }
+        if let Some(&(total, closed)) = counts.get(epic_id)
+            && total > 0
+            && total == closed
+        {
+            eligible += 1;
         }
     }
 
@@ -428,64 +449,38 @@ fn compute_recent_activity(jsonl_path: &Path, hours: u32) -> Option<RecentActivi
     let since = format!("{hours} hours ago");
     let repo_root = git_repo_root(jsonl_path.parent()?)?;
     let pathspec = repo_relative_git_path(jsonl_path, &repo_root)?;
-    let commits = git_recent_commits(&repo_root, &pathspec, &since)?;
-    let commit_count = commits.len();
-    let mut counts = ActivityCounts::default();
-
-    for commit in &commits {
-        counts.merge(git_issue_activity_for_commit(
-            &repo_root, commit, &pathspec,
-        )?);
-    }
+    let GitActivitySummary {
+        commit_count,
+        counts,
+    } = git_recent_activity(&repo_root, &pathspec, &since)?;
 
     Some(RecentActivity {
         hours_tracked: hours,
         commit_count,
-        issues_created: counts.issues_created,
-        issues_closed: counts.issues_closed,
-        issues_updated: counts.issues_updated,
-        issues_reopened: counts.issues_reopened,
+        issues_created: counts.created,
+        issues_closed: counts.closed,
+        issues_updated: counts.updated,
+        issues_reopened: counts.reopened,
         total_changes: counts.total_changes(),
     })
 }
 
-fn git_recent_commits(repo_root: &Path, pathspec: &Path, since: &str) -> Option<Vec<String>> {
-    let pathspec_str = pathspec.to_string_lossy().into_owned();
-    let output = Command::new("git")
-        .args(["log", "--format=%H", "--since", since, "--", &pathspec_str])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        let err_msg = String::from_utf8_lossy(&output.stderr);
-        debug!(stderr = %err_msg, "Git log failed");
-        return None;
-    }
-
-    Some(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-    )
-}
-
-fn git_issue_activity_for_commit(
+fn git_recent_activity(
     repo_root: &Path,
-    commit: &str,
     pathspec: &Path,
-) -> Option<ActivityCounts> {
+    since: &str,
+) -> Option<GitActivitySummary> {
     let pathspec_str = pathspec.to_string_lossy().into_owned();
     let output = Command::new("git")
         .args([
-            "show",
-            "--format=",
+            "log",
+            "--format=__BR_ACTIVITY_COMMIT__:%H",
+            "--patch",
             "--unified=0",
             "--no-color",
-            commit,
+            "--no-ext-diff",
+            "--since",
+            since,
             "--",
             &pathspec_str,
         ])
@@ -495,40 +490,89 @@ fn git_issue_activity_for_commit(
 
     if !output.status.success() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
-        debug!(commit, stderr = %err_msg, "Git show failed for activity diff");
+        debug!(stderr = %err_msg, "Git log failed for activity diff");
         return None;
     }
 
-    Some(parse_issue_activity_patch(&String::from_utf8_lossy(
+    Some(parse_issue_activity_log(&String::from_utf8_lossy(
         &output.stdout,
     )))
 }
 
+fn parse_issue_activity_log(log: &str) -> GitActivitySummary {
+    let mut summary = GitActivitySummary::default();
+    let mut removed = BTreeMap::new();
+    let mut added = BTreeMap::new();
+    let mut in_commit = false;
+
+    for line in log.lines() {
+        if line.starts_with(GIT_ACTIVITY_COMMIT_MARKER) {
+            if in_commit {
+                summary
+                    .counts
+                    .merge(count_issue_activity_transitions(&removed, &added));
+                removed.clear();
+                added.clear();
+            }
+
+            in_commit = true;
+            summary.commit_count += 1;
+            continue;
+        }
+
+        record_issue_activity_patch_line(line, &mut removed, &mut added);
+    }
+
+    if in_commit {
+        summary
+            .counts
+            .merge(count_issue_activity_transitions(&removed, &added));
+    }
+
+    summary
+}
+
+#[cfg(test)]
 fn parse_issue_activity_patch(patch: &str) -> ActivityCounts {
     let mut removed = BTreeMap::new();
     let mut added = BTreeMap::new();
 
     for line in patch.lines() {
-        let Some((marker, payload)) = parse_issue_patch_line(line) else {
-            continue;
-        };
-
-        match serde_json::from_str::<Issue>(payload) {
-            Ok(issue) => match marker {
-                '+' => {
-                    added.insert(issue.id.clone(), issue);
-                }
-                '-' => {
-                    removed.insert(issue.id.clone(), issue);
-                }
-                _ => unreachable!("parse_issue_patch_line only returns +/- markers"),
-            },
-            Err(err) => {
-                debug!(%err, "Skipping unparsable issue line from git diff");
-            }
-        }
+        record_issue_activity_patch_line(line, &mut removed, &mut added);
     }
 
+    count_issue_activity_transitions(&removed, &added)
+}
+
+fn record_issue_activity_patch_line(
+    line: &str,
+    removed: &mut BTreeMap<String, Issue>,
+    added: &mut BTreeMap<String, Issue>,
+) {
+    let Some((marker, payload)) = parse_issue_patch_line(line) else {
+        return;
+    };
+
+    match serde_json::from_str::<Issue>(payload) {
+        Ok(issue) => match marker {
+            '+' => {
+                added.insert(issue.id.clone(), issue);
+            }
+            '-' => {
+                removed.insert(issue.id.clone(), issue);
+            }
+            _ => unreachable!("parse_issue_patch_line only returns +/- markers"),
+        },
+        Err(err) => {
+            debug!(%err, "Skipping unparsable issue line from git diff");
+        }
+    }
+}
+
+fn count_issue_activity_transitions(
+    removed: &BTreeMap<String, Issue>,
+    added: &BTreeMap<String, Issue>,
+) -> ActivityCounts {
     let mut counts = ActivityCounts::default();
     let mut issue_ids: HashSet<&str> = removed.keys().map(String::as_str).collect();
     issue_ids.extend(added.keys().map(String::as_str));
@@ -1003,7 +1047,7 @@ mod tests {
         storage.create_issue(&third_issue, "tester").unwrap();
 
         let all_issues = vec![first_issue, second_issue, third_issue];
-        let summary = compute_summary(&storage, &all_issues).unwrap();
+        let summary = compute_summary(&storage, &all_issues, None).unwrap();
 
         assert_eq!(summary.total_issues, 3);
         assert_eq!(summary.open_issues, 1);
@@ -1027,6 +1071,23 @@ mod tests {
         let blocked_ids = storage.get_blocked_by_blocks_deps_only().unwrap();
         assert!(blocked_ids.contains("t-2"));
         assert!(!blocked_ids.contains("t-1"));
+    }
+
+    #[test]
+    fn test_compute_summary_ready_excludes_templates() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let regular_issue = make_issue("t-1", Status::Open, IssueType::Task);
+        let mut template_issue = make_issue("t-2", Status::Open, IssueType::Task);
+        template_issue.is_template = true;
+
+        storage.create_issue(&regular_issue, "tester").unwrap();
+        storage.create_issue(&template_issue, "tester").unwrap();
+
+        let all_issues = vec![regular_issue, template_issue];
+        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+
+        assert_eq!(summary.ready_issues, 1);
     }
 
     #[test]
@@ -1219,8 +1280,59 @@ mod tests {
         let mut counts = ActivityCounts::default();
         counts.record_transition(Some(&before), Some(&after));
 
-        assert_eq!(counts.issues_reopened, 0);
-        assert_eq!(counts.issues_updated, 1);
+        assert_eq!(counts.reopened, 0);
+        assert_eq!(counts.updated, 1);
+    }
+
+    #[test]
+    fn test_parse_issue_activity_patch_counts_created_issue() {
+        let issue = make_issue("bd-created", Status::Open, IssueType::Task);
+        let patch = format!(
+            "+{}\n",
+            serde_json::to_string(&issue).expect("serialize created issue"),
+        );
+
+        let counts = parse_issue_activity_patch(&patch);
+        assert_eq!(counts.created, 1);
+        assert_eq!(counts.closed, 0);
+        assert_eq!(counts.updated, 0);
+        assert_eq!(counts.reopened, 0);
+        assert_eq!(counts.total_changes(), 1);
+    }
+
+    #[test]
+    fn test_parse_issue_activity_log_keeps_commit_boundaries_separate() {
+        let base_time = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
+        let mut original = make_issue("bd-activity", Status::Open, IssueType::Task);
+        original.title = "Track recent activity".to_string();
+        original.created_at = base_time;
+        original.updated_at = base_time;
+
+        let mut updated = original.clone();
+        updated.title = "Track recent activity better".to_string();
+        updated.updated_at = base_time + chrono::Duration::hours(1);
+
+        let mut closed = updated.clone();
+        closed.status = Status::Closed;
+        closed.updated_at = base_time + chrono::Duration::hours(2);
+        closed.closed_at = Some(closed.updated_at);
+        closed.close_reason = Some("done".to_string());
+
+        let log = format!(
+            "{marker}commit-1\n-{original}\n+{updated}\n{marker}commit-2\n-{updated}\n+{closed}\n",
+            marker = GIT_ACTIVITY_COMMIT_MARKER,
+            original = serde_json::to_string(&original).expect("serialize original issue"),
+            updated = serde_json::to_string(&updated).expect("serialize updated issue"),
+            closed = serde_json::to_string(&closed).expect("serialize closed issue"),
+        );
+
+        let activity = parse_issue_activity_log(&log);
+        assert_eq!(activity.commit_count, 2);
+        assert_eq!(activity.counts.created, 0);
+        assert_eq!(activity.counts.updated, 1);
+        assert_eq!(activity.counts.closed, 1);
+        assert_eq!(activity.counts.reopened, 0);
+        assert_eq!(activity.counts.total_changes(), 2);
     }
 
     #[test]

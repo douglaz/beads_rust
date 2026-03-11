@@ -78,6 +78,11 @@ fn execute_inner(
     } else {
         None
     };
+    let assignee = match args.assignee.as_deref() {
+        Some("") => Some(config::resolve_actor(&config_layer)),
+        Some(value) => Some(value.to_string()),
+        None => None,
+    };
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
         outer_ctx.inherited_output_mode(),
@@ -87,7 +92,7 @@ fn execute_inner(
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
     let filters = ReadyFilters {
-        assignee: args.assignee.clone(),
+        assignee,
         unassigned: args.unassigned,
         labels_and: args.label.clone(),
         labels_or: args.label_any.clone(),
@@ -145,11 +150,13 @@ fn execute_inner(
     }
     match output_format {
         OutputFormat::Json => {
-            let ready_output: Vec<ReadyIssue> = ready_issues.iter().map(ReadyIssue::from).collect();
+            let ready_output: Vec<ReadyIssue> =
+                ready_issues.into_iter().map(ReadyIssue::from).collect();
             ctx.json_pretty(&ready_output);
         }
         OutputFormat::Toon => {
-            let ready_output: Vec<ReadyIssue> = ready_issues.iter().map(ReadyIssue::from).collect();
+            let ready_output: Vec<ReadyIssue> =
+                ready_issues.into_iter().map(ReadyIssue::from).collect();
             ctx.toon_with_stats(&ready_output, args.stats);
         }
         OutputFormat::Text | OutputFormat::Csv => {

@@ -4257,14 +4257,6 @@ impl SqliteStorage {
         }))
     }
 
-    /// Convert empty string to None for bd compatibility.
-    /// The database stores empty strings for NOT NULL DEFAULT '' fields,
-    /// but the API contract expects None for unset values.
-    #[inline]
-    fn empty_to_none(s: Option<String>) -> Option<String> {
-        s.filter(|v| !v.is_empty())
-    }
-
     fn issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
@@ -4272,9 +4264,20 @@ impl SqliteStorage {
                 .unwrap_or("")
                 .to_string()
         };
+        let get_str_ref = |idx: usize| -> &str {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+        };
         let get_opt_str = |idx: usize| -> Option<String> {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
+                .map(str::to_string)
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
         #[allow(clippy::cast_possible_truncation)]
@@ -4286,47 +4289,54 @@ impl SqliteStorage {
         let get_bool = |idx: usize| -> bool {
             row.get(idx).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
         };
+        let get_opt_datetime = |idx: usize| -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|s| !s.is_empty())
+                .map(parse_datetime)
+                .transpose()
+        };
 
         Ok(Issue {
             id: get_str(0),
             content_hash: get_opt_str(1),
             title: get_str(2),
-            description: Self::empty_to_none(get_opt_str(3)),
-            design: Self::empty_to_none(get_opt_str(4)),
-            acceptance_criteria: Self::empty_to_none(get_opt_str(5)),
-            notes: Self::empty_to_none(get_opt_str(6)),
+            description: get_non_empty_str(3),
+            design: get_non_empty_str(4),
+            acceptance_criteria: get_non_empty_str(5),
+            notes: get_non_empty_str(6),
             status: parse_status(row.get(7).and_then(SqliteValue::as_text)),
             priority: Priority(get_opt_i32(8).unwrap_or(2)),
             issue_type: parse_issue_type(row.get(9).and_then(SqliteValue::as_text)),
-            assignee: Self::empty_to_none(get_opt_str(10)),
-            owner: Self::empty_to_none(get_opt_str(11)),
+            assignee: get_non_empty_str(10),
+            owner: get_non_empty_str(11),
             estimated_minutes: get_opt_i32(12),
-            created_at: parse_datetime(&get_str(13))?,
-            created_by: Self::empty_to_none(get_opt_str(14)),
-            updated_at: parse_datetime(&get_str(15))?,
-            closed_at: get_opt_str(16).as_deref().map(parse_datetime).transpose()?,
-            close_reason: Self::empty_to_none(get_opt_str(17)),
-            closed_by_session: Self::empty_to_none(get_opt_str(18)),
-            due_at: get_opt_str(19).as_deref().map(parse_datetime).transpose()?,
-            defer_until: get_opt_str(20).as_deref().map(parse_datetime).transpose()?,
+            created_at: parse_datetime(get_str_ref(13))?,
+            created_by: get_non_empty_str(14),
+            updated_at: parse_datetime(get_str_ref(15))?,
+            closed_at: get_opt_datetime(16)?,
+            close_reason: get_non_empty_str(17),
+            closed_by_session: get_non_empty_str(18),
+            due_at: get_opt_datetime(19)?,
+            defer_until: get_opt_datetime(20)?,
             external_ref: get_opt_str(21),
-            source_system: Self::empty_to_none(get_opt_str(22)),
-            source_repo: Self::empty_to_none(get_opt_str(23)),
-            deleted_at: get_opt_str(24).as_deref().map(parse_datetime).transpose()?,
-            deleted_by: Self::empty_to_none(get_opt_str(25)),
-            delete_reason: Self::empty_to_none(get_opt_str(26)),
-            original_type: Self::empty_to_none(get_opt_str(27)),
+            source_system: get_non_empty_str(22),
+            source_repo: get_non_empty_str(23),
+            deleted_at: get_opt_datetime(24)?,
+            deleted_by: get_non_empty_str(25),
+            delete_reason: get_non_empty_str(26),
+            original_type: get_non_empty_str(27),
             compaction_level: get_opt_i32(28),
-            compacted_at: get_opt_str(29).as_deref().map(parse_datetime).transpose()?,
+            compacted_at: get_opt_datetime(29)?,
             compacted_at_commit: get_opt_str(30),
             original_size: get_opt_i32(31),
-            sender: Self::empty_to_none(get_opt_str(32)),
+            sender: get_non_empty_str(32),
             ephemeral: get_bool(33),
             pinned: get_bool(34),
             is_template: get_bool(35),
-            labels: vec![],       // Loaded separately if needed
-            dependencies: vec![], // Loaded separately if needed
-            comments: vec![],     // Loaded separately if needed
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
         })
     }
 

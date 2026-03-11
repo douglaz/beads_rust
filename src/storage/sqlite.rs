@@ -401,7 +401,10 @@ impl SqliteStorage {
                         // Write events
                         if !ctx.events.is_empty() {
                             for event_chunk in ctx.events.chunks(140) {
-                                let placeholders: Vec<&str> = event_chunk.iter().map(|_| "(?, ?, ?, ?, ?, ?, ?)").collect();
+                                let placeholders: Vec<&str> = event_chunk
+                                    .iter()
+                                    .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
+                                    .collect();
                                 let sql = format!(
                                     "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES {}",
                                     placeholders.join(", ")
@@ -411,9 +414,24 @@ impl SqliteStorage {
                                     params.push(SqliteValue::from(event.issue_id.as_str()));
                                     params.push(SqliteValue::from(event.event_type.as_str()));
                                     params.push(SqliteValue::from(event.actor.as_str()));
-                                    params.push(event.old_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from));
-                                    params.push(event.new_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from));
-                                    params.push(event.comment.as_deref().map_or(SqliteValue::Null, SqliteValue::from));
+                                    params.push(
+                                        event
+                                            .old_value
+                                            .as_deref()
+                                            .map_or(SqliteValue::Null, SqliteValue::from),
+                                    );
+                                    params.push(
+                                        event
+                                            .new_value
+                                            .as_deref()
+                                            .map_or(SqliteValue::Null, SqliteValue::from),
+                                    );
+                                    params.push(
+                                        event
+                                            .comment
+                                            .as_deref()
+                                            .map_or(SqliteValue::Null, SqliteValue::from),
+                                    );
                                     params.push(SqliteValue::from(event.created_at.to_rfc3339()));
                                 }
                                 self.conn.execute_with_params(&sql, &params)?;
@@ -441,12 +459,14 @@ impl SqliteStorage {
 
                                 // Insert new dirty flags
                                 for insert_chunk in chunk.chunks(400) {
-                                    let placeholders: Vec<&str> = insert_chunk.iter().map(|_| "(?, ?)").collect();
+                                    let placeholders: Vec<&str> =
+                                        insert_chunk.iter().map(|_| "(?, ?)").collect();
                                     let insert_sql = format!(
                                         "INSERT INTO dirty_issues (issue_id, marked_at) VALUES {}",
                                         placeholders.join(", ")
                                     );
-                                    let mut insert_params = Vec::with_capacity(insert_chunk.len() * 2);
+                                    let mut insert_params =
+                                        Vec::with_capacity(insert_chunk.len() * 2);
                                     for id in insert_chunk {
                                         insert_params.push(SqliteValue::from(id.as_str()));
                                         insert_params.push(SqliteValue::from(now_str.as_str()));
@@ -3280,6 +3300,48 @@ impl SqliteStorage {
         rows.iter().map(comment_from_row).collect()
     }
 
+    /// Get comments for multiple issues in batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_comments_for_issues(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<Comment>>> {
+        const SQLITE_VAR_LIMIT: usize = 900;
+        let mut map: std::collections::HashMap<String, Vec<Comment>> = std::collections::HashMap::new();
+        
+        if issue_ids.is_empty() {
+            return Ok(map);
+        }
+
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT id, issue_id, author, text, created_at
+                 FROM comments
+                 WHERE issue_id IN ({})
+                 ORDER BY created_at ASC",
+                placeholders.join(",")
+            );
+
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let comment = comment_from_row(row)?;
+                map.entry(comment.issue_id.clone()).or_default().push(comment);
+            }
+        }
+
+        Ok(map)
+    }
+
     /// Add a comment to an issue.
     ///
     /// # Errors
@@ -4165,7 +4227,7 @@ impl SqliteStorage {
         if exports.is_empty() {
             return Ok(0);
         }
-        
+
         // Wrap the entire batch in a single transaction for atomicity and performance
         self.conn.execute("BEGIN IMMEDIATE")?;
         match self.set_export_hashes_in_tx(exports) {
@@ -4863,6 +4925,42 @@ impl SqliteStorage {
         Ok(Some(issue))
     }
 
+    /// Get multiple issues with all relations populated for export.
+    ///
+    /// Includes labels, dependencies, and comments. This fetches in batch to avoid N+1 queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_issues_for_export(&self, ids: &[String]) -> Result<Vec<Issue>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut issues = self.get_issues_by_ids(ids)?;
+
+        // Fetch relations in batch
+        let labels_map = self.get_labels_for_issues(ids)?;
+        let deps_map = self.get_dependencies_full_for_issues(ids)?;
+        let comments_map = self.get_comments_for_issues(ids)?;
+
+        for issue in &mut issues {
+            if let Some(labels) = labels_map.get(&issue.id) {
+                issue.labels = labels.clone();
+                issue.labels.sort();
+                issue.labels.dedup();
+            }
+            if let Some(deps) = deps_map.get(&issue.id) {
+                issue.dependencies = deps.clone();
+            }
+            if let Some(comments) = comments_map.get(&issue.id) {
+                issue.comments = comments.clone();
+            }
+        }
+
+        Ok(issues)
+    }
+
     /// Get dependencies as full Dependency structs for export.
     ///
     /// # Errors
@@ -4918,6 +5016,79 @@ impl SqliteStorage {
         }
 
         Ok(deps)
+    }
+
+    /// Get dependencies as full Dependency structs for multiple issues in batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_dependencies_full_for_issues(&self, issue_ids: &[String]) -> Result<std::collections::HashMap<String, Vec<crate::model::Dependency>>> {
+        const SQLITE_VAR_LIMIT: usize = 900;
+        let mut map: std::collections::HashMap<String, Vec<crate::model::Dependency>> = std::collections::HashMap::new();
+
+        if issue_ids.is_empty() {
+            return Ok(map);
+        }
+
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+                 FROM dependencies
+                 WHERE issue_id IN ({})
+                 ORDER BY depends_on_id",
+                placeholders
+            );
+
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let created_at_str = row
+                    .get(3)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string();
+                let dep = crate::model::Dependency {
+                    issue_id: row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or("")
+                        .to_string(),
+                    depends_on_id: row
+                        .get(1)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or("")
+                        .to_string(),
+                    dep_type: row
+                        .get(2)
+                        .and_then(SqliteValue::as_text)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(crate::model::DependencyType::Blocks),
+                    created_at: parse_datetime(&created_at_str)?,
+                    created_by: row
+                        .get(4)
+                        .and_then(SqliteValue::as_text)
+                        .map(str::to_string),
+                    metadata: row
+                        .get(5)
+                        .and_then(SqliteValue::as_text)
+                        .map(str::to_string),
+                    thread_id: row
+                        .get(6)
+                        .and_then(SqliteValue::as_text)
+                        .map(str::to_string),
+                };
+                map.entry(dep.issue_id.clone()).or_default().push(dep);
+            }
+        }
+
+        Ok(map)
     }
 
     /// Clear dirty flags for the given issue IDs.

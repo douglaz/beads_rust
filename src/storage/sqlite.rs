@@ -788,7 +788,7 @@ impl SqliteStorage {
                         dep.depends_on_id, dep.dep_type
                     )),
                 );
-                ctx.invalidate_cache();
+                ctx.invalidate_cache_for(&[issue.id.as_str(), dep.depends_on_id.as_str()]);
             }
 
             // Insert Comments
@@ -3107,10 +3107,13 @@ impl SqliteStorage {
                     Some(format!("Removed {total} dependency links")),
                 );
                 ctx.mark_dirty(issue_id);
-                for affected_id in affected {
-                    ctx.mark_dirty(&affected_id);
+                for affected_id in &affected {
+                    ctx.mark_dirty(affected_id);
                 }
-                ctx.invalidate_cache();
+                let mut cache_ids: Vec<&str> = Vec::with_capacity(affected.len() + 1);
+                cache_ids.push(issue_id);
+                cache_ids.extend(affected.iter().map(String::as_str));
+                ctx.invalidate_cache_for(&cache_ids);
             }
 
             Ok(total)
@@ -3124,6 +3127,14 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn remove_parent(&mut self, issue_id: &str, actor: &str) -> Result<bool> {
         self.mutate("remove_parent", actor, |conn, ctx| {
+            let previous_parent = conn
+                .query_with_params(
+                    "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' LIMIT 1",
+                    &[SqliteValue::from(issue_id)],
+                )?
+                .first()
+                .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
+                .map(str::to_string);
             let rows = conn.execute_with_params(
                 "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
                 &[SqliteValue::from(issue_id)],
@@ -3144,7 +3155,11 @@ impl SqliteStorage {
                     Some("Removed parent".to_string()),
                 );
                 ctx.mark_dirty(issue_id);
-                ctx.invalidate_cache();
+                let mut cache_ids = vec![issue_id];
+                if let Some(parent_id) = previous_parent.as_deref() {
+                    cache_ids.push(parent_id);
+                }
+                ctx.invalidate_cache_for(&cache_ids);
             }
 
             Ok(rows > 0)
@@ -3162,7 +3177,30 @@ impl SqliteStorage {
         parent_id: Option<&str>,
         actor: &str,
     ) -> Result<()> {
+        self.set_parent_with_options(issue_id, parent_id, actor, false)
+    }
+
+    /// Set parent for an issue (replace existing) with optional deferred cache rebuild.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database update fails or cycle detected.
+    pub fn set_parent_with_options(
+        &mut self,
+        issue_id: &str,
+        parent_id: Option<&str>,
+        actor: &str,
+        skip_cache_rebuild: bool,
+    ) -> Result<()> {
         self.mutate("set_parent", actor, |conn, ctx| {
+            let previous_parent = conn
+                .query_with_params(
+                    "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' LIMIT 1",
+                    &[SqliteValue::from(issue_id)],
+                )?
+                .first()
+                .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
+                .map(str::to_string);
             // Remove existing parent
             conn.execute_with_params(
                 "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
@@ -3218,7 +3256,16 @@ impl SqliteStorage {
             )?;
 
             ctx.mark_dirty(issue_id);
-            ctx.invalidate_cache();
+            if !skip_cache_rebuild {
+                let mut cache_ids = vec![issue_id];
+                if let Some(parent_id) = previous_parent.as_deref() {
+                    cache_ids.push(parent_id);
+                }
+                if let Some(parent_id) = parent_id {
+                    cache_ids.push(parent_id);
+                }
+                ctx.invalidate_cache_for(&cache_ids);
+            }
             Ok(())
         })
     }

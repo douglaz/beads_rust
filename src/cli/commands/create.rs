@@ -1,4 +1,4 @@
-use super::resolve_issue_id;
+use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery};
 use crate::cli::CreateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -67,7 +67,10 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         actor: config::resolve_actor(&layer),
     };
 
-    let issue = create_issue_impl(&mut storage_ctx.storage, args, &config)?;
+    let issue =
+        retry_mutation_with_jsonl_recovery(&mut storage_ctx, true, "create", None, |storage| {
+            create_issue_impl(storage, args, &config)
+        })?;
     let created_id = issue.id.clone();
     let last_touched_dir = storage_ctx.paths.beads_dir.clone();
     let update_last_touched_after_flush = storage_ctx.no_db;
@@ -185,7 +188,7 @@ pub fn create_issue_impl(
         Status::Open
     };
 
-    let mut count = storage.count_issues()?;
+    let count = storage.count_issues()?;
     let mut retries = 0;
     loop {
         // 2. Generate ID

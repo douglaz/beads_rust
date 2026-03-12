@@ -4,6 +4,7 @@
 //! cascade/force/dry-run modes.
 
 use crate::cli::DeleteArgs;
+use crate::cli::commands::retry_mutation_with_jsonl_recovery;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
@@ -92,20 +93,21 @@ pub fn execute(
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let config_layer = storage_ctx.load_config(cli)?;
     let result = {
-        let storage = &mut storage_ctx.storage;
-
         // 3. Validate all IDs exist
         for id in &ids {
-            if storage.get_issue(id)?.is_none() {
+            if storage_ctx.storage.get_issue(id)?.is_none() {
                 return Err(BeadsError::IssueNotFound { id: id.clone() });
             }
         }
 
         // 4. Check for dependents (if not --force and not --cascade)
         let delete_set: HashSet<String> = ids.iter().cloned().collect();
-        let blocked_dependents = collect_direct_dependents(storage, &ids)?;
+        let blocked_dependents = collect_direct_dependents(&storage_ctx.storage, &ids)?;
         let cascade_dependents = if args.cascade {
-            Some(collect_sorted_cascade_dependents(storage, &ids)?)
+            Some(collect_sorted_cascade_dependents(
+                &storage_ctx.storage,
+                &ids,
+            )?)
         } else {
             None
         };
@@ -131,7 +133,7 @@ pub fn execute(
                 return Ok(());
             }
             if ctx.is_rich() {
-                render_dependents_warning_rich(&blocked_dependents, storage, ctx);
+                render_dependents_warning_rich(&blocked_dependents, &storage_ctx.storage, ctx);
             } else {
                 println!("The following issues depend on issues being deleted:");
                 for dep in &blocked_dependents {
@@ -178,12 +180,13 @@ pub fn execute(
                 } else {
                     vec![]
                 };
-                render_dry_run_rich(&ids, &cascade_ids, &orphan_ids, storage, ctx);
+                render_dry_run_rich(&ids, &cascade_ids, &orphan_ids, &storage_ctx.storage, ctx);
                 return Ok(());
             }
             println!("Dry-run: Would delete {} issue(s):", ids.len());
             for id in &ids {
-                let issue = storage
+                let issue = storage_ctx
+                    .storage
                     .get_issue(id)?
                     .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
                 println!("  - {}: {}", id, issue.title);
@@ -219,9 +222,19 @@ pub fn execute(
         let mut result = DeleteResult::new();
 
         // First, remove all dependency links for issues being deleted
+        let mut batch_has_mutated = false;
         for id in &final_delete_set {
-            let deps_removed = storage.remove_all_dependencies(id, &actor)?;
+            let deps_removed = retry_mutation_with_jsonl_recovery(
+                &mut storage_ctx,
+                !batch_has_mutated,
+                "delete remove dependencies",
+                Some(id.as_str()),
+                |storage| storage.remove_all_dependencies(id, &actor),
+            )?;
             result.dependencies_removed += deps_removed;
+            if deps_removed > 0 {
+                batch_has_mutated = true;
+            }
         }
 
         // Track orphaned issues (only relevant for --force mode)
@@ -234,13 +247,26 @@ pub fn execute(
         final_ids.sort();
         for id in &final_ids {
             if args.hard {
-                result.labels_removed += storage.get_labels(id)?.len();
-                result.events_removed += storage.count_issue_events(id)?;
+                result.labels_removed += storage_ctx.storage.get_labels(id)?.len();
+                result.events_removed += storage_ctx.storage.count_issue_events(id)?;
                 // Hard delete: physically remove from DB so it's pruned from JSONL
-                storage.purge_issue(id, &actor)?;
+                retry_mutation_with_jsonl_recovery(
+                    &mut storage_ctx,
+                    !batch_has_mutated,
+                    "delete purge",
+                    Some(id.as_str()),
+                    |storage| storage.purge_issue(id, &actor),
+                )?;
             } else {
-                storage.delete_issue(id, &actor, &args.reason, None)?;
+                retry_mutation_with_jsonl_recovery(
+                    &mut storage_ctx,
+                    !batch_has_mutated,
+                    "delete tombstone",
+                    Some(id.as_str()),
+                    |storage| storage.delete_issue(id, &actor, &args.reason, None),
+                )?;
             }
+            batch_has_mutated = true;
             result.deleted.push(id.clone());
         }
         result.deleted_count = result.deleted.len();

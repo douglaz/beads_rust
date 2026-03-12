@@ -2,7 +2,7 @@
 //!
 //! Provides label management: add, remove, list, list-all, and rename.
 
-use super::resolve_issue_id;
+use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery};
 use crate::cli::{LabelAddArgs, LabelCommands, LabelListArgs, LabelRemoveArgs, LabelRenameArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -163,18 +163,25 @@ fn label_add(
     prepared_route: &mut PreparedLabelRoute,
     label: &str,
 ) -> Result<Vec<LabelActionResult>> {
-    let storage = &mut prepared_route.storage_ctx.storage;
     let mut results = Vec::new();
+    let mut route_has_mutated = false;
 
     for issue_id in &prepared_route.resolved_ids {
         info!(issue_id = %issue_id, label = %label, "Adding label");
 
-        let added = storage.add_label(issue_id, label, &prepared_route.actor)?;
+        let added = retry_mutation_with_jsonl_recovery(
+            &mut prepared_route.storage_ctx,
+            !route_has_mutated,
+            "label add",
+            Some(issue_id.as_str()),
+            |storage| storage.add_label(issue_id, label, &prepared_route.actor),
+        )?;
 
         debug!(already_exists = !added, "Label status check");
 
         if added {
             info!(issue_id = %issue_id, label = %label, "Label added");
+            route_has_mutated = true;
         }
 
         results.push(LabelActionResult {
@@ -221,13 +228,22 @@ fn label_remove(
     prepared_route: &mut PreparedLabelRoute,
     label: &str,
 ) -> Result<Vec<LabelActionResult>> {
-    let storage = &mut prepared_route.storage_ctx.storage;
     let mut results = Vec::new();
+    let mut route_has_mutated = false;
 
     for issue_id in &prepared_route.resolved_ids {
         info!(issue_id = %issue_id, label = %label, "Removing label");
 
-        let removed = storage.remove_label(issue_id, label, &prepared_route.actor)?;
+        let removed = retry_mutation_with_jsonl_recovery(
+            &mut prepared_route.storage_ctx,
+            !route_has_mutated,
+            "label remove",
+            Some(issue_id.as_str()),
+            |storage| storage.remove_label(issue_id, label, &prepared_route.actor),
+        )?;
+        if removed {
+            route_has_mutated = true;
+        }
 
         results.push(LabelActionResult {
             status: if removed { "removed" } else { "not_found" }.to_string(),

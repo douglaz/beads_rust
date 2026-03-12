@@ -10,12 +10,14 @@ use crate::sync::{
     PathValidation, scan_conflict_markers, validate_no_git_path, validate_sync_path,
 };
 use fsqlite::Connection;
+use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Check result status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -47,6 +49,11 @@ struct DoctorRepairResult {
     imported: usize,
     skipped: usize,
     fk_violations_cleaned: usize,
+}
+
+struct DoctorRun {
+    report: DoctorReport,
+    jsonl_path: Option<PathBuf>,
 }
 
 fn push_check(
@@ -397,6 +404,247 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
             Some(messages.join("; ")),
             (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
         );
+    }
+}
+
+fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
+    let duplicate_schema_rows = conn.query(
+        "SELECT type, name, COUNT(*) AS row_count
+         FROM sqlite_master
+         WHERE name IN ('blocked_issues_cache', 'idx_blocked_cache_blocked_at')
+         GROUP BY type, name
+         HAVING COUNT(*) > 1
+         ORDER BY row_count DESC, name ASC
+         LIMIT 1",
+    )?;
+
+    let duplicate_config = conn.query(
+        "SELECT key, COUNT(*) AS row_count
+         FROM config
+         GROUP BY key
+         HAVING COUNT(*) > 1
+         ORDER BY row_count DESC, key ASC
+         LIMIT 1",
+    )?;
+
+    let duplicate_metadata = conn.query(
+        "SELECT key, COUNT(*) AS row_count
+         FROM metadata
+         GROUP BY key
+         HAVING COUNT(*) > 1
+         ORDER BY row_count DESC, key ASC
+         LIMIT 1",
+    )?;
+
+    let mut findings = Vec::new();
+
+    if let Some(row) = duplicate_schema_rows.first() {
+        let object_type = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("object");
+        let name = row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("unknown");
+        let row_count = row.get(2).and_then(SqliteValue::as_integer).unwrap_or(2);
+        findings.push(format!(
+            "sqlite_master contains duplicate {object_type} entries for '{name}' ({row_count} rows)"
+        ));
+    }
+
+    if let Some(row) = duplicate_config.first() {
+        let key = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("unknown");
+        let row_count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(2);
+        findings.push(format!(
+            "config contains duplicate rows for key '{key}' ({row_count} rows)"
+        ));
+    }
+
+    if let Some(row) = duplicate_metadata.first() {
+        let key = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("unknown");
+        let row_count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(2);
+        findings.push(format!(
+            "metadata contains duplicate rows for key '{key}' ({row_count} rows)"
+        ));
+    }
+
+    if findings.is_empty() {
+        push_check(
+            checks,
+            "db.recoverable_anomalies",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+    } else {
+        push_check(
+            checks,
+            "db.recoverable_anomalies",
+            CheckStatus::Error,
+            Some(findings[0].clone()),
+            Some(serde_json::json!({ "findings": findings })),
+        );
+    }
+
+    Ok(())
+}
+
+fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
+    let issue_id = match conn.query_row("SELECT id FROM issues ORDER BY id LIMIT 1") {
+        Ok(row) => row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .map(ToString::to_string),
+        Err(FrankenError::QueryReturnedNoRows) => None,
+        Err(err) => {
+            push_check(
+                checks,
+                "db.write_probe",
+                CheckStatus::Error,
+                Some(format!("Failed to select probe issue: {err}")),
+                None,
+            );
+            return;
+        }
+    };
+
+    let Some(issue_id) = issue_id else {
+        push_check(
+            checks,
+            "db.write_probe",
+            CheckStatus::Ok,
+            Some("No issues available for rollback-only write probe".to_string()),
+            None,
+        );
+        return;
+    };
+
+    let begin_result = conn.execute("BEGIN IMMEDIATE");
+    if let Err(err) = begin_result {
+        let status = if err.is_transient() {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Error
+        };
+        push_check(
+            checks,
+            "db.write_probe",
+            status,
+            Some(format!("Failed to begin rollback-only write probe: {err}")),
+            Some(serde_json::json!({ "issue_id": issue_id })),
+        );
+        return;
+    }
+
+    let update_result = conn.execute_with_params(
+        "UPDATE issues SET priority = priority, status = status WHERE id = ?",
+        &[SqliteValue::from(issue_id.as_str())],
+    );
+    let rollback_result = conn.execute("ROLLBACK");
+
+    if let Err(err) = rollback_result {
+        tracing::warn!(error = %err, issue_id = %issue_id, "ROLLBACK failed during doctor write probe");
+    }
+
+    match update_result {
+        Ok(_) => push_check(
+            checks,
+            "db.write_probe",
+            CheckStatus::Ok,
+            Some(format!(
+                "Rollback-only issue write succeeded for {issue_id}"
+            )),
+            None,
+        ),
+        Err(err) => push_check(
+            checks,
+            "db.write_probe",
+            CheckStatus::Error,
+            Some(format!("Rollback-only issue write failed: {err}")),
+            Some(serde_json::json!({ "issue_id": issue_id })),
+        ),
+    }
+}
+
+fn sqlite_cli_integrity_messages(db_path: &Path) -> Result<Vec<String>> {
+    let output = Command::new("sqlite3")
+        .arg(db_path)
+        .arg("PRAGMA integrity_check;")
+        .output()
+        .map_err(|err| BeadsError::Config(format!("failed to run sqlite3: {err}")))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut messages: Vec<String> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    if messages.is_empty() && !output.status.success() {
+        messages.push(format!(
+            "sqlite3 exited with status {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    if output.status.success() {
+        Ok(messages)
+    } else {
+        Err(BeadsError::Config(messages.join("; ")))
+    }
+}
+
+fn check_sqlite_cli_integrity(db_path: &Path, checks: &mut Vec<CheckResult>) {
+    match sqlite_cli_integrity_messages(db_path) {
+        Ok(messages) if messages.len() == 1 && messages[0].eq_ignore_ascii_case("ok") => {
+            push_check(
+                checks,
+                "sqlite3.integrity_check",
+                CheckStatus::Ok,
+                None,
+                None,
+            );
+        }
+        Ok(messages) => {
+            push_check(
+                checks,
+                "sqlite3.integrity_check",
+                CheckStatus::Error,
+                Some(messages.join("; ")),
+                (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
+            );
+        }
+        Err(BeadsError::Config(message))
+            if message.contains("No such file or directory")
+                || message.contains("failed to run sqlite3") =>
+        {
+            push_check(
+                checks,
+                "sqlite3.integrity_check",
+                CheckStatus::Warn,
+                Some("sqlite3 not available; skipping orthogonal integrity validation".to_string()),
+                None,
+            );
+        }
+        Err(err) => {
+            push_check(
+                checks,
+                "sqlite3.integrity_check",
+                CheckStatus::Error,
+                Some(err.to_string()),
+                None,
+            );
+        }
     }
 }
 
@@ -909,62 +1157,18 @@ fn check_sync_metadata(
     }
 }
 
-/// Execute the doctor command.
-///
-/// # Errors
-///
-/// Returns an error if report serialization fails or if IO operations fail.
-#[allow(clippy::too_many_lines)]
-pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
     let mut checks = Vec::new();
-    let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
-        push_check(
-            &mut checks,
-            "beads_dir",
-            CheckStatus::Error,
-            Some("Missing .beads directory (run `br init`)".to_string()),
-            None,
-        );
-        let report = DoctorReport {
-            ok: !has_error(&checks),
-            checks,
-        };
-        print_report(&report, ctx)?;
-        std::process::exit(1);
-    };
 
-    let paths = match config::resolve_paths(&beads_dir, cli.db.as_ref()) {
-        Ok(paths) => paths,
-        Err(err) => {
-            push_check(
-                &mut checks,
-                "metadata",
-                CheckStatus::Error,
-                Some(format!("Failed to read metadata.json: {err}")),
-                None,
-            );
-            let report = DoctorReport {
-                ok: !has_error(&checks),
-                checks,
-            };
-            print_report(&report, ctx)?;
-            std::process::exit(1);
-        }
-    };
-
-    check_merge_artifacts(&beads_dir, &mut checks)?;
+    check_merge_artifacts(beads_dir, &mut checks)?;
 
     let jsonl_path = if paths.jsonl_path.exists() {
         Some(paths.jsonl_path.clone())
     } else {
-        discover_jsonl(&beads_dir)
+        discover_jsonl(beads_dir)
     };
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
-        // SYNC SAFETY CHECKS (beads_rust-0v1.2.6)
-        // Check JSONL path is within sync allowlist
-        check_sync_jsonl_path(path, &beads_dir, &mut checks);
-
-        // Check for merge conflict markers
+        check_sync_jsonl_path(path, beads_dir, &mut checks);
         check_sync_conflict_markers(path, &mut checks);
 
         match check_jsonl(path, &mut checks) {
@@ -995,12 +1199,14 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     if db_path.exists() {
         match Connection::open(db_path.to_string_lossy().into_owned()) {
             Ok(conn) => {
+                let _ = conn.execute("PRAGMA busy_timeout=30000");
                 required_schema_checks(&conn, &mut checks)?;
+                check_recoverable_anomalies(&conn, &mut checks)?;
                 check_integrity(&conn, &mut checks);
+                check_issue_write_probe(&conn, &mut checks);
                 check_db_count(&conn, jsonl_count, &mut checks)?;
-
-                // SYNC SAFETY CHECK: metadata consistency (beads_rust-0v1.2.6)
-                check_sync_metadata(&conn, Some(&paths.jsonl_path), &mut checks);
+                check_sync_metadata(&conn, jsonl_path.as_deref(), &mut checks);
+                check_sqlite_cli_integrity(&db_path, &mut checks);
             }
             Err(err) => {
                 push_check(
@@ -1010,6 +1216,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     Some(format!("Failed to open DB read-only: {err}")),
                     Some(serde_json::json!({ "path": db_path.display().to_string() })),
                 );
+                check_sqlite_cli_integrity(&db_path, &mut checks);
             }
         }
     } else {
@@ -1022,57 +1229,129 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         );
     }
 
-    let report = DoctorReport {
-        ok: !has_error(&checks),
-        checks,
-    };
-    print_report(&report, ctx)?;
+    Ok(DoctorRun {
+        report: DoctorReport {
+            ok: !has_error(&checks),
+            checks,
+        },
+        jsonl_path,
+    })
+}
 
-    // --repair: rebuild DB from JSONL when errors are detected
-    if args.repair {
-        if report.ok {
-            if !ctx.is_json() {
-                ctx.info("No errors detected; nothing to repair.");
-            }
-            return Ok(());
-        }
-
-        let Some(jsonl_path) = jsonl_path.as_ref() else {
-            return Err(BeadsError::Config(
-                "Cannot repair: no JSONL file found to rebuild from".to_string(),
-            ));
+/// Execute the doctor command.
+///
+/// # Errors
+///
+/// Returns an error if report serialization fails or if IO operations fail.
+#[allow(clippy::too_many_lines)]
+pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
+        let mut checks = Vec::new();
+        push_check(
+            &mut checks,
+            "beads_dir",
+            CheckStatus::Error,
+            Some("Missing .beads directory (run `br init`)".to_string()),
+            None,
+        );
+        let report = DoctorReport {
+            ok: !has_error(&checks),
+            checks,
         };
-
-        if !ctx.is_json() {
-            ctx.info("Repairing: rebuilding DB from JSONL...");
-        }
-
-        match repair_database_from_jsonl(&beads_dir, &db_path, jsonl_path, cli, !ctx.is_json()) {
-            Ok(result) => {
-                if ctx.is_json() {
-                    ctx.json(&serde_json::json!({
-                        "repaired": true,
-                        "imported": result.imported,
-                        "skipped": result.skipped,
-                        "fk_violations_cleaned": result.fk_violations_cleaned,
-                    }));
-                } else {
-                    ctx.info(&format!(
-                        "Repair complete: imported {}, skipped {}",
-                        result.imported, result.skipped
-                    ));
-                }
-            }
-            Err(err) => {
-                return Err(BeadsError::Config(format!(
-                    "Repair import failed: {err}. \
-                     The JSONL file may be corrupt. \
-                     Try manually editing the JSONL to fix invalid records."
-                )));
-            }
-        }
-    } else if !report.ok {
+        print_report(&report, ctx)?;
         std::process::exit(1);
+    };
+
+    let paths = match config::resolve_paths(&beads_dir, cli.db.as_ref()) {
+        Ok(paths) => paths,
+        Err(err) => {
+            let mut checks = Vec::new();
+            push_check(
+                &mut checks,
+                "metadata",
+                CheckStatus::Error,
+                Some(format!("Failed to read metadata.json: {err}")),
+                None,
+            );
+            let report = DoctorReport {
+                ok: !has_error(&checks),
+                checks,
+            };
+            print_report(&report, ctx)?;
+            std::process::exit(1);
+        }
+    };
+
+    let initial = collect_doctor_report(&beads_dir, &paths)?;
+
+    if !args.repair {
+        print_report(&initial.report, ctx)?;
+        if !initial.report.ok {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if initial.report.ok {
+        if ctx.is_json() {
+            ctx.json(&serde_json::json!({
+                "report": initial.report,
+                "repaired": false,
+                "message": "No errors detected; nothing to repair."
+            }));
+        } else {
+            print_report(&initial.report, ctx)?;
+            ctx.info("No errors detected; nothing to repair.");
+        }
+        return Ok(());
+    }
+
+    let Some(jsonl_path) = initial.jsonl_path.as_ref() else {
+        return Err(BeadsError::Config(
+            "Cannot repair: no JSONL file found to rebuild from".to_string(),
+        ));
+    };
+
+    if !ctx.is_json() {
+        print_report(&initial.report, ctx)?;
+        ctx.info("Repairing: rebuilding DB from JSONL...");
+    }
+
+    let repair_result =
+        repair_database_from_jsonl(&beads_dir, &paths.db_path, jsonl_path, cli, !ctx.is_json())
+            .map_err(|err| {
+                BeadsError::Config(format!(
+                    "Repair import failed: {err}. \
+             The JSONL file may be corrupt. \
+             Try manually editing the JSONL to fix invalid records."
+                ))
+            })?;
+
+    let post_repair = collect_doctor_report(&beads_dir, &paths)?;
+
+    if ctx.is_json() {
+        ctx.json(&serde_json::json!({
+            "report": initial.report,
+            "repaired": true,
+            "imported": repair_result.imported,
+            "skipped": repair_result.skipped,
+            "fk_violations_cleaned": repair_result.fk_violations_cleaned,
+            "post_repair": post_repair.report,
+            "verified": post_repair.report.ok,
+        }));
+    } else {
+        ctx.info(&format!(
+            "Repair complete: imported {}, skipped {}",
+            repair_result.imported, repair_result.skipped
+        ));
+        ctx.info("Post-repair verification:");
+        print_report(&post_repair.report, ctx)?;
+    }
+
+    if !post_repair.report.ok {
+        return Err(BeadsError::Config(
+            "Repair completed, but post-repair verification still found issues".to_string(),
+        ));
     }
 
     Ok(())

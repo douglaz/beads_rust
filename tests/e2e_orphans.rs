@@ -491,7 +491,11 @@ fn e2e_orphans_robot_flag_overrides_toon_env_output() {
     let init = run_br(&workspace, ["init"], "br_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let create = run_br(&workspace, ["create", "Robot TOON override"], "create_issue");
+    let create = run_br(
+        &workspace,
+        ["create", "Robot TOON override"],
+        "create_issue",
+    );
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let issue_id = parse_created_id(&create.stdout);
 
@@ -574,7 +578,10 @@ fn e2e_orphans_empty_robot_output_overrides_toon_env_output() {
 
     let payload = extract_json_payload(&orphans.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
-    assert!(json.is_array(), "robot flag should still return JSON for empty output");
+    assert!(
+        json.is_array(),
+        "robot flag should still return JSON for empty output"
+    );
     assert!(json.as_array().unwrap().is_empty(), "expected empty array");
     info!("e2e_orphans_empty_robot_output_overrides_toon_env_output: assertions passed");
 }

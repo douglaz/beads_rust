@@ -1,7 +1,9 @@
 //! Reopen command implementation.
 
 use crate::cli::ReopenArgs;
-use crate::cli::commands::{preserve_blocked_cache_on_error, update_issue_with_recovery};
+use crate::cli::commands::{
+    preserve_blocked_cache_on_error, retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Status;
@@ -267,7 +269,13 @@ fn execute_route(
         if let Some(ref reason) = args.reason {
             let comment_text = format!("Reopened: {reason}");
             tracing::debug!(id = %id, "Adding reopen comment");
-            let comment_result = storage_ctx.storage.add_comment(id, &actor, &comment_text);
+            let comment_result = retry_mutation_with_jsonl_recovery(
+                &mut storage_ctx,
+                !cache_dirty,
+                "reopen comment",
+                Some(id.as_str()),
+                |storage| storage.add_comment(id, &actor, &comment_text),
+            );
             preserve_blocked_cache_on_error(
                 &mut storage_ctx.storage,
                 cache_dirty,

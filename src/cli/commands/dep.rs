@@ -1,6 +1,6 @@
 //! Dependency command implementation.
 
-use super::resolve_issue_id;
+use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery};
 use crate::cli::{
     DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
     OutputFormat, resolve_output_format_basic_with_outer_mode,
@@ -142,14 +142,13 @@ fn dep_add(
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let storage = &mut storage_ctx.storage;
-    let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
+    let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, all_ids, &args.issue)?;
 
     // External dependencies don't need resolution
     let depends_on_id = if args.depends_on.starts_with("external:") {
         args.depends_on.clone()
     } else {
-        resolve_issue_id(storage, resolver, all_ids, &args.depends_on)?
+        resolve_issue_id(&storage_ctx.storage, resolver, all_ids, &args.depends_on)?
     };
 
     // Parse and validate dependency type
@@ -183,19 +182,29 @@ fn dep_add(
     // Cycle check for blocking types only
     if dep_type.is_blocking()
         && !depends_on_id.starts_with("external:")
-        && storage.would_create_cycle(&issue_id, &depends_on_id, true)?
+        && storage_ctx
+            .storage
+            .would_create_cycle(&issue_id, &depends_on_id, true)?
     {
         return Err(BeadsError::DependencyCycle {
             path: format!("{issue_id} -> {depends_on_id}"),
         });
     }
 
-    let added = storage.add_dependency_with_metadata(
-        &issue_id,
-        &depends_on_id,
-        dep_type.as_str(),
-        actor,
-        args.metadata.as_deref(),
+    let added = retry_mutation_with_jsonl_recovery(
+        storage_ctx,
+        true,
+        "dep add",
+        Some(issue_id.as_str()),
+        |storage| {
+            storage.add_dependency_with_metadata(
+                &issue_id,
+                &depends_on_id,
+                dep_type.as_str(),
+                actor,
+                args.metadata.as_deref(),
+            )
+        },
     )?;
 
     storage_ctx.flush_no_db_then(|ctx| {
@@ -262,19 +271,24 @@ fn dep_remove(
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let storage = &mut storage_ctx.storage;
-    let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
+    let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, all_ids, &args.issue)?;
 
     // External dependencies don't need resolution
     let depends_on_id = if args.depends_on.starts_with("external:") {
         args.depends_on.clone()
     } else {
-        resolve_issue_id(storage, resolver, all_ids, &args.depends_on)?
+        resolve_issue_id(&storage_ctx.storage, resolver, all_ids, &args.depends_on)?
     };
 
-    let dep_type = dependency_type_for_pair(storage, &issue_id, &depends_on_id)?
+    let dep_type = dependency_type_for_pair(&storage_ctx.storage, &issue_id, &depends_on_id)?
         .unwrap_or_else(|| "unknown".to_string());
-    let removed = storage.remove_dependency(&issue_id, &depends_on_id, actor)?;
+    let removed = retry_mutation_with_jsonl_recovery(
+        storage_ctx,
+        true,
+        "dep remove",
+        Some(issue_id.as_str()),
+        |storage| storage.remove_dependency(&issue_id, &depends_on_id, actor),
+    )?;
 
     storage_ctx.flush_no_db_then(|ctx| {
         crate::util::set_last_touched_id(&ctx.paths.beads_dir, &issue_id);

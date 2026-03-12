@@ -1,6 +1,6 @@
 //! Update command implementation.
 
-use super::{resolve_issue_id, update_issue_with_recovery};
+use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery, update_issue_with_recovery};
 use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -269,6 +269,8 @@ fn execute_prepared_route(
     let mut render_items = Vec::new();
     let resolved_ids = prepared.resolved_ids.clone();
     let mut route_has_mutated = false;
+    let defer_blocked_cache_rebuild = prepared.update.status.is_some()
+        || !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
 
     for id in &prepared.resolved_ids {
         // Get issue before update for change tracking
@@ -276,12 +278,14 @@ fn execute_prepared_route(
 
         // Apply basic field updates
         if !prepared.update.is_empty() {
+            let mut issue_update = prepared.update.clone();
+            issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
             update_issue_with_recovery(
                 &mut prepared.storage_ctx,
                 !route_has_mutated,
                 "update",
                 id,
-                &prepared.update,
+                &issue_update,
                 &prepared.actor,
             )?;
             route_has_mutated = true;
@@ -289,34 +293,44 @@ fn execute_prepared_route(
 
         // Apply labels
         for label in &prepared.add_labels {
-            prepared
-                .storage_ctx
-                .storage
-                .add_label(id, label, &prepared.actor)?;
+            retry_mutation_with_jsonl_recovery(
+                &mut prepared.storage_ctx,
+                !route_has_mutated,
+                "update label add",
+                Some(id.as_str()),
+                |storage| storage.add_label(id, label, &prepared.actor),
+            )?;
             route_has_mutated = true;
         }
         for label in &prepared.remove_labels {
-            prepared
-                .storage_ctx
-                .storage
-                .remove_label(id, label, &prepared.actor)?;
+            retry_mutation_with_jsonl_recovery(
+                &mut prepared.storage_ctx,
+                !route_has_mutated,
+                "update label remove",
+                Some(id.as_str()),
+                |storage| storage.remove_label(id, label, &prepared.actor),
+            )?;
             route_has_mutated = true;
         }
         if prepared.set_labels {
-            prepared.storage_ctx.storage.set_labels(
-                id,
-                &prepared.valid_set_labels,
-                &prepared.actor,
+            retry_mutation_with_jsonl_recovery(
+                &mut prepared.storage_ctx,
+                !route_has_mutated,
+                "update label set",
+                Some(id.as_str()),
+                |storage| storage.set_labels(id, &prepared.valid_set_labels, &prepared.actor),
             )?;
             route_has_mutated = true;
         }
 
         // Apply parent
         apply_parent_update(
-            &mut prepared.storage_ctx.storage,
+            &mut prepared.storage_ctx,
+            !route_has_mutated,
             id,
             &prepared.resolved_parent,
             &prepared.actor,
+            defer_blocked_cache_rebuild,
         )?;
         if !matches!(&prepared.resolved_parent, ParentUpdatePlan::Unchanged) {
             route_has_mutated = true;
@@ -340,6 +354,10 @@ fn execute_prepared_route(
                 render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
             }
         }
+    }
+
+    if defer_blocked_cache_rebuild && route_has_mutated {
+        prepared.storage_ctx.storage.rebuild_blocked_cache(true)?;
     }
 
     prepared.storage_ctx.flush_no_db_if_dirty()?;
@@ -719,15 +737,36 @@ fn resolve_parent_update(
 }
 
 fn apply_parent_update(
-    storage: &mut SqliteStorage,
+    storage_ctx: &mut config::OpenStorageResult,
+    allow_recovery: bool,
     issue_id: &str,
     parent: &ParentUpdatePlan,
     actor: &str,
+    skip_cache_rebuild: bool,
 ) -> Result<()> {
     match parent {
         ParentUpdatePlan::Unchanged => Ok(()),
-        ParentUpdatePlan::Clear => storage.set_parent(issue_id, None, actor),
-        ParentUpdatePlan::Set(parent_id) => storage.set_parent(issue_id, Some(parent_id), actor),
+        ParentUpdatePlan::Clear => retry_mutation_with_jsonl_recovery(
+            storage_ctx,
+            allow_recovery,
+            "update parent clear",
+            Some(issue_id),
+            |storage| storage.set_parent_with_options(issue_id, None, actor, skip_cache_rebuild),
+        ),
+        ParentUpdatePlan::Set(parent_id) => retry_mutation_with_jsonl_recovery(
+            storage_ctx,
+            allow_recovery,
+            "update parent set",
+            Some(issue_id),
+            |storage| {
+                storage.set_parent_with_options(
+                    issue_id,
+                    Some(parent_id),
+                    actor,
+                    skip_cache_rebuild,
+                )
+            },
+        ),
     }
 }
 

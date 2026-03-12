@@ -1,6 +1,6 @@
 //! Comments command implementation.
 
-use super::resolve_issue_id;
+use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery};
 use crate::cli::{CommentAddArgs, CommentCommands, CommentsArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -56,12 +56,19 @@ fn execute_add(
     let all_ids = storage_ctx.storage.get_all_ids()?;
     let actor = config::actor_from_layer(&config_layer);
 
-    let (issue_id, comment) = add_comment(
+    let (issue_id, author, text) = prepare_comment_add(
         args,
-        &mut storage_ctx.storage,
+        &storage_ctx.storage,
         &resolver,
         &all_ids,
         actor.as_deref(),
+    )?;
+    let comment = retry_mutation_with_jsonl_recovery(
+        &mut storage_ctx,
+        true,
+        "comment add",
+        Some(issue_id.as_str()),
+        |storage| storage.add_comment(&issue_id, &author, &text),
     )?;
     storage_ctx.flush_no_db_if_dirty()?;
     crate::util::set_last_touched_id(beads_dir, &issue_id);
@@ -122,13 +129,13 @@ fn open_routed_storage_for_input(
     Ok((storage_ctx, route_cli))
 }
 
-fn add_comment(
+fn prepare_comment_add(
     args: &CommentAddArgs,
-    storage: &mut SqliteStorage,
+    storage: &SqliteStorage,
     resolver: &IdResolver,
     all_ids: &[String],
     actor: Option<&str>,
-) -> Result<(String, Comment)> {
+) -> Result<(String, String, String)> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.id)?;
     let text = read_comment_text(args)?;
     if text.trim().is_empty() {
@@ -138,9 +145,7 @@ fn add_comment(
         ));
     }
     let author = resolve_author(args.author.as_deref(), actor);
-
-    let comment = storage.add_comment(&issue_id, &author, &text)?;
-    Ok((issue_id, comment))
+    Ok((issue_id, author, text))
 }
 
 fn list_comments_by_id(

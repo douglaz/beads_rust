@@ -25,6 +25,8 @@ const EXPORT_HASH_CHUNK_SIZE: usize = 900;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
 const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
 const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
+const BLOCKED_CACHE_STATE_KEY: &str = "blocked_cache_state";
+const BLOCKED_CACHE_STATE_STALE: &str = "stale";
 
 /// SQLite-based storage backend.
 #[derive(Debug)]
@@ -46,6 +48,25 @@ pub struct MutationContext {
     /// while `invalidate_blocked_cache` is true, the entire cache is rebuilt.
     pub cache_affected_ids: Option<HashSet<String>>,
     pub force_flush: bool,
+}
+
+#[derive(Debug, Clone)]
+enum BlockedCacheRefreshPlan {
+    Full,
+    Incremental(HashSet<String>),
+}
+
+impl BlockedCacheRefreshPlan {
+    fn from_context(ctx: &MutationContext) -> Option<Self> {
+        if !ctx.invalidate_blocked_cache {
+            return None;
+        }
+
+        match &ctx.cache_affected_ids {
+            Some(ids) if !ids.is_empty() => Some(Self::Incremental(ids.clone())),
+            _ => Some(Self::Full),
+        }
+    }
 }
 
 impl MutationContext {
@@ -120,6 +141,130 @@ impl MutationContext {
 }
 
 impl SqliteStorage {
+    fn with_connection_write_transaction<F, R>(conn: &Connection, mut f: F) -> Result<R>
+    where
+        F: FnMut(&Connection) -> Result<R>,
+    {
+        const MAX_RETRIES: u32 = 5;
+        let base_backoff_ms: u64 = 10;
+
+        for attempt in 0..MAX_RETRIES {
+            match conn.execute("BEGIN IMMEDIATE") {
+                Ok(_) => {}
+                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                    let backoff = base_backoff_ms * 2u64.pow(attempt);
+                    std::thread::sleep(Duration::from_millis(backoff));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            match f(conn) {
+                Ok(result) => match conn.execute("COMMIT") {
+                    Ok(_) => return Ok(result),
+                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                        if let Err(rb_err) = conn.execute("ROLLBACK") {
+                            tracing::warn!(
+                                error = %rb_err,
+                                "ROLLBACK failed after transient COMMIT error"
+                            );
+                        }
+                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                        std::thread::sleep(Duration::from_millis(backoff));
+                    }
+                    Err(e) => {
+                        if let Err(rb_err) = conn.execute("ROLLBACK") {
+                            tracing::warn!(error = %rb_err, "ROLLBACK failed after COMMIT error");
+                        }
+                        return Err(e.into());
+                    }
+                },
+                Err(e) => {
+                    if let Err(rb_err) = conn.execute("ROLLBACK") {
+                        tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
+                    }
+                    if e.is_transient() && attempt < MAX_RETRIES - 1 {
+                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                        std::thread::sleep(Duration::from_millis(backoff));
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        unreachable!("Retry loop exited without returning")
+    }
+
+    fn delete_metadata_key_in_tx(conn: &Connection, key: &str) -> Result<()> {
+        conn.execute_with_params(
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(key)],
+        )?;
+        Ok(())
+    }
+
+    fn metadata_equals(conn: &Connection, key: &str, expected: &str) -> Result<bool> {
+        match conn.query_row_with_params(
+            "SELECT value FROM metadata WHERE key = ?",
+            &[SqliteValue::from(key)],
+        ) {
+            Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text) == Some(expected)),
+            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn apply_blocked_cache_refresh_plan(
+        conn: &Connection,
+        plan: &BlockedCacheRefreshPlan,
+    ) -> Result<usize> {
+        match plan {
+            BlockedCacheRefreshPlan::Full => Self::rebuild_blocked_cache_impl(conn),
+            BlockedCacheRefreshPlan::Incremental(ids) => {
+                Self::incremental_blocked_cache_update(conn, ids)
+            }
+        }
+    }
+
+    fn refresh_blocked_cache_after_commit(
+        &self,
+        op: &str,
+        plan: &BlockedCacheRefreshPlan,
+    ) -> Result<()> {
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            let refreshed = Self::apply_blocked_cache_refresh_plan(conn, plan)?;
+            Self::delete_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY)?;
+            tracing::debug!(operation = op, refreshed, "Refreshed blocked issues cache");
+            Ok(())
+        })
+    }
+
+    pub(crate) fn blocked_cache_marked_stale(&self) -> Result<bool> {
+        Self::metadata_equals(
+            &self.conn,
+            BLOCKED_CACHE_STATE_KEY,
+            BLOCKED_CACHE_STATE_STALE,
+        )
+    }
+
+    pub(crate) fn ensure_blocked_cache_fresh(&self) -> Result<bool> {
+        if !self.blocked_cache_marked_stale()? {
+            return Ok(false);
+        }
+
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            if !Self::metadata_equals(conn, BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)? {
+                return Ok(false);
+            }
+
+            let refreshed = Self::rebuild_blocked_cache_impl(conn)?;
+            Self::delete_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY)?;
+            tracing::debug!(refreshed, "Rebuilt stale blocked issues cache on demand");
+            Ok(true)
+        })
+    }
+
     /// Open a new connection to the database at the given path.
     ///
     /// # Errors
@@ -523,7 +668,7 @@ impl SqliteStorage {
     where
         F: FnMut(&Connection, &mut MutationContext) -> Result<R>,
     {
-        self.with_write_transaction(|storage| {
+        let (result, blocked_cache_plan) = self.with_write_transaction(|storage| {
             let mut ctx = MutationContext::new(op, actor);
             let result = f(&storage.conn, &mut ctx)?;
 
@@ -592,16 +737,9 @@ impl SqliteStorage {
                 }
             }
 
-            // Rebuild blocked cache inside the transaction if needed
-            if ctx.invalidate_blocked_cache {
-                match ctx.cache_affected_ids {
-                    Some(ref affected) if !affected.is_empty() => {
-                        Self::incremental_blocked_cache_update(&storage.conn, affected)?;
-                    }
-                    _ => {
-                        Self::rebuild_blocked_cache_impl(&storage.conn)?;
-                    }
-                }
+            let blocked_cache_plan = BlockedCacheRefreshPlan::from_context(&ctx);
+            if blocked_cache_plan.is_some() {
+                storage.set_metadata_in_tx(BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)?;
             }
 
             if ctx.force_flush {
@@ -615,8 +753,20 @@ impl SqliteStorage {
                 )?;
             }
 
-            Ok(result)
-        })
+            Ok((result, blocked_cache_plan))
+        })?;
+
+        if let Some(ref plan) = blocked_cache_plan
+            && let Err(error) = self.refresh_blocked_cache_after_commit(op, plan)
+        {
+            tracing::warn!(
+                operation = op,
+                error = %error,
+                "Blocked cache refresh deferred after commit; cache remains marked stale"
+            );
+        }
+
+        Ok(result)
     }
 
     /// Create a new issue.
@@ -1819,6 +1969,7 @@ impl SqliteStorage {
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
+        let _ = self.ensure_blocked_cache_fresh()?;
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -1983,6 +2134,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocked_ids(&self) -> Result<HashSet<String>> {
+        let _ = self.ensure_blocked_cache_fresh()?;
         let rows = self
             .conn
             .query("SELECT issue_id FROM blocked_issues_cache")?;
@@ -2055,6 +2207,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn is_blocked(&self, issue_id: &str) -> Result<bool> {
+        let _ = self.ensure_blocked_cache_fresh()?;
         let rows = self.conn.query_with_params(
             "SELECT 1 FROM blocked_issues_cache WHERE issue_id = ? LIMIT 1",
             &[SqliteValue::from(issue_id)],
@@ -2072,6 +2225,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+        let _ = self.ensure_blocked_cache_fresh()?;
         let rows = self.conn.query_with_params(
             "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
@@ -2105,7 +2259,11 @@ impl SqliteStorage {
         if !force_rebuild {
             return Ok(0);
         }
-        self.with_write_transaction(|storage| Self::rebuild_blocked_cache_impl(&storage.conn))
+        self.with_write_transaction(|storage| {
+            let rebuilt = Self::rebuild_blocked_cache_impl(&storage.conn)?;
+            Self::delete_metadata_key_in_tx(&storage.conn, BLOCKED_CACHE_STATE_KEY)?;
+            Ok(rebuilt)
+        })
     }
 
     /// Rebuild the blocked cache using the caller's active transaction.
@@ -2114,7 +2272,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the rebuild fails.
     pub(crate) fn rebuild_blocked_cache_in_tx(&self) -> Result<usize> {
-        Self::rebuild_blocked_cache_impl(&self.conn)
+        let rebuilt = Self::rebuild_blocked_cache_impl(&self.conn)?;
+        Self::delete_metadata_key_in_tx(&self.conn, BLOCKED_CACHE_STATE_KEY)?;
+        Ok(rebuilt)
     }
 
     /// Rebuild the child counters table from all existing issues.
@@ -2242,38 +2402,18 @@ impl SqliteStorage {
         conn: &Connection,
         seed_ids: &HashSet<String>,
     ) -> Result<usize> {
-        // 1. Expand seed IDs to include all transitive children via parent-child edges.
         let children_by_parent = Self::load_local_parent_child_edges_impl(conn)?;
-        let mut affected: HashSet<String> = seed_ids.clone();
-        let mut queue: Vec<String> = seed_ids.iter().cloned().collect();
-        while let Some(id) = queue.pop() {
-            if let Some(children) = children_by_parent.get(&id) {
-                for child in children {
-                    if affected.insert(child.clone()) {
-                        queue.push(child.clone());
-                    }
-                }
-            }
-        }
+        let parents_by_child = Self::build_parents_by_child(&children_by_parent);
+        let affected =
+            Self::expand_blocked_cache_component(seed_ids, &children_by_parent, &parents_by_child);
+        let affected_children_by_parent =
+            Self::filter_parent_child_edges_for_ids(&children_by_parent, &affected);
 
-        // Also expand upward: if a seed is a child, its parent may be affected
-        // (e.g., open-child blocker list changes).
-        let mut parents_to_add: Vec<String> = Vec::new();
-        for (parent, children) in &children_by_parent {
-            for child in children {
-                if affected.contains(child) && !affected.contains(parent) {
-                    parents_to_add.push(parent.clone());
-                }
-            }
-        }
-        for p in parents_to_add {
-            affected.insert(p);
-        }
-
-        // 2. Compute the full blocked map (same logic as full rebuild).
-        let mut blocked_issues_map = Self::load_direct_blockers_impl(conn)?;
-        Self::propagate_blocked_parents(&mut blocked_issues_map, &children_by_parent);
-        let child_blockers = Self::load_local_open_child_blockers_impl(conn)?;
+        // Recompute only the affected component instead of rebuilding the full
+        // blocker graph inside the active write transaction.
+        let mut blocked_issues_map = Self::load_direct_blockers_for_ids_impl(conn, &affected)?;
+        Self::propagate_blocked_parents(&mut blocked_issues_map, &affected_children_by_parent);
+        let child_blockers = Self::load_local_open_child_blockers_for_ids_impl(conn, &affected)?;
         for (parent_id, mut blockers) in child_blockers {
             blocked_issues_map
                 .entry(parent_id)
@@ -2380,6 +2520,59 @@ impl SqliteStorage {
         Ok(blocked_issues_map)
     }
 
+    fn load_direct_blockers_for_ids_impl(
+        conn: &Connection,
+        issue_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut blocked_issues_map: HashMap<String, Vec<String>> = HashMap::new();
+        let issue_ids: Vec<_> = issue_ids.iter().collect();
+
+        for chunk in issue_ids.chunks(400) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
+                 FROM dependencies d
+                 LEFT JOIN issues i ON d.depends_on_id = i.id
+                 WHERE d.issue_id IN ({})
+                   AND d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+                   AND d.depends_on_id NOT LIKE 'external:%'
+                   AND (
+                     i.status NOT IN ('closed', 'tombstone')
+                     OR i.id IS NULL
+                   )
+                   AND (i.is_template = 0 OR i.is_template IS NULL OR i.id IS NULL)",
+                placeholders.join(", ")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect();
+            let rows = conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(blocker_ref) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                if issue_id.is_empty() || blocker_ref.is_empty() {
+                    continue;
+                }
+                blocked_issues_map
+                    .entry(issue_id.to_string())
+                    .or_default()
+                    .push(blocker_ref.to_string());
+            }
+        }
+
+        Ok(blocked_issues_map)
+    }
+
     fn load_local_parent_child_edges_impl(
         conn: &Connection,
     ) -> Result<HashMap<String, Vec<String>>> {
@@ -2406,6 +2599,71 @@ impl SqliteStorage {
         }
 
         Ok(children_by_parent)
+    }
+
+    fn build_parents_by_child(
+        children_by_parent: &HashMap<String, Vec<String>>,
+    ) -> HashMap<String, Vec<String>> {
+        let mut parents_by_child: HashMap<String, Vec<String>> = HashMap::new();
+        for (parent_id, children) in children_by_parent {
+            for child_id in children {
+                parents_by_child
+                    .entry(child_id.clone())
+                    .or_default()
+                    .push(parent_id.clone());
+            }
+        }
+        parents_by_child
+    }
+
+    fn expand_blocked_cache_component(
+        seed_ids: &HashSet<String>,
+        children_by_parent: &HashMap<String, Vec<String>>,
+        parents_by_child: &HashMap<String, Vec<String>>,
+    ) -> HashSet<String> {
+        let mut affected = seed_ids.clone();
+        let mut queue: Vec<String> = seed_ids.iter().cloned().collect();
+
+        while let Some(id) = queue.pop() {
+            if let Some(children) = children_by_parent.get(&id) {
+                for child_id in children {
+                    if affected.insert(child_id.clone()) {
+                        queue.push(child_id.clone());
+                    }
+                }
+            }
+
+            if let Some(parents) = parents_by_child.get(&id) {
+                for parent_id in parents {
+                    if affected.insert(parent_id.clone()) {
+                        queue.push(parent_id.clone());
+                    }
+                }
+            }
+        }
+
+        affected
+    }
+
+    fn filter_parent_child_edges_for_ids(
+        children_by_parent: &HashMap<String, Vec<String>>,
+        issue_ids: &HashSet<String>,
+    ) -> HashMap<String, Vec<String>> {
+        let mut filtered = HashMap::new();
+        for (parent_id, children) in children_by_parent {
+            if !issue_ids.contains(parent_id) {
+                continue;
+            }
+            let affected_children: Vec<String> = children
+                .iter()
+                .filter(|child_id| issue_ids.contains(child_id.as_str()))
+                .cloned()
+                .collect();
+            if !affected_children.is_empty() {
+                filtered.insert(parent_id.clone(), affected_children);
+            }
+        }
+        filtered
     }
 
     fn load_local_open_child_blockers_impl(
@@ -2436,6 +2694,56 @@ impl SqliteStorage {
                 .or_default()
                 .push(blocker.to_string());
         }
+        Ok(map)
+    }
+
+    fn load_local_open_child_blockers_for_ids_impl(
+        conn: &Connection,
+        parent_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        if parent_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        let parent_ids: Vec<_> = parent_ids.iter().collect();
+
+        for chunk in parent_ids.chunks(400) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
+                 FROM dependencies d
+                 JOIN issues i ON d.issue_id = i.id
+                 WHERE d.depends_on_id IN ({})
+                   AND d.type = 'parent-child'
+                   AND i.status NOT IN ('closed', 'tombstone')
+                   AND (i.is_template = 0 OR i.is_template IS NULL)
+                   AND d.depends_on_id NOT LIKE 'external:%'
+                   AND d.issue_id NOT LIKE 'external:%'",
+                placeholders.join(", ")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|parent_id| SqliteValue::from(parent_id.as_str()))
+                .collect();
+            let rows = conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let Some(parent_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(blocker) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                if parent_id.is_empty() || blocker.is_empty() {
+                    continue;
+                }
+                map.entry(parent_id.to_string())
+                    .or_default()
+                    .push(blocker.to_string());
+            }
+        }
+
         Ok(map)
     }
 
@@ -2474,6 +2782,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocked_issues(&self) -> Result<Vec<(Issue, Vec<String>)>> {
+        let _ = self.ensure_blocked_cache_fresh()?;
         let rows = self.conn.query(
             r"SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
                      i.status, i.priority, i.issue_type, i.assignee, i.owner, i.estimated_minutes,
@@ -7495,6 +7804,111 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_expand_blocked_cache_component_includes_parent_and_siblings() {
+        let children_by_parent = HashMap::from([
+            (
+                "bd-root".to_string(),
+                vec!["bd-parent".to_string(), "bd-aunt".to_string()],
+            ),
+            (
+                "bd-parent".to_string(),
+                vec!["bd-parent.1".to_string(), "bd-parent.2".to_string()],
+            ),
+        ]);
+        let parents_by_child = SqliteStorage::build_parents_by_child(&children_by_parent);
+        let seed_ids = HashSet::from(["bd-parent.1".to_string()]);
+
+        let affected = SqliteStorage::expand_blocked_cache_component(
+            &seed_ids,
+            &children_by_parent,
+            &parents_by_child,
+        );
+
+        assert!(affected.contains("bd-parent.1"));
+        assert!(affected.contains("bd-parent"));
+        assert!(affected.contains("bd-parent.2"));
+        assert!(affected.contains("bd-root"));
+        assert!(affected.contains("bd-aunt"));
+    }
+
+    #[test]
+    fn test_incremental_blocked_cache_update_recomputes_entire_parent_child_component() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+
+        for issue in [
+            make_issue("bd-parent", "Parent", Status::Open, 2, None, now, None),
+            make_issue("bd-parent.1", "Child 1", Status::Open, 2, None, now, None),
+            make_issue("bd-parent.2", "Child 2", Status::Open, 2, None, now, None),
+            make_issue("bd-blocker", "Blocker", Status::Open, 2, None, now, None),
+            make_issue(
+                "bd-unrelated",
+                "Unrelated",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-unrelated-blocker",
+                "Unrelated blocker",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        storage
+            .add_dependency("bd-parent.1", "bd-parent", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-parent.2", "bd-parent", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-parent", "bd-blocker", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-unrelated", "bd-unrelated-blocker", "blocks", "tester")
+            .unwrap();
+
+        assert!(storage.is_blocked("bd-parent").unwrap());
+        assert!(storage.is_blocked("bd-parent.1").unwrap());
+        assert!(storage.is_blocked("bd-parent.2").unwrap());
+        assert!(storage.is_blocked("bd-unrelated").unwrap());
+
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
+                &[
+                    SqliteValue::from("bd-parent"),
+                    SqliteValue::from("bd-blocker"),
+                ],
+            )
+            .unwrap();
+
+        let seed_ids = HashSet::from(["bd-parent.1".to_string()]);
+        SqliteStorage::incremental_blocked_cache_update(&storage.conn, &seed_ids).unwrap();
+
+        let parent_blockers = storage.get_blockers("bd-parent").unwrap();
+        assert_eq!(
+            parent_blockers,
+            vec!["bd-parent.1".to_string(), "bd-parent.2".to_string()]
+        );
+        assert!(storage.get_blockers("bd-parent.1").unwrap().is_empty());
+        assert!(storage.get_blockers("bd-parent.2").unwrap().is_empty());
+        assert_eq!(
+            storage.get_blockers("bd-unrelated").unwrap(),
+            vec!["bd-unrelated-blocker".to_string()]
+        );
     }
 
     #[test]

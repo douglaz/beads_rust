@@ -176,6 +176,7 @@ fn render_defer_output(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_defer_route(
     args: &DeferArgs,
     cli: &config::CliOverrides,

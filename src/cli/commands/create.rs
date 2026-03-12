@@ -553,8 +553,7 @@ fn execute_import(
 
     let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
-    let all_ids_orig = storage.get_all_ids()?;
-    let mut all_ids = all_ids_orig.clone();
+    let mut all_ids = storage.get_all_ids()?;
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
     'outer: for parsed in parsed_issues {

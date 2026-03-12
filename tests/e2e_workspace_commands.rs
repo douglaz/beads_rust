@@ -6,6 +6,7 @@
 mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use fsqlite::Connection;
 use serde_json::Value;
 use std::fs;
 
@@ -351,6 +352,70 @@ fn e2e_doctor_detects_issues() {
     // Run doctor
     let doctor = run_br(&workspace, ["doctor"], "doctor_check");
     assert!(doctor.status.success(), "doctor failed: {}", doctor.stderr);
+}
+
+#[test]
+fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
+    let _log = common::test_log("e2e_doctor_repair_json_rebuilds_and_returns_single_payload");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Repair doctor JSON"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    assert!(db_path.exists(), "database should exist before repair test");
+    assert!(
+        jsonl_path.exists(),
+        "issues.jsonl should exist before repair test"
+    );
+
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
+    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+        .expect("insert duplicate config row a");
+    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+        .expect("insert duplicate config row b");
+
+    let pre_repair = run_br(&workspace, ["doctor", "--json"], "doctor_pre_repair_json");
+    assert!(
+        !pre_repair.status.success(),
+        "doctor should fail before repair when recoverable anomalies are present"
+    );
+    let pre_payload = extract_json_payload(&pre_repair.stdout);
+    let pre_json: Value = serde_json::from_str(&pre_payload).expect("pre-repair doctor json");
+    assert_eq!(pre_json["ok"], Value::Bool(false));
+
+    let repaired = run_br(
+        &workspace,
+        ["doctor", "--repair", "--json"],
+        "doctor_repair_json",
+    );
+    assert!(
+        repaired.status.success(),
+        "doctor --repair --json failed: stdout='{}' stderr='{}'",
+        repaired.stdout,
+        repaired.stderr
+    );
+
+    let payload = extract_json_payload(&repaired.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("repair doctor json");
+    assert_eq!(json["repaired"], Value::Bool(true));
+    assert_eq!(json["verified"], Value::Bool(true));
+    assert_eq!(json["report"]["ok"], Value::Bool(false));
+    assert_eq!(json["post_repair"]["ok"], Value::Bool(true));
+
+    let anomaly_checks = json["report"]["checks"]
+        .as_array()
+        .expect("initial checks array");
+    assert!(
+        anomaly_checks.iter().any(|check| {
+            check["name"] == "db.recoverable_anomalies" && check["status"] == "error"
+        }),
+        "expected recoverable anomaly in initial doctor report: {json:?}"
+    );
 }
 
 // ============================================================================

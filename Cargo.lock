@@ -1270,7 +1270,6 @@ dependencies = [
 [[package]]
 name = "fsqlite"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -1284,7 +1283,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-ast"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-types",
 ]
@@ -1292,7 +1290,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-btree"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -1305,7 +1302,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-core"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1317,6 +1313,7 @@ dependencies = [
  "fsqlite-ext-icu",
  "fsqlite-ext-json",
  "fsqlite-ext-misc",
+ "fsqlite-ext-rtree",
  "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-observability",
@@ -1342,7 +1339,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-error"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "thiserror",
 ]
@@ -1350,7 +1346,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-fts5"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1361,7 +1356,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-icu"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1372,7 +1366,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-json"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1384,7 +1377,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-misc"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1397,16 +1389,15 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-rtree"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-error",
+ "fsqlite-func",
  "fsqlite-types",
 ]
 
 [[package]]
 name = "fsqlite-func"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
@@ -1416,7 +1407,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-mvcc"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "blake3",
  "crossbeam-epoch",
@@ -1437,7 +1427,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-observability"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1448,7 +1437,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-pager"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1466,7 +1454,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-parser"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1478,7 +1465,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-planner"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -1492,7 +1478,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-types"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "asupersync",
  "bitflags",
@@ -1508,7 +1493,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-vdbe"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "crossbeam-deque",
  "fsqlite-ast",
@@ -1529,7 +1513,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-vfs"
 version = "0.1.2"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -1545,7 +1528,6 @@ dependencies = [
 [[package]]
 name = "fsqlite-wal"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=bc9bdff85ade981ff676f0dd1b15c2f50f7064f8#bc9bdff85ade981ff676f0dd1b15c2f50f7064f8"
 dependencies = [
  "asupersync",
  "blake3",

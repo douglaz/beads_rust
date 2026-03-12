@@ -159,8 +159,7 @@ where
             let issue_id_label = probe_issue_id.unwrap_or("<none>");
             let probe_error_display = probe_error
                 .as_ref()
-                .map(std::string::ToString::to_string)
-                .unwrap_or_else(|| "n/a".to_string());
+                .map_or_else(|| "n/a".to_string(), std::string::ToString::to_string);
             tracing::warn!(
                 command = command,
                 issue_id = issue_id_label,
@@ -174,15 +173,18 @@ where
             let original_error = operation_err.to_string();
             storage_ctx.recover_database_from_jsonl().map_err(|recovery_err| {
                 BeadsError::WithContext {
-                    context: if let Some(issue_id) = probe_issue_id {
+                    context: probe_issue_id.map_or_else(
+                        || {
+                            format!(
+                                "automatic database recovery failed after {command} write; original write error: {original_error}"
+                            )
+                        },
+                        |issue_id| {
                         format!(
                             "automatic database recovery failed after {command} write for issue '{issue_id}'; original write error: {original_error}"
                         )
-                    } else {
-                        format!(
-                            "automatic database recovery failed after {command} write; original write error: {original_error}"
-                        )
-                    },
+                        },
+                    ),
                     source: Box::new(recovery_err),
                 }
             })?;

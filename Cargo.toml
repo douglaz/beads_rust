@@ -146,28 +146,28 @@ self_update = [
     "self_update/compression-zip-deflate",
 ]
 
-# Override crates.io fsqlite with a known-good Git revision that includes the
-# pure-Rust UnixVfs work. Tracking `main` directly made builds nondeterministic
-# and currently pulls a broken upstream revision into this crate.
+# Override crates.io fsqlite with the local frankensqlite checkout so this
+# repo always exercises the in-progress engine fixes instead of a stale Git
+# snapshot.
 [patch.crates-io]
-fsqlite          = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite" }
-fsqlite-ast      = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-ast" }
-fsqlite-btree    = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-btree" }
-fsqlite-core     = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-core" }
-fsqlite-error    = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-error" }
-fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-ext-fts5" }
-fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-ext-json" }
-fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-ext-rtree" }
-fsqlite-func     = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-func" }
-fsqlite-mvcc     = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-mvcc" }
-fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-observability" }
-fsqlite-pager    = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-pager" }
-fsqlite-parser   = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-parser" }
-fsqlite-planner  = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-planner" }
-fsqlite-types    = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-types" }
-fsqlite-vdbe     = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-vdbe" }
-fsqlite-vfs      = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-vfs" }
-fsqlite-wal      = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-wal" }
+fsqlite              = { path = "../frankensqlite/crates/fsqlite", package = "fsqlite" }
+fsqlite-ast          = { path = "../frankensqlite/crates/fsqlite-ast", package = "fsqlite-ast" }
+fsqlite-btree        = { path = "../frankensqlite/crates/fsqlite-btree", package = "fsqlite-btree" }
+fsqlite-core         = { path = "../frankensqlite/crates/fsqlite-core", package = "fsqlite-core" }
+fsqlite-error        = { path = "../frankensqlite/crates/fsqlite-error", package = "fsqlite-error" }
+fsqlite-ext-fts5     = { path = "../frankensqlite/crates/fsqlite-ext-fts5", package = "fsqlite-ext-fts5" }
+fsqlite-ext-json     = { path = "../frankensqlite/crates/fsqlite-ext-json", package = "fsqlite-ext-json" }
+fsqlite-ext-rtree    = { path = "../frankensqlite/crates/fsqlite-ext-rtree", package = "fsqlite-ext-rtree" }
+fsqlite-func         = { path = "../frankensqlite/crates/fsqlite-func", package = "fsqlite-func" }
+fsqlite-mvcc         = { path = "../frankensqlite/crates/fsqlite-mvcc", package = "fsqlite-mvcc" }
+fsqlite-observability = { path = "../frankensqlite/crates/fsqlite-observability", package = "fsqlite-observability" }
+fsqlite-pager        = { path = "../frankensqlite/crates/fsqlite-pager", package = "fsqlite-pager" }
+fsqlite-parser       = { path = "../frankensqlite/crates/fsqlite-parser", package = "fsqlite-parser" }
+fsqlite-planner      = { path = "../frankensqlite/crates/fsqlite-planner", package = "fsqlite-planner" }
+fsqlite-types        = { path = "../frankensqlite/crates/fsqlite-types", package = "fsqlite-types" }
+fsqlite-vdbe         = { path = "../frankensqlite/crates/fsqlite-vdbe", package = "fsqlite-vdbe" }
+fsqlite-vfs          = { path = "../frankensqlite/crates/fsqlite-vfs", package = "fsqlite-vfs" }
+fsqlite-wal          = { path = "../frankensqlite/crates/fsqlite-wal", package = "fsqlite-wal" }
 
 [lints.rust]
 unsafe_code = "forbid"

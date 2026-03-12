@@ -6,6 +6,7 @@ use crate::cli::DoctorArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
+use crate::storage::SqliteStorage;
 use crate::sync::{
     PathValidation, scan_conflict_markers, validate_no_git_path, validate_sync_path,
 };
@@ -51,9 +52,15 @@ struct DoctorRepairResult {
     fk_violations_cleaned: usize,
 }
 
+#[derive(Debug, Clone)]
 struct DoctorRun {
     report: DoctorReport,
     jsonl_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct LocalRepairResult {
+    blocked_cache_rebuilt: bool,
 }
 
 fn push_check(
@@ -136,6 +143,14 @@ fn repair_database_from_jsonl(
         imported: import_result.imported_count,
         skipped: import_result.skipped_count,
         fk_violations_cleaned: fk_violations,
+    })
+}
+
+fn repair_recoverable_db_state(db_path: &Path) -> Result<LocalRepairResult> {
+    let storage = SqliteStorage::open(db_path)?;
+    let blocked_cache_rebuilt = storage.ensure_blocked_cache_fresh()?;
+    Ok(LocalRepairResult {
+        blocked_cache_rebuilt,
     })
 }
 
@@ -436,6 +451,13 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
          LIMIT 1",
     )?;
 
+    let blocked_cache_stale = conn.query(
+        "SELECT value
+         FROM metadata
+         WHERE key = 'blocked_cache_state'
+         LIMIT 1",
+    )?;
+
     let mut findings = Vec::new();
 
     if let Some(row) = duplicate_schema_rows.first() {
@@ -473,6 +495,14 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
         findings.push(format!(
             "metadata contains duplicate rows for key '{key}' ({row_count} rows)"
         ));
+    }
+
+    if blocked_cache_stale
+        .first()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
+        == Some("stale")
+    {
+        findings.push("blocked_issues_cache is marked stale and needs rebuild".to_string());
     }
 
     if findings.is_empty() {
@@ -1306,6 +1336,38 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
+    let local_repair = repair_recoverable_db_state(&paths.db_path)?;
+    let after_local_repair = if local_repair.blocked_cache_rebuilt {
+        collect_doctor_report(&beads_dir, &paths)?
+    } else {
+        initial.clone()
+    };
+
+    if after_local_repair.report.ok {
+        if ctx.is_json() {
+            ctx.json(&serde_json::json!({
+                "report": initial.report,
+                "repaired": local_repair.blocked_cache_rebuilt,
+                "local_repair": local_repair,
+                "message": if local_repair.blocked_cache_rebuilt {
+                    "Repair complete: rebuilt stale blocked cache."
+                } else {
+                    "No remaining errors detected after recoverable-state repair."
+                },
+                "post_repair": after_local_repair.report,
+                "verified": true,
+            }));
+        } else {
+            print_report(&initial.report, ctx)?;
+            if local_repair.blocked_cache_rebuilt {
+                ctx.info("Repair complete: rebuilt stale blocked cache.");
+                ctx.info("Post-repair verification:");
+                print_report(&after_local_repair.report, ctx)?;
+            }
+        }
+        return Ok(());
+    }
+
     let Some(jsonl_path) = initial.jsonl_path.as_ref() else {
         return Err(BeadsError::Config(
             "Cannot repair: no JSONL file found to rebuild from".to_string(),
@@ -1333,6 +1395,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         ctx.json(&serde_json::json!({
             "report": initial.report,
             "repaired": true,
+            "local_repair": local_repair,
             "imported": repair_result.imported,
             "skipped": repair_result.skipped,
             "fk_violations_cleaned": repair_result.fk_violations_cleaned,
@@ -1369,6 +1432,50 @@ mod tests {
 
     fn find_check<'a>(checks: &'a [CheckResult], name: &str) -> Option<&'a CheckResult> {
         checks.iter().find(|check| check.name == name)
+    }
+
+    fn sample_issue(id: &str, title: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            content_hash: None,
+            title: title.to_string(),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: Utc::now(),
+            created_by: None,
+            updated_at: Utc::now(),
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            comments: Vec::new(),
+        }
     }
 
     #[test]
@@ -1414,6 +1521,82 @@ mod tests {
                 "row 1 missing from index idx_a".to_string(),
                 "row 2 missing from index idx_a".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_check_recoverable_anomalies_detects_duplicate_config_and_metadata() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+            .unwrap();
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+            .unwrap();
+        conn.execute("INSERT INTO metadata (key, value) VALUES ('project', 'dup-a')")
+            .unwrap();
+        conn.execute("INSERT INTO metadata (key, value) VALUES ('project', 'dup-b')")
+            .unwrap();
+
+        let mut checks = Vec::new();
+        check_recoverable_anomalies(&conn, &mut checks)?;
+
+        let check = find_check(&checks, "db.recoverable_anomalies").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Error));
+
+        let findings = check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("findings"))
+            .and_then(serde_json::Value::as_array)
+            .expect("findings array");
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .as_str()
+                    .is_some_and(|message| message.contains("config contains duplicate rows"))
+            }),
+            "expected duplicate config finding: {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .as_str()
+                    .is_some_and(|message| message.contains("metadata contains duplicate rows"))
+            }),
+            "expected duplicate metadata finding: {findings:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_issue_write_probe_succeeds_on_healthy_database() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .create_issue(&sample_issue("bd-probe", "Probe me"), "tester")
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_issue_write_probe(&conn, &mut checks);
+
+        let check = find_check(&checks, "db.write_probe").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("bd-probe")),
+            "unexpected check message: {:?}",
+            check.message
         );
     }
 

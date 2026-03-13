@@ -315,6 +315,13 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     })
 }
 
+pub(crate) fn validate_list_args(args: &ListArgs) -> Result<()> {
+    let _ = build_filters(args)?;
+    validate_sort_key(args.sort.as_deref())?;
+    validate_priority_bounds(args.priority_min, args.priority_max)?;
+    Ok(())
+}
+
 fn needs_client_filters(args: &ListArgs) -> bool {
     !args.id.is_empty()
         || args.priority_min.is_some()
@@ -349,16 +356,7 @@ fn apply_client_filters(
             .iter()
             .any(|status| status.eq_ignore_ascii_case("deferred"));
 
-    if let Some(min) = min_priority
-        && !(0..=4).contains(&min)
-    {
-        return Err(BeadsError::InvalidPriority { priority: min });
-    }
-    if let Some(max) = max_priority
-        && !(0..=4).contains(&max)
-    {
-        return Err(BeadsError::InvalidPriority { priority: max });
-    }
+    validate_priority_bounds(args.priority_min, args.priority_max)?;
 
     for issue in issues {
         if let Some(ids) = &id_filter
@@ -452,6 +450,22 @@ fn validate_sort_key(sort: Option<&str>) -> Result<()> {
             reason: format!("invalid sort field '{sort_key}'"),
         }),
     }
+}
+
+fn validate_priority_bounds(priority_min: Option<u8>, priority_max: Option<u8>) -> Result<()> {
+    if let Some(min) = priority_min.map(i32::from)
+        && !(0..=4).contains(&min)
+    {
+        return Err(BeadsError::InvalidPriority { priority: min });
+    }
+
+    if let Some(max) = priority_max.map(i32::from)
+        && !(0..=4).contains(&max)
+    {
+        return Err(BeadsError::InvalidPriority { priority: max });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -621,5 +635,29 @@ mod tests {
             .map(|issue| issue.id.as_str())
             .collect();
         assert_eq!(overdue_with_deferred_ids, vec!["bd-1", "bd-2"]);
+    }
+
+    #[test]
+    fn test_validate_list_args_rejects_invalid_sort() {
+        init_logging();
+        let err = validate_list_args(&ListArgs {
+            sort: Some("nonsense".to_string()),
+            ..Default::default()
+        })
+        .expect_err("invalid sort should fail");
+
+        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "sort"));
+    }
+
+    #[test]
+    fn test_validate_list_args_rejects_invalid_priority_bounds() {
+        init_logging();
+        let err = validate_list_args(&ListArgs {
+            priority_min: Some(7),
+            ..Default::default()
+        })
+        .expect_err("invalid priority should fail");
+
+        assert!(matches!(err, BeadsError::InvalidPriority { priority: 7 }));
     }
 }

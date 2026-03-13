@@ -2602,20 +2602,20 @@ fn detect_collision(
         };
     }
 
-    // Phase 2: Content hash match
-    if let Some(existing_id) = id_by_hash.get(computed_hash) {
-        return CollisionResult::Match {
-            existing_id: existing_id.clone(),
-            match_type: MatchType::ContentHash,
-            phase: 2,
-        };
-    }
-
-    // Phase 3: ID match
+    // Phase 2: ID match
     if meta_by_id.contains_key(&incoming.id) {
         return CollisionResult::Match {
             existing_id: incoming.id.clone(),
             match_type: MatchType::Id,
+            phase: 2,
+        };
+    }
+
+    // Phase 3: Content hash match
+    if let Some(existing_id) = id_by_hash.get(computed_hash) {
+        return CollisionResult::Match {
+            existing_id: existing_id.clone(),
+            match_type: MatchType::ContentHash,
             phase: 3,
         };
     }
@@ -3047,16 +3047,11 @@ pub fn import_from_jsonl(
         let target_id = match &collision {
             CollisionResult::Match { existing_id, .. } => existing_id.clone(),
             CollisionResult::NewIssue => {
-                let id = issue.id.clone();
-                // Update maps for intra-JSONL collision detection.
-                // This ensures that if the JSONL file has duplicate issues (same content hash),
-                // the second one is correctly identified as a match to the first one
-                // even if the first one hasn't been committed to the database yet.
-                id_by_hash.insert(computed_hash.clone(), id.clone());
-                if let Some(ref ext_ref) = issue.external_ref {
-                    id_by_ext_ref.insert(ext_ref.clone(), id.clone());
-                }
-                id
+                // Keep distinct rows from the same JSONL snapshot distinct during the scan
+                // phase. Only metadata-backed collisions (already in storage) should remap
+                // IDs; otherwise `--no-db` imports can collapse valid duplicate records or
+                // try to update rows that do not exist yet.
+                issue.id.clone()
             }
         };
 
@@ -5036,7 +5031,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_collision_content_hash_before_id() {
+    fn test_detect_collision_id_preempts_content_hash() {
         let storage = SqliteStorage::open_memory().unwrap();
 
         let mut hash_issue = make_issue_at("bd-hash", "Same Content", fixed_time(100));
@@ -5068,8 +5063,8 @@ mod tests {
             phase,
         } = collision
         {
-            assert_eq!(existing_id, "bd-hash");
-            assert_eq!(match_type, MatchType::ContentHash);
+            assert_eq!(existing_id, "bd-same");
+            assert_eq!(match_type, MatchType::Id);
             assert_eq!(phase, 2);
         }
     }
@@ -5110,7 +5105,7 @@ mod tests {
         {
             assert_eq!(existing_id, "bd-first");
             assert_eq!(match_type, MatchType::ContentHash);
-            assert_eq!(phase, 2);
+            assert_eq!(phase, 3);
         }
     }
 
@@ -5145,7 +5140,7 @@ mod tests {
         {
             assert_eq!(existing_id, "bd-1");
             assert_eq!(match_type, MatchType::Id);
-            assert_eq!(phase, 3);
+            assert_eq!(phase, 2);
         }
     }
 

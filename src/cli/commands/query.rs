@@ -294,6 +294,8 @@ fn query_save(
         ));
     }
 
+    super::list::validate_list_args(&args.filters)?;
+
     let saved_query = SavedQuery {
         name: name.to_string(),
         description: args.description.clone(),
@@ -562,6 +564,7 @@ fn render_query_delete_rich(name: &str, ctx: &OutputContext) {
 mod tests {
     use super::*;
     use crate::cli::OutputFormat;
+    use crate::storage::SqliteStorage;
 
     #[test]
     fn test_saved_filters_from_list_args() {
@@ -986,5 +989,23 @@ mod tests {
         // Saved filters should not contain output-related fields
         // They're simply not part of the SavedFilters struct
         assert_eq!(filters.status, vec!["open"]);
+    }
+
+    #[test]
+    fn test_query_save_rejects_invalid_filters_without_persisting() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let ctx = OutputContext::from_output_format(OutputFormat::Text, true, true);
+        let args = QuerySaveArgs {
+            name: "broken".to_string(),
+            description: None,
+            filters: ListArgs {
+                sort: Some("nonsense".to_string()),
+                ..Default::default()
+            },
+        };
+
+        let err = query_save(&args, &mut storage, &ctx).expect_err("invalid query save");
+        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "sort"));
+        assert_eq!(storage.get_config("saved_query:broken").unwrap(), None);
     }
 }

@@ -4039,6 +4039,65 @@ routing:
     }
 
     #[test]
+    fn open_storage_with_cli_no_db_keeps_distinct_closed_issues_with_identical_content() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let now = Utc::now();
+        let first = Issue {
+            id: "bd-a1111".to_string(),
+            title: "Same title".to_string(),
+            status: Status::Closed,
+            created_at: now,
+            updated_at: now,
+            closed_at: Some(now),
+            close_reason: Some("fixed".to_string()),
+            ..Issue::default()
+        };
+        let second = Issue {
+            id: "bd-b2222".to_string(),
+            title: "Same title".to_string(),
+            status: Status::Closed,
+            created_at: now + chrono::Duration::minutes(1),
+            updated_at: now + chrono::Duration::minutes(1),
+            closed_at: Some(now + chrono::Duration::minutes(1)),
+            close_reason: Some("duplicate".to_string()),
+            ..Issue::default()
+        };
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).expect("serialize first issue"),
+            serde_json::to_string(&second).expect("serialize second issue")
+        );
+        fs::write(&jsonl_path, content).expect("write jsonl");
+
+        let cli = CliOverrides {
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+        let storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
+
+        let first_loaded = storage_ctx
+            .storage
+            .get_issue("bd-a1111")
+            .expect("query first issue");
+        let second_loaded = storage_ctx
+            .storage
+            .get_issue("bd-b2222")
+            .expect("query second issue");
+        assert!(
+            first_loaded.is_some(),
+            "first duplicate issue should remain addressable"
+        );
+        assert!(
+            second_loaded.is_some(),
+            "second duplicate issue should remain addressable"
+        );
+    }
+
+    #[test]
     fn implicit_external_jsonl_allowed_requires_external_db_family() {
         let beads_dir = PathBuf::from("/tmp/project/.beads");
         let local_db = beads_dir.join("beads.db");

@@ -549,22 +549,12 @@ fn execute_route(
             is_blocked_result,
         )? {
             let blockers_result = storage_ctx.storage.get_blockers(id);
-            let mut blockers = preserve_blocked_cache_on_error(
+            preserve_blocked_cache_on_error(
                 &mut storage_ctx.storage,
                 cache_dirty,
                 "close",
                 blockers_result,
-            )?;
-            if blockers.is_empty() {
-                let dependencies_result = storage_ctx.storage.get_dependencies(id);
-                blockers = preserve_blocked_cache_on_error(
-                    &mut storage_ctx.storage,
-                    cache_dirty,
-                    "close",
-                    dependencies_result,
-                )?;
-            }
-            blockers
+            )?
         } else {
             Vec::new()
         };

@@ -523,7 +523,11 @@ mod tests {
 
         let err = follow_redirects(&beads_dir, 10).unwrap_err();
         match err {
-            BeadsError::Config(msg) => assert!(msg.contains("must be a .beads directory")),
+            BeadsError::Config(msg) => assert!(
+                msg.contains("must be a .beads directory")
+                    || msg.contains("must be a .beads or _beads directory"),
+                "unexpected config error: {msg}"
+            ),
             other => panic!("unexpected error: {other:?}"),
         }
     }

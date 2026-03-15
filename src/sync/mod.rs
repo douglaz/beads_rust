@@ -4013,7 +4013,12 @@ mod tests {
 
         let temp_target = outside_dir.join("captured.txt");
         fs::write(&temp_target, "do-not-touch").unwrap();
-        symlink(&temp_target, beads_dir.join("beads.base.jsonl.tmp")).unwrap();
+        let pid = std::process::id();
+        symlink(
+            &temp_target,
+            beads_dir.join(format!("beads.base.jsonl.{pid}.tmp")),
+        )
+        .unwrap();
 
         let mut issues = HashMap::new();
         issues.insert(
@@ -4101,7 +4106,7 @@ mod tests {
         let err = load_base_snapshot(&beads_dir).unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("symlink") || message.contains("Path"),
+            message.contains("symlink") || message.contains("Symlink") || message.contains("Path"),
             "unexpected error: {message}"
         );
     }

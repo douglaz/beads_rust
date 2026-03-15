@@ -437,7 +437,7 @@ mod tests {
 
     impl DirGuard {
         fn new(target: &std::path::Path) -> Self {
-            let previous = env::current_dir().expect("current dir");
+            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
             env::set_current_dir(target).expect("set current dir");
             Self { previous }
         }
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn execute_clears_defer_until_when_reopening_closed_deferred_issue() {
-        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn execute_reopen_tombstone_skips_without_resurrecting_it() {
-        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");

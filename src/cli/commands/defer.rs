@@ -726,7 +726,7 @@ mod tests {
 
     impl DirGuard {
         fn new(target: &std::path::Path) -> Self {
-            let previous = env::current_dir().expect("current dir");
+            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
             env::set_current_dir(target).expect("set current dir");
             Self { previous }
         }
@@ -881,7 +881,7 @@ mod tests {
 
     #[test]
     fn execute_defer_sets_status_and_until() {
-        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
@@ -906,7 +906,7 @@ mod tests {
 
     #[test]
     fn execute_defer_without_until_sets_indefinite() {
-        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
@@ -931,15 +931,17 @@ mod tests {
 
     #[test]
     fn execute_undefer_clears_defer_until() {
-        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
-        let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
-        let issue = make_issue("bd-defer-3", "Undefer me");
-        storage.create_issue(&issue, "tester").expect("create");
+        {
+            let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
+            let issue = make_issue("bd-defer-3", "Undefer me");
+            storage.create_issue(&issue, "tester").expect("create");
+        }
 
         let _guard = DirGuard::new(temp.path());
         let defer_args = DeferArgs {
@@ -955,6 +957,7 @@ mod tests {
         };
         execute_undefer(&undefer_args, true, &CliOverrides::default(), &ctx).expect("undefer");
 
+        let storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("reopen");
         let updated = storage.get_issue("bd-defer-3").expect("get").unwrap();
         assert_eq!(updated.status, Status::Open);
         assert!(updated.defer_until.is_none());
@@ -962,7 +965,7 @@ mod tests {
 
     #[test]
     fn execute_undefer_preserves_non_deferred_status_for_soft_defer() {
-        let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
+        let _lock = TEST_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");

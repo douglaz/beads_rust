@@ -257,20 +257,26 @@ mod tests {
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
 
-        let mut storage = SqliteStorage::open(&db_path).expect("storage");
-        let issue = Issue {
-            id: "bd-1".to_string(),
-            title: "test".to_string(),
-            ..Issue::default()
-        };
-        storage
-            .create_issue(&issue, "tester")
-            .expect("create issue");
-        let export_config = ExportConfig {
-            beads_dir: Some(beads_dir.clone()),
-            ..Default::default()
-        };
-        export_to_jsonl_with_policy(&storage, &jsonl_path, &export_config).expect("export jsonl");
+        // Scope the initial storage so the connection is closed before
+        // recovery opens a new one at the same path.  fsqlite tracks pages
+        // by file path, so an older connection causes BusySnapshot.
+        {
+            let mut storage = SqliteStorage::open(&db_path).expect("storage");
+            let issue = Issue {
+                id: "bd-1".to_string(),
+                title: "test".to_string(),
+                ..Issue::default()
+            };
+            storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+            let export_config = ExportConfig {
+                beads_dir: Some(beads_dir.clone()),
+                ..Default::default()
+            };
+            export_to_jsonl_with_policy(&storage, &jsonl_path, &export_config)
+                .expect("export jsonl");
+        }
 
         let mut storage_ctx =
             open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage ctx");

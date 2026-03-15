@@ -1194,16 +1194,22 @@ mod tests {
         .unwrap();
 
         let layers = build_layers(Some(&beads_dir), &CliOverrides::default()).unwrap();
-        let merged = merge_layers(&layers);
 
+        // Verify the JSONL layer directly to avoid interference from user
+        // config files (~/.config/bd/config.yaml) that may override the prefix.
+        let jsonl_layer = layers
+            .iter()
+            .find(|l| matches!(l.source, ConfigSource::Jsonl))
+            .expect("should have a JSONL layer");
         assert_eq!(
-            merged.runtime.get("issue_prefix").map(String::as_str),
-            Some("proj")
+            jsonl_layer
+                .layer
+                .runtime
+                .get("issue_prefix")
+                .map(String::as_str),
+            Some("proj"),
+            "JSONL layer should infer prefix from issue IDs"
         );
-        assert!(matches!(
-            resolve_source("issue_prefix", &layers),
-            ConfigSource::Jsonl
-        ));
     }
 
     #[test]

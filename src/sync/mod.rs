@@ -1607,7 +1607,13 @@ pub fn export_to_jsonl_with_policy(
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = fs::set_permissions(output_path, perms);
+        if let Err(e) = fs::set_permissions(output_path, perms) {
+            tracing::warn!(
+                path = %output_path.display(),
+                error = %e,
+                "Failed to set restrictive permissions on exported JSONL file"
+            );
+        }
     }
 
     let result = ExportResult {
@@ -2302,7 +2308,13 @@ fn write_jsonl_lines_atomically(
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = fs::set_permissions(output_path, perms);
+        if let Err(e) = fs::set_permissions(output_path, perms) {
+            tracing::warn!(
+                path = %output_path.display(),
+                error = %e,
+                "Failed to set restrictive permissions on exported JSONL file"
+            );
+        }
     }
 
     Ok(format!("{:x}", hasher.finalize()))

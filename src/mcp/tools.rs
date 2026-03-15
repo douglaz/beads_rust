@@ -28,24 +28,59 @@ use super::BeadsState;
 /// Field keys in `update_issue` that map to `IssueUpdate` struct fields.
 /// Used to distinguish field updates from label/comment side-effects.
 const UPDATE_FIELD_KEYS: &[&str] = &[
-    "title", "description", "status", "priority", "type",
-    "assignee", "owner", "due_at", "defer_until",
-    "estimated_minutes", "external_ref",
+    "title",
+    "description",
+    "status",
+    "priority",
+    "type",
+    "assignee",
+    "owner",
+    "due_at",
+    "defer_until",
+    "estimated_minutes",
+    "external_ref",
 ];
 
 /// Known placeholder strings agents hallucinate instead of real IDs.
 const PLACEHOLDER_EXACT: &[&str] = &[
-    "your_id", "your-id", "yourid", "your_issue_id",
-    "issue_id", "issue-id", "issueid",
-    "example", "example_id", "example-id",
-    "test", "test_id", "test-id",
-    "foo", "bar", "baz", "qux",
-    "xxx", "yyy", "zzz",
-    "placeholder", "replace_me", "replace-me",
-    "todo", "fixme", "tbd",
-    "id", "issue", "some_id", "some-id",
-    "abc", "abc123", "id_here", "insert_id",
-    "none", "null", "undefined", "n/a",
+    "your_id",
+    "your-id",
+    "yourid",
+    "your_issue_id",
+    "issue_id",
+    "issue-id",
+    "issueid",
+    "example",
+    "example_id",
+    "example-id",
+    "test",
+    "test_id",
+    "test-id",
+    "foo",
+    "bar",
+    "baz",
+    "qux",
+    "xxx",
+    "yyy",
+    "zzz",
+    "placeholder",
+    "replace_me",
+    "replace-me",
+    "todo",
+    "fixme",
+    "tbd",
+    "id",
+    "issue",
+    "some_id",
+    "some-id",
+    "abc",
+    "abc123",
+    "id_here",
+    "insert_id",
+    "none",
+    "null",
+    "undefined",
+    "n/a",
 ];
 
 // ---------------------------------------------------------------------------
@@ -162,8 +197,7 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
     // Add contextual suggested_tool_calls based on error type
     match structured.code {
         ErrorCode::IssueNotFound | ErrorCode::AmbiguousId => {
-            data["suggested_tool_calls"] =
-                json!([{"tool": "list_issues", "arguments": {}}]);
+            data["suggested_tool_calls"] = json!([{"tool": "list_issues", "arguments": {}}]);
         }
         ErrorCode::CycleDetected => {
             // Suggest list_issues so the agent can discover IDs and
@@ -176,21 +210,24 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
         }
         ErrorCode::InvalidStatus => {
             data["available_options"] = json!([
-                "open", "in_progress", "blocked", "deferred", "draft", "closed", "pinned"
+                "open",
+                "in_progress",
+                "blocked",
+                "deferred",
+                "draft",
+                "closed",
+                "pinned"
             ]);
-            data["fix_hint"] =
-                json!("Aliases also accepted: wip, todo, done, stuck, later, hold");
+            data["fix_hint"] = json!("Aliases also accepted: wip, todo, done, stuck, later, hold");
         }
         ErrorCode::InvalidPriority => {
-            data["available_options"] =
-                json!(["critical", "high", "medium", "low", "backlog"]);
+            data["available_options"] = json!(["critical", "high", "medium", "low", "backlog"]);
             data["fix_hint"] =
                 json!("Aliases also accepted: urgent, important, normal, minor, someday");
         }
         _ => {
-            data["discovery_hint"] = json!(
-                "Use list_issues tool or beads://labels resource to find valid values"
-            );
+            data["discovery_hint"] =
+                json!("Use list_issues tool or beads://labels resource to find valid values");
         }
     }
 
@@ -251,8 +288,9 @@ fn parse_status(s: &str) -> McpResult<(Status, Option<String>)> {
     let lower = s.to_lowercase();
     let (status, canonical) = match lower.as_str() {
         "open" | "new" | "todo" => (Status::Open, "open"),
-        "in_progress" | "in-progress" | "inprogress" | "wip" | "working" | "active"
-        | "started" => (Status::InProgress, "in_progress"),
+        "in_progress" | "in-progress" | "inprogress" | "wip" | "working" | "active" | "started" => {
+            (Status::InProgress, "in_progress")
+        }
         "blocked" | "stuck" | "waiting" => (Status::Blocked, "blocked"),
         "deferred" | "later" | "postponed" | "backlogged" => (Status::Deferred, "deferred"),
         "draft" => (Status::Draft, "draft"),
@@ -283,8 +321,7 @@ fn parse_status(s: &str) -> McpResult<(Status, Option<String>)> {
         }
     };
 
-    let warning = (lower != canonical)
-        .then(|| format!("'{s}' interpreted as '{canonical}'"));
+    let warning = (lower != canonical).then(|| format!("'{s}' interpreted as '{canonical}'"));
 
     Ok((status, warning))
 }
@@ -339,9 +376,7 @@ fn parse_issue_type(s: &str) -> (IssueType, Option<String>) {
     let (issue_type, canonical) = match lower.as_str() {
         "task" | "issue" => (IssueType::Task, "task"),
         "bug" | "bugfix" | "defect" | "regression" => (IssueType::Bug, "bug"),
-        "feature" | "feat" | "enhancement" | "story" | "request" => {
-            (IssueType::Feature, "feature")
-        }
+        "feature" | "feat" | "enhancement" | "story" | "request" => (IssueType::Feature, "feature"),
         "epic" => (IssueType::Epic, "epic"),
         "chore" | "maintenance" | "cleanup" | "refactor" | "tech_debt" | "tech-debt" => {
             (IssueType::Chore, "chore")
@@ -351,8 +386,7 @@ fn parse_issue_type(s: &str) -> (IssueType, Option<String>) {
         other => return (IssueType::Custom(other.to_string()), None),
     };
 
-    let warning =
-        (lower != canonical).then(|| format!("'{s}' interpreted as '{canonical}'"));
+    let warning = (lower != canonical).then(|| format!("'{s}' interpreted as '{canonical}'"));
 
     (issue_type, warning)
 }
@@ -371,9 +405,7 @@ fn parse_dep_type(s: &str) -> McpResult<(String, Option<String>)> {
         "waits-for" | "waits_for" | "waitfor" | "waitsfor" | "waiting" => ("waits-for", true),
         "duplicates" | "duplicate" | "dupe" | "dup" => ("duplicates", true),
         "supersedes" | "supersede" | "replaces" => ("supersedes", true),
-        "caused-by" | "caused_by" | "causedby" | "root_cause" | "root-cause" => {
-            ("caused-by", true)
-        }
+        "caused-by" | "caused_by" | "causedby" | "root_cause" | "root-cause" => ("caused-by", true),
         "conditional-blocks" | "conditional_blocks" | "conditionalblocks" => {
             ("conditional-blocks", true)
         }
@@ -399,8 +431,8 @@ fn parse_dep_type(s: &str) -> McpResult<(String, Option<String>)> {
         }
     };
 
-    let warning = (alias && lower != canonical)
-        .then(|| format!("'{s}' interpreted as '{canonical}'"));
+    let warning =
+        (alias && lower != canonical).then(|| format!("'{s}' interpreted as '{canonical}'"));
 
     Ok((canonical.to_string(), warning))
 }
@@ -443,10 +475,7 @@ fn parse_timestamp(s: &str) -> McpResult<(chrono::DateTime<chrono::Utc>, Option<
 
     // Try parsing date-only (YYYY-MM-DD → start of day UTC)
     if let Ok(date) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
-        let dt = date
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc();
+        let dt = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
         return Ok((
             dt,
             Some(format!("'{s}' interpreted as '{}'", dt.to_rfc3339())),
@@ -495,9 +524,11 @@ fn nullable_str(args: &serde_json::Value, key: &str) -> McpResult<Option<Option<
         None => Ok(None),
         Some(v) if v.is_null() => Ok(Some(None)),
         Some(v) => v.as_str().map_or_else(
-            || Err(McpError::invalid_params(format!(
-                "'{key}' must be a string or null, got {v}"
-            ))),
+            || {
+                Err(McpError::invalid_params(format!(
+                    "'{key}' must be a string or null, got {v}"
+                )))
+            },
             |s| Ok(Some(Some(s.to_string()))),
         ),
     }
@@ -515,9 +546,7 @@ fn parse_update_fields(
 
     if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         if title.is_empty() || title.len() > 500 {
-            return Err(McpError::invalid_params(
-                "Title must be 1-500 characters",
-            ));
+            return Err(McpError::invalid_params("Title must be 1-500 characters"));
         }
         updates.title = Some(title.to_string());
     }
@@ -597,9 +626,8 @@ fn parse_update_fields(
         if v.is_null() {
             updates.estimated_minutes = Some(None);
         } else if let Some(n) = v.as_i64() {
-            let mins = i32::try_from(n).map_err(|_| {
-                McpError::invalid_params("estimated_minutes must fit in i32")
-            })?;
+            let mins = i32::try_from(n)
+                .map_err(|_| McpError::invalid_params("estimated_minutes must fit in i32"))?;
             updates.estimated_minutes = Some(Some(mins));
         } else if let Some(s) = v.as_str() {
             // Forgive by Default: coerce string → integer
@@ -608,7 +636,9 @@ fn parse_update_fields(
                     "'estimated_minutes' must be an integer, got string '{s}'"
                 ))
             })?;
-            coercions.push(format!("estimated_minutes: string '{s}' coerced to integer {mins}"));
+            coercions.push(format!(
+                "estimated_minutes: string '{s}' coerced to integer {mins}"
+            ));
             updates.estimated_minutes = Some(Some(mins));
         } else {
             return Err(McpError::invalid_params(format!(
@@ -651,20 +681,17 @@ fn build_list_filters(
         })
         .transpose()?;
 
-    let types = args
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(|s| {
-            s.split(',')
-                .map(|p| {
-                    let (t, warning) = parse_issue_type(p.trim());
-                    if let Some(w) = warning {
-                        coercions.push(w);
-                    }
-                    t
-                })
-                .collect::<Vec<_>>()
-        });
+    let types = args.get("type").and_then(|v| v.as_str()).map(|s| {
+        s.split(',')
+            .map(|p| {
+                let (t, warning) = parse_issue_type(p.trim());
+                if let Some(w) = warning {
+                    coercions.push(w);
+                }
+                t
+            })
+            .collect::<Vec<_>>()
+    });
 
     let priorities = args
         .get("priority")
@@ -682,10 +709,11 @@ fn build_list_filters(
         })
         .transpose()?;
 
-    let labels = args
-        .get("labels")
-        .and_then(|v| v.as_str())
-        .map(|s| s.split(',').map(|l| l.trim().to_string()).collect::<Vec<_>>());
+    let labels = args.get("labels").and_then(|v| v.as_str()).map(|s| {
+        s.split(',')
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+    });
 
     let include_closed = args
         .get("include_closed")
@@ -698,15 +726,9 @@ fn build_list_filters(
         .unwrap_or(50);
     let limit = Some(raw_limit.min(500) as usize);
 
-    let sort = args
-        .get("sort")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let sort = args.get("sort").and_then(|v| v.as_str()).map(String::from);
 
-    let title_contains = args
-        .get("title")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let title_contains = args.get("title").and_then(|v| v.as_str()).map(String::from);
 
     // Forgive by Default: if the status filter explicitly includes Closed or
     // Deferred, automatically enable the corresponding include flag so the
@@ -832,8 +854,9 @@ impl ToolHandler for ListIssuesTool {
                 storage.search_issues(&q, &filters).map_err(beads_to_mcp)?
             } else {
                 // Bare wildcard — fall back to list (no search filter)
-                coercions
-                    .push(format!("search '{raw_q}' was a bare wildcard, returning all"));
+                coercions.push(format!(
+                    "search '{raw_q}' was a bare wildcard, returning all"
+                ));
                 storage.list_issues(&filters).map_err(beads_to_mcp)?
             }
         } else {
@@ -940,40 +963,59 @@ impl ToolHandler for ShowIssueTool {
             obj.insert("comments".into(), json!(details.comments));
             obj.insert(
                 "dependencies".into(),
-                json!(details.dependencies.iter().map(|d| {
-                    json!({
-                        "id": d.id,
-                        "title": d.title,
-                        "status": d.status,
-                        "dep_type": d.dep_type
-                    })
-                }).collect::<Vec<_>>()),
+                json!(
+                    details
+                        .dependencies
+                        .iter()
+                        .map(|d| {
+                            json!({
+                                "id": d.id,
+                                "title": d.title,
+                                "status": d.status,
+                                "dep_type": d.dep_type
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                ),
             );
             obj.insert(
                 "dependents".into(),
-                json!(details.dependents.iter().map(|d| {
-                    json!({
-                        "id": d.id,
-                        "title": d.title,
-                        "status": d.status,
-                        "dep_type": d.dep_type
-                    })
-                }).collect::<Vec<_>>()),
+                json!(
+                    details
+                        .dependents
+                        .iter()
+                        .map(|d| {
+                            json!({
+                                "id": d.id,
+                                "title": d.title,
+                                "status": d.status,
+                                "dep_type": d.dep_type
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                ),
             );
             if let Some(parent) = &details.parent {
                 obj.insert("parent".into(), json!(parent));
             }
             obj.insert(
                 "recent_events".into(),
-                json!(details.events.iter().take(10).map(|e| {
-                    json!({
-                        "type": e.event_type,
-                        "actor": e.actor,
-                        "old_value": e.old_value,
-                        "new_value": e.new_value,
-                        "created_at": e.created_at
-                    })
-                }).collect::<Vec<_>>()),
+                json!(
+                    details
+                        .events
+                        .iter()
+                        .take(10)
+                        .map(|e| {
+                            json!({
+                                "type": e.event_type,
+                                "actor": e.actor,
+                                "old_value": e.old_value,
+                                "new_value": e.new_value,
+                                "created_at": e.created_at
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                ),
             );
 
             // Contextual next_actions based on issue state
@@ -991,9 +1033,7 @@ impl ToolHandler for ShowIssueTool {
                 actions.push("This issue is closed. Use list_issues to find open work.".into());
             } else {
                 actions.push("Use update_issue to modify fields or add a comment.".into());
-                actions.push(
-                    "Use manage_dependencies to link to other issues.".into(),
-                );
+                actions.push("Use manage_dependencies to link to other issues.".into());
             }
             obj.insert("next_actions".into(), json!(actions));
         }
@@ -1084,9 +1124,7 @@ impl ToolHandler for CreateIssueTool {
             .ok_or_else(|| McpError::invalid_params("'title' is required"))?;
 
         if title.is_empty() || title.len() > 500 {
-            return Err(McpError::invalid_params(
-                "Title must be 1-500 characters",
-            ));
+            return Err(McpError::invalid_params("Title must be 1-500 characters"));
         }
 
         let mut coercions: Vec<String> = Vec::new();
@@ -1113,9 +1151,8 @@ impl ToolHandler for CreateIssueTool {
 
         let now = chrono::Utc::now();
         let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
-        let id_gen = crate::util::id::IdGenerator::new(
-            crate::util::id::IdConfig::with_prefix(prefix),
-        );
+        let id_gen =
+            crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
         let id = id_gen.generate(title, None, Some(&self.0.actor), now, 0, |candidate| {
             storage.id_exists(candidate).unwrap_or(false)
         });
@@ -1310,10 +1347,18 @@ impl ToolHandler for UpdateIssueTool {
         // If only side-effects (labels_add, labels_remove, comment), skip the
         // update_issue call which would fail with NothingToDo.
         let has_field_updates = UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
-        let has_side_effects =
-            args.get("labels_add").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
-                || args.get("labels_remove").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
-                || args.get("comment").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+        let has_side_effects = args
+            .get("labels_add")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+            || args
+                .get("labels_remove")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty())
+            || args
+                .get("comment")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty());
 
         let issue = if has_field_updates {
             storage
@@ -1450,7 +1495,9 @@ impl ToolHandler for CloseIssueTool {
         require_valid_issue(&storage, id)?;
 
         // Idempotency: if already closed, return existing state without error
-        if let Some(details) = storage.get_issue_details(id, false, false, 0).map_err(beads_to_mcp)?
+        if let Some(details) = storage
+            .get_issue_details(id, false, false, 0)
+            .map_err(beads_to_mcp)?
             && details.issue.status == Status::Closed
         {
             return Ok(vec![Content::text(
@@ -1531,9 +1578,7 @@ fn dep_add(
     let depends_on = args
         .get("depends_on")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            McpError::invalid_params("'depends_on' is required for action 'add'")
-        })?;
+        .ok_or_else(|| McpError::invalid_params("'depends_on' is required for action 'add'"))?;
 
     // Validate target ID exists too
     require_valid_issue(storage, depends_on)?;
@@ -1593,9 +1638,7 @@ fn dep_remove(
     let depends_on = args
         .get("depends_on")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            McpError::invalid_params("'depends_on' is required for action 'remove'")
-        })?;
+        .ok_or_else(|| McpError::invalid_params("'depends_on' is required for action 'remove'"))?;
 
     // Validate target ID (placeholder check only — it might have been deleted)
     if let Some(err) = detect_placeholder(depends_on) {
@@ -1805,7 +1848,9 @@ impl ToolHandler for ProjectOverviewTool {
             limit: Some(50),
             ..ListFilters::default()
         };
-        let in_progress = storage.list_issues(&in_progress_filters).map_err(beads_to_mcp)?;
+        let in_progress = storage
+            .list_issues(&in_progress_filters)
+            .map_err(beads_to_mcp)?;
 
         let deferred_filters = ListFilters {
             statuses: Some(vec![Status::Deferred]),
@@ -1814,7 +1859,9 @@ impl ToolHandler for ProjectOverviewTool {
             limit: Some(50),
             ..ListFilters::default()
         };
-        let deferred = storage.list_issues(&deferred_filters).map_err(beads_to_mcp)?;
+        let deferred = storage
+            .list_issues(&deferred_filters)
+            .map_err(beads_to_mcp)?;
 
         let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
 

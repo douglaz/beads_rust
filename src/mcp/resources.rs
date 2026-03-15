@@ -16,7 +16,7 @@ use crate::error::StructuredError;
 use crate::model::{Event, Issue, Status};
 use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 
-use super::{to_mcp, BeadsState};
+use super::{BeadsState, to_mcp};
 
 /// Build a structured "issue not found" error with fuzzy suggestions,
 /// mirroring the tools.rs pattern for consistent agent UX.
@@ -658,15 +658,13 @@ fn longest_chain_from(
     if !visiting.insert(node.to_string()) {
         return 0;
     }
-    let depth = edges
-        .get(node)
-        .map_or(0, |children| {
-            children
-                .iter()
-                .map(|c| 1 + longest_chain_from(c, edges, cache, visiting))
-                .max()
-                .unwrap_or(0)
-        });
+    let depth = edges.get(node).map_or(0, |children| {
+        children
+            .iter()
+            .map(|c| 1 + longest_chain_from(c, edges, cache, visiting))
+            .max()
+            .unwrap_or(0)
+    });
     visiting.remove(node);
     cache.insert(node.to_string(), depth);
     depth
@@ -738,9 +736,8 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
             // Simple heuristic: check if any blocked issue forms a cycle
             // Full cycle detection would require DFS, but would_create_cycle
             // is per-pair. We use the presence of mutual edges as a proxy.
-            adj.get(to.as_str()).is_some_and(|targets| {
-                targets.iter().any(|t| t == from)
-            })
+            adj.get(to.as_str())
+                .is_some_and(|targets| targets.iter().any(|t| t == from))
         });
 
     Ok(json!({
@@ -825,8 +822,7 @@ fn compute_bottlenecks(storage: &SqliteStorage) -> McpResult<serde_json::Value> 
         ..ListFilters::default()
     };
     let open_issues = storage.list_issues(&open_filters).map_err(to_mcp)?;
-    let open_map: HashMap<&str, &Issue> =
-        open_issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    let open_map: HashMap<&str, &Issue> = open_issues.iter().map(|i| (i.id.as_str(), i)).collect();
 
     // Count how many open issues each open issue blocks
     let mut blocks_count: HashMap<&str, usize> = HashMap::new();

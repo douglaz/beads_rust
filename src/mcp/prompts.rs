@@ -7,8 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fastmcp_rust::{
-    Content, McpContext, McpResult, Prompt, PromptArgument, PromptHandler, PromptMessage,
-    Role,
+    Content, McpContext, McpResult, Prompt, PromptArgument, PromptHandler, PromptMessage, Role,
 };
 use serde_json::json;
 
@@ -17,7 +16,7 @@ use std::collections::HashSet;
 use crate::model::{Issue, IssueType, Status};
 use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 
-use super::{to_mcp, BeadsState};
+use super::{BeadsState, to_mcp};
 
 // ---------------------------------------------------------------------------
 // Display limits — extracted from magic numbers for maintainability
@@ -247,9 +246,7 @@ impl PromptHandler for TriagePrompt {
         _ctx: &McpContext,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
-        let raw_focus = arguments
-            .get("focus")
-            .map_or("all", String::as_str);
+        let raw_focus = arguments.get("focus").map_or("all", String::as_str);
         let (focus, focus_warning) = validate_prompt_arg(
             raw_focus,
             &["all", "blocked", "unassigned", "deferred"],
@@ -338,9 +335,7 @@ impl PromptHandler for StatusReportPrompt {
         _ctx: &McpContext,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
-        let raw_period = arguments
-            .get("period")
-            .map_or("all", String::as_str);
+        let raw_period = arguments.get("period").map_or("all", String::as_str);
         let (period, period_warning) = validate_prompt_arg(
             raw_period,
             &["all", "today", "week", "month"],
@@ -451,8 +446,7 @@ fn bottleneck_context(storage: &SqliteStorage) -> McpResult<String> {
         return Ok("No dependency bottlenecks detected.".into());
     }
 
-    let issue_map: HashMap<&str, &Issue> =
-        open_issues.iter().map(|i| (i.id.as_str(), i)).collect();
+    let issue_map: HashMap<&str, &Issue> = open_issues.iter().map(|i| (i.id.as_str(), i)).collect();
 
     let bottleneck_json: Vec<_> = ranked
         .iter()
@@ -562,9 +556,7 @@ impl PromptHandler for PlanNextWorkPrompt {
         _ctx: &McpContext,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
-        let raw_goal = arguments
-            .get("goal")
-            .map_or("balanced", String::as_str);
+        let raw_goal = arguments.get("goal").map_or("balanced", String::as_str);
         let (goal, goal_warning) = validate_prompt_arg(
             raw_goal,
             &["balanced", "unblock", "quick-wins"],
@@ -686,10 +678,7 @@ fn completeness_context(storage: &SqliteStorage) -> McpResult<String> {
         // Default priority is medium (value=2) — flag if still default
         // and issue is non-trivial (not a chore/question)
         if issue.priority.0 == 2
-            && !matches!(
-                issue.issue_type,
-                IssueType::Chore | IssueType::Question
-            )
+            && !matches!(issue.issue_type, IssueType::Chore | IssueType::Question)
         {
             no_priority_set.push(issue);
         }
@@ -698,9 +687,11 @@ fn completeness_context(storage: &SqliteStorage) -> McpResult<String> {
     let mut parts: Vec<String> = Vec::new();
 
     if !no_description.is_empty() {
-        let ids: Vec<_> = no_description.iter().take(QUALITY_SAMPLE_LIMIT).map(|i| {
-            json!({"id": i.id, "title": i.title})
-        }).collect();
+        let ids: Vec<_> = no_description
+            .iter()
+            .take(QUALITY_SAMPLE_LIMIT)
+            .map(|i| json!({"id": i.id, "title": i.title}))
+            .collect();
         parts.push(format!(
             "Issues with NO description ({}):\n{}",
             no_description.len(),
@@ -720,9 +711,11 @@ fn completeness_context(storage: &SqliteStorage) -> McpResult<String> {
     }
 
     if !no_priority_set.is_empty() {
-        let ids: Vec<_> = no_priority_set.iter().take(QUALITY_SAMPLE_LIMIT).map(|i| {
-            json!({"id": i.id, "title": i.title, "type": i.issue_type})
-        }).collect();
+        let ids: Vec<_> = no_priority_set
+            .iter()
+            .take(QUALITY_SAMPLE_LIMIT)
+            .map(|i| json!({"id": i.id, "title": i.title, "type": i.issue_type}))
+            .collect();
         parts.push(format!(
             "Issues still at default priority (medium) that may need review ({}):\n{}",
             no_priority_set.len(),
@@ -829,9 +822,7 @@ impl PromptHandler for PolishBacklogPrompt {
         _ctx: &McpContext,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
-        let raw_focus = arguments
-            .get("focus")
-            .map_or("all", String::as_str);
+        let raw_focus = arguments.get("focus").map_or("all", String::as_str);
         let (focus, focus_warning) = validate_prompt_arg(
             raw_focus,
             &["all", "completeness", "dependencies"],

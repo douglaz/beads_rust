@@ -63,10 +63,7 @@ pub struct ServeArgs {
 ///
 /// Returns an error if the beads workspace is not initialised or storage
 /// cannot be opened.
-pub fn run_serve(
-    args: &ServeArgs,
-    overrides: &config::CliOverrides,
-) -> crate::Result<()> {
+pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(overrides)?;
     let res = config::open_storage_with_cli(&beads_dir, overrides)?;
 

@@ -290,6 +290,7 @@ dependencies = [
  "criterion",
  "crossterm",
  "dunce",
+ "fastmcp-rust",
  "fsqlite",
  "fsqlite-ast",
  "fsqlite-btree",
@@ -1048,6 +1049,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1160,6 +1182,115 @@ checksum = "7223ae2d2f179b803433d9c830478527e92b8117eab39460edae7f1614d9fb73"
 dependencies = [
  "heapless",
  "serde",
+]
+
+[[package]]
+name = "fastmcp-client"
+version = "0.2.0"
+dependencies = [
+ "asupersync",
+ "dirs",
+ "fastmcp-core",
+ "fastmcp-protocol",
+ "fastmcp-transport",
+ "log",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "fastmcp-console"
+version = "0.2.0"
+dependencies = [
+ "fastmcp-core",
+ "fastmcp-protocol",
+ "log",
+ "regex",
+ "rich_rust",
+ "serde",
+ "serde_json",
+ "strip-ansi-escapes",
+ "time",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "fastmcp-core"
+version = "0.2.0"
+dependencies = [
+ "asupersync",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fastmcp-derive"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "fastmcp-protocol"
+version = "0.2.0"
+dependencies = [
+ "base64",
+ "fastmcp-core",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fastmcp-rust"
+version = "0.2.0"
+dependencies = [
+ "asupersync",
+ "fastmcp-client",
+ "fastmcp-core",
+ "fastmcp-derive",
+ "fastmcp-protocol",
+ "fastmcp-server",
+ "fastmcp-transport",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fastmcp-server"
+version = "0.2.0"
+dependencies = [
+ "asupersync",
+ "base64",
+ "chrono",
+ "fastmcp-client",
+ "fastmcp-console",
+ "fastmcp-core",
+ "fastmcp-protocol",
+ "fastmcp-transport",
+ "getrandom 0.4.2",
+ "hmac",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "fastmcp-transport"
+version = "0.2.0"
+dependencies = [
+ "asupersync",
+ "fastmcp-core",
+ "fastmcp-protocol",
+ "getrandom 0.4.2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3275,6 +3406,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "option-ext"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
 name = "os_pipe"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3868,6 +4005,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_users"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
+dependencies = [
+ "getrandom 0.2.17",
+ "libredox",
+ "thiserror",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4251,6 +4399,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8bbf91e5a4d6315eee45e704372590b30e260ee83af6639d64557f51b067776"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4445,6 +4602,15 @@ checksum = "cffa8a2e517b4e9f270c47e1c4120df90506d9451c1efa67e3698d66446d30ce"
 dependencies = [
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "strip-ansi-escapes"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a8f8038e7e7969abb3f1b7c2a811225e9296da208539e0f79c5251d6cac0025"
+dependencies = [
+ "vte",
 ]
 
 [[package]]
@@ -4674,6 +4840,45 @@ dependencies = [
  "pin-project-lite",
  "tokio",
 ]
+
+[[package]]
+name = "toml"
+version = "1.0.6+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "399b1124a3c9e16766831c6bba21e50192572cdd98706ea114f9502509686ffc"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "1.0.0+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32c2555c699578a4f59f0cc68e5116c8d7cabbd45e1409b989d4be085b53f13e"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.0.9+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "702d4415e08923e7e1ef96cd5727c0dfed80b4d2fa25db9647fe5eb6f7c5a4c4"
+dependencies = [
+ "winnow",
+]
+
+[[package]]
+name = "toml_writer"
+version = "1.0.6+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab16f14aed21ee8bfd8ec22513f7287cd4a91aa92e44edfe2c17ddd004e92607"
 
 [[package]]
 name = "tower"
@@ -5008,6 +5213,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "vte"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "231fdcd7ef3037e8330d8e17e61011a2c244126acc0a982f4040ac3f9f0bc077"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

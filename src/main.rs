@@ -196,6 +196,9 @@ fn main() {
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
+        #[cfg(feature = "mcp")]
+        Commands::Serve(ref args) => beads_rust::mcp::run_serve(args, &overrides),
+
         #[cfg(feature = "self_update")]
         Commands::Upgrade(args) => commands::upgrade::execute(&args, &output_ctx),
         Commands::Completions(args) => commands::completions::execute(&args, &output_ctx),
@@ -442,6 +445,9 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::History(_)
         | Commands::Orphans(_)
         | Commands::Agents(_) => false,
+
+        #[cfg(feature = "mcp")]
+        Commands::Serve(_) => false,
 
         #[cfg(feature = "self_update")]
         Commands::Upgrade(_) => false,

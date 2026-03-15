@@ -105,6 +105,9 @@ unicode-width = "0.2.2"
 # Versioning
 semver = "1.0.27"
 
+# MCP server (optional; gated behind the `mcp` feature)
+fastmcp-rust = { version = "0.2.0", optional = true }
+
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "0.42", features = ["rustls", "archive-tar", "compression-flate2"], default-features = false, optional = true }
 
@@ -137,6 +140,7 @@ opt-level = 1
 
 [features]
 default = ["self_update"]
+mcp = ["dep:fastmcp-rust"]
 self_update = [
     "dep:self_update",
     "self_update/rustls",
@@ -168,6 +172,7 @@ fsqlite-types        = { path = "../frankensqlite/crates/fsqlite-types", package
 fsqlite-vdbe         = { path = "../frankensqlite/crates/fsqlite-vdbe", package = "fsqlite-vdbe" }
 fsqlite-vfs          = { path = "../frankensqlite/crates/fsqlite-vfs", package = "fsqlite-vfs" }
 fsqlite-wal          = { path = "../frankensqlite/crates/fsqlite-wal", package = "fsqlite-wal" }
+fastmcp-rust         = { path = "../fastmcp_rust/crates/fastmcp" }
 
 [lints.rust]
 unsafe_code = "forbid"

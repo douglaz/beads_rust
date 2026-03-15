@@ -32,6 +32,9 @@ pub mod sync;
 pub mod util;
 pub mod validation;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 pub use error::{BeadsError, ErrorCode, Result, StructuredError};
 
 /// Run the CLI application.

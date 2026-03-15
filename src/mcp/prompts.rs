@@ -88,11 +88,11 @@ fn blocked_context(storage: &SqliteStorage) -> McpResult<String> {
 fn unassigned_context(storage: &SqliteStorage) -> McpResult<String> {
     let filters = ListFilters {
         include_closed: false,
+        unassigned: true,
         limit: Some(UNASSIGNED_FETCH_LIMIT),
         ..ListFilters::default()
     };
-    let all_open = storage.list_issues(&filters).map_err(to_mcp)?;
-    let unassigned: Vec<&Issue> = all_open.iter().filter(|i| i.assignee.is_none()).collect();
+    let unassigned = storage.list_issues(&filters).map_err(to_mcp)?;
     if unassigned.is_empty() {
         return Ok("All open issues are assigned.".into());
     }

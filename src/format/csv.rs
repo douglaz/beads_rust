@@ -303,7 +303,10 @@ mod tests {
 
     #[test]
     fn test_escape_field_formula_injection_plus() {
-        assert_eq!(escape_field("+cmd|' /C calc'!A0"), "\"'+cmd|' /C calc'!A0\"");
+        assert_eq!(
+            escape_field("+cmd|' /C calc'!A0"),
+            "\"'+cmd|' /C calc'!A0\""
+        );
     }
 
     #[test]

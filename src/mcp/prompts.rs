@@ -7,17 +7,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fastmcp_rust::{
-    Content, McpContext, McpError, McpResult, Prompt, PromptArgument, PromptHandler, PromptMessage,
+    Content, McpContext, McpResult, Prompt, PromptArgument, PromptHandler, PromptMessage,
     Role,
 };
 use serde_json::json;
 
 use std::collections::HashSet;
 
-use crate::model::{Issue, Status};
+use crate::model::{Issue, IssueType, Status};
 use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 
-use super::BeadsState;
+use super::{to_mcp, BeadsState};
 
 // ---------------------------------------------------------------------------
 // Display limits — extracted from magic numbers for maintainability
@@ -38,11 +38,6 @@ const COMPLETENESS_FETCH_LIMIT: usize = 100;
 const QUALITY_SAMPLE_LIMIT: usize = 10;
 const ORPHAN_DISPLAY_LIMIT: usize = 15;
 const DEPENDENCY_HEALTH_FETCH_LIMIT: usize = 500;
-
-/// Map a `crate::error::BeadsError` into an `McpError`.
-fn to_mcp(err: impl std::fmt::Display) -> McpError {
-    McpError::tool_error(err.to_string())
-}
 
 /// Validate a prompt argument against known values. Returns the validated value
 /// and an optional warning if the input was unrecognized and defaulted.
@@ -364,7 +359,7 @@ impl PromptHandler for StatusReportPrompt {
             .map_err(to_mcp)?;
 
         let in_progress_filters = ListFilters {
-            statuses: Some(vec![crate::model::Status::InProgress]),
+            statuses: Some(vec![Status::InProgress]),
             include_closed: false,
             limit: Some(50),
             ..ListFilters::default()
@@ -693,7 +688,7 @@ fn completeness_context(storage: &SqliteStorage) -> McpResult<String> {
         if issue.priority.0 == 2
             && !matches!(
                 issue.issue_type,
-                crate::model::IssueType::Chore | crate::model::IssueType::Question
+                IssueType::Chore | IssueType::Question
             )
         {
             no_priority_set.push(issue);
@@ -746,6 +741,7 @@ fn completeness_context(storage: &SqliteStorage) -> McpResult<String> {
 fn dependency_health_context(storage: &SqliteStorage) -> McpResult<String> {
     let filters = ListFilters {
         include_closed: false,
+        include_deferred: true, // deferred issues are still part of the project
         limit: Some(DEPENDENCY_HEALTH_FETCH_LIMIT),
         ..ListFilters::default()
     };
@@ -766,7 +762,7 @@ fn dependency_health_context(storage: &SqliteStorage) -> McpResult<String> {
 
     let orphans: Vec<_> = open_issues
         .iter()
-        .filter(|i| !connected.contains(i.id.as_str()) && i.status != Status::Closed)
+        .filter(|i| !connected.contains(i.id.as_str()))
         .take(ORPHAN_DISPLAY_LIMIT)
         .map(|i| json!({"id": i.id, "title": i.title, "priority": i.priority}))
         .collect();

@@ -25,6 +25,14 @@ use super::BeadsState;
 // Constants — pre-computed sets for O(1) placeholder detection
 // ---------------------------------------------------------------------------
 
+/// Field keys in `update_issue` that map to `IssueUpdate` struct fields.
+/// Used to distinguish field updates from label/comment side-effects.
+const UPDATE_FIELD_KEYS: &[&str] = &[
+    "title", "description", "status", "priority", "type",
+    "assignee", "owner", "due_at", "defer_until",
+    "estimated_minutes", "external_ref",
+];
+
 /// Known placeholder strings agents hallucinate instead of real IDs.
 const PLACEHOLDER_EXACT: &[&str] = &[
     "your_id", "your-id", "yourid", "your_issue_id",
@@ -158,8 +166,12 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
                 json!([{"tool": "list_issues", "arguments": {}}]);
         }
         ErrorCode::CycleDetected => {
+            // Suggest list_issues so the agent can discover IDs and
+            // inspect the dependency graph.  We can't suggest tools
+            // that require an `id` param because we don't know which
+            // ID is relevant from the error alone.
             data["suggested_tool_calls"] = json!([
-                {"tool": "manage_dependencies", "arguments": {"action": "list"}}
+                {"tool": "list_issues", "arguments": {}}
             ]);
         }
         ErrorCode::InvalidStatus => {
@@ -476,13 +488,24 @@ fn sanitize_search(query: &str) -> Option<String> {
 
 /// Read a nullable string field from JSON args: present-string → `Some(Some(s))`,
 /// present-null → `Some(None)`, absent → `None`.
+/// Returns an error if the value is present but neither a string nor null.
 #[allow(clippy::option_option)]
-fn nullable_str(args: &serde_json::Value, key: &str) -> Option<Option<String>> {
-    args.get(key).map(|v| v.as_str().map(String::from))
+fn nullable_str(args: &serde_json::Value, key: &str) -> McpResult<Option<Option<String>>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(Some(None)),
+        Some(v) => v.as_str().map_or_else(
+            || Err(McpError::invalid_params(format!(
+                "'{key}' must be a string or null, got {v}"
+            ))),
+            |s| Ok(Some(Some(s.to_string()))),
+        ),
+    }
 }
 
 /// Parse update fields from JSON args into an `IssueUpdate` + coercion warnings.
 /// Extracted to keep `UpdateIssueTool::call` under the line limit.
+#[allow(clippy::too_many_lines)]
 fn parse_update_fields(
     id: &str,
     args: &serde_json::Value,
@@ -498,7 +521,7 @@ fn parse_update_fields(
         }
         updates.title = Some(title.to_string());
     }
-    updates.description = nullable_str(args, "description");
+    updates.description = nullable_str(args, "description")?;
     if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
         let (status, warning) = parse_status(s)?;
 
@@ -538,8 +561,8 @@ fn parse_update_fields(
         }
         updates.issue_type = Some(issue_type);
     }
-    updates.assignee = nullable_str(args, "assignee");
-    updates.owner = nullable_str(args, "owner");
+    updates.assignee = nullable_str(args, "assignee")?;
+    updates.owner = nullable_str(args, "owner")?;
     if let Some(v) = args.get("due_at") {
         if v.is_null() {
             updates.due_at = Some(None);
@@ -549,6 +572,10 @@ fn parse_update_fields(
                 coercions.push(format!("due_at: {w}"));
             }
             updates.due_at = Some(Some(dt));
+        } else {
+            return Err(McpError::invalid_params(format!(
+                "'due_at' must be an ISO 8601 string or null, got {v}"
+            )));
         }
     }
     if let Some(v) = args.get("defer_until") {
@@ -560,6 +587,10 @@ fn parse_update_fields(
                 coercions.push(format!("defer_until: {w}"));
             }
             updates.defer_until = Some(Some(dt));
+        } else {
+            return Err(McpError::invalid_params(format!(
+                "'defer_until' must be an ISO 8601 string or null, got {v}"
+            )));
         }
     }
     if let Some(v) = args.get("estimated_minutes") {
@@ -570,9 +601,22 @@ fn parse_update_fields(
                 McpError::invalid_params("estimated_minutes must fit in i32")
             })?;
             updates.estimated_minutes = Some(Some(mins));
+        } else if let Some(s) = v.as_str() {
+            // Forgive by Default: coerce string → integer
+            let mins: i32 = s.parse().map_err(|_| {
+                McpError::invalid_params(format!(
+                    "'estimated_minutes' must be an integer, got string '{s}'"
+                ))
+            })?;
+            coercions.push(format!("estimated_minutes: string '{s}' coerced to integer {mins}"));
+            updates.estimated_minutes = Some(Some(mins));
+        } else {
+            return Err(McpError::invalid_params(format!(
+                "'estimated_minutes' must be an integer or null, got {v}"
+            )));
         }
     }
-    updates.external_ref = nullable_str(args, "external_ref");
+    updates.external_ref = nullable_str(args, "external_ref")?;
 
     Ok((updates, coercions))
 }
@@ -1262,9 +1306,40 @@ impl ToolHandler for UpdateIssueTool {
         // Validate ID exists before attempting update (placeholder + existence check)
         require_valid_issue(&storage, id)?;
 
-        let issue = storage
-            .update_issue(id, &updates, &self.0.actor)
-            .map_err(beads_to_mcp)?;
+        // Detect whether we have field changes vs label/comment side-effects.
+        // If only side-effects (labels_add, labels_remove, comment), skip the
+        // update_issue call which would fail with NothingToDo.
+        let has_field_updates = UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
+        let has_side_effects =
+            args.get("labels_add").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
+                || args.get("labels_remove").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
+                || args.get("comment").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+
+        let issue = if has_field_updates {
+            storage
+                .update_issue(id, &updates, &self.0.actor)
+                .map_err(beads_to_mcp)?
+        } else if has_side_effects {
+            // No field changes but labels/comments to process — read current state
+            storage
+                .get_issue_details(id, false, false, 0)
+                .map_err(beads_to_mcp)?
+                .ok_or_else(|| issue_not_found_err(&storage, id))?
+                .issue
+        } else {
+            return Err(McpError::with_data(
+                McpErrorCode::ToolExecutionError,
+                "No changes specified",
+                json!({
+                    "error_type": "NOTHING_TO_DO",
+                    "recoverable": true,
+                    "hint": "Provide at least one field to update, a label operation, or a comment",
+                    "suggested_tool_calls": [
+                        {"tool": "show_issue", "arguments": {"id": id}}
+                    ]
+                }),
+            ));
+        };
 
         // Handle label mutations
         if let Some(labels) = args.get("labels_add").and_then(|v| v.as_array()) {

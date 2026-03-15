@@ -13,8 +13,18 @@ mod tools;
 
 use std::path::PathBuf;
 
+use fastmcp_rust::McpError;
+
 use crate::config;
 use crate::storage::SqliteStorage;
+
+/// Map any `Display` error into a flat `McpError::tool_error`.
+///
+/// Used by resources and prompts for non-structured error mapping.
+/// Tools use the richer `beads_to_mcp` in `tools.rs` instead.
+pub(super) fn to_mcp(err: impl std::fmt::Display) -> McpError {
+    McpError::tool_error(err.to_string())
+}
 
 /// Shared configuration available to every MCP handler.
 ///

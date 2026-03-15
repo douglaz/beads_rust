@@ -1187,6 +1187,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-client"
 version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#c6e6e1c6064fa5a22f9da858ed49e2963a194e33"
 dependencies = [
  "asupersync",
  "dirs",
@@ -1202,6 +1203,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-console"
 version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#c6e6e1c6064fa5a22f9da858ed49e2963a194e33"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1219,6 +1221,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-core"
 version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#c6e6e1c6064fa5a22f9da858ed49e2963a194e33"
 dependencies = [
  "asupersync",
  "log",
@@ -1229,6 +1232,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-derive"
 version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#c6e6e1c6064fa5a22f9da858ed49e2963a194e33"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1238,6 +1242,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-protocol"
 version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#c6e6e1c6064fa5a22f9da858ed49e2963a194e33"
 dependencies = [
  "base64",
  "fastmcp-core",
@@ -1249,6 +1254,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-rust"
 version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#c6e6e1c6064fa5a22f9da858ed49e2963a194e33"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -1264,6 +1270,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-server"
 version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#c6e6e1c6064fa5a22f9da858ed49e2963a194e33"
 dependencies = [
  "asupersync",
  "base64",
@@ -1284,6 +1291,7 @@ dependencies = [
 [[package]]
 name = "fastmcp-transport"
 version = "0.2.0"
+source = "git+https://github.com/Dicklesworthstone/fastmcp_rust#c6e6e1c6064fa5a22f9da858ed49e2963a194e33"
 dependencies = [
  "asupersync",
  "fastmcp-core",
@@ -1401,6 +1409,7 @@ dependencies = [
 [[package]]
 name = "fsqlite"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -1414,6 +1423,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ast"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-types",
 ]
@@ -1421,6 +1431,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-btree"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -1433,6 +1444,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-core"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1470,6 +1482,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-error"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "thiserror",
 ]
@@ -1477,6 +1490,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-fts5"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1487,6 +1501,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-icu"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1497,6 +1512,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-json"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1508,6 +1524,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-misc"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1520,6 +1537,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-rtree"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1529,6 +1547,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-func"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
@@ -1538,6 +1557,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-mvcc"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "blake3",
  "crossbeam-epoch",
@@ -1558,6 +1578,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-observability"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1568,6 +1589,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-pager"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1585,6 +1607,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-parser"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1596,6 +1619,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-planner"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -1609,6 +1633,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-types"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "asupersync",
  "bitflags",
@@ -1624,6 +1649,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-vdbe"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "crossbeam-deque",
  "fsqlite-ast",
@@ -1644,6 +1670,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-vfs"
 version = "0.1.2"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -1659,6 +1686,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-wal"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite#e9b37dab8d88d994539192c1d4713cf834a4d51f"
 dependencies = [
  "asupersync",
  "blake3",

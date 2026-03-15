@@ -16,12 +16,7 @@ use crate::error::StructuredError;
 use crate::model::{Event, Issue, Status};
 use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 
-use super::BeadsState;
-
-/// Map a `crate::error::BeadsError` into an `McpError`.
-fn to_mcp(err: impl std::fmt::Display) -> McpError {
-    McpError::tool_error(err.to_string())
-}
+use super::{to_mcp, BeadsState};
 
 /// Build a structured "issue not found" error with fuzzy suggestions,
 /// mirroring the tools.rs pattern for consistent agent UX.
@@ -707,10 +702,8 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
 
     // Build adjacency list for chain depth computation
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
     for (from, to) in &open_edges {
         adj.entry(from.clone()).or_default().push(to.clone());
-        *in_degree.entry(to.clone()).or_default() += 1;
     }
 
     // Longest chain depth

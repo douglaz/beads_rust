@@ -548,7 +548,7 @@ fn execute_flush(
 
     // Configure export
     let export_config = ExportConfig {
-        force: args.force || (needs_flush && dirty_ids.is_empty()),
+        force: args.force || needs_flush,
         is_default_path: true,
         error_policy: export_policy,
         retention_days,

@@ -1,5 +1,5 @@
 use super::Theme;
-use crate::cli::{Cli, InheritedOutputMode, OutputFormat};
+use crate::cli::{Cli, InheritedOutputMode, OutputFormat, command_requests_robot_json};
 use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
 use serde::Serialize;
@@ -132,7 +132,7 @@ impl OutputContext {
     }
 
     fn detect_mode_with_env(args: &Cli, env_output_format: Option<OutputFormat>) -> OutputMode {
-        if args.json {
+        if args.json || command_requests_robot_json(&args.command) {
             return OutputMode::Json;
         }
         if args.quiet {
@@ -501,6 +501,15 @@ mod tests {
         let cli = Cli::parse_from(["br", "--json", "count"]);
         assert_eq!(
             OutputContext::detect_mode_with_env(&cli, Some(OutputFormat::Toon)),
+            OutputMode::Json
+        );
+    }
+
+    #[test]
+    fn detect_mode_uses_robot_flag_for_sync() {
+        let cli = Cli::parse_from(["br", "sync", "--robot"]);
+        assert_eq!(
+            OutputContext::detect_mode_with_env(&cli, Some(OutputFormat::Text)),
             OutputMode::Json
         );
     }

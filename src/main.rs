@@ -1,5 +1,5 @@
 use beads_rust::cli::commands;
-use beads_rust::cli::{Cli, Commands, OutputFormat};
+use beads_rust::cli::{Cli, Commands, OutputFormat, command_requests_robot_json};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
 use beads_rust::output::OutputContext;
@@ -452,22 +452,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
 
         #[cfg(feature = "self_update")]
         Commands::Upgrade(_) => false,
-    }
-}
-
-const fn command_requests_robot_json(cmd: &Commands) -> bool {
-    match cmd {
-        Commands::Close(args) => args.robot,
-        Commands::Reopen(args) => args.robot,
-        Commands::Ready(args) => args.robot,
-        Commands::Blocked(args) => args.robot,
-        Commands::Stats(args) | Commands::Status(args) => args.robot,
-        Commands::Defer(args) => args.robot,
-        Commands::Undefer(args) => args.robot,
-        Commands::Orphans(args) => args.robot,
-        Commands::Changelog(args) => args.robot,
-        Commands::Sync(args) => args.robot,
-        _ => false,
     }
 }
 

@@ -255,6 +255,37 @@ fn e2e_robot_flag_stderr_diagnostics() {
     );
 }
 
+#[test]
+fn e2e_robot_flag_sync_flush_outputs_json() {
+    let _log = common::test_log("e2e_robot_flag_sync_flush_outputs_json");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Robot sync flush test", "--no-auto-flush"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let sync = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--robot"],
+        "sync_robot_flush",
+    );
+    assert!(
+        sync.status.success(),
+        "sync --robot failed: {}",
+        sync.stderr
+    );
+
+    let payload = extract_json_payload(&sync.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("robot mode should output valid JSON");
+    assert_eq!(json["exported_issues"].as_u64(), Some(1));
+}
+
 // ============================================================================
 // --no-color flag tests
 // ============================================================================

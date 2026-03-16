@@ -1329,6 +1329,24 @@ pub fn resolve_output_format(
     }
 }
 
+/// Returns true when a subcommand-local `--robot` flag requests JSON output.
+#[must_use]
+pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Close(args) => args.robot,
+        Commands::Reopen(args) => args.robot,
+        Commands::Ready(args) => args.robot,
+        Commands::Blocked(args) => args.robot,
+        Commands::Stats(args) | Commands::Status(args) => args.robot,
+        Commands::Defer(args) => args.robot,
+        Commands::Undefer(args) => args.robot,
+        Commands::Orphans(args) => args.robot,
+        Commands::Changelog(args) => args.robot,
+        Commands::Sync(args) => args.robot,
+        _ => false,
+    }
+}
+
 /// Machine-readable or quiet state inherited from an outer command context.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InheritedOutputMode {

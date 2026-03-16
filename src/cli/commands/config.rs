@@ -530,9 +530,11 @@ fn set_config_value(
     let old_value = get_yaml_value(&config, &parts);
     set_yaml_value(&mut config, &parts, parse_scalar_config_value(value));
 
-    // Write back
+    // Write back atomically (temp file + rename) to prevent corruption on crash
     let yaml_str = serde_yml::to_string(&config)?;
-    fs::write(&config_path, yaml_str)?;
+    let temp_path = config_path.with_extension("yaml.tmp");
+    fs::write(&temp_path, &yaml_str)?;
+    fs::rename(&temp_path, &config_path)?;
 
     info!(
         key,
@@ -809,7 +811,10 @@ fn apply_prepared_yaml_delete(prepared: Option<PreparedYamlDelete>) -> Result<bo
         return Ok(false);
     };
 
-    fs::write(prepared.path, prepared.yaml)?;
+    // Atomic write: temp file + rename to prevent corruption on crash
+    let temp_path = prepared.path.with_extension("yaml.tmp");
+    fs::write(&temp_path, &prepared.yaml)?;
+    fs::rename(&temp_path, &prepared.path)?;
     Ok(true)
 }
 

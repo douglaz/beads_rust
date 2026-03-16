@@ -137,11 +137,14 @@ fn placeholder_error(s: &str) -> McpError {
 /// Check for placeholder AND validate ID exists. Returns fuzzy suggestions
 /// with `suggested_tool_calls` if not found.
 fn require_valid_issue(storage: &SqliteStorage, id: &str) -> McpResult<()> {
-    if let Some(err) = detect_placeholder(id) {
-        return Err(err);
-    }
+    // Check DB first: if the ID exists, it's real regardless of name.
     if storage.id_exists(id).map_err(beads_to_mcp)? {
         return Ok(());
+    }
+    // ID not found — give a more helpful placeholder error if the ID looks
+    // hallucinated, otherwise give a standard not-found error.
+    if let Some(err) = detect_placeholder(id) {
+        return Err(err);
     }
     Err(issue_not_found_err(storage, id))
 }

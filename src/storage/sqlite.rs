@@ -4135,6 +4135,12 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn add_comment(&mut self, issue_id: &str, author: &str, text: &str) -> Result<Comment> {
+        if text.trim().is_empty() {
+            return Err(crate::error::BeadsError::validation(
+                "comment",
+                "comment text cannot be empty",
+            ));
+        }
         self.mutate("add_comment", author, |conn, ctx| {
             let comment_id = insert_comment_row(conn, issue_id, author, text)?;
 

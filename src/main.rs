@@ -524,6 +524,7 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         json: Some(cli.json),
         display_color: if cli.no_color { Some(false) } else { None },
         quiet: Some(cli.quiet),
+        allow_stale: if cli.allow_stale { Some(true) } else { None },
         no_db: if cli.no_db { Some(true) } else { None },
         no_daemon: if cli.no_daemon { Some(true) } else { None },
         no_auto_flush: if cli.no_auto_flush { Some(true) } else { None },
@@ -587,6 +588,7 @@ mod tests {
             "br",
             "--json",
             "--no-color",
+            "--allow-stale",
             "--no-db",
             "--no-auto-flush",
             "--lock-timeout",
@@ -596,6 +598,7 @@ mod tests {
         let overrides = build_cli_overrides(&cli);
         assert_eq!(overrides.json, Some(true));
         assert_eq!(overrides.display_color, Some(false));
+        assert_eq!(overrides.allow_stale, Some(true));
         assert_eq!(overrides.no_db, Some(true));
         assert_eq!(overrides.no_auto_flush, Some(true));
         assert_eq!(overrides.lock_timeout, Some(2500));
@@ -610,6 +613,7 @@ mod tests {
         assert_eq!(overrides.no_daemon, None);
         assert_eq!(overrides.no_auto_flush, None);
         assert_eq!(overrides.no_auto_import, None);
+        assert_eq!(overrides.allow_stale, None);
     }
 
     #[test]
@@ -680,9 +684,9 @@ mod tests {
     }
 
     #[test]
-    fn orphans_auto_imports_before_reading_issue_state() {
+    fn orphans_handles_freshness_without_global_auto_import() {
         let command = Cli::parse_from(["br", "orphans"]).command;
-        assert!(should_auto_import(&command));
+        assert!(!should_auto_import(&command));
     }
 
     #[test]

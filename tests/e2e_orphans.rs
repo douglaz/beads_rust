@@ -77,6 +77,29 @@ fn parse_created_id(stdout: &str) -> String {
     id_part.trim().to_string()
 }
 
+fn rewrite_jsonl_issue_as_closed(workspace: &BrWorkspace, issue_id: &str) {
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let contents = fs::read_to_string(&jsonl_path).expect("read issues.jsonl");
+
+    let rewritten = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut issue: Value = serde_json::from_str(line).expect("parse issue json");
+            if issue["id"].as_str() == Some(issue_id) {
+                issue["status"] = Value::String("closed".to_string());
+                issue["updated_at"] = Value::String("2026-01-01T00:00:00Z".to_string());
+                issue["closed_at"] = Value::String("2026-01-01T00:00:00Z".to_string());
+                issue["close_reason"] = Value::String("Closed via JSONL edit".to_string());
+            }
+            serde_json::to_string(&issue).expect("serialize issue json")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    fs::write(&jsonl_path, format!("{rewritten}\n")).expect("write issues.jsonl");
+}
+
 // =============================================================================
 // Success Path Tests
 // =============================================================================
@@ -157,6 +180,46 @@ fn e2e_orphans_detects_open_issue_in_commit() {
         orphans.stdout
     );
     info!("e2e_orphans_detects_open_issue_in_commit: assertions passed");
+}
+
+#[test]
+fn e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state() {
+    common::init_test_logging();
+    info!("e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state: starting");
+    let workspace = BrWorkspace::new();
+
+    init_git(&workspace, "git_init");
+    let init = run_br(&workspace, ["init"], "br_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Issue closed only in JSONL"],
+        "create_issue",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    git_commit(
+        &workspace,
+        &format!("Implement from stale DB ({issue_id})"),
+        "commit_ref",
+    );
+
+    rewrite_jsonl_issue_as_closed(&workspace, &issue_id);
+
+    let orphans = run_br(&workspace, ["orphans"], "orphans_auto_import");
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
+    assert!(
+        orphans.stdout.contains("No orphan"),
+        "expected auto-imported closed issue to disappear from orphan list, got: {}",
+        orphans.stdout
+    );
+    info!("e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state: assertions passed");
 }
 
 #[test]

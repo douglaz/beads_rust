@@ -1927,6 +1927,16 @@ impl SqliteStorage {
             params.push(SqliteValue::from(format!("%{escaped}%")));
         }
 
+        if let Some(ts) = filters.updated_before {
+            sql.push_str(" AND updated_at <= ?");
+            params.push(SqliteValue::from(ts.to_rfc3339()));
+        }
+
+        if let Some(ts) = filters.updated_after {
+            sql.push_str(" AND updated_at >= ?");
+            params.push(SqliteValue::from(ts.to_rfc3339()));
+        }
+
         if let Some(ref sort_field) = filters.sort {
             let order = if filters.reverse { "DESC" } else { "ASC" };
             match sort_field.as_str() {
@@ -9263,6 +9273,68 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "bd-s-sort-b");
+    }
+
+    #[test]
+    fn test_search_issues_filter_by_updated_date() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(10);
+        let older = now - chrono::Duration::days(20);
+
+        let issue1 = make_issue(
+            "bd-search-old",
+            "authentication old",
+            Status::Open,
+            2,
+            None,
+            old,
+            None,
+        );
+        let issue2 = make_issue(
+            "bd-search-older",
+            "authentication older",
+            Status::Open,
+            2,
+            None,
+            older,
+            None,
+        );
+        let issue3 = make_issue(
+            "bd-search-new",
+            "authentication new",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+
+        storage.create_issue(&issue1, "tester").unwrap();
+        storage.create_issue(&issue2, "tester").unwrap();
+        storage.create_issue(&issue3, "tester").unwrap();
+
+        let mut filters = ListFilters {
+            updated_before: Some(old),
+            ..Default::default()
+        };
+
+        let issues = storage.search_issues("authentication", &filters).unwrap();
+        let ids: Vec<_> = issues.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(issues.len(), 2);
+        assert!(ids.contains(&"bd-search-old"));
+        assert!(ids.contains(&"bd-search-older"));
+        assert!(!ids.contains(&"bd-search-new"));
+
+        filters.updated_before = None;
+        filters.updated_after = Some(old);
+
+        let issues = storage.search_issues("authentication", &filters).unwrap();
+        let ids: Vec<_> = issues.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(issues.len(), 2);
+        assert!(ids.contains(&"bd-search-old"));
+        assert!(ids.contains(&"bd-search-new"));
+        assert!(!ids.contains(&"bd-search-older"));
     }
 
     #[test]

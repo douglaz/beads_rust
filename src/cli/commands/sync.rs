@@ -934,31 +934,41 @@ fn execute_import(
         show_progress,
     };
 
-    // Get expected prefix from the full merged config layer (YAML, env, CLI, DB)
-    // rather than reading only from the DB, so that project config is respected.
-    let layer = config::load_config(beads_dir, Some(storage), cli)?;
-    let id_cfg = config::id_config_from_layer(&layer);
-    let prefix = if id_cfg.prefix == "br" {
-        // Prefix is still the default — check if we should auto-detect from JSONL
-        let db_prefix = storage.get_config("issue_prefix")?;
-        if let Some(p) = db_prefix {
-            p
-        } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
-            info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
-            // Persist the detected prefix to config for future operations
-            storage.set_config("issue_prefix", &detected)?;
-            detected
+    // Prefix is a default for newly generated IDs, not a project-wide import
+    // invariant. Only compute an expected prefix when the caller explicitly
+    // asked to rename imported IDs into the configured prefix.
+    let target_prefix = if args.rename_prefix {
+        let layer = config::load_config(beads_dir, Some(storage), cli)?;
+        let id_cfg = config::id_config_from_layer(&layer);
+        Some(if id_cfg.prefix == "br" {
+            // Prefix is still the default — check if we should auto-detect from JSONL
+            let db_prefix = storage.get_config("issue_prefix")?;
+            if let Some(p) = db_prefix {
+                p
+            } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
+                info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
+                // Persist the detected prefix to config for future operations
+                storage.set_config("issue_prefix", &detected)?;
+                detected
+            } else {
+                "br".to_string()
+            }
         } else {
-            "br".to_string()
-        }
+            // Config layer resolved a non-default prefix — use it
+            id_cfg.prefix
+        })
     } else {
-        // Config layer resolved a non-default prefix — use it
-        id_cfg.prefix
+        None
     };
 
     // Execute import
     info!(path = %jsonl_path.display(), "Importing from JSONL");
-    let mut import_result = import_from_jsonl(storage, jsonl_path, &import_config, Some(&prefix))?;
+    let mut import_result = import_from_jsonl(
+        storage,
+        jsonl_path,
+        &import_config,
+        target_prefix.as_deref(),
+    )?;
 
     info!(
         created_or_updated = import_result.imported_count,

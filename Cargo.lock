@@ -241,6 +241,7 @@ dependencies = [
 [[package]]
 name = "asupersync"
 version = "0.2.8"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=82cee07#82cee0731ce88cb2a56837bb12f6a0c0dccf1778"
 dependencies = [
  "base64",
  "bincode-next",
@@ -1430,6 +1431,7 @@ dependencies = [
 [[package]]
 name = "franken-decision"
 version = "0.2.8"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=82cee07#82cee0731ce88cb2a56837bb12f6a0c0dccf1778"
 dependencies = [
  "franken-evidence 0.2.8",
  "franken-kernel 0.2.8",
@@ -1449,6 +1451,7 @@ dependencies = [
 [[package]]
 name = "franken-evidence"
 version = "0.2.8"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=82cee07#82cee0731ce88cb2a56837bb12f6a0c0dccf1778"
 dependencies = [
  "serde",
  "serde_json",
@@ -1466,6 +1469,7 @@ dependencies = [
 [[package]]
 name = "franken-kernel"
 version = "0.2.8"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=82cee07#82cee0731ce88cb2a56837bb12f6a0c0dccf1778"
 dependencies = [
  "serde",
 ]

@@ -6,11 +6,11 @@
   "expected_command_outcomes": [
     {
       "surface": "startup/open",
-      "outcome": "fails_prefix_mismatch"
+      "outcome": "success"
     },
     {
       "surface": "create",
-      "outcome": "fails_prefix_mismatch"
+      "outcome": "success"
     },
     {
       "surface": "doctor",
@@ -22,7 +22,7 @@
     },
     {
       "surface": "sync --import-only",
-      "outcome": "fails_prefix_mismatch"
+      "outcome": "success"
     }
   ],
   "source_hint": "Models the DB/JSONL mismatch class called out in beads_rust-rsei.2.1.",

@@ -2322,12 +2322,8 @@ mod tests {
     #[test]
     fn test_integrity_check_messages_collects_all_rows() {
         let messages = integrity_check_messages(&[
-            vec![SqliteValue::Text(
-                "row 1 missing from index idx_a".to_string(),
-            )],
-            vec![SqliteValue::Text(
-                "row 2 missing from index idx_a".to_string(),
-            )],
+            vec![SqliteValue::Text("row 1 missing from index idx_a".into())],
+            vec![SqliteValue::Text("row 2 missing from index idx_a".into())],
         ]);
 
         assert_eq!(

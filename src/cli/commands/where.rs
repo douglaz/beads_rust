@@ -95,16 +95,16 @@ fn detect_prefix(
 
     match inspect_jsonl_prefix(jsonl_path) {
         JsonlPrefixState::Detected(prefix) => {
-            return prefix_from_db_without_recovery(db_path).or(Some(prefix));
+            return configured_prefix_from_db_without_recovery(db_path).or(Some(prefix));
         }
-        JsonlPrefixState::Mixed => return None,
+        JsonlPrefixState::Mixed => return configured_prefix_from_db_without_recovery(db_path),
         JsonlPrefixState::Missing => {}
     }
 
     prefix_from_db_without_recovery(db_path)
 }
 
-fn prefix_from_db_without_recovery(db_path: &Path) -> Option<String> {
+fn configured_prefix_from_db_without_recovery(db_path: &Path) -> Option<String> {
     if !db_path.is_file() {
         return None;
     }
@@ -112,26 +112,17 @@ fn prefix_from_db_without_recovery(db_path: &Path) -> Option<String> {
     config::with_database_family_snapshot(db_path, |snapshot_db_path| {
         let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
 
-        if let Ok(rows) = conn.query(
-            "SELECT value FROM config \
-             WHERE key IN ('issue_prefix', 'issue-prefix', 'prefix') \
-             ORDER BY CASE key \
-                 WHEN 'issue_prefix' THEN 0 \
-                 WHEN 'issue-prefix' THEN 1 \
-                 ELSE 2 \
-             END \
-             LIMIT 1",
-        ) && let Some(prefix) = rows
-            .first()
-            .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
-            .map(str::trim)
-            .filter(|prefix| !prefix.is_empty())
-        {
-            return Ok(Some(prefix.to_string()));
-        }
-
         Ok(conn
-            .query("SELECT id FROM issues ORDER BY rowid LIMIT 1")
+            .query(
+                "SELECT value FROM config \
+                 WHERE key IN ('issue_prefix', 'issue-prefix', 'prefix') \
+                 ORDER BY CASE key \
+                     WHEN 'issue_prefix' THEN 0 \
+                     WHEN 'issue-prefix' THEN 1 \
+                     ELSE 2 \
+                 END \
+                 LIMIT 1",
+            )
             .ok()
             .and_then(|rows| rows.first().cloned())
             .and_then(|row| {
@@ -139,10 +130,35 @@ fn prefix_from_db_without_recovery(db_path: &Path) -> Option<String> {
                     .and_then(SqliteValue::as_text)
                     .map(str::to_string)
             })
-            .and_then(|id| parse_id(&id).ok().map(|parsed| parsed.prefix)))
+            .map(|prefix| prefix.trim().to_string())
+            .filter(|prefix| !prefix.is_empty()))
     })
     .ok()
     .flatten()
+}
+
+fn prefix_from_db_without_recovery(db_path: &Path) -> Option<String> {
+    configured_prefix_from_db_without_recovery(db_path).or_else(|| {
+        if !db_path.is_file() {
+            return None;
+        }
+
+        config::with_database_family_snapshot(db_path, |snapshot_db_path| {
+            let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+            Ok(conn
+                .query("SELECT id FROM issues ORDER BY rowid LIMIT 1")
+                .ok()
+                .and_then(|rows| rows.first().cloned())
+                .and_then(|row| {
+                    row.get(0)
+                        .and_then(SqliteValue::as_text)
+                        .map(str::to_string)
+                })
+                .and_then(|id| parse_id(&id).ok().map(|parsed| parsed.prefix)))
+        })
+        .ok()
+        .flatten()
+    })
 }
 
 #[cfg(test)]
@@ -506,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_prefix_omits_storage_prefix_when_jsonl_prefixes_conflict() {
+    fn detect_prefix_prefers_configured_storage_prefix_when_jsonl_prefixes_conflict() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -531,7 +547,7 @@ mod tests {
 
         assert_eq!(
             detect_prefix(&beads_dir, &db_path, &jsonl_path, &CliOverrides::default()),
-            None
+            Some("proj".to_string())
         );
     }
 

@@ -38,6 +38,101 @@ fn e2e_init_new_workspace() {
 }
 
 #[test]
+fn e2e_sync_import_only_accepts_mixed_prefixes_and_keeps_default_prefix_for_new_ids() {
+    let _log = common::test_log(
+        "e2e_sync_import_only_accepts_mixed_prefixes_and_keeps_default_prefix_for_new_ids",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(
+        &workspace,
+        ["init", "--prefix", "local"],
+        "init_local_prefix",
+    );
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Seed issue", "--json"],
+        "create_seed_issue",
+    );
+    assert!(
+        create.status.success(),
+        "seed create failed: {}",
+        create.stderr
+    );
+    let seed_payload = extract_json_payload(&create.stdout);
+    let seed_issue: Value =
+        serde_json::from_str(&seed_payload).expect("seed create should emit valid JSON");
+
+    let mut imported_issue = seed_issue.clone();
+    imported_issue["id"] = Value::String("other-abc12".to_string());
+    imported_issue["title"] = Value::String("Imported mixed-prefix issue".to_string());
+    imported_issue["content_hash"] = Value::Null;
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    fs::write(
+        &jsonl_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&seed_issue).expect("serialize seed issue"),
+            serde_json::to_string(&imported_issue).expect("serialize imported issue"),
+        ),
+    )
+    .expect("write mixed-prefix jsonl");
+
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--json"],
+        "sync_import_mixed_prefixes",
+    );
+    assert!(
+        import.status.success(),
+        "sync --import-only should accept mixed prefixes: {}",
+        import.stderr
+    );
+
+    let list = run_br(&workspace, ["list", "--json"], "list_after_mixed_import");
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let list_payload = extract_json_payload(&list.stdout);
+    let issues: Value = serde_json::from_str(&list_payload).expect("list JSON");
+    let ids: Vec<&str> = issues
+        .as_array()
+        .expect("list array")
+        .iter()
+        .filter_map(|issue| issue["id"].as_str())
+        .collect();
+    assert!(
+        ids.iter().any(|id| id.starts_with("local-")),
+        "expected local-prefixed issue in {ids:?}"
+    );
+    assert!(
+        ids.contains(&"other-abc12"),
+        "expected other-abc12 in {ids:?}"
+    );
+
+    let create_after_import = run_br(
+        &workspace,
+        ["create", "Fresh local issue", "--json"],
+        "create_after_mixed_import",
+    );
+    assert!(
+        create_after_import.status.success(),
+        "create after mixed import failed: {}",
+        create_after_import.stderr
+    );
+    let created_payload = extract_json_payload(&create_after_import.stdout);
+    let created_issue: Value = serde_json::from_str(&created_payload).expect("created issue JSON");
+    let created_id = created_issue["id"]
+        .as_str()
+        .expect("created issue id should be present");
+    assert!(
+        created_id.starts_with("local-"),
+        "new issues should keep configured default prefix: {created_id}"
+    );
+}
+
+#[test]
 fn e2e_init_already_initialized() {
     let _log = common::test_log("e2e_init_already_initialized");
     let workspace = BrWorkspace::new();
@@ -852,13 +947,13 @@ fn e2e_where_json_recovers_prefix_from_valid_lines_despite_malformed_jsonl_entri
 }
 
 #[test]
-fn e2e_where_json_omits_prefix_for_mixed_jsonl_even_with_existing_db_prefix() {
+fn e2e_where_json_uses_configured_prefix_for_mixed_jsonl_when_db_has_default_prefix() {
     let _log = common::test_log(
-        "e2e_where_json_omits_prefix_for_mixed_jsonl_even_with_existing_db_prefix",
+        "e2e_where_json_uses_configured_prefix_for_mixed_jsonl_when_db_has_default_prefix",
     );
     let workspace = BrWorkspace::new();
 
-    let init = run_br(&workspace, ["init"], "init");
+    let init = run_br(&workspace, ["init", "--prefix", "proj"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     fs::write(
@@ -882,10 +977,7 @@ fn e2e_where_json_omits_prefix_for_mixed_jsonl_even_with_existing_db_prefix() {
     let payload = extract_json_payload(&whr.stdout);
     let json: Value =
         serde_json::from_str(&payload).expect("where --json should output valid JSON");
-    assert!(
-        json.get("prefix").is_none(),
-        "where should omit misleading prefix when JSONL prefixes conflict even if a DB exists: {json}"
-    );
+    assert_eq!(json["prefix"].as_str(), Some("proj"));
 }
 
 // ============================================================================

@@ -683,7 +683,7 @@ fn e2e_no_db_read_write() {
 }
 
 #[test]
-fn e2e_no_db_mixed_prefix_error() {
+fn e2e_no_db_mixed_prefixes_are_supported() {
     let workspace = BrWorkspace::new();
     let beads_dir = workspace.root.join(".beads");
     fs::create_dir_all(&beads_dir).expect("create .beads");
@@ -704,14 +704,21 @@ fn e2e_no_db_mixed_prefix_error() {
         "list_no_db_mixed",
     );
     assert!(
-        !list.status.success(),
-        "list --no-db should fail with mixed prefixes"
-    );
-    assert!(
-        list.stderr.contains("Mixed issue prefixes"),
-        "missing mixed prefix error: {}",
+        list.status.success(),
+        "list --no-db should accept mixed prefixes: {}",
         list.stderr
     );
+
+    let payload = extract_json_payload(&list.stdout);
+    let issues: Value = serde_json::from_str(&payload).expect("parse list JSON");
+    let ids: Vec<&str> = issues
+        .as_array()
+        .expect("list payload array")
+        .iter()
+        .filter_map(|issue| issue["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"aa-abc"), "expected aa-abc in {ids:?}");
+    assert!(ids.contains(&"bb-def"), "expected bb-def in {ids:?}");
 }
 
 #[test]

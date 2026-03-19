@@ -1982,9 +1982,9 @@ pub fn auto_import_if_stale(
     }
 
     let import_config = ImportConfig {
-        // Auto-import should be strict about prefix mismatches to prevent
-        // silently importing issues from another project.
-        skip_prefix_validation: false,
+        // The configured prefix is the default for new IDs, not a project-wide
+        // invariant. Auto-import should preserve mixed-prefix workspaces.
+        skip_prefix_validation: true,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
         show_progress: false,

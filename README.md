@@ -431,7 +431,7 @@ br uses layered configuration:
 ```yaml
 # .beads/config.yaml
 
-# Issue ID prefix (default: "bd")
+# Default issue ID prefix for newly created issues
 id:
   prefix: "proj"
 
@@ -565,18 +565,18 @@ br list | grep -i "abc"
 
 ### Error: "Prefix mismatch"
 
-**Cause:** JSONL contains issues with different ID prefix.
+**Cause:** This now only applies when you explicitly ask br to enforce or rewrite
+prefixes during import. Mixed prefixes in a project are supported by default.
 
 ```bash
-# Check your prefix
+# Check your default creation prefix
 br config get id.prefix
 
-# Import with validation skip (careful!)
-br sync --import-only --skip-prefix-validation
+# Import while rewriting IDs into your configured default prefix
+br sync --import-only --rename-prefix
 ```
 
-If this appears during auto-import on read-only commands, re-run with
-`--allow-stale` or `--no-auto-import` to proceed without importing.
+If you want to preserve imported IDs exactly as-is, omit `--rename-prefix`.
 
 ### Error: "Stale database"
 
@@ -721,6 +721,9 @@ Yes:
 br config set id.prefix=myproj
 # New issues: myproj-abc123
 ```
+
+You can also mix multiple prefixes in the same project. The configured prefix is
+the default for newly created issues, not a restriction on existing IDs.
 
 ### Q: Where is data stored?
 

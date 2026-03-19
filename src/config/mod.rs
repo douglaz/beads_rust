@@ -22,7 +22,7 @@ use crate::util::id::{IdConfig, split_prefix_remainder};
 use chrono::Utc;
 use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, IsTerminal};
@@ -639,6 +639,7 @@ pub(crate) fn repair_database_from_jsonl(
     let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, jsonl_path)?;
     let mut import_config = import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path);
     import_config.show_progress = show_progress;
+    import_config.skip_prefix_validation = true;
 
     preflight_import(jsonl_path, &import_config, Some(&prefix))?.into_result()?;
 
@@ -1231,8 +1232,9 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
         storage.set_config("issue_prefix", &prefix)?;
 
         if paths.jsonl_path.is_file() {
-            let import_config =
+            let mut import_config =
                 import_config_for_resolved_jsonl(beads_dir, &paths.db_path, &paths.jsonl_path);
+            import_config.skip_prefix_validation = true;
             import_from_jsonl(
                 &mut storage,
                 &paths.jsonl_path,
@@ -1326,7 +1328,7 @@ fn resolve_bootstrap_issue_prefix(
         }
     }
 
-    if let Some(prefix) = common_prefix_from_jsonl(jsonl_path)? {
+    if let Some(prefix) = first_prefix_from_jsonl(jsonl_path)? {
         return Ok(prefix);
     }
 
@@ -1442,59 +1444,6 @@ pub(crate) fn first_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String
     }
 
     Ok(None)
-}
-
-fn common_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
-    if !jsonl_path.is_file() {
-        return Ok(None);
-    }
-
-    let file = std::fs::File::open(jsonl_path)?;
-    let reader = std::io::BufReader::new(file);
-    let mut prefixes: HashSet<String> = HashSet::new();
-
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
-        })?;
-
-        // Skip tombstones — they may retain a foreign prefix legitimately
-        // (e.g. issues created under the old "bd-" prefix before migration).
-        if value
-            .get("status")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s == "tombstone")
-        {
-            continue;
-        }
-
-        let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
-            continue;
-        };
-
-        let Some((prefix, _)) = split_prefix_remainder(id) else {
-            return Err(BeadsError::InvalidId { id: id.to_string() });
-        };
-        if prefix.is_empty() {
-            return Err(BeadsError::InvalidId { id: id.to_string() });
-        }
-
-        prefixes.insert(prefix.to_string());
-        if prefixes.len() > 1 {
-            return Err(BeadsError::Config(
-                "Mixed issue prefixes detected in JSONL. Set issue-prefix in .beads/config.yaml."
-                    .to_string(),
-            ));
-        }
-    }
-
-    Ok(prefixes.into_iter().next())
 }
 
 /// Resolve config paths using startup config layers for overrides.
@@ -3299,7 +3248,7 @@ routing:
     }
 
     #[test]
-    fn common_prefix_from_jsonl_preserves_hyphenated_prefixes() {
+    fn first_prefix_from_jsonl_preserves_hyphenated_prefixes_across_multiple_rows() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -3326,7 +3275,7 @@ routing:
         .expect("write jsonl");
 
         assert_eq!(
-            common_prefix_from_jsonl(&jsonl_path).expect("infer prefix"),
+            first_prefix_from_jsonl(&jsonl_path).expect("infer prefix"),
             Some("document-intelligence".to_string())
         );
     }

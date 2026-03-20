@@ -1618,6 +1618,7 @@ dependencies = [
  "blake3",
  "crc32c",
  "crossbeam-epoch",
+ "fsqlite-btree",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-pager",

@@ -194,8 +194,7 @@ fn assert_doctor_healthy(root: &PathBuf) {
         "doctor failed after contention and --repair could not recover it:\n\
          initial: stdout={} stderr={}\n\
          repair:  stdout={} stderr={}",
-        doctor.stdout, doctor.stderr,
-        repair.stdout, repair.stderr
+        doctor.stdout, doctor.stderr, repair.stdout, repair.stderr
     );
 }
 
@@ -1386,7 +1385,10 @@ fn e2e_interleaved_command_families_preserve_workspace_integrity() {
         comment_json.len()
     );
 
-    let labels = run_br_in_dir(&root, ["--no-auto-import", "label", "list", &issue_id, "--json"]);
+    let labels = run_br_in_dir(
+        &root,
+        ["--no-auto-import", "label", "list", &issue_id, "--json"],
+    );
     assert!(
         labels.success,
         "label list failed after contention: {}",
@@ -1809,7 +1811,13 @@ fn e2e_actor_oriented_command_families_preserve_workspace_integrity() {
 
     let comments = run_br_in_dir(
         &root,
-        ["--no-auto-import", "comments", "list", &comment_id, "--json"],
+        [
+            "--no-auto-import",
+            "comments",
+            "list",
+            &comment_id,
+            "--json",
+        ],
     );
     assert!(
         comments.success,
@@ -1833,7 +1841,10 @@ fn e2e_actor_oriented_command_families_preserve_workspace_integrity() {
         comments.stdout
     );
 
-    let labels = run_br_in_dir(&root, ["--no-auto-import", "label", "list", &label_id, "--json"]);
+    let labels = run_br_in_dir(
+        &root,
+        ["--no-auto-import", "label", "list", &label_id, "--json"],
+    );
     assert!(
         labels.success,
         "label list failed after actor contention: {}",
@@ -2000,7 +2011,10 @@ fn e2e_routed_access_remains_bounded_while_remote_workspace_mutates() {
     assert_doctor_healthy(&main_root);
 
     // Use --no-auto-import for post-contention reads to avoid SYNC_CONFLICT.
-    let routed_show = run_br_in_dir(&main_root, ["--no-auto-import", "show", &external_id, "--json"]);
+    let routed_show = run_br_in_dir(
+        &main_root,
+        ["--no-auto-import", "show", &external_id, "--json"],
+    );
     assert!(
         routed_show.success,
         "show routed issue failed: {}",
@@ -2035,7 +2049,10 @@ fn e2e_routed_access_remains_bounded_while_remote_workspace_mutates() {
         external_labels.stdout
     );
 
-    let local_show = run_br_in_dir(&main_root, ["--no-auto-import", "show", &local_id, "--json"]);
+    let local_show = run_br_in_dir(
+        &main_root,
+        ["--no-auto-import", "show", &local_id, "--json"],
+    );
     assert!(
         local_show.success,
         "show local issue failed after routed contention: {}",

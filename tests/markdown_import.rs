@@ -1,5 +1,5 @@
 mod common;
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br};
 use std::fs;
 
 #[test]
@@ -485,9 +485,8 @@ fn test_markdown_import_all_failed_returns_error() {
         "list_after_all_failed_import",
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
-    let listed: serde_json::Value =
-        serde_json::from_str(&extract_json_payload(&list.stdout)).expect("list json");
-    assert_eq!(listed.as_array().expect("list array").len(), 0);
+    let listed = parse_list_issues(&list.stdout);
+    assert_eq!(listed.len(), 0);
 }
 
 #[test]

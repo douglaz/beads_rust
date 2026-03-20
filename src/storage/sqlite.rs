@@ -8099,7 +8099,10 @@ mod tests {
 
         // Trigger a read — is_blocked calls ensure_blocked_cache_fresh internally.
         let blocked = storage.is_blocked("bd-c1").unwrap();
-        assert!(!blocked, "bd-c1 should not be blocked after adding only a 'related' dep");
+        assert!(
+            !blocked,
+            "bd-c1 should not be blocked after adding only a 'related' dep"
+        );
 
         // After the lazy rebuild the stale marker should be cleared.
         assert!(

@@ -903,8 +903,7 @@ fn integrity_messages_only_unused_pages(messages: &[String]) -> bool {
     //   (b) a sqlite3 CLI context header line ("*** in database main ***")
     messages.iter().all(|msg| {
         let lower = msg.to_lowercase();
-        lower.contains("never used")
-            || lower.contains("*** in database")
+        lower.contains("never used") || lower.contains("*** in database")
     })
 }
 

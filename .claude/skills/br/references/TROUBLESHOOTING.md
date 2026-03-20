@@ -31,7 +31,7 @@ br sync --status  # Safe read-only check
 
 ```bash
 # Check if issue exists
-br list --json | jq '.[] | select(.id == "<id>")'
+br list --json | jq '.issues[] | select(.id == "<id>")'
 
 # Check for similar IDs
 br search "keyword" --json

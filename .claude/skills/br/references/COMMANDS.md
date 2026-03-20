@@ -166,11 +166,11 @@ br upgrade                                   # Self-update (if enabled)
 br ready --json | jq '.[0]'
 
 # Filter high priority
-br list --json | jq '.[] | select(.priority <= 1)'
+br list --json | jq '.issues[] | select(.priority <= 1)'
 
 # Get specific issue field
 br show <id> --json | jq '.title'
 
 # Count open issues by type
-br list --status open --json | jq 'group_by(.type) | map({type: .[0].type, count: length})'
+br list --status open --json | jq '.issues | group_by(.type) | map({type: .[0].type, count: length})'
 ```

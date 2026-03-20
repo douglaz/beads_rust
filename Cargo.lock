@@ -1483,6 +1483,7 @@ dependencies = [
  "fsqlite-ext-fts5",
  "fsqlite-ext-json",
  "fsqlite-ext-rtree",
+ "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-vfs",
 ]

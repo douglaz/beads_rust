@@ -410,7 +410,7 @@ The output mode is automatically detected:
 
 ```bash
 # CORRECT - stable, parseable output
-br list --json | jq '.[0]'
+br list --json | jq '.issues[0]'
 br ready --robot
 
 # WRONG - output format may vary based on terminal state

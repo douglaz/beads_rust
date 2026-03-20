@@ -218,7 +218,7 @@ fn execute_inner(
             let has_more = if user_limit == 0 {
                 false
             } else {
-                json_total > user_offset + user_limit
+                json_total > user_offset.saturating_add(user_limit)
             };
 
             let page = ListPage {

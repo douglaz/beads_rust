@@ -525,7 +525,7 @@ fn compute_recent_activity(
 
     let repo_ctx = git_repo_context(jsonl_path.parent()?)?;
     let pathspec = repo_relative_git_path(jsonl_path, &repo_ctx.repo_root)?;
-    let pathspec_str = pathspec.to_string_lossy().into_owned();
+    let pathspec_str = git_pathspec_string(&pathspec);
     let cache_key = recent_activity_cache_key(&pathspec_str, hours);
     let now_epoch = Utc::now().timestamp();
 
@@ -548,7 +548,7 @@ fn compute_recent_activity(
         commit_count,
         counts,
         earliest_commit_ts,
-    } = git_recent_activity(&repo_ctx.repo_root, &pathspec, &since)?;
+    } = git_recent_activity(&repo_ctx.repo_root, &pathspec_str, &since)?;
 
     let activity = RecentActivity {
         hours_tracked: hours,
@@ -580,13 +580,12 @@ fn compute_recent_activity(
 
 fn git_recent_activity(
     repo_root: &Path,
-    pathspec: &Path,
+    pathspec: &str,
     since: &str,
 ) -> Option<GitActivitySummary> {
-    use std::io::BufReader;
+    use std::io::{BufReader, Read};
     use std::process::Stdio;
 
-    let pathspec_str = pathspec.to_string_lossy().into_owned();
     let mut child = Command::new("git")
         .args([
             "log",
@@ -598,7 +597,7 @@ fn git_recent_activity(
             "--since",
             since,
             "--",
-            &pathspec_str,
+            pathspec,
         ])
         .current_dir(repo_root)
         .stdout(Stdio::piped())
@@ -606,18 +605,24 @@ fn git_recent_activity(
         .spawn()
         .ok()?;
 
-    let stdout = child.stdout.take().expect("Failed to open git log stdout");
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut err_msg = String::new();
+            let _ = stderr.read_to_string(&mut err_msg);
+            err_msg
+        })
+    });
+
+    let stdout = child.stdout.take()?;
     let reader = BufReader::new(stdout);
 
     let summary = parse_issue_activity_stream(reader);
 
     let status = child.wait().ok()?;
+    let err_msg = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
     if !status.success() {
-        let mut err_msg = String::new();
-        if let Some(mut err_stream) = child.stderr.take() {
-            use std::io::Read;
-            let _ = err_stream.read_to_string(&mut err_msg);
-        }
         debug!(stderr = %err_msg.trim(), "Git log failed for activity diff");
         return None;
     }
@@ -783,6 +788,13 @@ fn repo_relative_git_path(path: &Path, repo_root: &Path) -> Option<PathBuf> {
         .strip_prefix(&canonical_repo_root)
         .ok()
         .map(Path::to_path_buf)
+}
+
+fn git_pathspec_string(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn recent_activity_cache_key(pathspec: &str, hours: u32) -> String {
@@ -1729,6 +1741,18 @@ mod tests {
         fs::write(&outside_path, "").expect("write outside jsonl");
 
         assert!(repo_relative_git_path(&outside_path, &repo_root).is_none());
+    }
+
+    #[test]
+    fn test_git_pathspec_string_normalizes_separators() {
+        assert_eq!(
+            git_pathspec_string(&PathBuf::from(r".beads\issues.jsonl")),
+            ".beads/issues.jsonl"
+        );
+        assert_eq!(
+            git_pathspec_string(&PathBuf::from(".beads/issues.jsonl")),
+            ".beads/issues.jsonl"
+        );
     }
 
     #[test]

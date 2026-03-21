@@ -2222,7 +2222,29 @@ impl SqliteStorage {
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
-        let _ = self.ensure_blocked_cache_fresh()?;
+        match self.ensure_blocked_cache_fresh() {
+            Ok(_) => match self.query_ready_issue_candidates(filters, sort, true, true) {
+                Ok(issues) => Ok(issues),
+                Err(error) => {
+                    let blocked_ids = self.recover_blocked_ids("ready_issues_query", &error)?;
+                    self.query_ready_issues_without_cache(filters, sort, &blocked_ids)
+                }
+            },
+            Err(error) => {
+                let blocked_ids = self.recover_blocked_ids("ready_issues_refresh", &error)?;
+                self.query_ready_issues_without_cache(filters, sort, &blocked_ids)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn query_ready_issue_candidates(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+        exclude_blocked_in_sql: bool,
+        apply_limit: bool,
+    ) -> Result<Vec<Issue>> {
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -2264,9 +2286,12 @@ impl SqliteStorage {
             sql.push_str(" AND status = 'open'");
         }
 
-        // Ready condition 2: NOT in blocked_issues_cache (NOT IN — frankensqlite
-        // does not support correlated NOT EXISTS subqueries)
-        sql.push_str(" AND issues.id NOT IN (SELECT issue_id FROM blocked_issues_cache)");
+        // Ready condition 2: blocked issues are filtered in SQL when the cache
+        // is healthy; fallback callers filter them in Rust after directly
+        // recomputing the blocker graph from dependencies.
+        if exclude_blocked_in_sql {
+            sql.push_str(" AND issues.id NOT IN (SELECT issue_id FROM blocked_issues_cache)");
+        }
 
         // Ready condition 3: `defer_until` is NULL or <= now (unless `include_deferred`)
         if !filters.include_deferred {
@@ -2363,8 +2388,10 @@ impl SqliteStorage {
             }
         }
 
-        // Apply limit in SQL to avoid fetching extra rows.
-        if let Some(limit) = filters.limit
+        // Apply limit in SQL only when the blocked filter also happens in SQL.
+        // Fallback callers must filter blocked IDs in Rust first.
+        if apply_limit
+            && let Some(limit) = filters.limit
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
@@ -2379,16 +2406,60 @@ impl SqliteStorage {
         Ok(issues)
     }
 
+    fn query_ready_issues_without_cache(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+        blocked_ids: &HashSet<String>,
+    ) -> Result<Vec<Issue>> {
+        let mut issues = self.query_ready_issue_candidates(filters, sort, false, false)?;
+        issues.retain(|issue| !blocked_ids.contains(issue.id.as_str()));
+        if let Some(limit) = filters.limit
+            && limit > 0
+            && issues.len() > limit
+        {
+            issues.truncate(limit);
+        }
+        Ok(issues)
+    }
+
+    fn recover_blocked_issues_map(
+        &self,
+        stage: &'static str,
+        error: &dyn std::fmt::Display,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        tracing::warn!(
+            stage,
+            %error,
+            "Blocked cache unavailable; computing blocker graph directly"
+        );
+        Self::compute_blocked_issues_map_impl(&self.conn)
+    }
+
+    fn recover_blocked_ids(
+        &self,
+        stage: &'static str,
+        error: &dyn std::fmt::Display,
+    ) -> Result<HashSet<String>> {
+        Ok(self
+            .recover_blocked_issues_map(stage, error)?
+            .into_keys()
+            .collect())
+    }
+
     /// Get IDs of blocked issues from cache.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocked_ids(&self) -> Result<HashSet<String>> {
-        let _ = self.ensure_blocked_cache_fresh()?;
-        let rows = self
-            .conn
-            .query("SELECT issue_id FROM blocked_issues_cache")?;
+        if let Err(error) = self.ensure_blocked_cache_fresh() {
+            return self.recover_blocked_ids("get_blocked_ids_refresh", &error);
+        }
+        let rows = match self.conn.query("SELECT issue_id FROM blocked_issues_cache") {
+            Ok(rows) => rows,
+            Err(error) => return self.recover_blocked_ids("get_blocked_ids_query", &error),
+        };
         let mut ids = HashSet::new();
         for row in &rows {
             if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
@@ -2458,11 +2529,20 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn is_blocked(&self, issue_id: &str) -> Result<bool> {
-        let _ = self.ensure_blocked_cache_fresh()?;
-        let rows = self.conn.query_with_params(
+        if let Err(error) = self.ensure_blocked_cache_fresh() {
+            let blocked_ids = self.recover_blocked_ids("is_blocked_refresh", &error)?;
+            return Ok(blocked_ids.contains(issue_id));
+        }
+        let rows = match self.conn.query_with_params(
             "SELECT 1 FROM blocked_issues_cache WHERE issue_id = ? LIMIT 1",
             &[SqliteValue::from(issue_id)],
-        )?;
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                let blocked_ids = self.recover_blocked_ids("is_blocked_query", &error)?;
+                return Ok(blocked_ids.contains(issue_id));
+            }
+        };
         Ok(!rows.is_empty())
     }
 
@@ -2476,22 +2556,46 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
-        let _ = self.ensure_blocked_cache_fresh()?;
-        let rows = self.conn.query_with_params(
+        if let Err(error) = self.ensure_blocked_cache_fresh() {
+            let blocked_issues_map =
+                self.recover_blocked_issues_map("get_blockers_refresh", &error)?;
+            return Ok(Self::blocker_refs_to_issue_ids(
+                blocked_issues_map
+                    .get(issue_id)
+                    .map_or(&[][..], Vec::as_slice),
+            ));
+        }
+        let rows = match self.conn.query_with_params(
             "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
-        )?;
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                let blocked_issues_map =
+                    self.recover_blocked_issues_map("get_blockers_query", &error)?;
+                return Ok(Self::blocker_refs_to_issue_ids(
+                    blocked_issues_map
+                        .get(issue_id)
+                        .map_or(&[][..], Vec::as_slice),
+                ));
+            }
+        };
         let Some(row) = rows.first() else {
             return Ok(Vec::new());
         };
 
-        let blockers = parse_blocked_by_json(issue_id, row.get(0).and_then(SqliteValue::as_text))?;
-
-        // Extract just the issue IDs (strip status annotations like ":open")
-        Ok(blockers
-            .into_iter()
-            .map(|b| b.split(':').next().unwrap_or(&b).to_string())
-            .collect())
+        match parse_blocked_by_json(issue_id, row.get(0).and_then(SqliteValue::as_text)) {
+            Ok(blockers) => Ok(Self::blocker_refs_to_issue_ids(&blockers)),
+            Err(error) => {
+                let blocked_issues_map =
+                    self.recover_blocked_issues_map("get_blockers_parse", &error)?;
+                Ok(Self::blocker_refs_to_issue_ids(
+                    blocked_issues_map
+                        .get(issue_id)
+                        .map_or(&[][..], Vec::as_slice),
+                ))
+            }
+        }
     }
 
     /// Rebuild the blocked issues cache from scratch.
@@ -2603,7 +2707,7 @@ impl SqliteStorage {
         Ok(count)
     }
 
-    fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
+    fn compute_blocked_issues_map_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
         let mut blocked_issues_map = Self::load_direct_blockers_impl(conn)?;
         let children_by_parent = Self::load_local_parent_child_edges_impl(conn)?;
 
@@ -2622,18 +2726,70 @@ impl SqliteStorage {
                 .append(&mut blockers);
         }
 
+        blocked_issues_map.retain(|_, blockers| {
+            blockers.sort();
+            blockers.dedup();
+            !blockers.is_empty()
+        });
+
+        Ok(blocked_issues_map)
+    }
+
+    fn blocker_refs_to_issue_ids(blockers: &[String]) -> Vec<String> {
+        blockers
+            .iter()
+            .map(|blocker| {
+                blocker
+                    .split(':')
+                    .next()
+                    .unwrap_or(blocker.as_str())
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn load_blocked_issues_from_map(
+        &self,
+        blocked_issues_map: HashMap<String, Vec<String>>,
+    ) -> Result<Vec<(Issue, Vec<String>)>> {
+        if blocked_issues_map.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = self.conn.query(
+            r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
+                     status, priority, issue_type, assignee, owner, estimated_minutes,
+                     created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                     due_at, defer_until, external_ref, source_system, source_repo,
+                     deleted_at, deleted_by, delete_reason, original_type, compaction_level,
+                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                     pinned, is_template
+              FROM issues
+              WHERE status NOT IN ('closed', 'tombstone')
+              ORDER BY priority ASC, created_at DESC",
+        )?;
+
+        let mut blocked_issues = Vec::new();
+        for row in &rows {
+            let issue = Self::issue_from_row(row)?;
+            if let Some(blockers) = blocked_issues_map.get(issue.id.as_str()) {
+                blocked_issues.push((issue, blockers.clone()));
+            }
+        }
+
+        Ok(blocked_issues)
+    }
+
+    fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
+        let blocked_issues_map = Self::compute_blocked_issues_map_impl(conn)?;
+
         // Atomic update: Clear and Re-insert
         // Since we are within a BEGIN IMMEDIATE transaction, this is safe and efficient.
         conn.execute("DELETE FROM blocked_issues_cache")?;
 
         let mut entries = Vec::with_capacity(blocked_issues_map.len());
 
-        for (issue_id, mut blockers) in blocked_issues_map {
-            if blockers.is_empty() {
-                continue;
-            }
-            blockers.sort();
-            blockers.dedup();
+        for (issue_id, blockers) in blocked_issues_map {
             let blockers_json = match serde_json::to_string(&blockers) {
                 Ok(blockers_json) => blockers_json,
                 Err(error) => {
@@ -3048,8 +3204,12 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocked_issues(&self) -> Result<Vec<(Issue, Vec<String>)>> {
-        let _ = self.ensure_blocked_cache_fresh()?;
-        let rows = self.conn.query(
+        if let Err(error) = self.ensure_blocked_cache_fresh() {
+            let blocked_issues_map =
+                self.recover_blocked_issues_map("get_blocked_issues_refresh", &error)?;
+            return self.load_blocked_issues_from_map(blocked_issues_map);
+        }
+        let rows = match self.conn.query(
             r"SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
                      i.status, i.priority, i.issue_type, i.assignee, i.owner, i.estimated_minutes,
                      i.created_at, i.created_by, i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
@@ -3062,13 +3222,29 @@ impl SqliteStorage {
               INNER JOIN blocked_issues_cache bc ON i.id = bc.issue_id
               WHERE i.status NOT IN ('closed', 'tombstone')
               ORDER BY i.priority ASC, i.created_at DESC",
-        )?;
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                let blocked_issues_map =
+                    self.recover_blocked_issues_map("get_blocked_issues_query", &error)?;
+                return self.load_blocked_issues_from_map(blocked_issues_map);
+            }
+        };
 
         let mut blocked_issues = Vec::new();
         for row in &rows {
             let issue = Self::issue_from_row(row)?;
-            let blockers =
-                parse_blocked_by_json(&issue.id, row.get(36).and_then(SqliteValue::as_text))?;
+            let blockers = match parse_blocked_by_json(
+                &issue.id,
+                row.get(36).and_then(SqliteValue::as_text),
+            ) {
+                Ok(blockers) => blockers,
+                Err(error) => {
+                    let blocked_issues_map =
+                        self.recover_blocked_issues_map("get_blocked_issues_parse", &error)?;
+                    return self.load_blocked_issues_from_map(blocked_issues_map);
+                }
+            };
             blocked_issues.push((issue, blockers));
         }
 
@@ -8497,9 +8673,10 @@ mod tests {
     }
 
     #[test]
-    fn test_get_blockers_errors_on_malformed_cache_json() {
+    fn test_get_blocked_ids_and_is_blocked_fall_back_when_cache_table_missing() {
         let mut storage = SqliteStorage::open_memory().unwrap();
-        let issue = make_issue(
+        let blocker = make_issue("bd-b1", "Blocker", Status::Open, 2, None, Utc::now(), None);
+        let blocked = make_issue(
             "bd-c1",
             "Blocked issue",
             Status::Open,
@@ -8508,29 +8685,71 @@ mod tests {
             Utc::now(),
             None,
         );
-        storage.create_issue(&issue, "tester").unwrap();
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency("bd-c1", "bd-b1", "blocks", "tester")
+            .unwrap();
 
         storage
             .conn
-            .execute_with_params(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-                &[SqliteValue::from("bd-c1"), SqliteValue::from("not-json")],
-            )
+            .execute("DROP TABLE blocked_issues_cache")
             .unwrap();
 
-        let err = storage.get_blockers("bd-c1").unwrap_err();
-        match err {
-            BeadsError::Config(msg) => {
-                assert!(msg.contains("Malformed blocked_by JSON"));
-                assert!(msg.contains("bd-c1"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let blocked_ids = storage.get_blocked_ids().unwrap();
+        assert!(blocked_ids.contains("bd-c1"));
+        assert!(storage.is_blocked("bd-c1").unwrap());
     }
 
     #[test]
-    fn test_get_blocked_issues_errors_on_malformed_cache_json() {
+    fn test_get_ready_issues_fall_back_when_cache_table_missing() {
         let mut storage = SqliteStorage::open_memory().unwrap();
+        let blocker = make_issue("bd-b1", "Blocker", Status::Open, 1, None, Utc::now(), None);
+        let blocked = make_issue(
+            "bd-c1",
+            "Blocked issue",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        let ready = make_issue(
+            "bd-r1",
+            "Ready issue",
+            Status::Open,
+            3,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage.create_issue(&ready, "tester").unwrap();
+        storage
+            .add_dependency("bd-c1", "bd-b1", "blocks", "tester")
+            .unwrap();
+
+        storage
+            .conn
+            .execute("DROP TABLE blocked_issues_cache")
+            .unwrap();
+
+        let ready_ids: HashSet<_> = storage
+            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Priority)
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+        assert!(!ready_ids.contains("bd-c1"));
+        assert!(ready_ids.contains("bd-b1"));
+        assert!(ready_ids.contains("bd-r1"));
+    }
+
+    #[test]
+    fn test_get_blockers_fall_back_on_malformed_cache_json() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let blocker = make_issue("bd-b1", "Blocker", Status::Open, 2, None, Utc::now(), None);
         let issue = make_issue(
             "bd-c1",
             "Blocked issue",
@@ -8540,24 +8759,64 @@ mod tests {
             Utc::now(),
             None,
         );
+        storage.create_issue(&blocker, "tester").unwrap();
         storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_dependency("bd-c1", "bd-b1", "blocks", "tester")
+            .unwrap();
 
         storage
             .conn
             .execute_with_params(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-                &[SqliteValue::from("bd-c1"), SqliteValue::from("not-json")],
+                "UPDATE blocked_issues_cache SET blocked_by = ? WHERE issue_id = ?",
+                &[SqliteValue::from("not-json"), SqliteValue::from("bd-c1")],
             )
             .unwrap();
 
-        let err = storage.get_blocked_issues().unwrap_err();
-        match err {
-            BeadsError::Config(msg) => {
-                assert!(msg.contains("Malformed blocked_by JSON"));
-                assert!(msg.contains("bd-c1"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_eq!(
+            storage.get_blockers("bd-c1").unwrap(),
+            vec!["bd-b1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_get_blocked_issues_fall_back_on_malformed_cache_json() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let blocker = make_issue("bd-b1", "Blocker", Status::Open, 1, None, Utc::now(), None);
+        let blocked = make_issue(
+            "bd-c1",
+            "Blocked issue",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency("bd-c1", "bd-b1", "blocks", "tester")
+            .unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "UPDATE blocked_issues_cache SET blocked_by = ? WHERE issue_id = ?",
+                &[SqliteValue::from("not-json"), SqliteValue::from("bd-c1")],
+            )
+            .unwrap();
+
+        let blocked_issues = storage.get_blocked_issues().unwrap();
+        assert_eq!(blocked_issues.len(), 1);
+        assert_eq!(blocked_issues[0].0.id, "bd-c1");
+        assert!(
+            blocked_issues[0]
+                .1
+                .iter()
+                .any(|blocker_ref| blocker_ref.starts_with("bd-b1:")),
+            "fallback should preserve blocker metadata, got: {:?}",
+            blocked_issues[0].1
+        );
     }
 
     #[test]

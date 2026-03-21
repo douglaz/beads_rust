@@ -172,12 +172,14 @@ pub fn contains_any_blurb(content: &str) -> bool {
     contains_blurb(content) || contains_legacy_blurb(content)
 }
 
+static BLURB_VERSION_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"<!-- br-agent-instructions-v(\d+) -->").expect("static regex compilation must not fail")
+});
+
 /// Extract the version number from an existing blurb.
 #[must_use]
-#[allow(clippy::missing_panics_doc)] // Regex is static and valid
 pub fn get_blurb_version(content: &str) -> u8 {
-    let re = Regex::new(r"<!-- br-agent-instructions-v(\d+) -->").unwrap();
-    if let Some(caps) = re.captures(content)
+    if let Some(caps) = BLURB_VERSION_REGEX.captures(content)
         && let Some(m) = caps.get(1)
     {
         return m.as_str().parse().unwrap_or(0);

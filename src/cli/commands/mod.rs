@@ -69,30 +69,32 @@ pub(super) fn rebuild_blocked_cache_after_partial_mutation(
         return Ok(());
     }
 
-    let stale_mark_error = storage.mark_blocked_cache_stale().err();
-    if let Some(mark_error) = stale_mark_error.as_ref() {
-        tracing::warn!(
-            command = command,
-            error = %mark_error,
-            "Failed to pre-mark blocked cache stale before rebuilding after partial mutation"
-        );
-    }
-
-    storage
-        .rebuild_blocked_cache(true)
-        .map(|_| ())
-        .map_err(|rebuild_err| crate::error::BeadsError::WithContext {
-            context: stale_mark_error.as_ref().map_or_else(
-                || format!("failed to rebuild blocked cache after partial {command} mutation"),
-                |mark_error| {
-                    format!(
+    match storage.mark_blocked_cache_stale() {
+        Ok(()) => {
+            tracing::debug!(
+                command = command,
+                "Blocked cache repair deferred after partial mutation; cache remains marked stale"
+            );
+            Ok(())
+        }
+        Err(mark_error) => {
+            tracing::warn!(
+                command = command,
+                error = %mark_error,
+                "Failed to pre-mark blocked cache stale before rebuilding after partial mutation"
+            );
+            storage
+                .rebuild_blocked_cache(true)
+                .map(|_| ())
+                .map_err(|rebuild_err| crate::error::BeadsError::WithContext {
+                    context: format!(
                         "failed to rebuild blocked cache after partial {command} mutation; \
                          pre-marking it stale also failed: {mark_error}"
-                    )
-                },
-            ),
-            source: Box::new(rebuild_err),
-        })
+                    ),
+                    source: Box::new(rebuild_err),
+                })
+        }
+    }
 }
 
 pub(super) fn preserve_blocked_cache_on_error<T>(
@@ -128,40 +130,39 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
         return Ok(());
     }
 
-    let cache_already_stale = storage.blocked_cache_marked_stale().unwrap_or(false);
-    let stale_mark_error = if cache_already_stale {
-        None
-    } else {
-        storage.mark_blocked_cache_stale().err()
-    };
-    if let Some(mark_error) = stale_mark_error.as_ref() {
-        tracing::warn!(
+    if storage.blocked_cache_marked_stale().unwrap_or(false) {
+        tracing::debug!(
             command = command,
-            error = %mark_error,
-            "Failed to pre-mark blocked cache stale before batched refresh"
+            "Blocked cache already marked stale inside the mutation transaction; skipping eager batched refresh"
         );
+        return Ok(());
     }
 
-    match storage.rebuild_blocked_cache(true) {
-        Ok(_) => Ok(()),
-        Err(rebuild_err) if cache_already_stale || stale_mark_error.is_none() => {
-            tracing::warn!(
+    match storage.mark_blocked_cache_stale() {
+        Ok(()) => {
+            tracing::debug!(
                 command = command,
-                error = %rebuild_err,
                 "Blocked cache refresh deferred after successful batched mutation; cache remains marked stale"
             );
             Ok(())
         }
-        Err(rebuild_err) => Err(crate::error::BeadsError::WithContext {
-            context: format!(
-                "failed to rebuild blocked cache after successful batched {command} mutation; \
-                 leaving the cache stale also failed first: {}",
-                stale_mark_error
-                    .as_ref()
-                    .expect("stale mark error should exist on this branch")
-            ),
-            source: Box::new(rebuild_err),
-        }),
+        Err(mark_error) => {
+            tracing::warn!(
+                command = command,
+                error = %mark_error,
+                "Failed to pre-mark blocked cache stale before batched refresh"
+            );
+            storage
+                .rebuild_blocked_cache(true)
+                .map(|_| ())
+                .map_err(|rebuild_err| crate::error::BeadsError::WithContext {
+                    context: format!(
+                        "failed to rebuild blocked cache after successful batched {command} mutation; \
+                         leaving the cache stale also failed first: {mark_error}"
+                    ),
+                    source: Box::new(rebuild_err),
+                })
+        }
     }
 }
 
@@ -275,14 +276,18 @@ mod tests {
 
     #[test]
     fn partial_mutation_rebuild_skips_clean_state() {
-        let mut storage = SqliteStorage::open_memory().expect("storage");
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
         rebuild_blocked_cache_after_partial_mutation(&mut storage, false, "close")
             .expect("clean state should not rebuild");
     }
 
     #[test]
-    fn preserve_returns_original_error_when_rebuild_succeeds() {
-        let mut storage = SqliteStorage::open_memory().expect("storage");
+    fn preserve_returns_original_error_when_cache_is_marked_stale() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
         let result: crate::Result<()> = Err(BeadsError::validation("ids", "boom"));
         let err = preserve_blocked_cache_on_error::<()>(&mut storage, true, "close", result)
             .expect_err("operation should still fail");
@@ -291,13 +296,15 @@ mod tests {
     }
 
     #[test]
-    fn preserve_surfaces_rebuild_failure() {
+    fn preserve_surfaces_rebuild_failure_when_stale_marker_write_also_fails() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
         let mut storage = SqliteStorage::open(&db_path).expect("storage");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("conn");
         conn.execute("DROP TABLE blocked_issues_cache")
             .expect("drop blocked cache table");
+        conn.execute("DROP TABLE metadata")
+            .expect("drop metadata table");
 
         let result: crate::Result<()> = Err(BeadsError::validation("ids", "boom"));
         let err = preserve_blocked_cache_on_error::<()>(&mut storage, true, "reopen", result)
@@ -311,12 +318,10 @@ mod tests {
             other => panic!("expected WithContext, got {other:?}"),
         }
 
-        assert_eq!(
-            storage
-                .get_metadata("blocked_cache_state")
-                .unwrap()
-                .as_deref(),
-            Some("stale")
+        let metadata_probe = storage.get_metadata("blocked_cache_state");
+        assert!(
+            metadata_probe.is_err(),
+            "metadata lookup should fail once the metadata table has been dropped"
         );
     }
 

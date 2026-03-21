@@ -5352,6 +5352,21 @@ impl SqliteStorage {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
+    /// Count active project issues using default user-facing visibility.
+    ///
+    /// Active issues are non-closed issues, including deferred issues, while
+    /// excluding template issues like the default command/query surfaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_active_issues(&self) -> Result<usize> {
+        self.count_issues_with_filters(&ListFilters {
+            include_deferred: true,
+            ..ListFilters::default()
+        })
+    }
+
     /// Get full issue details.
     ///
     /// # Errors

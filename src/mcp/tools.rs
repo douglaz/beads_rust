@@ -1862,7 +1862,7 @@ impl ToolHandler for ProjectOverviewTool {
         let storage = open(&self.0)?;
 
         let total = storage.count_all_issues().map_err(beads_to_mcp)?;
-        let active = storage.count_issues().map_err(beads_to_mcp)?;
+        let active = storage.count_active_issues().map_err(beads_to_mcp)?;
         let labels = storage
             .get_unique_labels_with_counts()
             .map_err(beads_to_mcp)?;

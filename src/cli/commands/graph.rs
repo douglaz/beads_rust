@@ -3,7 +3,7 @@
 //! Visualizes dependency graphs with focus on reverse dependencies (dependents).
 //!
 //! - `br graph <issue-id>`: Show all dependents of an issue (what depends on it)
-//! - `br graph --all`: Show connected components for `open`/`in_progress`/`blocked` issues
+//! - `br graph --all`: Show connected components for all nonterminal issues
 
 use super::resolve_issue_id;
 use crate::cli::GraphArgs;
@@ -179,17 +179,17 @@ fn graph_single(
     Ok(())
 }
 
-/// Show graph for all `open`/`in_progress`/`blocked` issues.
+/// Show graph for all nonterminal issues.
 #[allow(clippy::too_many_lines)]
 fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Result<()> {
     if ctx.is_quiet() {
         return Ok(());
     }
 
-    // Get all open/in_progress/blocked issues
+    // Get all nonterminal issues
     let filters = ListFilters {
-        statuses: Some(vec![Status::Open, Status::InProgress, Status::Blocked]),
         include_closed: false,
+        include_deferred: true,
         include_templates: false,
         ..Default::default()
     };
@@ -212,7 +212,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_no_issues_rich(ctx);
         } else {
-            println!("No open/in_progress/blocked issues found");
+            println!("No active issues found");
         }
         return Ok(());
     }

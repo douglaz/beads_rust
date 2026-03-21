@@ -47,19 +47,23 @@ pub fn execute_with_storage(
 
 fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage) -> Result<()> {
     let statuses = if args.status.is_empty() {
-        vec![Status::Open, Status::InProgress]
+        Vec::new()
     } else {
         parse_statuses(&args.status)?
     };
 
     let mut filters = ListFilters::default();
-    if statuses.iter().any(Status::is_terminal) {
-        filters.include_closed = true;
-    }
-    if statuses.contains(&Status::Deferred) {
+    if statuses.is_empty() {
         filters.include_deferred = true;
+    } else {
+        if statuses.iter().any(Status::is_terminal) {
+            filters.include_closed = true;
+        }
+        if statuses.contains(&Status::Deferred) {
+            filters.include_deferred = true;
+        }
+        filters.statuses = Some(statuses);
     }
-    filters.statuses = Some(statuses);
 
     let now = Utc::now();
     let threshold = now - Duration::days(args.days);

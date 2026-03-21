@@ -788,6 +788,30 @@ fn count_issues_returns_correct_count() {
     assert_eq!(storage.count_issues().unwrap(), 3);
 }
 
+#[test]
+fn count_active_issues_excludes_closed_and_templates_but_includes_deferred() {
+    let mut storage = test_db();
+
+    let open = fixtures::issue("active-open");
+    let mut deferred = fixtures::issue("active-deferred");
+    deferred.status = Status::Deferred;
+
+    let mut closed = fixtures::issue("active-closed");
+    closed.status = Status::Closed;
+    closed.closed_at = Some(Utc::now());
+
+    let mut template = fixtures::issue("active-template");
+    template.is_template = true;
+
+    storage.create_issue(&open, "tester").unwrap();
+    storage.create_issue(&deferred, "tester").unwrap();
+    storage.create_issue(&closed, "tester").unwrap();
+    storage.create_issue(&template, "tester").unwrap();
+
+    assert_eq!(storage.count_issues().unwrap(), 4);
+    assert_eq!(storage.count_active_issues().unwrap(), 2);
+}
+
 // ============================================================================
 // PERSISTENCE TESTS (with file-backed DB)
 // ============================================================================

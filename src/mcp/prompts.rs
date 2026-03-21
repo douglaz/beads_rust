@@ -263,7 +263,7 @@ impl PromptHandler for TriagePrompt {
         }
 
         let total = storage.count_all_issues().map_err(to_mcp)?;
-        let active = storage.count_issues().map_err(to_mcp)?;
+        let active = storage.count_active_issues().map_err(to_mcp)?;
         parts.push(format!(
             "Project has {total} total issues ({active} active/non-closed)."
         ));
@@ -346,7 +346,7 @@ impl PromptHandler for StatusReportPrompt {
         let storage = self.0.open_storage().map_err(to_mcp)?;
 
         let total = storage.count_all_issues().map_err(to_mcp)?;
-        let active = storage.count_issues().map_err(to_mcp)?;
+        let active = storage.count_active_issues().map_err(to_mcp)?;
         let labels = storage.get_unique_labels_with_counts().map_err(to_mcp)?;
         let blocked = storage.get_blocked_issues().map_err(to_mcp)?;
         let ready = storage
@@ -567,7 +567,7 @@ impl PromptHandler for PlanNextWorkPrompt {
         let storage = self.0.open_storage().map_err(to_mcp)?;
 
         let total = storage.count_all_issues().map_err(to_mcp)?;
-        let active = storage.count_issues().map_err(to_mcp)?;
+        let active = storage.count_active_issues().map_err(to_mcp)?;
         let blocked = storage.get_blocked_issues().map_err(to_mcp)?;
         let ready = storage
             .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
@@ -833,7 +833,7 @@ impl PromptHandler for PolishBacklogPrompt {
         let storage = self.0.open_storage().map_err(to_mcp)?;
 
         let total = storage.count_all_issues().map_err(to_mcp)?;
-        let active = storage.count_issues().map_err(to_mcp)?;
+        let active = storage.count_active_issues().map_err(to_mcp)?;
 
         let mut parts: Vec<String> = Vec::new();
 

@@ -141,3 +141,41 @@ fn e2e_stale_with_deferred_status_filter() {
     assert_eq!(json[0]["title"], "Deferred Issue");
     assert_eq!(json[0]["status"], "deferred");
 }
+
+#[test]
+fn e2e_stale_default_includes_custom_nonterminal_statuses() {
+    common::init_test_logging();
+    let workspace = BrWorkspace::new();
+    run_br(&workspace, ["init"], "init");
+
+    let create = run_br(&workspace, ["create", "Review Issue"], "create_review");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = create
+        .stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("bd-"))
+        .unwrap()
+        .trim_end_matches(':');
+
+    let update = run_br(
+        &workspace,
+        ["update", issue_id, "--status", "review"],
+        "set_review_status",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let stale = run_br(
+        &workspace,
+        ["stale", "--days", "0", "--json"],
+        "stale_review",
+    );
+    assert!(stale.status.success(), "stale failed: {}", stale.stderr);
+
+    let payload = extract_json_payload(&stale.stdout);
+    let json: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
+    assert!(
+        json.iter()
+            .any(|issue| issue["id"] == issue_id && issue["status"] == "review"),
+        "custom nonterminal status should be included in default stale output"
+    );
+}

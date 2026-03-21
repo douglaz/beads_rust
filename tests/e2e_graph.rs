@@ -263,9 +263,49 @@ fn e2e_graph_all_no_issues() {
     let graph = run_br(&workspace, ["graph", "--all"], "graph_all_empty");
     assert!(graph.status.success(), "graph failed: {}", graph.stderr);
     assert!(
-        graph.stdout.contains("No open/in_progress/blocked issues"),
+        graph.stdout.contains("No active issues found"),
         "Expected 'No issues' message, got: {}",
         graph.stdout
+    );
+}
+
+#[test]
+fn e2e_graph_all_includes_custom_status_issues() {
+    let _log = common::test_log("e2e_graph_all_includes_custom_status_issues");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let review = run_br(&workspace, ["create", "Review issue"], "create_review");
+    assert!(
+        review.status.success(),
+        "create review failed: {}",
+        review.stderr
+    );
+    let review_id = parse_created_id(&review.stdout);
+
+    let update = run_br(
+        &workspace,
+        ["update", &review_id, "--status", "review"],
+        "set_review_status",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let graph = run_br(&workspace, ["graph", "--all", "--json"], "graph_all_review");
+    assert!(graph.status.success(), "graph failed: {}", graph.stderr);
+
+    let payload = extract_json_payload(&graph.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("graph json");
+    let components = json["components"].as_array().expect("components array");
+
+    assert!(
+        components.iter().any(|component| {
+            component["nodes"]
+                .as_array()
+                .is_some_and(|nodes| nodes.iter().any(|node| node["id"] == review_id))
+        }),
+        "custom-status nonterminal issue should appear in graph --all output"
     );
 }
 

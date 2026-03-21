@@ -1,6 +1,7 @@
 mod common;
 
 use beads_rust::model::{Issue, IssueType, Priority, Status};
+use beads_rust::storage::SqliteStorage;
 use chrono::Utc;
 use common::cli::{
     BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_smoke_at_root_with_env,
@@ -812,6 +813,53 @@ fn e2e_no_db_mutations_succeed_with_large_export_hash_batches() {
                 .any(|dependency| { dependency["depends_on_id"].as_str() == Some("bd-a00") })),
         "created issue should retain the no-db dependency mutation"
     );
+}
+
+#[test]
+fn e2e_sync_flush_only_succeeds_with_large_mixed_prefix_export_hash_rewrite() {
+    let _log = common::test_log(
+        "e2e_sync_flush_only_succeeds_with_large_mixed_prefix_export_hash_rewrite",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open workspace db");
+    let now = Utc::now();
+
+    let seeded_hashes: Vec<(String, String)> = (0..160)
+        .map(|idx| {
+            let prefix = if idx % 2 == 0 { "bd" } else { "br" };
+            let issue_id = format!("{prefix}-sync-{idx:03}");
+            let issue = make_issue(&issue_id, &format!("Seed issue {idx}"), now);
+            storage.create_issue(&issue, "tester").expect("seed issue");
+            (issue_id, format!("seed-hash-{idx:03}"))
+        })
+        .collect();
+    storage
+        .set_export_hashes(&seeded_hashes)
+        .expect("seed export hashes");
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--no-auto-import"],
+        "sync_flush_large_mixed_export_hash_rewrite",
+    );
+    assert!(
+        flush.status.success(),
+        "sync --flush-only should succeed when rewriting many existing mixed-prefix export hashes: {}",
+        flush.stderr
+    );
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let exported_count = fs::read_to_string(&jsonl_path)
+        .expect("read issues.jsonl")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    assert_eq!(exported_count, seeded_hashes.len());
 }
 
 #[test]

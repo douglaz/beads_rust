@@ -85,7 +85,7 @@ fn quarantine_if_exists(path: &Path) {
 fn reimport_workspace_db_from_jsonl(workspace: &BrWorkspace, label_prefix: &str) {
     let sync_before = run_br(
         workspace,
-        ["sync"],
+        ["sync", "--flush-only"],
         &format!("{label_prefix}_sync_before_reimport"),
     );
     assert!(
@@ -136,12 +136,14 @@ fn parse_issue_ids(stdout: &str) -> Vec<String> {
             .collect();
     }
 
-    value["issues"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item["id"].as_str().map(ToOwned::to_owned))
-        .collect()
+    if let Some(items) = value["issues"].as_array() {
+        return items
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(ToOwned::to_owned))
+            .collect();
+    }
+
+    panic!("unexpected issues JSON payload: {payload}");
 }
 
 #[test]
@@ -379,6 +381,25 @@ fn repro_issue_198_update_status_closed_after_reimport_keeps_ready_usable() {
 
     reimport_workspace_db_from_jsonl(&workspace, "issue_198_update");
 
+    let ready_before_close = run_br(
+        &workspace,
+        ["ready", "--json"],
+        "issue_198_update_ready_before_close",
+    );
+    assert!(
+        ready_before_close.status.success(),
+        "ready failed before closing blocker via update: stdout={} stderr={}",
+        ready_before_close.stdout,
+        ready_before_close.stderr
+    );
+    assert_no_cache_integrity_signal(&ready_before_close.stdout, &ready_before_close.stderr);
+
+    let ready_before_ids = parse_issue_ids(&ready_before_close.stdout);
+    assert!(
+        !ready_before_ids.contains(&child_id),
+        "child should still be blocked before parent is closed, ready ids={ready_before_ids:?}"
+    );
+
     let close_via_update = run_br(
         &workspace,
         ["update", &parent_id, "--status=closed", "--json"],
@@ -439,6 +460,25 @@ fn repro_issue_198_close_command_after_reimport_keeps_ready_usable() {
     );
 
     reimport_workspace_db_from_jsonl(&workspace, "issue_198_close");
+
+    let ready_before_close = run_br(
+        &workspace,
+        ["ready", "--json"],
+        "issue_198_close_ready_before_close",
+    );
+    assert!(
+        ready_before_close.status.success(),
+        "ready failed before close command: stdout={} stderr={}",
+        ready_before_close.stdout,
+        ready_before_close.stderr
+    );
+    assert_no_cache_integrity_signal(&ready_before_close.stdout, &ready_before_close.stderr);
+
+    let ready_before_ids = parse_issue_ids(&ready_before_close.stdout);
+    assert!(
+        !ready_before_ids.contains(&child_id),
+        "child should still be blocked before parent is closed, ready ids={ready_before_ids:?}"
+    );
 
     let close = run_br(
         &workspace,

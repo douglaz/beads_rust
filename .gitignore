@@ -115,3 +115,27 @@ br_malformed_*/
 # SQLite WAL/SHM files in sample databases
 sample_beads_db_files/**/*.db-shm
 sample_beads_db_files/**/*.db-wal
+
+# Test database files (agent test artifacts)
+-memorytest.db
+*memorytest.db
+
+# Root-level test scratch files (agent-generated)
+/test_file
+/test_file.rs
+/test_lock
+/test_lock.rs
+
+# Beads snapshot backups (timestamped)
+.beads.snapshot_*/
+
+# UBS scan output
+ubs.json
+ubs_output.*
+rust-bug-scan.txt
+report.json
+
+# Codex CLI ephemeral directories
+.codex-local-check/
+.codex-bench/
+.codex-tmp/

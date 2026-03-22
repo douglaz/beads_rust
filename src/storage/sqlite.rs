@@ -844,18 +844,13 @@ impl SqliteStorage {
                     // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
                     // fsqlite does not reliably support UNIQUE constraint upserts.
                     for insert_chunk in chunk.chunks(450) {
-                        // Delete existing entries for this chunk first
-                        let del_placeholders: Vec<&str> =
-                            insert_chunk.iter().map(|_| "?").collect();
-                        let delete_sql = format!(
-                            "DELETE FROM dirty_issues WHERE issue_id IN ({})",
-                            del_placeholders.join(", ")
-                        );
-                        let mut delete_params = Vec::with_capacity(insert_chunk.len());
-                        for id in insert_chunk {
-                            delete_params.push(SqliteValue::from(id.as_str()));
+                        // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
+                        for id in *insert_chunk {
+                            storage.conn.execute_with_params(
+                                "DELETE FROM dirty_issues WHERE issue_id = ?",
+                                &[SqliteValue::from(id.as_str())],
+                            )?;
                         }
-                        storage.conn.execute_with_params(&delete_sql, &delete_params)?;
 
                         // Now insert fresh rows
                         let placeholders: Vec<&str> =

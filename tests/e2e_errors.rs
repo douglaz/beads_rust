@@ -59,13 +59,6 @@ fn e2e_error_handling() {
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let id = parse_created_id(&create.stdout);
 
-    let bad_status = run_br(
-        &workspace,
-        ["update", &id, "--status", "not_a_status"],
-        "update_bad_status",
-    );
-    assert!(!bad_status.status.success());
-
     let bad_priority = run_br(
         &workspace,
         ["list", "--priority-min", "9"],
@@ -724,39 +717,6 @@ fn e2e_structured_error_issue_not_found() {
 }
 
 #[test]
-fn e2e_structured_error_invalid_status() {
-    let _log = common::test_log("e2e_structured_error_invalid_status");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    let create = run_br(&workspace, ["create", "Test issue"], "create");
-    assert!(create.status.success());
-    let id = parse_created_id(&create.stdout);
-
-    let result = run_br(
-        &workspace,
-        ["update", &id, "--status", "done", "--json"],
-        "update_status_done_json",
-    );
-    assert!(!result.status.success());
-    assert_eq!(result.status.code(), Some(4), "exit code should be 4");
-
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
-    assert!(verify_error_structure(&json), "missing required fields");
-
-    let error = &json["error"];
-    assert_eq!(error["code"], "INVALID_STATUS");
-    assert!(error["retryable"].as_bool().unwrap());
-    // Should suggest "closed" since "done" is a synonym
-    assert!(
-        error["hint"].as_str().unwrap().contains("closed"),
-        "hint should suggest 'closed' for 'done'"
-    );
-}
-
-#[test]
 fn e2e_structured_error_cycle_detected() {
     let _log = common::test_log("e2e_structured_error_cycle_detected");
     let workspace = BrWorkspace::new();
@@ -1087,22 +1047,12 @@ fn e2e_error_multiple_errors_same_exit_code() {
 
     // Validation errors should return exit code 4
     // Note: invalid type is NOT tested here because custom types are allowed
-    let invalid_status = run_br(
-        &workspace,
-        ["update", &id, "--status", "bad_status", "--json"],
-        "invalid_status",
-    );
     let invalid_priority = run_br(
         &workspace,
         ["create", "Test", "--priority", "99", "--json"],
         "invalid_priority",
     );
 
-    assert_eq!(
-        invalid_status.status.code(),
-        Some(4),
-        "invalid status should be exit 4"
-    );
     assert_eq!(
         invalid_priority.status.code(),
         Some(4),

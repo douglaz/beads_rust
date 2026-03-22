@@ -69,6 +69,22 @@ struct LocalRepairResult {
 }
 
 const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
+const ROOT_GITIGNORE_OFFENDING_PATTERNS: &[&str] = &[
+    ".beads",
+    ".beads/",
+    ".beads/*",
+    ".beads/**",
+    ".beads/.gitignore",
+    "/.beads",
+    "/.beads/",
+    "/.beads/*",
+    "/.beads/**",
+    "/.beads/.gitignore",
+];
+const ROOT_GITIGNORE_REPAIR_MESSAGE: &str =
+    "Removed offending .beads ignore pattern(s) from root .gitignore";
+const NO_OP_REPAIR_MESSAGE: &str = "No errors detected; nothing to repair.";
+const REINDEX_INCOMPLETE_MESSAGE: &str = "REINDEX was attempted but did not complete.";
 
 #[derive(Debug, Default)]
 struct SidecarInspection {
@@ -214,6 +230,40 @@ fn local_repair_message(local_repair: &LocalRepairResult) -> String {
         "No remaining errors detected after recoverable-state repair.".to_string()
     } else {
         format!("Repair complete: {}.", actions.join("; "))
+    }
+}
+
+fn is_offending_root_gitignore_pattern(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('#')
+        && !trimmed.starts_with('!')
+        && ROOT_GITIGNORE_OFFENDING_PATTERNS.contains(&trimmed)
+}
+
+fn repair_outcome_message(
+    gitignore_repaired: bool,
+    local_repair: Option<&LocalRepairResult>,
+    incomplete_attempt_message: Option<&str>,
+) -> String {
+    let mut messages = Vec::new();
+
+    if gitignore_repaired {
+        messages.push(ROOT_GITIGNORE_REPAIR_MESSAGE.to_string());
+    }
+
+    if let Some(repair) = local_repair {
+        if repair.applied() {
+            messages.push(local_repair_message(repair));
+        } else if let Some(message) = incomplete_attempt_message {
+            messages.push(message.to_string());
+        }
+    }
+
+    if messages.is_empty() {
+        NO_OP_REPAIR_MESSAGE.to_string()
+    } else {
+        messages.join(" ")
     }
 }
 
@@ -1390,7 +1440,7 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
 /// Check whether the project root `.gitignore` contains a pattern that would
 /// hide `.beads/.gitignore`, preventing git from reading br's ignore rules.
 /// This commonly happens during bd-to-br migration where the old `.gitignore`
-/// included `.beads/.gitignore` or `.beads/*`.
+/// included patterns like `.beads/`, `.beads/*`, or `.beads/.gitignore`.
 fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let Some(project_root) = beads_dir.parent() else {
         return;
@@ -1403,17 +1453,7 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 
     let offending: Vec<String> = content
         .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            // Skip comments and blank lines.
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                return false;
-            }
-            // Patterns that would cause git to ignore .beads/.gitignore:
-            //   .beads/.gitignore   — exact match
-            //   .beads/*            — wildcard that covers .gitignore inside
-            trimmed == ".beads/.gitignore" || trimmed == ".beads/*"
-        })
+        .filter(|line| is_offending_root_gitignore_pattern(line))
         .map(String::from)
         .collect();
 
@@ -1439,28 +1479,29 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 
 /// When `--repair` is passed and the `gitignore.beads_inner` warning is present,
 /// automatically remove the offending lines from the root `.gitignore`.
-fn fix_root_gitignore_if_warned(beads_dir: &Path, report: &DoctorReport, ctx: &OutputContext) {
+fn fix_root_gitignore_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+) -> bool {
     let has_warning = report
         .checks
         .iter()
         .any(|c| c.name == "gitignore.beads_inner" && c.status == CheckStatus::Warn);
     if !has_warning {
-        return;
+        return false;
     }
     let Some(project_root) = beads_dir.parent() else {
-        return;
+        return false;
     };
     let gitignore_path = project_root.join(".gitignore");
     let Ok(content) = fs::read_to_string(&gitignore_path) else {
-        return;
+        return false;
     };
 
     let filtered: Vec<&str> = content
         .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            trimmed != ".beads/.gitignore" && trimmed != ".beads/*"
-        })
+        .filter(|line| !is_offending_root_gitignore_pattern(line))
         .collect();
     let mut new_content = filtered.join("\n");
     if content.ends_with('\n') {
@@ -1471,8 +1512,12 @@ fn fix_root_gitignore_if_warned(beads_dir: &Path, report: &DoctorReport, ctx: &O
         if !ctx.is_json() {
             ctx.warning(&format!("Failed to fix .gitignore: {err}"));
         }
-    } else if !ctx.is_json() {
-        ctx.info("Removed offending .beads/.gitignore pattern(s) from root .gitignore");
+        false
+    } else {
+        if !ctx.is_json() {
+            ctx.info(ROOT_GITIGNORE_REPAIR_MESSAGE);
+        }
+        true
     }
 }
 
@@ -2176,12 +2221,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     };
 
-    let initial = collect_doctor_report(&beads_dir, &paths)?;
+    let mut initial = collect_doctor_report(&beads_dir, &paths)?;
 
     // Auto-fix root .gitignore if --repair is passed and the warning is present.
-    if args.repair {
-        fix_root_gitignore_if_warned(&beads_dir, &initial.report, ctx);
-    }
+    let gitignore_repaired = if args.repair {
+        let repaired = fix_root_gitignore_if_warned(&beads_dir, &initial.report, ctx);
+        if repaired {
+            initial = collect_doctor_report(&beads_dir, &paths)?;
+        }
+        repaired
+    } else {
+        false
+    };
 
     if !args.repair {
         print_report(&initial.report, ctx)?;
@@ -2198,15 +2249,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let mut repair = LocalRepairResult::default();
             repair_partial_indexes(&paths.db_path, &mut repair);
             let post_reindex = collect_doctor_report(&beads_dir, &paths)?;
-            let repair_message = if repair.indexes_reindexed {
-                local_repair_message(&repair)
-            } else {
-                "REINDEX was attempted but did not complete.".to_string()
-            };
+            let repair_message = repair_outcome_message(
+                gitignore_repaired,
+                Some(&repair),
+                Some(REINDEX_INCOMPLETE_MESSAGE),
+            );
             if ctx.is_json() {
                 ctx.json(&serde_json::json!({
                     "report": initial.report,
-                    "repaired": repair.applied(),
+                    "repaired": gitignore_repaired || repair.applied(),
                     "local_repair": repair,
                     "message": repair_message,
                     "post_repair": post_reindex.report,
@@ -2221,12 +2272,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         } else if ctx.is_json() {
             ctx.json(&serde_json::json!({
                 "report": initial.report,
-                "repaired": false,
-                "message": "No errors detected; nothing to repair."
+                "repaired": gitignore_repaired,
+                "message": repair_outcome_message(gitignore_repaired, None, None)
             }));
         } else {
             print_report(&initial.report, ctx)?;
-            ctx.info("No errors detected; nothing to repair.");
+            ctx.info(&repair_outcome_message(gitignore_repaired, None, None));
         }
         return Ok(());
     }
@@ -2250,11 +2301,11 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     if after_local_repair.report.ok {
-        let repair_message = local_repair_message(&local_repair);
+        let repair_message = repair_outcome_message(gitignore_repaired, Some(&local_repair), None);
         if ctx.is_json() {
             ctx.json(&serde_json::json!({
                 "report": initial.report,
-                "repaired": local_repair.applied(),
+                "repaired": gitignore_repaired || local_repair.applied(),
                 "local_repair": local_repair,
                 "message": repair_message,
                 "post_repair": after_local_repair.report,
@@ -2377,6 +2428,105 @@ mod tests {
             dependencies: Vec::new(),
             comments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_check_root_gitignore_warns_for_directory_patterns() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            temp.path().join(".gitignore"),
+            ".beads/\n/.beads/*\n!.beads/.gitignore\nkeep-me\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_root_gitignore(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "gitignore.beads_inner").expect("gitignore check");
+        assert!(matches!(check.status, CheckStatus::Warn));
+
+        let offending = check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("offending_patterns"))
+            .and_then(serde_json::Value::as_array)
+            .expect("offending patterns");
+
+        assert_eq!(
+            offending,
+            &vec![
+                serde_json::Value::String(".beads/".to_string()),
+                serde_json::Value::String("/.beads/*".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fix_root_gitignore_if_warned_removes_all_offending_patterns() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let gitignore_path = temp.path().join(".gitignore");
+        fs::write(
+            &gitignore_path,
+            ".beads/\nkeep-me\n/.beads/.gitignore\n!.beads/.gitignore\n",
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&sample_issue("bd-test01", "Valid issue")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        let report_before = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let before_check =
+            find_check(&report_before.report.checks, "gitignore.beads_inner").expect("warning");
+        assert!(matches!(before_check.status, CheckStatus::Warn));
+
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+        assert!(fix_root_gitignore_if_warned(
+            &beads_dir,
+            &report_before.report,
+            &ctx
+        ));
+        assert_eq!(
+            fs::read_to_string(&gitignore_path).unwrap(),
+            "keep-me\n!.beads/.gitignore\n"
+        );
+
+        let report_after = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let after_check =
+            find_check(&report_after.report.checks, "gitignore.beads_inner").expect("status");
+        assert!(matches!(after_check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_repair_outcome_message_combines_gitignore_and_incomplete_reindex() {
+        let message = repair_outcome_message(
+            true,
+            Some(&LocalRepairResult::default()),
+            Some(REINDEX_INCOMPLETE_MESSAGE),
+        );
+
+        assert!(message.contains(ROOT_GITIGNORE_REPAIR_MESSAGE));
+        assert!(message.contains(REINDEX_INCOMPLETE_MESSAGE));
     }
 
     #[test]

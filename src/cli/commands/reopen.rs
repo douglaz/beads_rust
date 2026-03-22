@@ -427,30 +427,10 @@ mod tests {
     use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
     use chrono::{Duration, Utc};
-    use std::env;
-    use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-    struct DirGuard {
-        previous: PathBuf,
-    }
-
-    impl DirGuard {
-        fn new(target: &std::path::Path) -> Self {
-            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-            env::set_current_dir(target).expect("set current dir");
-            Self { previous }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous);
-        }
-    }
 
     fn make_closed_deferred_issue(id: &str, title: &str) -> Issue {
         let now = Utc::now();
@@ -488,13 +468,16 @@ mod tests {
             .expect("create issue");
         drop(storage);
 
-        let _guard = DirGuard::new(temp.path());
         let args = ReopenArgs {
             ids: vec!["bd-reopen-deferred".to_string()],
             reason: None,
             robot: false,
         };
-        execute(&args, false, &CliOverrides::default(), &ctx).expect("reopen");
+        let overrides = CliOverrides {
+            db: Some(db_path.clone()),
+            ..CliOverrides::default()
+        };
+        execute(&args, false, &overrides, &ctx).expect("reopen");
 
         let storage = SqliteStorage::open(&db_path).expect("reopen storage");
         let issue = storage
@@ -542,13 +525,16 @@ mod tests {
             .expect("delete issue");
         drop(storage);
 
-        let _guard = DirGuard::new(temp.path());
         let args = ReopenArgs {
             ids: vec!["bd-reopen-tombstone".to_string()],
             reason: None,
             robot: false,
         };
-        execute(&args, false, &CliOverrides::default(), &ctx).expect("reopen");
+        let overrides = CliOverrides {
+            db: Some(db_path.clone()),
+            ..CliOverrides::default()
+        };
+        execute(&args, false, &overrides, &ctx).expect("reopen");
 
         let storage = SqliteStorage::open(&db_path).expect("reopen storage");
         let issue = storage

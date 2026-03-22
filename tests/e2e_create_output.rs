@@ -3,6 +3,18 @@ use std::collections::BTreeSet;
 use std::process::Command;
 use toon_rust::try_decode;
 
+fn extract_issues_array(stdout: &[u8]) -> Vec<serde_json::Value> {
+    let payload: serde_json::Value = serde_json::from_slice(stdout).expect("list output json");
+    if let Some(issues) = payload.as_array() {
+        return issues.clone();
+    }
+    payload
+        .get("issues")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .expect("list output issues array")
+}
+
 /// Test that the --title flag works as an alternative to positional argument
 /// This was added to fix GitHub issue #7 where --title-flag was used instead of --title
 #[test]
@@ -281,11 +293,7 @@ fn test_create_file_silent_outputs_only_ids() {
         "list after silent import failed: {list_output:?}"
     );
 
-    let issues_json: serde_json::Value =
-        serde_json::from_slice(&list_output.stdout).expect("list output json");
-    let expected_ids: BTreeSet<String> = issues_json
-        .as_array()
-        .expect("list output array")
+    let expected_ids: BTreeSet<String> = extract_issues_array(&list_output.stdout)
         .iter()
         .map(|issue| issue["id"].as_str().expect("issue id present").to_string())
         .collect();

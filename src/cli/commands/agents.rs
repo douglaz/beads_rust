@@ -156,14 +156,17 @@ const fn inferred_dry_run_action(detection: &AgentFileDetection) -> &'static str
 /// Check if content contains the br agent blurb.
 #[must_use]
 pub fn contains_blurb(content: &str) -> bool {
-    content.contains("<!-- br-agent-instructions-v")
+    contains_marker_block(content, "<!-- br-agent-instructions-v", BLURB_END_MARKER)
 }
 
 /// Check if content contains the legacy bv blurb.
 #[must_use]
 pub fn contains_legacy_blurb(content: &str) -> bool {
-    // Check for bv blurb markers
-    content.contains("<!-- bv-agent-instructions-v")
+    contains_marker_block(
+        content,
+        "<!-- bv-agent-instructions-v",
+        "<!-- end-bv-agent-instructions -->",
+    )
 }
 
 /// Check if content contains any blurb (br or bv).
@@ -180,7 +183,13 @@ static BLURB_VERSION_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::ne
 /// Extract the version number from an existing blurb.
 #[must_use]
 pub fn get_blurb_version(content: &str) -> u8 {
-    if let Some(caps) = BLURB_VERSION_REGEX.captures(content)
+    let Some((start_idx, end_idx)) =
+        find_marker_block_range(content, "<!-- br-agent-instructions-v", BLURB_END_MARKER)
+    else {
+        return 0;
+    };
+
+    if let Some(caps) = BLURB_VERSION_REGEX.captures(&content[start_idx..end_idx])
         && let Some(m) = caps.get(1)
     {
         return m.as_str().parse().unwrap_or(0);
@@ -263,19 +272,79 @@ where
 #[must_use]
 pub fn detect_agent_file_in_parents(work_dir: &Path, max_levels: usize) -> AgentFileDetection {
     let mut current_dir = work_dir.to_path_buf();
+    let mut levels = 0;
 
-    for _ in 0..=max_levels {
+    loop {
         let detection = detect_agent_file(&current_dir);
         if detection.found() {
             return detection;
+        }
+
+        if levels == max_levels {
+            break;
         }
 
         // Move to parent
         match current_dir.parent() {
             Some(parent) if parent != current_dir => {
                 current_dir = parent.to_path_buf();
+                levels += 1;
             }
             _ => break, // Reached root
+        }
+    }
+
+    AgentFileDetection::default()
+}
+
+fn find_agent_search_root(work_dir: &Path) -> PathBuf {
+    let mut current_dir = work_dir.to_path_buf();
+
+    loop {
+        let is_project_root = current_dir.join(".git").exists()
+            || current_dir.join(".beads").is_dir()
+            || current_dir.join("_beads").is_dir();
+        if is_project_root {
+            return current_dir;
+        }
+
+        match current_dir.parent() {
+            Some(parent) if parent != current_dir => {
+                current_dir = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+
+    work_dir.to_path_buf()
+}
+
+/// Detect an agent file within the current project boundary.
+///
+/// Searches upward from the working directory to the nearest project root
+/// marker (`.git`, `.beads`, or `_beads`). If no project marker exists, only
+/// the current directory is searched to avoid capturing unrelated files above
+/// the active workspace.
+#[must_use]
+pub fn detect_agent_file_in_project(work_dir: &Path) -> AgentFileDetection {
+    let search_root = find_agent_search_root(work_dir);
+    let mut current_dir = work_dir.to_path_buf();
+
+    loop {
+        let detection = detect_agent_file(&current_dir);
+        if detection.found() {
+            return detection;
+        }
+
+        if current_dir == search_root {
+            break;
+        }
+
+        match current_dir.parent() {
+            Some(parent) if parent != current_dir => {
+                current_dir = parent.to_path_buf();
+            }
+            _ => break,
         }
     }
 
@@ -285,6 +354,10 @@ pub fn detect_agent_file_in_parents(work_dir: &Path, max_levels: usize) -> Agent
 /// Append the blurb to content.
 #[must_use]
 pub fn append_blurb(content: &str) -> String {
+    if content.is_empty() {
+        return format!("{AGENT_BLURB}\n");
+    }
+
     let mut result = content.to_string();
     if !result.ends_with('\n') {
         result.push('\n');
@@ -299,44 +372,12 @@ pub fn append_blurb(content: &str) -> String {
 #[must_use]
 pub fn remove_blurb(content: &str) -> String {
     let start_marker = "<!-- br-agent-instructions-v";
-    let Some(start_idx) = content.find(start_marker) else {
+    let Some((start_idx, end_idx)) =
+        find_marker_block_range(content, start_marker, BLURB_END_MARKER)
+    else {
         return content.to_string();
     };
-
-    let Some(end_pos) = content.find(BLURB_END_MARKER) else {
-        return content.to_string();
-    };
-    let end_idx = end_pos + BLURB_END_MARKER.len();
-
-    // Trim whitespace around the removed section
-    let mut start = start_idx;
-    let mut end = end_idx;
-
-    // Remove trailing newlines (and carriage returns)
-    while end < content.len()
-        && (content[end..].starts_with('\n') || content[end..].starts_with('\r'))
-    {
-        end += 1;
-    }
-
-    // Remove leading newlines (up to 2, handling CRLF)
-    let mut removed_leading = 0;
-    while start > 0 && removed_leading < 2 {
-        if content[..start].ends_with('\n') {
-            start -= 1;
-            if start > 0 && content[..start].ends_with('\r') {
-                start -= 1;
-            }
-            removed_leading += 1;
-        } else if content[..start].ends_with('\r') {
-            start -= 1;
-            removed_leading += 1;
-        } else {
-            break;
-        }
-    }
-
-    format!("{}{}", &content[..start], &content[end..])
+    remove_marker_block(content, start_idx, end_idx)
 }
 
 /// Remove legacy bv blurb from content.
@@ -349,44 +390,11 @@ pub fn remove_legacy_blurb(content: &str) -> String {
     let start_marker = "<!-- bv-agent-instructions-v";
     let end_marker = "<!-- end-bv-agent-instructions -->";
 
-    let Some(start_idx) = content.find(start_marker) else {
+    let Some((start_idx, end_idx)) = find_marker_block_range(content, start_marker, end_marker)
+    else {
         return content.to_string();
     };
-
-    let Some(end_pos) = content.find(end_marker) else {
-        return content.to_string();
-    };
-    let end_idx = end_pos + end_marker.len();
-
-    // Trim whitespace around the removed section
-    let mut start = start_idx;
-    let mut end = end_idx;
-
-    // Remove trailing newlines (and carriage returns)
-    while end < content.len()
-        && (content[end..].starts_with('\n') || content[end..].starts_with('\r'))
-    {
-        end += 1;
-    }
-
-    // Remove leading newlines (up to 2, handling CRLF)
-    let mut removed_leading = 0;
-    while start > 0 && removed_leading < 2 {
-        if content[..start].ends_with('\n') {
-            start -= 1;
-            if start > 0 && content[..start].ends_with('\r') {
-                start -= 1;
-            }
-            removed_leading += 1;
-        } else if content[..start].ends_with('\r') {
-            start -= 1;
-            removed_leading += 1;
-        } else {
-            break;
-        }
-    }
-
-    format!("{}{}", &content[..start], &content[end..])
+    remove_marker_block(content, start_idx, end_idx)
 }
 
 /// Update an existing blurb to the current version.
@@ -397,10 +405,172 @@ pub fn update_blurb(content: &str) -> String {
     append_blurb(&content)
 }
 
+fn find_marker_end_after(content: &str, start_idx: usize, end_marker: &str) -> Option<usize> {
+    content[start_idx..]
+        .find(end_marker)
+        .map(|relative_end| start_idx + relative_end + end_marker.len())
+}
+
+fn find_marker_block_range(
+    content: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> Option<(usize, usize)> {
+    let mut search_from = 0;
+
+    while search_from < content.len() {
+        let relative_start = content[search_from..].find(start_marker)?;
+        let start_idx = search_from + relative_start;
+        let next_search_from = start_idx + start_marker.len();
+        let next_start_idx = content[next_search_from..]
+            .find(start_marker)
+            .map(|relative_next| next_search_from + relative_next);
+
+        if let Some(end_idx) = find_marker_end_after(content, start_idx, end_marker)
+            && next_start_idx.is_none_or(|next_start| end_idx <= next_start)
+        {
+            return Some((start_idx, end_idx));
+        }
+
+        search_from = next_search_from;
+    }
+
+    None
+}
+
+fn contains_marker_block(content: &str, start_marker: &str, end_marker: &str) -> bool {
+    find_marker_block_range(content, start_marker, end_marker).is_some()
+}
+
+fn remove_marker_block(content: &str, start_idx: usize, end_idx: usize) -> String {
+    let before = content[..start_idx].trim_end_matches(['\r', '\n']);
+    let after = content[end_idx..].trim_start_matches(['\r', '\n']);
+
+    if before.is_empty() {
+        return after.to_string();
+    }
+
+    if after.is_empty() {
+        return before.to_string();
+    }
+
+    let newline = if content[..start_idx].contains("\r\n") || content[end_idx..].contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    format!("{before}{newline}{newline}{after}")
+}
+
 /// Get the preferred path for a new agent file.
 #[must_use]
 pub fn get_preferred_agent_file_path(work_dir: &Path) -> PathBuf {
     work_dir.join("AGENTS.md")
+}
+
+fn require_force_for_json_action(force: bool, ctx: &OutputContext) -> Result<()> {
+    if ctx.is_json() && !force {
+        return Err(BeadsError::Validation {
+            field: "force".to_string(),
+            reason: "--force is required for mutating `br agents` actions in JSON mode".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn backup_agent_file(file_path: &Path, ctx: &OutputContext) -> Option<PathBuf> {
+    let backup_path = file_path.with_extension("md.bak");
+    match fs::copy(file_path, &backup_path) {
+        Ok(_) => {
+            if !ctx.is_json() && !matches!(ctx.mode(), OutputMode::Rich) {
+                println!("Backup created: {}", backup_path.display());
+            }
+            Some(backup_path)
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: Could not create backup at {}: {}",
+                backup_path.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+fn add_confirmation_message(detection: &AgentFileDetection, file_path: &Path) -> String {
+    if detection.found() {
+        format!(
+            "This will add beads workflow instructions to: {}",
+            file_path.display()
+        )
+    } else {
+        format!(
+            "This will create a new AGENTS.md with beads workflow instructions.\nFile: {}",
+            file_path.display()
+        )
+    }
+}
+
+fn confirm_add_operation(
+    detection: &AgentFileDetection,
+    file_path: &Path,
+    force: bool,
+) -> Result<bool> {
+    if force {
+        return Ok(true);
+    }
+
+    println!("{}", add_confirmation_message(detection, file_path));
+    print!("Continue? [y/N] ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
+}
+
+fn validate_action_selection(args: &AgentsArgs) -> Result<()> {
+    let selected_actions = [args.add, args.remove, args.update, args.check]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+
+    if selected_actions > 1 {
+        return Err(BeadsError::Validation {
+            field: "action".to_string(),
+            reason: "choose only one of --add, --remove, --update, or --check".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn search_scope_description(work_dir: &Path) -> String {
+    let search_root = find_agent_search_root(work_dir);
+    if search_root == work_dir {
+        format!("in {}", work_dir.display())
+    } else {
+        format!(
+            "between {} and project root {}",
+            work_dir.display(),
+            search_root.display()
+        )
+    }
+}
+
+fn agent_file_not_found_reason(work_dir: &Path) -> String {
+    let search_root = find_agent_search_root(work_dir);
+    if search_root == work_dir {
+        format!("not found in current directory ({})", work_dir.display())
+    } else {
+        format!(
+            "not found between current directory ({}) and project root ({})",
+            work_dir.display(),
+            search_root.display()
+        )
+    }
 }
 
 /// Arguments for the agents command.
@@ -427,12 +597,10 @@ pub struct AgentsArgs {
 ///
 /// Returns an error if file operations fail.
 pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
-    let work_dir = std::env::current_dir()?;
-    let detection = detect_agent_file_in_parents(&work_dir, 3);
+    validate_action_selection(args)?;
 
-    if ctx.is_json() {
-        return execute_json(&detection, args, ctx);
-    }
+    let work_dir = std::env::current_dir()?;
+    let detection = detect_agent_file_in_project(&work_dir);
 
     // Default to check mode if no action specified
     let is_check = !args.add && !args.remove && !args.update;
@@ -440,10 +608,16 @@ pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
     // When --dry-run is passed without an explicit action, infer the action
     // from the current state so the user sees what *would* happen.
     if args.dry_run && is_check {
+        if ctx.is_json() {
+            return execute_json(&detection, args, ctx);
+        }
         return execute_dry_run_inferred(&detection, &work_dir, ctx);
     }
 
     if is_check || args.check {
+        if ctx.is_json() {
+            return execute_json(&detection, args, ctx);
+        }
         return execute_check(&detection, &work_dir, ctx);
     }
 
@@ -452,11 +626,11 @@ pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
     }
 
     if args.remove {
-        return execute_remove(&detection, args.dry_run, args.force, ctx);
+        return execute_remove(&detection, &work_dir, args.dry_run, args.force, ctx);
     }
 
     if args.update {
-        return execute_update(&detection, args.dry_run, args.force, ctx);
+        return execute_update(&detection, &work_dir, args.dry_run, args.force, ctx);
     }
 
     Ok(())
@@ -639,8 +813,8 @@ fn execute_check(
 
     if !detection.found() {
         println!(
-            "No AGENTS.md or CLAUDE.md found in {} or parent directories.",
-            work_dir.display()
+            "No AGENTS.md or CLAUDE.md found {}.",
+            search_scope_description(work_dir)
         );
         println!("\nTo add beads workflow instructions:");
         println!("  br agents --add");
@@ -691,7 +865,16 @@ fn execute_add(
         && !detection.has_legacy_blurb
         && detection.blurb_version >= BLURB_VERSION
     {
-        if matches!(ctx.mode(), OutputMode::Rich) {
+        if ctx.is_json() {
+            let output = serde_json::json!({
+                "action": "add",
+                "performed": false,
+                "reason": "already_current",
+                "file_path": detection.file_path.as_ref().map(|path| path.display().to_string()),
+                "current_version": BLURB_VERSION,
+            });
+            ctx.json_pretty(&output);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_already_current_rich(ctx);
         } else {
             println!(
@@ -723,13 +906,23 @@ fn execute_add(
     if detection.has_legacy_blurb
         || (detection.has_blurb && detection.blurb_version < BLURB_VERSION)
     {
-        return execute_update(detection, dry_run, force, ctx);
+        return execute_update(detection, work_dir, dry_run, force, ctx);
     }
 
     let new_content = append_blurb(&content);
 
     if dry_run {
-        if matches!(ctx.mode(), OutputMode::Rich) {
+        if ctx.is_json() {
+            let output = serde_json::json!({
+                "dry_run": true,
+                "action": "add",
+                "file_path": file_path.display().to_string(),
+                "created_file": !detection.found(),
+                "current_version": BLURB_VERSION,
+                "would_action": "add",
+            });
+            ctx.json_pretty(&output);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_dry_run_add_rich(&file_path, ctx);
         } else {
             println!(
@@ -742,36 +935,32 @@ fn execute_add(
         return Ok(());
     }
 
-    // Prompt for confirmation unless forced
-    if !force && !detection.found() {
-        println!("This will create a new AGENTS.md with beads workflow instructions.");
-        println!("File: {}", file_path.display());
-        print!("Continue? [y/N] ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("Aborted.");
-            return Ok(());
-        }
+    require_force_for_json_action(force, ctx)?;
+
+    if !confirm_add_operation(detection, &file_path, force)? {
+        println!("Aborted.");
+        return Ok(());
     }
 
     // Backup existing file
-    if detection.found() {
-        let backup_path = file_path.with_extension("md.bak");
-        if let Err(e) = fs::copy(&file_path, &backup_path) {
-            eprintln!(
-                "Warning: Could not create backup at {}: {}",
-                backup_path.display(),
-                e
-            );
-        } else if !matches!(ctx.mode(), OutputMode::Rich) {
-            println!("Backup created: {}", backup_path.display());
-        }
-    }
+    let backup_path = detection
+        .found()
+        .then(|| backup_agent_file(&file_path, ctx))
+        .flatten();
 
     fs::write(&file_path, &new_content)?;
-    if matches!(ctx.mode(), OutputMode::Rich) {
+    if ctx.is_json() {
+        let output = serde_json::json!({
+            "action": "add",
+            "performed": true,
+            "file_path": file_path.display().to_string(),
+            "backup_path": backup_path.as_ref().map(|path| path.display().to_string()),
+            "created_file": !detection.found(),
+            "bytes_written": new_content.len(),
+            "current_version": BLURB_VERSION,
+        });
+        ctx.json_pretty(&output);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_add_success_rich(&file_path, new_content.len(), ctx);
     } else {
         println!(
@@ -785,6 +974,7 @@ fn execute_add(
 
 fn execute_remove(
     detection: &AgentFileDetection,
+    work_dir: &Path,
     dry_run: bool,
     force: bool,
     ctx: &OutputContext,
@@ -792,7 +982,7 @@ fn execute_remove(
     if !detection.found() {
         return Err(BeadsError::Validation {
             field: "AGENTS.md".to_string(),
-            reason: "not found in current directory or parents".to_string(),
+            reason: agent_file_not_found_reason(work_dir),
         });
     }
 
@@ -805,7 +995,16 @@ fn execute_remove(
     }
 
     if !detection.has_blurb && !detection.has_legacy_blurb {
-        if matches!(ctx.mode(), OutputMode::Rich) {
+        if ctx.is_json() {
+            let output = serde_json::json!({
+                "action": "remove",
+                "performed": false,
+                "reason": "nothing_to_remove",
+                "file_path": detection.file_path.as_ref().map(|path| path.display().to_string()),
+                "current_version": BLURB_VERSION,
+            });
+            ctx.json_pretty(&output);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_nothing_to_remove_rich(ctx);
         } else {
             println!("No beads workflow instructions found to remove.");
@@ -823,7 +1022,16 @@ fn execute_remove(
     };
 
     if dry_run {
-        if matches!(ctx.mode(), OutputMode::Rich) {
+        if ctx.is_json() {
+            let output = serde_json::json!({
+                "dry_run": true,
+                "action": "remove",
+                "file_path": file_path.display().to_string(),
+                "current_version": BLURB_VERSION,
+                "would_action": "remove",
+            });
+            ctx.json_pretty(&output);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_dry_run_remove_rich(file_path, ctx);
         } else {
             println!(
@@ -833,6 +1041,8 @@ fn execute_remove(
         }
         return Ok(());
     }
+
+    require_force_for_json_action(force, ctx)?;
 
     // Prompt for confirmation unless forced
     if !force {
@@ -851,19 +1061,20 @@ fn execute_remove(
     }
 
     // Backup
-    let backup_path = file_path.with_extension("md.bak");
-    if let Err(e) = fs::copy(file_path, &backup_path) {
-        eprintln!(
-            "Warning: Could not create backup at {}: {}",
-            backup_path.display(),
-            e
-        );
-    } else if !matches!(ctx.mode(), OutputMode::Rich) {
-        println!("Backup created: {}", backup_path.display());
-    }
+    let backup_path = backup_agent_file(file_path, ctx);
 
-    fs::write(file_path, new_content)?;
-    if matches!(ctx.mode(), OutputMode::Rich) {
+    fs::write(file_path, &new_content)?;
+    if ctx.is_json() {
+        let output = serde_json::json!({
+            "action": "remove",
+            "performed": true,
+            "file_path": file_path.display().to_string(),
+            "backup_path": backup_path.as_ref().map(|path| path.display().to_string()),
+            "bytes_written": new_content.len(),
+            "current_version": BLURB_VERSION,
+        });
+        ctx.json_pretty(&output);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_remove_success_rich(file_path, ctx);
     } else {
         println!(
@@ -877,6 +1088,7 @@ fn execute_remove(
 
 fn execute_update(
     detection: &AgentFileDetection,
+    work_dir: &Path,
     dry_run: bool,
     force: bool,
     ctx: &OutputContext,
@@ -884,7 +1096,7 @@ fn execute_update(
     if !detection.found() {
         return Err(BeadsError::Validation {
             field: "AGENTS.md".to_string(),
-            reason: "not found in current directory or parents".to_string(),
+            reason: agent_file_not_found_reason(work_dir),
         });
     }
 
@@ -897,7 +1109,16 @@ fn execute_update(
     }
 
     if !detection.needs_upgrade() {
-        if matches!(ctx.mode(), OutputMode::Rich) {
+        if ctx.is_json() {
+            let output = serde_json::json!({
+                "action": "update",
+                "performed": false,
+                "reason": "already_up_to_date",
+                "file_path": detection.file_path.as_ref().map(|path| path.display().to_string()),
+                "current_version": BLURB_VERSION,
+            });
+            ctx.json_pretty(&output);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_already_up_to_date_rich(ctx);
         } else {
             println!("Beads workflow instructions are already up to date (v{BLURB_VERSION}).");
@@ -916,7 +1137,17 @@ fn execute_update(
     };
 
     if dry_run {
-        if matches!(ctx.mode(), OutputMode::Rich) {
+        if ctx.is_json() {
+            let output = serde_json::json!({
+                "dry_run": true,
+                "action": "update",
+                "file_path": file_path.display().to_string(),
+                "from_version": from_version,
+                "to_version": BLURB_VERSION,
+                "would_action": "update",
+            });
+            ctx.json_pretty(&output);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_dry_run_update_rich(file_path, &from_version, ctx);
         } else {
             println!(
@@ -926,6 +1157,8 @@ fn execute_update(
         }
         return Ok(());
     }
+
+    require_force_for_json_action(force, ctx)?;
 
     // Prompt for confirmation unless forced
     if !force {
@@ -944,19 +1177,21 @@ fn execute_update(
     }
 
     // Backup
-    let backup_path = file_path.with_extension("md.bak");
-    if let Err(e) = fs::copy(file_path, &backup_path) {
-        eprintln!(
-            "Warning: Could not create backup at {}: {}",
-            backup_path.display(),
-            e
-        );
-    } else if !matches!(ctx.mode(), OutputMode::Rich) {
-        println!("Backup created: {}", backup_path.display());
-    }
+    let backup_path = backup_agent_file(file_path, ctx);
 
     fs::write(file_path, &new_content)?;
-    if matches!(ctx.mode(), OutputMode::Rich) {
+    if ctx.is_json() {
+        let output = serde_json::json!({
+            "action": "update",
+            "performed": true,
+            "file_path": file_path.display().to_string(),
+            "backup_path": backup_path.as_ref().map(|path| path.display().to_string()),
+            "from_version": from_version,
+            "to_version": BLURB_VERSION,
+            "bytes_written": new_content.len(),
+        });
+        ctx.json_pretty(&output);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_update_success_rich(file_path, &from_version, new_content.len(), ctx);
     } else {
         println!(
@@ -1021,8 +1256,8 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
         }
     } else {
         content.append_styled("\u{2717} ", theme.warning.clone());
-        content.append("No AGENTS.md or CLAUDE.md found in ");
-        content.append_styled(&work_dir.display().to_string(), theme.accent.clone());
+        content.append("No AGENTS.md or CLAUDE.md found ");
+        content.append_styled(&search_scope_description(work_dir), theme.accent.clone());
         content.append("\n\n");
         content.append_styled(
             "To add beads workflow instructions:\n",
@@ -1229,13 +1464,53 @@ fn render_update_success_rich(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::OutputContext;
+    use std::env;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DirGuard {
+        previous: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new(target: &Path) -> Self {
+            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+            env::set_current_dir(target).expect("set current dir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous);
+        }
+    }
 
     #[test]
     fn test_contains_blurb() {
         let content = "Some text\n<!-- br-agent-instructions-v1 -->\nblurb\n<!-- end-br-agent-instructions -->";
         assert!(contains_blurb(content));
         assert!(!contains_legacy_blurb(content));
+    }
+
+    #[test]
+    fn test_contains_blurb_requires_end_marker() {
+        let content = "Some text\n<!-- br-agent-instructions-v1 -->\nblurb";
+
+        assert!(!contains_blurb(content));
+        assert_eq!(get_blurb_version(content), 0);
+    }
+
+    #[test]
+    fn test_contains_blurb_skips_incomplete_marker_before_valid_block() {
+        let content =
+            format!("Example start marker: <!-- br-agent-instructions-v9 -->\n\n{AGENT_BLURB}");
+
+        assert!(contains_blurb(&content));
+        assert_eq!(get_blurb_version(&content), 1);
     }
 
     #[test]
@@ -1247,9 +1522,26 @@ mod tests {
     }
 
     #[test]
+    fn test_contains_legacy_blurb_requires_end_marker() {
+        let content = "Some text\n<!-- bv-agent-instructions-v1 -->\nblurb";
+
+        assert!(!contains_legacy_blurb(content));
+    }
+
+    #[test]
     fn test_get_blurb_version() {
-        assert_eq!(get_blurb_version("<!-- br-agent-instructions-v1 -->"), 1);
-        assert_eq!(get_blurb_version("<!-- br-agent-instructions-v2 -->"), 2);
+        assert_eq!(
+            get_blurb_version(
+                "<!-- br-agent-instructions-v1 -->\n<!-- end-br-agent-instructions -->"
+            ),
+            1
+        );
+        assert_eq!(
+            get_blurb_version(
+                "<!-- br-agent-instructions-v2 -->\n<!-- end-br-agent-instructions -->"
+            ),
+            2
+        );
         assert_eq!(get_blurb_version("no marker"), 0);
     }
 
@@ -1345,6 +1637,14 @@ mod tests {
     }
 
     #[test]
+    fn test_append_blurb_to_empty_content_has_no_leading_blank_lines() {
+        let result = append_blurb("");
+
+        assert!(result.starts_with(BLURB_START_MARKER));
+        assert_eq!(result, format!("{AGENT_BLURB}\n"));
+    }
+
+    #[test]
     fn test_remove_blurb() {
         let content = format!("# Agents\n\n{AGENT_BLURB}\n\nMore content.");
         let result = remove_blurb(&content);
@@ -1354,12 +1654,72 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_blurb_ignores_earlier_end_marker_text() {
+        let content = format!(
+            "# Agents\n\nLiteral marker: {BLURB_END_MARKER}\n\n{AGENT_BLURB}\n\nMore content."
+        );
+
+        let result = remove_blurb(&content);
+
+        assert_eq!(
+            result,
+            format!("# Agents\n\nLiteral marker: {BLURB_END_MARKER}\n\nMore content.")
+        );
+    }
+
+    #[test]
+    fn test_remove_blurb_skips_incomplete_marker_before_valid_block() {
+        let content = format!(
+            "# Agents\n\nBroken example: <!-- br-agent-instructions-v9 -->\n\n{AGENT_BLURB}\n\nMore content."
+        );
+
+        let result = remove_blurb(&content);
+
+        assert_eq!(
+            result,
+            "# Agents\n\nBroken example: <!-- br-agent-instructions-v9 -->\n\nMore content."
+        );
+    }
+
+    #[test]
     fn test_update_blurb() {
         // Test updating legacy bv blurb
         let legacy_content = "# Agents\n\n<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->\n";
         let result = update_blurb(legacy_content);
         assert!(!result.contains("bv-agent-instructions"));
         assert!(result.contains("br-agent-instructions-v1"));
+    }
+
+    #[test]
+    fn test_remove_legacy_blurb_ignores_earlier_end_marker_text() {
+        let legacy_blurb =
+            "<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->";
+        let content = format!(
+            "# Agents\n\nLiteral marker: <!-- end-bv-agent-instructions -->\n\n{legacy_blurb}\n\nMore content."
+        );
+
+        let result = remove_legacy_blurb(&content);
+
+        assert_eq!(
+            result,
+            "# Agents\n\nLiteral marker: <!-- end-bv-agent-instructions -->\n\nMore content."
+        );
+    }
+
+    #[test]
+    fn test_remove_legacy_blurb_skips_incomplete_marker_before_valid_block() {
+        let legacy_blurb =
+            "<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->";
+        let content = format!(
+            "# Agents\n\nBroken example: <!-- bv-agent-instructions-v9 -->\n\n{legacy_blurb}\n\nMore content."
+        );
+
+        let result = remove_legacy_blurb(&content);
+
+        assert_eq!(
+            result,
+            "# Agents\n\nBroken example: <!-- bv-agent-instructions-v9 -->\n\nMore content."
+        );
     }
 
     #[test]
@@ -1376,5 +1736,227 @@ mod tests {
         let detection = detect_agent_file_in_parents(&sub_dir, 3);
         assert!(detection.found());
         assert_eq!(detection.file_path.unwrap(), agents_path);
+    }
+
+    #[test]
+    fn test_detect_in_deep_project_parents() {
+        let temp_dir = TempDir::new().unwrap();
+        let deep_dir = temp_dir
+            .path()
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("d")
+            .join("e");
+        fs::create_dir_all(&deep_dir).unwrap();
+        fs::create_dir(temp_dir.path().join(".git")).unwrap();
+
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        fs::write(&agents_path, "# Agents\n").unwrap();
+
+        let detection = detect_agent_file_in_project(&deep_dir);
+        assert!(detection.found());
+        assert_eq!(detection.file_path.unwrap(), agents_path);
+    }
+
+    #[test]
+    fn test_execute_json_add_force_creates_file() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = DirGuard::new(temp_dir.path());
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        execute(
+            &AgentsArgs {
+                add: true,
+                force: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect("execute add in json mode");
+
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        let content = fs::read_to_string(&agents_path).expect("read AGENTS.md");
+        assert!(content.contains(BLURB_START_MARKER));
+        assert!(content.contains(BLURB_END_MARKER));
+        assert!(content.starts_with(BLURB_START_MARKER));
+    }
+
+    #[test]
+    fn test_execute_json_add_requires_force() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = DirGuard::new(temp_dir.path());
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        let err = execute(
+            &AgentsArgs {
+                add: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect_err("json add without force should fail");
+
+        match err {
+            BeadsError::Validation { field, reason } => {
+                assert_eq!(field, "force");
+                assert!(reason.contains("--force"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_json_add_dry_run_does_not_require_force() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = DirGuard::new(temp_dir.path());
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        execute(
+            &AgentsArgs {
+                add: true,
+                dry_run: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect("json add dry-run should succeed without force");
+
+        assert!(
+            !temp_dir.path().join("AGENTS.md").exists(),
+            "dry-run must not create AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn test_execute_json_remove_dry_run_without_file_errors() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = DirGuard::new(temp_dir.path());
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        let err = execute(
+            &AgentsArgs {
+                remove: true,
+                dry_run: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect_err("json remove dry-run without file should error");
+
+        match err {
+            BeadsError::Validation { field, reason } => {
+                assert_eq!(field, "AGENTS.md");
+                assert!(reason.contains("current directory"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_json_update_dry_run_without_file_errors() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = DirGuard::new(temp_dir.path());
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        let err = execute(
+            &AgentsArgs {
+                update: true,
+                dry_run: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect_err("json update dry-run without file should error");
+
+        match err {
+            BeadsError::Validation { field, reason } => {
+                assert_eq!(field, "AGENTS.md");
+                assert!(reason.contains("current directory"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_search_scope_description_for_project_subdir() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join(".git")).unwrap();
+        let sub_dir = temp_dir.path().join("nested").join("deeper");
+        fs::create_dir_all(&sub_dir).unwrap();
+
+        let description = search_scope_description(&sub_dir);
+
+        assert!(description.contains(&sub_dir.display().to_string()));
+        assert!(description.contains(&temp_dir.path().display().to_string()));
+        assert!(description.contains("project root"));
+    }
+
+    #[test]
+    fn test_agent_file_not_found_reason_for_project_subdir() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join(".git")).unwrap();
+        let sub_dir = temp_dir.path().join("nested");
+        fs::create_dir(&sub_dir).unwrap();
+
+        let reason = agent_file_not_found_reason(&sub_dir);
+
+        assert!(reason.contains("not found between current directory"));
+        assert!(reason.contains(&sub_dir.display().to_string()));
+        assert!(reason.contains(&temp_dir.path().display().to_string()));
+    }
+
+    #[test]
+    fn test_add_confirmation_message_for_new_file() {
+        let file_path = PathBuf::from("/tmp/AGENTS.md");
+        let message = add_confirmation_message(&AgentFileDetection::default(), &file_path);
+
+        assert!(message.contains("create a new AGENTS.md"));
+        assert!(message.contains(file_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn test_add_confirmation_message_for_existing_file() {
+        let detection = AgentFileDetection {
+            file_path: Some(PathBuf::from("/tmp/CLAUDE.md")),
+            file_type: Some("CLAUDE.md".to_string()),
+            content: Some("# Existing".to_string()),
+            ..Default::default()
+        };
+        let file_path = detection.file_path.clone().unwrap();
+        let message = add_confirmation_message(&detection, &file_path);
+
+        assert!(message.contains("add beads workflow instructions to"));
+        assert!(message.contains(file_path.to_string_lossy().as_ref()));
+        assert!(!message.contains("create a new AGENTS.md"));
+    }
+
+    #[test]
+    fn test_execute_rejects_conflicting_actions() {
+        let ctx = OutputContext::from_flags(false, false, true);
+
+        let err = execute(
+            &AgentsArgs {
+                add: true,
+                check: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect_err("conflicting actions should fail");
+
+        match err {
+            BeadsError::Validation { field, reason } => {
+                assert_eq!(field, "action");
+                assert!(reason.contains("--add"));
+                assert!(reason.contains("--check"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

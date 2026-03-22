@@ -2516,19 +2516,19 @@ pub struct GraphArgs {
 #[allow(clippy::struct_excessive_bools)]
 pub struct AgentsArgs {
     /// Add beads workflow instructions to AGENTS.md
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["remove", "update", "check"])]
     pub add: bool,
 
     /// Remove beads workflow instructions from AGENTS.md
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["add", "update", "check"])]
     pub remove: bool,
 
     /// Update beads workflow instructions to latest version
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["add", "remove", "check"])]
     pub update: bool,
 
     /// Check status only (default behavior)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["add", "remove", "update"])]
     pub check: bool,
 
     /// Preview changes without modifying files
@@ -2581,6 +2581,13 @@ mod tests {
     fn test_ready_assignee_conflicts_with_unassigned() {
         let err = Cli::try_parse_from(["br", "ready", "--assignee", "alice", "--unassigned"])
             .expect_err("ready filters should conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_agents_add_conflicts_with_check() {
+        let err = Cli::try_parse_from(["br", "agents", "--add", "--check"])
+            .expect_err("agents actions should conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 

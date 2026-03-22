@@ -226,6 +226,23 @@ fn e2e_history_restore_json_output() {
     assert_eq!(json["restored"], true);
     assert!(json["target"].as_str().is_some());
     assert!(json["next_step"].as_str().is_some());
+    let notes = json["notes"]
+        .as_array()
+        .expect("restore json should include notes");
+    assert!(
+        notes.iter().any(|note| {
+            note.as_str()
+                .is_some_and(|value| value.contains("SQLite is unchanged"))
+        }),
+        "restore notes should explain that JSONL restore does not update SQLite"
+    );
+    assert!(
+        notes.iter().any(|note| {
+            note.as_str()
+                .is_some_and(|value| value.contains("Tombstone protection"))
+        }),
+        "restore notes should explain tombstone protection"
+    );
 }
 
 // =============================================================================

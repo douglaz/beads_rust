@@ -47,6 +47,9 @@ impl Drop for TempRestoreGuard {
 }
 
 const MAX_RESTORE_ROLLBACK_PATH_ATTEMPTS: u64 = 1024;
+const RESTORE_NOTE_DB_UNCHANGED: &str = "SQLite is unchanged until you run the import step.";
+const RESTORE_NOTE_TOMBSTONE_PROTECTION: &str =
+    "Tombstone protection remains active; deleted issues are not resurrected by import.";
 
 fn create_restore_rollback_snapshot(
     target_path: &Path,
@@ -130,14 +133,19 @@ fn emit_restore_output(
     backup_name: &str,
     target_path: &Path,
     target_name: &str,
+    beads_dir: &Path,
 ) {
+    let next_step = restore_next_step(beads_dir, target_path);
+    let notes = [RESTORE_NOTE_DB_UNCHANGED, RESTORE_NOTE_TOMBSTONE_PROTECTION];
+
     if ctx.is_json() {
         let output = json!({
             "action": "restore",
             "backup": backup_name,
             "target": target_path.display().to_string(),
             "restored": true,
-            "next_step": "br sync --import-only --force",
+            "next_step": next_step,
+            "notes": notes,
         });
         ctx.json_pretty(&output);
         return;
@@ -149,7 +157,8 @@ fn emit_restore_output(
             "backup": backup_name,
             "target": target_path.display().to_string(),
             "restored": true,
-            "next_step": "br sync --import-only --force",
+            "next_step": next_step,
+            "notes": notes,
         });
         ctx.toon(&output);
         return;
@@ -162,7 +171,10 @@ fn emit_restore_output(
     if ctx.is_rich() {
         let theme = ctx.theme();
         let body = format!(
-            "Restored {backup_name} to {target_name}.\nNext: br sync --import-only --force"
+            "Restored {backup_name} to {target_name}.\n\
+             Next: {next_step}\n\
+             Note: {RESTORE_NOTE_DB_UNCHANGED}\n\
+             Note: {RESTORE_NOTE_TOMBSTONE_PROTECTION}"
         );
         let panel = Panel::from_text(&body)
             .title(Text::styled("History Restore", theme.panel_title.clone()))
@@ -171,7 +183,9 @@ fn emit_restore_output(
         ctx.render(&panel);
     } else {
         println!("Restored {backup_name} to {target_name}");
-        println!("Run 'br sync --import-only --force' to import this state into the database.");
+        println!("Next: {next_step}");
+        println!("Note: {RESTORE_NOTE_DB_UNCHANGED}");
+        println!("Note: {RESTORE_NOTE_TOMBSTONE_PROTECTION}");
     }
 }
 
@@ -547,7 +561,7 @@ fn restore_backup(
         |from, to| fs::rename(from, to),
     )?;
     temp_guard.persist();
-    emit_restore_output(ctx, &backup_name, &target_path, &target_name);
+    emit_restore_output(ctx, &backup_name, &target_path, &target_name, beads_dir);
 
     Ok(())
 }
@@ -664,10 +678,7 @@ fn current_jsonl_path_for_backup_with_cwd(
         beads_dir,
         &beads_dir.join(".br_history").join(backup_name),
     )?;
-    let canonical_beads =
-        dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
-    let is_external_target =
-        !target_path.starts_with(beads_dir) && !target_path.starts_with(&canonical_beads);
+    let is_external_target = is_external_jsonl_target(beads_dir, &target_path);
 
     if is_external_target {
         let active_jsonl_path = active_jsonl_path.ok_or_else(|| {
@@ -692,6 +703,46 @@ fn current_jsonl_path_for_backup_with_cwd(
     }
 
     Ok(target_path)
+}
+
+fn is_external_jsonl_target(beads_dir: &Path, target_path: &Path) -> bool {
+    let canonical_beads =
+        dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
+    !target_path.starts_with(beads_dir) && !target_path.starts_with(&canonical_beads)
+}
+
+fn is_default_jsonl_target(beads_dir: &Path, target_path: &Path) -> bool {
+    let default_target = beads_dir.join("issues.jsonl");
+    if target_path == default_target {
+        return true;
+    }
+
+    let canonical_target =
+        dunce::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let canonical_default = dunce::canonicalize(&default_target).unwrap_or(default_target);
+    canonical_target == canonical_default
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn restore_next_step(beads_dir: &Path, target_path: &Path) -> String {
+    let mut command = String::new();
+
+    if !is_default_jsonl_target(beads_dir, target_path) {
+        command.push_str("BEADS_JSONL=");
+        command.push_str(&shell_quote(&target_path.display().to_string()));
+        command.push(' ');
+    }
+
+    command.push_str("br sync --import-only --force");
+
+    if is_external_jsonl_target(beads_dir, target_path) {
+        command.push_str(" --allow-external-jsonl");
+    }
+
+    command
 }
 
 fn normalize_jsonl_match_path(path: &Path, cwd: Option<&Path>) -> PathBuf {
@@ -915,6 +966,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, external_target);
+    }
+
+    #[test]
+    fn test_restore_next_step_uses_default_import_for_internal_targets() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let internal_target = beads_dir.join("issues.jsonl");
+
+        assert_eq!(
+            restore_next_step(&beads_dir, &internal_target),
+            "br sync --import-only --force"
+        );
+    }
+
+    #[test]
+    fn test_restore_next_step_sets_jsonl_path_for_internal_custom_targets() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let custom_target = beads_dir.join("custom.jsonl");
+
+        assert_eq!(
+            restore_next_step(&beads_dir, &custom_target),
+            format!(
+                "BEADS_JSONL={} br sync --import-only --force",
+                shell_quote(&custom_target.display().to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn test_restore_next_step_requires_external_flag_for_external_targets() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_target = temp.path().join("external").join("issues.jsonl");
+
+        assert_eq!(
+            restore_next_step(&beads_dir, &external_target),
+            format!(
+                "BEADS_JSONL={} br sync --import-only --force --allow-external-jsonl",
+                shell_quote(&external_target.display().to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn test_shell_quote_escapes_single_quotes() {
+        assert_eq!(
+            shell_quote("/tmp/issue's.jsonl"),
+            r#"'/tmp/issue'"'"'s.jsonl'"#
+        );
     }
 
     #[test]

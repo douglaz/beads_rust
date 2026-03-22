@@ -123,13 +123,29 @@ jobs:
           VERGEN_GIT_SHA: ${{ github.sha }}
           VERGEN_GIT_BRANCH: ${{ github.ref_name }}
 
-      - name: Verify binary runs (Unix)
+      - name: Verify binary version matches tag (Unix)
         if: runner.os != 'Windows'
-        run: ./target/${{ matrix.target }}/release/br --version
+        run: |
+          EXPECTED="${{ github.ref_name }}"
+          EXPECTED="${EXPECTED#v}"  # strip leading v
+          ACTUAL=$(./target/${{ matrix.target }}/release/br --version 2>&1)
+          if ! echo "$ACTUAL" | grep -q "$EXPECTED"; then
+            echo "ERROR: Binary reports '$ACTUAL' but expected version '$EXPECTED'"
+            exit 1
+          fi
+          echo "Version check passed: $ACTUAL contains $EXPECTED"
 
-      - name: Verify binary runs (Windows)
+      - name: Verify binary version matches tag (Windows)
         if: runner.os == 'Windows'
-        run: ./target/${{ matrix.target }}/release/br.exe --version
+        shell: pwsh
+        run: |
+          $expected = "${{ github.ref_name }}" -replace '^v', ''
+          $actual = & ./target/${{ matrix.target }}/release/br.exe --version 2>&1 | Out-String
+          if ($actual -notmatch [regex]::Escape($expected)) {
+            Write-Error "ERROR: Binary reports '$actual' but expected version '$expected'"
+            exit 1
+          }
+          Write-Host "Version check passed: $actual contains $expected"
 
       - name: Create archive (Unix)
         if: runner.os != 'Windows'

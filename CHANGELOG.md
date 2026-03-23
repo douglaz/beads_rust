@@ -15,6 +15,21 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## [v0.1.33](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.1.33) -- 2026-03-23 (Release)
+
+This release supersedes the partial `v0.1.32` fallback build by fixing release automation so `dsr` can produce installer-compatible assets deterministically.
+
+### Release and CI
+
+- **Rust cache pinning** was updated across all GitHub workflows to the current signed `Swatinem/rust-cache` v2.9.1 commit after the prior pinned SHA stopped resolving and broke fallback builds.
+- **Release builds now fail closed on missing artifacts**: Linux ARM64 and Windows AMD64 are treated as required release outputs instead of being silently omitted from a published release.
+- **Cross-platform fallback coverage improved** by moving Linux ARM64 and Windows AMD64 fallback builds onto Linux-based cross-compilation paths, reducing dependence on specialized remote runners for those targets.
+
+### Testing
+
+- **Single-issue graph rendering** now preserves DFS subtree order in plain output so dependents render contiguously instead of visually nesting under later siblings.
+- **List output regression coverage** now reflects the actual plain-output behavior for unknown custom statuses, keeping release validation aligned with user-visible CLI output.
+
 ## [v0.1.32](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.1.32) -- 2026-03-23 (Release)
 
 This release extends cross-project routing coverage, hardens storage for frankensqlite compatibility, and tightens the release pipeline around version and installer correctness.

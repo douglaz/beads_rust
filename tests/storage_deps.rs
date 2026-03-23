@@ -409,7 +409,9 @@ fn would_create_cycle_detects_simple_cycle() {
         .unwrap();
 
     // Would B depending on A create a cycle? Yes!
-    let would_cycle = storage.would_create_cycle(&b.id, &a.id, true).unwrap();
+    let would_cycle = storage
+        .would_create_cycle(&b.id, &a.id, Some(DependencyType::Blocks.as_str()), true)
+        .unwrap();
     assert!(would_cycle);
 }
 
@@ -434,7 +436,9 @@ fn would_create_cycle_transitive_detection() {
         .unwrap();
 
     // Would C depending on A create a cycle? Yes!
-    let would_cycle = storage.would_create_cycle(&c.id, &a.id, true).unwrap();
+    let would_cycle = storage
+        .would_create_cycle(&c.id, &a.id, Some(DependencyType::Blocks.as_str()), true)
+        .unwrap();
     assert!(would_cycle);
 }
 
@@ -456,11 +460,15 @@ fn would_create_cycle_no_cycle() {
         .unwrap();
 
     // Would A depending on C create a cycle? No (C is unconnected)
-    let would_cycle = storage.would_create_cycle(&a.id, &c.id, true).unwrap();
+    let would_cycle = storage
+        .would_create_cycle(&a.id, &c.id, Some(DependencyType::Blocks.as_str()), true)
+        .unwrap();
     assert!(!would_cycle);
 
     // Would C depending on B create a cycle? No
-    let would_cycle = storage.would_create_cycle(&c.id, &b.id, true).unwrap();
+    let would_cycle = storage
+        .would_create_cycle(&c.id, &b.id, Some(DependencyType::Blocks.as_str()), true)
+        .unwrap();
     assert!(!would_cycle);
 }
 
@@ -482,14 +490,18 @@ fn would_create_cycle_mixed_types() {
     // Would B -> blocks -> A create a BLOCKING cycle?
     // Path B -> ... -> A? No, because A->B is 'related' (non-blocking).
     // So blocking_only=true should return false.
-    let blocking_cycle = storage.would_create_cycle(&b.id, &a.id, true).unwrap();
+    let blocking_cycle = storage
+        .would_create_cycle(&b.id, &a.id, Some(DependencyType::Blocks.as_str()), true)
+        .unwrap();
     assert!(
         !blocking_cycle,
         "Should not detect blocking cycle through related dependency"
     );
 
     // blocking_only=false should detect it (graph reachability)
-    let any_cycle = storage.would_create_cycle(&b.id, &a.id, false).unwrap();
+    let any_cycle = storage
+        .would_create_cycle(&b.id, &a.id, Some(DependencyType::Blocks.as_str()), false)
+        .unwrap();
     assert!(any_cycle, "Should detect general graph cycle");
 }
 
@@ -632,7 +644,12 @@ fn deep_hierarchy_five_levels() {
 
     // Would l5 -> l0 create a cycle? Yes!
     let would_cycle = storage
-        .would_create_cycle(&level5.id, &level0.id, true)
+        .would_create_cycle(
+            &level5.id,
+            &level0.id,
+            Some(DependencyType::Blocks.as_str()),
+            true,
+        )
         .unwrap();
     assert!(would_cycle);
 }
@@ -744,7 +761,9 @@ fn diamond_pattern_dependencies() {
     assert!(d_dependents.contains(&c.id));
 
     // Would D -> A create a cycle? Yes (through either path)
-    let would_cycle = storage.would_create_cycle(&d.id, &a.id, true).unwrap();
+    let would_cycle = storage
+        .would_create_cycle(&d.id, &a.id, Some(DependencyType::Blocks.as_str()), true)
+        .unwrap();
     assert!(would_cycle);
 
     // No cycles currently exist

@@ -258,9 +258,12 @@ fn dep_add(
     // Cycle check for blocking types only
     if dep_type.is_blocking()
         && !depends_on_id.starts_with("external:")
-        && storage_ctx
-            .storage
-            .would_create_cycle(&issue_id, &depends_on_id, true)?
+        && storage_ctx.storage.would_create_cycle(
+            &issue_id,
+            &depends_on_id,
+            Some(dep_type.as_str()),
+            true,
+        )?
     {
         return Err(BeadsError::DependencyCycle {
             path: format!("{issue_id} -> {depends_on_id}"),
@@ -1388,7 +1391,7 @@ mod tests {
 
         // bd-002 depends on bd-001 would create a cycle
         let would_cycle = storage
-            .would_create_cycle("bd-002", "bd-001", true)
+            .would_create_cycle("bd-002", "bd-001", Some("blocks"), true)
             .unwrap();
         assert!(would_cycle);
         info!("test_cycle_detection_simple: assertions passed");
@@ -1417,13 +1420,13 @@ mod tests {
 
         // bd-003 -> bd-001 would create a cycle
         let would_cycle = storage
-            .would_create_cycle("bd-003", "bd-001", true)
+            .would_create_cycle("bd-003", "bd-001", Some("blocks"), true)
             .unwrap();
         assert!(would_cycle);
 
         // bd-003 -> bd-002 would also create a cycle
         let would_cycle = storage
-            .would_create_cycle("bd-003", "bd-002", true)
+            .would_create_cycle("bd-003", "bd-002", Some("blocks"), true)
             .unwrap();
         assert!(would_cycle);
         info!("test_cycle_detection_transitive: assertions passed");
@@ -1449,7 +1452,7 @@ mod tests {
 
         // bd-003 -> bd-002 should NOT be a cycle
         let would_cycle = storage
-            .would_create_cycle("bd-003", "bd-002", true)
+            .would_create_cycle("bd-003", "bd-002", Some("blocks"), true)
             .unwrap();
         assert!(!would_cycle);
         info!("test_no_false_positive_cycle: assertions passed");

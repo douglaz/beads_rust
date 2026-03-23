@@ -750,6 +750,7 @@ fn bench_cycle_detection(c: &mut Criterion) {
             let result = storage.would_create_cycle(
                 black_box("bench-000000"),
                 black_box("bench-000099"),
+                Some("blocks"),
                 true,
             );
             black_box(result)
@@ -765,6 +766,7 @@ fn bench_cycle_detection(c: &mut Criterion) {
             let result = storage.would_create_cycle(
                 black_box("bench-000099"),
                 black_box("bench-000000"),
+                Some("blocks"),
                 true,
             );
             black_box(result)

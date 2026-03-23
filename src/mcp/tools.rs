@@ -477,7 +477,10 @@ fn parse_timestamp(s: &str) -> McpResult<(chrono::DateTime<chrono::Utc>, Option<
 
     // Try parsing date-only (YYYY-MM-DD → start of day UTC)
     if let Ok(date) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
-        let dt = date.and_hms_opt(0, 0, 0).expect("midnight is always a valid time").and_utc();
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always a valid time")
+            .and_utc();
         return Ok((
             dt,
             Some(format!("'{s}' interpreted as '{}'", dt.to_rfc3339())),
@@ -1622,9 +1625,12 @@ fn dep_add(
     let (dep_type_str, dep_coercion) = parse_dep_type(dep_type_raw)?;
 
     // Check for cycles with structured error
-    if storage
-        .would_create_cycle(id, depends_on, true)
-        .map_err(beads_to_mcp)?
+    if dep_type_str
+        .parse::<crate::model::DependencyType>()
+        .is_ok_and(|dep_type| dep_type.is_blocking())
+        && storage
+            .would_create_cycle(id, depends_on, Some(dep_type_str), true)
+            .map_err(beads_to_mcp)?
     {
         return Err(McpError::with_data(
             McpErrorCode::ToolExecutionError,

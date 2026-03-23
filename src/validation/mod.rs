@@ -158,7 +158,12 @@ pub trait DependencyStore {
     /// # Errors
     ///
     /// Returns an error if the storage lookup fails.
-    fn would_create_cycle(&self, issue_id: &str, depends_on_id: &str) -> Result<bool, BeadsError>;
+    fn would_create_cycle(
+        &self,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: Option<&str>,
+    ) -> Result<bool, BeadsError>;
 }
 
 /// Validates dependency invariants, optionally consulting storage.
@@ -192,7 +197,11 @@ impl DependencyValidator {
         }
 
         if dep.dep_type.is_blocking()
-            && store.would_create_cycle(&dep.issue_id, &dep.depends_on_id)?
+            && store.would_create_cycle(
+                &dep.issue_id,
+                &dep.depends_on_id,
+                Some(dep.dep_type.as_str()),
+            )?
         {
             errors.push(ValidationError::new(
                 "depends_on_id",
@@ -388,7 +397,7 @@ impl SyncSafetyValidator {
             }
         }
 
-        let canonical_path = dunce::canonicalize(&path_to_check).unwrap_or_else(|_| path_to_check);
+        let canonical_path = dunce::canonicalize(&path_to_check).unwrap_or(path_to_check);
 
         // Check if the closest existing ancestor is under beads_dir
         if !canonical_path.starts_with(&canonical_beads) {
@@ -416,7 +425,7 @@ impl SyncSafetyValidator {
         }
 
         if !normalized.starts_with(&canonical_beads) && !normalized.starts_with(beads_dir) {
-             return Err(ValidationError::new(
+            return Err(ValidationError::new(
                 "path",
                 format!(
                     "path '{}' traverses outside allowed directory '{}' \
@@ -620,6 +629,7 @@ mod tests {
             &self,
             _issue_id: &str,
             _depends_on_id: &str,
+            _dep_type: Option<&str>,
         ) -> Result<bool, BeadsError> {
             Ok(self.would_cycle)
         }

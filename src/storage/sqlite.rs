@@ -7146,8 +7146,9 @@ impl crate::validation::DependencyStore for SqliteStorage {
         &self,
         issue_id: &str,
         depends_on_id: &str,
+        dep_type: Option<&str>,
     ) -> std::result::Result<bool, crate::error::BeadsError> {
-        Self::check_cycle(&self.conn, issue_id, depends_on_id, None, true)
+        Self::check_cycle(&self.conn, issue_id, depends_on_id, dep_type, true)
     }
 }
 
@@ -8191,7 +8192,7 @@ mod tests {
             .unwrap();
 
         let creates_cycle = storage
-            .would_create_cycle("bd-cy3", "bd-cy1", true)
+            .would_create_cycle("bd-cy3", "bd-cy1", Some("blocks"), true)
             .unwrap();
         assert!(creates_cycle);
     }

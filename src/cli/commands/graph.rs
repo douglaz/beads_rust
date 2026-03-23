@@ -5,7 +5,7 @@
 //! - `br graph <issue-id>`: Show all dependents of an issue (what depends on it)
 //! - `br graph --all`: Show connected components for all nonterminal issues
 
-use super::resolve_issue_id;
+use super::{auto_import_storage_ctx_if_stale, resolve_issue_id};
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -78,7 +78,7 @@ pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let route_cli = routed_cli_for_graph(cli, args, &beads_dir)?;
     let storage_ctx = open_storage_for_graph(args, &route_cli, &beads_dir)?;
-    execute_with_storage_ctx(args, &route_cli, ctx, &storage_ctx)
+    execute_with_storage_ctx(args, &route_cli, ctx, &beads_dir, &storage_ctx)
 }
 
 fn routed_cli_for_graph(
@@ -105,10 +105,14 @@ fn open_storage_for_graph(
         && !args.all
     {
         let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-        return config::open_storage_with_cli(&route.beads_dir, cli);
+        let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, cli)?;
+        auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+        return Ok(storage_ctx);
     }
 
-    config::open_storage_with_cli(local_beads_dir, cli)
+    let mut storage_ctx = config::open_storage_with_cli(local_beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+    Ok(storage_ctx)
 }
 
 /// Execute the graph command using storage that was already opened by the caller.
@@ -117,6 +121,30 @@ fn open_storage_for_graph(
 ///
 /// Returns an error if database operations fail or if inputs are invalid.
 pub fn execute_with_storage_ctx(
+    args: &GraphArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &std::path::Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
+    if let Some(issue_input) = args.issue.as_deref()
+        && !args.all
+    {
+        let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+        if route.is_external {
+            let mut route_cli = cli.clone();
+            route_cli.db = None;
+            let mut routed_storage_ctx =
+                config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+            auto_import_storage_ctx_if_stale(&mut routed_storage_ctx, &route_cli)?;
+            return execute_graph_with_storage_ctx(args, &route_cli, ctx, &routed_storage_ctx);
+        }
+    }
+
+    execute_graph_with_storage_ctx(args, cli, ctx, storage_ctx)
+}
+
+fn execute_graph_with_storage_ctx(
     args: &GraphArgs,
     cli: &config::CliOverrides,
     ctx: &OutputContext,

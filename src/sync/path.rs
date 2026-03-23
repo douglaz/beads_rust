@@ -128,6 +128,26 @@ impl PathValidation {
     }
 }
 
+fn normalize_path_lexically(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(normalized)
+}
+
 /// Validates that a path does not target git internals.
 ///
 /// This is a hard safety invariant: sync operations NEVER access `.git/` directories.
@@ -224,20 +244,20 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         return git_check;
     }
 
-    // Check for traversal attempts by inspecting components
-    for component in path.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            let result = PathValidation::TraversalAttempt {
-                path: path.to_path_buf(),
-            };
-            warn!(
-                path = %path.display(),
-                reason = %result.rejection_reason().unwrap_or_default(),
-                "Path validation rejected"
-            );
-            return result;
-        }
-    }
+    let had_parent_dir = path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir));
+    let Some(normalized_path) = normalize_path_lexically(path) else {
+        let result = PathValidation::TraversalAttempt {
+            path: path.to_path_buf(),
+        };
+        warn!(
+            path = %path.display(),
+            reason = %result.rejection_reason().unwrap_or_default(),
+            "Path validation rejected"
+        );
+        return result;
+    };
 
     // Canonicalize the beads directory
     let canonical_beads = match dunce::canonicalize(beads_dir) {
@@ -256,23 +276,38 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         }
     };
 
+    if had_parent_dir
+        && !normalized_path.starts_with(beads_dir)
+        && !normalized_path.starts_with(&canonical_beads)
+    {
+        let result = PathValidation::TraversalAttempt {
+            path: path.to_path_buf(),
+        };
+        warn!(
+            path = %path.display(),
+            reason = %result.rejection_reason().unwrap_or_default(),
+            "Path validation rejected"
+        );
+        return result;
+    }
+
     // For new files that don't exist yet, we check the parent directory
-    let path_to_check = if path.exists() {
-        path.to_path_buf()
+    let path_to_check = if normalized_path.exists() {
+        normalized_path.clone()
     } else {
         // For non-existent files, verify the parent exists and is valid
-        match path.parent() {
+        match normalized_path.parent() {
             Some(parent) if parent.exists() => parent.to_path_buf(),
             _ => {
                 // If parent doesn't exist, just check if the path would be under beads_dir
-                if let Ok(relative) = path.strip_prefix(&canonical_beads) {
+                if let Ok(relative) = normalized_path.strip_prefix(&canonical_beads) {
                     // Path is specified relative to beads_dir
                     if !relative.to_string_lossy().contains("..") {
-                        return validate_extension_and_name(path);
+                        return validate_extension_and_name(&normalized_path);
                     }
                 }
                 // Otherwise, try to check as-is
-                path.to_path_buf()
+                normalized_path.clone()
             }
         }
     };
@@ -282,10 +317,12 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         Ok(p) => p,
         Err(e) => {
             // For non-existent files, we can't canonicalize, so check prefix
-            if !path.exists() {
+            if !normalized_path.exists() {
                 // Check if the path starts with the beads directory
-                if path.starts_with(beads_dir) || path.starts_with(&canonical_beads) {
-                    return validate_extension_and_name(path);
+                if normalized_path.starts_with(beads_dir)
+                    || normalized_path.starts_with(&canonical_beads)
+                {
+                    return validate_extension_and_name(&normalized_path);
                 }
             }
             let result = PathValidation::CanonicalizationFailed {
@@ -302,8 +339,8 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     };
 
     // Check if the path is a symlink pointing outside beads_dir
-    if path.is_symlink()
-        && let Ok(target) = std::fs::read_link(path)
+    if normalized_path.is_symlink()
+        && let Ok(target) = std::fs::read_link(&normalized_path)
     {
         let canonical_target = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
         if !canonical_target.starts_with(&canonical_beads) {
@@ -320,8 +357,8 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         }
     }
 
-    if path.exists() {
-        match std::fs::symlink_metadata(path) {
+    if normalized_path.exists() {
+        match std::fs::symlink_metadata(&normalized_path) {
             Ok(metadata) if !metadata.is_file() => {
                 let result = PathValidation::NonRegularFile {
                     path: path.to_path_buf(),
@@ -351,10 +388,10 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
 
     // Verify the path is under the beads directory
     // For existing files, use the canonical path; for new files, use the parent's canonical + filename
-    let effective_canonical = if path.exists() {
+    let effective_canonical = if normalized_path.exists() {
         canonical_path
     } else {
-        canonical_path.join(path.file_name().unwrap_or_default())
+        canonical_path.join(normalized_path.file_name().unwrap_or_default())
     };
 
     if !effective_canonical.starts_with(&canonical_beads) {
@@ -372,7 +409,7 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     }
 
     // Validate extension and name
-    let extension_result = validate_extension_and_name(path);
+    let extension_result = validate_extension_and_name(&normalized_path);
     if !extension_result.is_allowed() {
         warn!(
             path = %path.display(),
@@ -462,20 +499,17 @@ pub fn require_valid_sync_path(path: &Path, beads_dir: &Path) -> Result<()> {
 /// before attempting operations.
 #[must_use]
 pub fn is_sync_path_allowed(path: &Path, beads_dir: &Path) -> bool {
-    // Quick check without full canonicalization for obvious cases
-    for component in path.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            return false;
-        }
-    }
+    let Some(normalized_path) = normalize_path_lexically(path) else {
+        return false;
+    };
 
     // Check if path is under beads_dir and has allowed extension
-    if path.starts_with(beads_dir) {
-        return validate_extension_and_name(path).is_allowed();
+    if normalized_path.starts_with(beads_dir) {
+        return validate_extension_and_name(&normalized_path).is_allowed();
     }
 
     // Full validation for edge cases
-    validate_sync_path(path, beads_dir).is_allowed()
+    validate_sync_path(&normalized_path, beads_dir).is_allowed()
 }
 
 /// Validates a path for sync operations with optional external path support.
@@ -761,6 +795,21 @@ mod tests {
     }
 
     #[test]
+    fn test_allowed_normalized_internal_path_with_parent_component() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let subdir = temp.path().join("subdir");
+        std::fs::create_dir_all(&subdir).expect("create subdir");
+        std::fs::write(beads_dir.join("issues.jsonl"), "{}").expect("write issues.jsonl");
+
+        let path = subdir.join("..").join(".beads").join("issues.jsonl");
+        let result = validate_sync_path(&path, &beads_dir);
+        assert!(
+            result.is_allowed(),
+            "Normalized in-tree paths should be allowed"
+        );
+    }
+
+    #[test]
     fn test_allowed_metadata_file() {
         let (_temp, beads_dir) = setup_test_beads_dir();
         let path = beads_dir.join("metadata.json");
@@ -924,6 +973,18 @@ mod tests {
         ));
         assert!(!is_sync_path_allowed(
             &beads_dir.join("../evil.jsonl"),
+            &beads_dir
+        ));
+    }
+
+    #[test]
+    fn test_is_sync_path_allowed_accepts_normalized_internal_path() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let subdir = temp.path().join("subdir");
+        std::fs::create_dir_all(&subdir).expect("create subdir");
+
+        assert!(is_sync_path_allowed(
+            &subdir.join("..").join(".beads").join("issues.jsonl"),
             &beads_dir
         ));
     }

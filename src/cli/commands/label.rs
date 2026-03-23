@@ -2,7 +2,9 @@
 //!
 //! Provides label management: add, remove, list, list-all, and rename.
 
-use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery};
+use super::{
+    auto_import_storage_ctx_if_stale, resolve_issue_id, retry_mutation_with_jsonl_recovery,
+};
 use crate::cli::{LabelAddArgs, LabelCommands, LabelListArgs, LabelRemoveArgs, LabelRenameArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -271,7 +273,8 @@ fn execute_label_list_command(
     if let Some(input) = &args.issue {
         let route = config::routing::resolve_route(input, beads_dir)?;
         let route_cli = routed_cli_for_batch(cli, route.is_external);
-        let storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+        let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+        auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
         let config_layer = storage_ctx.load_config(&route_cli)?;
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
@@ -295,7 +298,8 @@ fn prepare_label_routes(
 
     for batch in routed_batches {
         let batch_cli = routed_cli_for_batch(cli, batch.is_external);
-        let storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
+        let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
+        auto_import_storage_ctx_if_stale(&mut storage_ctx, &batch_cli)?;
         let config_layer = storage_ctx.load_config(&batch_cli)?;
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));

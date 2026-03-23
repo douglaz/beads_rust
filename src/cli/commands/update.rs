@@ -1,8 +1,9 @@
 //! Update command implementation.
 
 use super::{
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_id,
-    resolve_issue_ids, retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
+    preserve_blocked_cache_on_error, resolve_issue_id, resolve_issue_ids,
+    retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
 };
 use crate::cli::UpdateArgs;
 use crate::config;
@@ -205,7 +206,8 @@ fn prepare_single_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<PreparedUpdateRoute> {
-    let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);

@@ -2,8 +2,8 @@
 
 use crate::cli::CloseArgs as CliCloseArgs;
 use crate::cli::commands::{
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_ids,
-    update_issue_with_recovery,
+    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
+    preserve_blocked_cache_on_error, resolve_issue_ids, update_issue_with_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -451,6 +451,7 @@ fn execute_route(
     auto_flush_external: bool,
 ) -> Result<CloseExecution> {
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);

@@ -2,7 +2,7 @@
 //!
 //! Checks issues for missing recommended template sections based on issue type.
 
-use super::resolve_issue_id;
+use super::{auto_import_storage_ctx_if_stale, resolve_issue_id};
 use crate::cli::LintArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -287,7 +287,8 @@ fn resolve_issues(
 
     for batch in routed_batches {
         let batch_cli = routed_cli_for_batch(cli, batch.is_external);
-        let storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
+        let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
+        auto_import_storage_ctx_if_stale(&mut storage_ctx, &batch_cli)?;
         let config_layer = storage_ctx.load_config(&batch_cli)?;
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));

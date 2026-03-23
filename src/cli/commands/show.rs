@@ -1,5 +1,6 @@
 //! Show command implementation.
 
+use crate::cli::commands::auto_import_storage_ctx_if_stale;
 use crate::cli::{ShowArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -346,11 +347,14 @@ fn load_issue_details_for_route(
     let mut bootstrap_config = startup.merged_config.clone();
     bootstrap_config.merge_from(&cli.as_layer());
     let no_db = config::no_db_from_layer(&bootstrap_config).unwrap_or(false);
-    let owned_storage_ctx = if no_db || preloaded_storage.is_some() {
+    let mut owned_storage_ctx = if no_db || preloaded_storage.is_some() {
         None
     } else {
         Some(config::open_storage_with_cli(beads_dir, cli)?)
     };
+    if let Some(storage_ctx) = owned_storage_ctx.as_mut() {
+        auto_import_storage_ctx_if_stale(storage_ctx, cli)?;
+    }
     let config_layer = if let Some(storage_ctx) = owned_storage_ctx.as_ref() {
         storage_ctx.load_config(cli)?
     } else {

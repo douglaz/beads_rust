@@ -4,13 +4,13 @@
 //! that are still `open/in_progress` but referenced in commits.
 
 use crate::cli::OrphansArgs;
+use crate::cli::commands::auto_import_storage_ctx_if_stale;
 use crate::cli::commands::close::{self, CloseArgs};
 use crate::config;
 use crate::error::Result;
 use crate::model::{Issue, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::ListFilters;
-use crate::sync::auto_import_if_stale;
 use crate::util::id::normalize_id;
 use regex::Regex;
 use rich_rust::prelude::*;
@@ -303,25 +303,7 @@ fn auto_import_owned_storage_ctx_if_stale(
     storage_ctx: &mut config::OpenStorageResult,
     cli: &config::CliOverrides,
 ) -> Result<()> {
-    let config_layer = storage_ctx.load_config(cli)?;
-    let no_auto_import = config::no_auto_import_from_layer(&config_layer).unwrap_or(false);
-    let allow_external_jsonl = config::implicit_external_jsonl_allowed(
-        &storage_ctx.paths.beads_dir,
-        &storage_ctx.paths.db_path,
-        &storage_ctx.paths.jsonl_path,
-    );
-    let expected_prefix = storage_ctx.storage.get_config("issue_prefix")?;
-
-    auto_import_if_stale(
-        &mut storage_ctx.storage,
-        &storage_ctx.paths.beads_dir,
-        &storage_ctx.paths.jsonl_path,
-        expected_prefix.as_deref(),
-        allow_external_jsonl,
-        cli.allow_stale.unwrap_or(false),
-        no_auto_import,
-    )
-    .map(|_| ())
+    auto_import_storage_ctx_if_stale(storage_ctx, cli)
 }
 
 fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {

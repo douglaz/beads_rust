@@ -1,6 +1,8 @@
 //! Dependency command implementation.
 
-use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery};
+use super::{
+    auto_import_storage_ctx_if_stale, resolve_issue_id, retry_mutation_with_jsonl_recovery,
+};
 use crate::cli::{
     DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
     OutputFormat, resolve_output_format_basic_with_outer_mode,
@@ -153,7 +155,8 @@ fn open_routed_storage_for_input(
     if route.is_external {
         route_cli.db = None;
     }
-    let storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
     Ok((storage_ctx, route_cli, route.is_external))
 }
 

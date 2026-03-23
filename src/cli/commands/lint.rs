@@ -2,6 +2,7 @@
 //!
 //! Checks issues for missing recommended template sections based on issue type.
 
+use super::resolve_issue_id;
 use crate::cli::LintArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -89,14 +90,14 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let storage = &storage_ctx.storage;
 
     let issues = if args.ids.is_empty() {
+        let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+        let storage = &storage_ctx.storage;
         let filters = build_filters(args)?;
         storage.list_issues(&filters)?
     } else {
-        resolve_issues(storage, &beads_dir, args, cli)?
+        resolve_issues(&beads_dir, args, cli)?
     };
 
     let summary = lint_issues(&issues);
@@ -277,36 +278,68 @@ fn build_filters(args: &LintArgs) -> Result<ListFilters> {
 }
 
 fn resolve_issues(
-    storage: &SqliteStorage,
     beads_dir: &Path,
     args: &LintArgs,
     cli: &config::CliOverrides,
 ) -> Result<Vec<Issue>> {
-    let config_layer = config::load_config(beads_dir, Some(storage), cli)?;
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let routed_batches = config::routing::group_issue_inputs_by_route(&args.ids, beads_dir)?;
+    let mut issues_by_input = std::collections::HashMap::new();
 
-    let mut resolved_ids = Vec::new();
-    for id_input in &args.ids {
-        let resolution = resolver.resolve_fallible(
-            id_input,
-            |id| storage.id_exists(id),
-            |hash| storage.find_ids_by_hash(hash),
-        )?;
-        resolved_ids.push(resolution.id);
-    }
+    for batch in routed_batches {
+        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
+        let storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
+        let config_layer = storage_ctx.load_config(&batch_cli)?;
+        let id_config = config::id_config_from_layer(&config_layer);
+        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
 
-    let issues = storage.get_issues_by_ids(&resolved_ids)?;
-    let found_ids: std::collections::HashSet<String> =
-        issues.iter().map(|i| i.id.clone()).collect();
+        let mut resolved_ids = Vec::with_capacity(batch.issue_inputs.len());
+        for id_input in &batch.issue_inputs {
+            resolved_ids.push(resolve_issue_id(&storage_ctx.storage, &resolver, id_input)?);
+        }
 
-    for id in &resolved_ids {
-        if !found_ids.contains(id) {
-            eprintln!("Issue not found: {}", id);
+        let issues = fetch_issues_in_resolved_order(&storage_ctx.storage, &resolved_ids)?;
+        for (input, issue) in batch.issue_inputs.into_iter().zip(issues) {
+            issues_by_input.insert(input, issue);
         }
     }
 
-    Ok(issues)
+    args.ids
+        .iter()
+        .map(|input| {
+            issues_by_input
+                .get(input)
+                .cloned()
+                .ok_or_else(|| BeadsError::IssueNotFound { id: input.clone() })
+        })
+        .collect()
+}
+
+fn fetch_issues_in_resolved_order(
+    storage: &SqliteStorage,
+    resolved_ids: &[String],
+) -> Result<Vec<Issue>> {
+    let mut issues_by_id = storage
+        .get_issues_by_ids(resolved_ids)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    resolved_ids
+        .iter()
+        .map(|id| {
+            issues_by_id
+                .remove(id)
+                .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })
+        })
+        .collect()
+}
+
+fn routed_cli_for_batch(cli: &config::CliOverrides, is_external: bool) -> config::CliOverrides {
+    let mut routed_cli = cli.clone();
+    if is_external {
+        routed_cli.db = None;
+    }
+    routed_cli
 }
 
 fn lint_issues(issues: &[Issue]) -> LintSummary {

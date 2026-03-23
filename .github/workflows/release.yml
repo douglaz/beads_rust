@@ -134,6 +134,17 @@ jobs:
             sudo apt-get install -y mingw-w64 zip
           fi
 
+      - name: Fix MinGW import library case
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          libkernel32="$(x86_64-w64-mingw32-gcc -print-file-name=libkernel32.a)"
+          libdir="$(dirname "$libkernel32")"
+          if [ "$libkernel32" = "libkernel32.a" ] || [ ! -f "$libkernel32" ]; then
+            echo "Could not locate libkernel32.a"
+            exit 1
+          fi
+          sudo ln -sf "$libkernel32" "$libdir/libKernel32.a"
+
       - name: Configure cross linker
         if: matrix.linker != ''
         run: |

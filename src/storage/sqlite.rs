@@ -686,17 +686,13 @@ impl SqliteStorage {
         let mut count = 0;
 
         for chunk in unique_exports.chunks(EXPORT_HASH_CHUNK_SIZE) {
-            // Bulk delete existing hashes for this chunk
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-            let sql = format!(
-                "DELETE FROM export_hashes WHERE issue_id IN ({})",
-                placeholders.join(",")
-            );
-            let params: Vec<SqliteValue> = chunk
-                .iter()
-                .map(|(id, _)| SqliteValue::from(id.as_str()))
-                .collect();
-            self.conn.execute_with_params(&sql, &params)?;
+            // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
+            for (id, _) in chunk {
+                self.conn.execute_with_params(
+                    "DELETE FROM export_hashes WHERE issue_id = ?",
+                    &[SqliteValue::from(id.as_str())],
+                )?;
+            }
 
             // `fsqlite` can report a false primary-key conflict when many
             // existing rows are reinserted via one VALUES list, so keep each
@@ -745,16 +741,16 @@ impl SqliteStorage {
 
         let mut total_deleted = 0;
         for chunk in issue_ids.chunks(EXPORT_HASH_CHUNK_SIZE) {
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-            let sql = format!(
-                "DELETE FROM export_hashes WHERE issue_id IN ({})",
-                placeholders.join(",")
-            );
-            let params: Vec<SqliteValue> = chunk
-                .iter()
-                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
-                .collect();
-            total_deleted += self.conn.execute_with_params(&sql, &params)?;
+            // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
+            let mut chunk_deleted = 0;
+            for id in chunk {
+                let deleted = self.conn.execute_with_params(
+                    "DELETE FROM export_hashes WHERE issue_id = ?",
+                    &[SqliteValue::from(id.as_str())],
+                )?;
+                chunk_deleted += deleted;
+            }
+            total_deleted += chunk_deleted;
         }
 
         Ok(total_deleted)
@@ -845,26 +841,23 @@ impl SqliteStorage {
                     // fsqlite does not reliably support UNIQUE constraint upserts.
                     for insert_chunk in chunk.chunks(450) {
                         // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
-                        for id in *insert_chunk {
+                        for id in insert_chunk {
                             storage.conn.execute_with_params(
                                 "DELETE FROM dirty_issues WHERE issue_id = ?",
                                 &[SqliteValue::from(id.as_str())],
                             )?;
                         }
 
-                        // Now insert fresh rows
-                        let placeholders: Vec<&str> =
-                            insert_chunk.iter().map(|_| "(?, ?)").collect();
-                        let insert_sql = format!(
-                            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES {}",
-                            placeholders.join(", ")
-                        );
-                        let mut insert_params = Vec::with_capacity(insert_chunk.len() * 2);
+                        // Now insert fresh rows one by one
                         for id in insert_chunk {
-                            insert_params.push(SqliteValue::from(id.as_str()));
-                            insert_params.push(SqliteValue::from(now_str.as_str()));
+                            storage.conn.execute_with_params(
+                                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                                &[
+                                    SqliteValue::from(id.as_str()),
+                                    SqliteValue::from(now_str.as_str()),
+                                ],
+                            )?;
                         }
-                        storage.conn.execute_with_params(&insert_sql, &insert_params)?;
                     }
                 }
             }
@@ -2993,16 +2986,13 @@ impl SqliteStorage {
             .collect::<Vec<_>>()
             .chunks(BLOCKED_CACHE_DELETE_CHUNK_SIZE)
         {
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-            let sql = format!(
-                "DELETE FROM blocked_issues_cache WHERE issue_id IN ({})",
-                placeholders.join(", ")
-            );
-            let params: Vec<SqliteValue> = chunk
-                .iter()
-                .map(|id| SqliteValue::from(id.as_str()))
-                .collect();
-            conn.execute_with_params(&sql, &params)?;
+            // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
+            for id in chunk {
+                conn.execute_with_params(
+                    "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
+                    &[SqliteValue::from(id.as_str())],
+                )?;
+            }
         }
 
         // 4. Re-insert only affected rows that have blockers.
@@ -3999,17 +3989,15 @@ impl SqliteStorage {
                 )?;
 
                 for chunk in affected.chunks(400) {
-                    let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-                    let sql = format!(
-                        "UPDATE issues SET updated_at = ? WHERE id IN ({})",
-                        placeholders.join(", ")
-                    );
-                    let mut params = Vec::with_capacity(chunk.len() + 1);
-                    params.push(SqliteValue::from(now.as_str()));
                     for id in chunk {
-                        params.push(SqliteValue::from(id.as_str()));
+                        conn.execute_with_params(
+                            "UPDATE issues SET updated_at = ? WHERE id = ?",
+                            &[
+                                SqliteValue::from(now.as_str()),
+                                SqliteValue::from(id.as_str()),
+                            ],
+                        )?;
                     }
-                    conn.execute_with_params(&sql, &params)?;
                 }
 
                 ctx.record_event(
@@ -5447,19 +5435,16 @@ impl SqliteStorage {
 
         let mut total_deleted = 0;
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-            let sql = format!(
-                "DELETE FROM dirty_issues WHERE issue_id IN ({})",
-                placeholders.join(",")
-            );
-
-            let params: Vec<SqliteValue> = chunk
-                .iter()
-                .map(|s| SqliteValue::from(s.as_str()))
-                .collect();
-
-            let count = self.conn.execute_with_params(&sql, &params)?;
-            total_deleted += count;
+            // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
+            let mut chunk_deleted = 0;
+            for id in chunk {
+                let deleted = self.conn.execute_with_params(
+                    "DELETE FROM dirty_issues WHERE issue_id = ?",
+                    &[SqliteValue::from(id.as_str())],
+                )?;
+                chunk_deleted += deleted;
+            }
+            total_deleted += chunk_deleted;
         }
 
         Ok(total_deleted)
@@ -6606,15 +6591,16 @@ impl SqliteStorage {
 
         let mut total_deleted = 0;
         for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
-            let placeholders = vec!["?"; chunk.len()].join(", ");
-            let sql = format!("DELETE FROM dirty_issues WHERE issue_id IN ({placeholders})");
-
-            let params: Vec<SqliteValue> = chunk
-                .iter()
-                .map(|s| SqliteValue::from(s.as_str()))
-                .collect();
-            let deleted = self.conn.execute_with_params(&sql, &params)?;
-            total_deleted += deleted;
+            // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
+            let mut chunk_deleted = 0;
+            for id in chunk {
+                let deleted = self.conn.execute_with_params(
+                    "DELETE FROM dirty_issues WHERE issue_id = ?",
+                    &[SqliteValue::from(id.as_str())],
+                )?;
+                chunk_deleted += deleted;
+            }
+            total_deleted += chunk_deleted;
         }
 
         Ok(total_deleted)

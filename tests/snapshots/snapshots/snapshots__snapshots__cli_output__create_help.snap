@@ -13,7 +13,7 @@ Options:
       --title <TITLE_FLAG>           Issue title (alternative to positional argument)
   -t, --type <TYPE>                  Issue type (task, bug, feature, etc.)
   -p, --priority <PRIORITY>          Priority (0-4 or P0-P4)
-  -d, --description <DESCRIPTION>    Description
+  -d, --description <DESCRIPTION>    Description [aliases: --body]
   -a, --assignee <ASSIGNEE>          Assign to person
       --owner <OWNER>                Set owner email
   -l, --labels <LABELS>              Labels (ID-REDACTED)

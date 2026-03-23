@@ -5,7 +5,7 @@ expression: normalize_output(&output.stdout)
 
 🚫 Blocked issues (2):
 
-[● P2] ID-REDACTED: User model
-  Blocked by 1 open dependencies: [ID-REDACTED]
 [● P2] ID-REDACTED: Auth module
+  Blocked by 1 open dependencies: [ID-REDACTED]
+[● P2] ID-REDACTED: User model
   Blocked by 1 open dependencies: [ID-REDACTED]

@@ -190,7 +190,10 @@ fn e2e_graph_single_issue_honors_toon_env_mode() {
     let decoded = try_decode(graph.stdout.trim(), None).expect("valid graph TOON");
     let json = Value::from(decoded);
     assert_eq!(json["root"].as_str(), Some(blocker_id.as_str()));
-    assert_eq!(json["count"].as_u64(), Some(2));
+    assert_eq!(
+        json["count"].as_f64().map(|f| f as u64).or(json["count"].as_u64()),
+        Some(2)
+    );
     assert_eq!(json["nodes"].as_array().map(Vec::len), Some(2));
     assert_eq!(json["edges"].as_array().map(Vec::len), Some(1));
     assert_eq!(json["edges"][0][0].as_str(), Some(blocked_id.as_str()));

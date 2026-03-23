@@ -31,19 +31,6 @@ fn snapshot_error_invalid_priority() {
 }
 
 #[test]
-fn snapshot_error_invalid_status() {
-    let workspace = init_workspace();
-    let id = create_issue(&workspace, "Test issue", "create_for_bad_status");
-    let output = run_br(
-        &workspace,
-        ["update", &id, "--status", "invalid"],
-        "update_bad_status",
-    );
-    assert!(!output.status.success(), "expected failure");
-    assert_snapshot!("error_invalid_status", normalize_output(&output.stderr));
-}
-
-#[test]
 fn snapshot_error_dependency_cycle() {
     let workspace = init_workspace();
     let id1 = create_issue(&workspace, "Issue A", "create_cycle_a");

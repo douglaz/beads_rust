@@ -1085,18 +1085,22 @@ fn e2e_list_before_init_fails() {
 }
 
 #[test]
-fn e2e_list_invalid_status() {
-    let _log = common::test_log("e2e_list_invalid_status");
+fn e2e_list_custom_status() {
+    let _log = common::test_log("e2e_list_custom_status");
     let (workspace, _ids) = setup_diverse_workspace();
 
     let list = run_br(
         &workspace,
         ["list", "--status", "invalid_status"],
-        "list_invalid_status",
+        "list_custom_status",
     );
     assert!(
-        !list.status.success(),
-        "list with invalid status should fail"
+        list.status.success(),
+        "list with custom status should succeed (custom statuses are allowed)"
+    );
+    assert!(
+        list.stdout.contains("Issues (0)"),
+        "list with unknown custom status should return 0 issues"
     );
 }
 

@@ -2,6 +2,7 @@ use crate::config::OpenStorageResult;
 use crate::error::BeadsError;
 use crate::model::Issue;
 use crate::storage::{IssueUpdate, SqliteStorage};
+use crate::sync::auto_import_if_stale;
 use crate::util::id::IdResolver;
 
 pub mod agents;
@@ -194,6 +195,31 @@ pub(super) fn update_issue_with_recovery(
         Some(issue_id),
         |storage| storage.update_issue(issue_id, update, actor),
     )
+}
+
+pub(super) fn auto_import_storage_ctx_if_stale(
+    storage_ctx: &mut OpenStorageResult,
+    cli: &crate::config::CliOverrides,
+) -> crate::Result<()> {
+    let config_layer = storage_ctx.load_config(cli)?;
+    let no_auto_import = crate::config::no_auto_import_from_layer(&config_layer).unwrap_or(false);
+    let allow_external_jsonl = crate::config::implicit_external_jsonl_allowed(
+        &storage_ctx.paths.beads_dir,
+        &storage_ctx.paths.db_path,
+        &storage_ctx.paths.jsonl_path,
+    );
+    let expected_prefix = crate::config::id_config_from_layer(&config_layer).prefix;
+
+    auto_import_if_stale(
+        &mut storage_ctx.storage,
+        &storage_ctx.paths.beads_dir,
+        &storage_ctx.paths.jsonl_path,
+        Some(expected_prefix.as_str()),
+        allow_external_jsonl,
+        cli.allow_stale.unwrap_or(false),
+        no_auto_import,
+    )
+    .map(|_| ())
 }
 
 pub(super) fn retry_mutation_with_jsonl_recovery<T, F>(

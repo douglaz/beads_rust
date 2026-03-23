@@ -1850,6 +1850,47 @@ fn e2e_routing_delete_preview_does_not_mutate_earlier_local_batch() {
 }
 
 #[test]
+fn e2e_routing_lint_external_issue_via_main_workspace() {
+    let _log = common::test_log("e2e_routing_lint_external_issue_via_main_workspace");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let create = run_br(
+        &external_workspace,
+        ["create", "External lint target", "--type", "bug", "--json"],
+        "create_external_lint_target",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let create_json: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = create_json["id"].as_str().expect("issue id").to_string();
+
+    let routed_issue = routed_partial_id(&issue_id);
+    let lint = run_br(
+        &main_workspace,
+        ["lint", &routed_issue, "--json"],
+        "lint_external_via_route",
+    );
+    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+
+    let json: Value = serde_json::from_str(&extract_json_payload(&lint.stdout)).expect("lint json");
+    assert_eq!(json["issues"].as_u64(), Some(1));
+    let results = json["results"].as_array().expect("lint results");
+    assert_eq!(results[0]["id"].as_str(), Some(issue_id.as_str()));
+    assert!(
+        results[0]["missing"]
+            .as_array()
+            .is_some_and(|missing| !missing.is_empty()),
+        "routed lint should report missing sections for the external issue: {json}"
+    );
+}
+
+#[test]
 fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
     let _log = common::test_log("e2e_routing_label_add_failure_does_not_mutate_earlier_batches");
 

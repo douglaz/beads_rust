@@ -1701,6 +1701,113 @@ fn e2e_routing_graph_external_issue_via_main_workspace() {
 }
 
 #[test]
+fn e2e_routing_delete_external_issue_via_main_workspace() {
+    let _log = common::test_log("e2e_routing_delete_external_issue_via_main_workspace");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let issue_id = create_issue_and_get_id(
+        &external_workspace,
+        "External delete target",
+        "create_external_delete_target",
+    );
+    let routed_issue = routed_partial_id(&issue_id);
+
+    let delete = run_br(
+        &main_workspace,
+        ["delete", &routed_issue, "--force", "--json"],
+        "delete_external_via_route",
+    );
+    assert!(delete.status.success(), "delete failed: {}", delete.stderr);
+    let json: Value =
+        serde_json::from_str(&extract_json_payload(&delete.stdout)).expect("delete json");
+    assert_eq!(json["deleted_count"].as_u64(), Some(1));
+    assert_eq!(json["deleted"][0].as_str(), Some(issue_id.as_str()));
+
+    let external_issue = issue_from_jsonl(&external_workspace, &issue_id);
+    assert_eq!(external_issue["status"].as_str(), Some("tombstone"));
+}
+
+#[test]
+fn e2e_routing_delete_preview_does_not_mutate_earlier_local_batch() {
+    let _log = common::test_log("e2e_routing_delete_preview_does_not_mutate_earlier_local_batch");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let local_id = create_issue_and_get_id(
+        &main_workspace,
+        "Local delete should remain",
+        "create_local_delete_guard",
+    );
+    let blocker_id = create_issue_and_get_id(
+        &external_workspace,
+        "External delete blocker",
+        "create_external_delete_blocker",
+    );
+    let child_id = create_issue_and_get_id(
+        &external_workspace,
+        "External delete child",
+        "create_external_delete_child",
+    );
+
+    let dep_add = run_br(
+        &external_workspace,
+        ["dep", "add", &child_id, &blocker_id, "--json"],
+        "external_dep_add_for_delete_preview",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let routed_blocker = routed_partial_id(&blocker_id);
+    let delete = run_br(
+        &main_workspace,
+        ["delete", &local_id, &routed_blocker, "--json"],
+        "delete_preview_cross_route_guard",
+    );
+    assert!(
+        delete.status.success(),
+        "delete preview failed: {}",
+        delete.stderr
+    );
+    let json: Value =
+        serde_json::from_str(&extract_json_payload(&delete.stdout)).expect("delete preview json");
+    assert_eq!(json["preview"].as_bool(), Some(true));
+
+    let would_delete = json["would_delete"].as_array().expect("would_delete array");
+    assert!(
+        would_delete
+            .iter()
+            .any(|value| value == &Value::String(local_id.clone())),
+        "preview should include the local issue"
+    );
+    assert!(
+        would_delete
+            .iter()
+            .any(|value| value == &Value::String(blocker_id.clone())),
+        "preview should include the routed external issue"
+    );
+
+    let local_issue = issue_from_jsonl(&main_workspace, &local_id);
+    assert_eq!(local_issue["status"].as_str(), Some("open"));
+
+    let external_issue = issue_from_jsonl(&external_workspace, &blocker_id);
+    assert_eq!(external_issue["status"].as_str(), Some("open"));
+}
+
+#[test]
 fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
     let _log = common::test_log("e2e_routing_label_add_failure_does_not_mutate_earlier_batches");
 

@@ -4,17 +4,18 @@
 //! cascade/force/dry-run modes.
 
 use crate::cli::DeleteArgs;
-use crate::cli::commands::retry_mutation_with_jsonl_recovery;
+use crate::cli::commands::{resolve_issue_ids, retry_mutation_with_jsonl_recovery};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
+use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Result of a delete operation for JSON output.
 #[derive(Debug, Serialize)]
@@ -50,6 +51,16 @@ struct DeletePreviewResult {
     cascade_delete: Vec<String>,
     blocked_dependents: Vec<String>,
     orphaned_issues: Vec<String>,
+}
+
+struct PreparedDeleteRoute {
+    beads_dir: PathBuf,
+    route_cli: config::CliOverrides,
+    resolved_ids: Vec<String>,
+    blocked_dependents: Vec<String>,
+    cascade_delete: Vec<String>,
+    final_delete_ids: Vec<String>,
+    auto_flush_external: bool,
 }
 
 /// Execute the delete command.
@@ -88,19 +99,20 @@ pub fn execute(
         .collect();
     ids.sort();
 
-    // 2. Open storage
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let routed_batches = config::routing::group_issue_inputs_by_route(&ids, &beads_dir)?;
+    if routed_batches.iter().any(|batch| batch.is_external) {
+        return execute_routed(args, cli, ctx, &beads_dir, routed_batches);
+    }
+
+    // 2. Open storage
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let config_layer = storage_ctx.load_config(cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let ids = sorted_unique_strings(resolve_issue_ids(&storage_ctx.storage, &resolver, &ids)?);
     let result = {
-        // 3. Validate all IDs exist
-        for id in &ids {
-            if storage_ctx.storage.get_issue(id)?.is_none() {
-                return Err(BeadsError::IssueNotFound { id: id.clone() });
-            }
-        }
-
-        // 4. Check for dependents (if not --force and not --cascade)
+        // 3. Check for dependents (if not --force and not --cascade)
         let delete_set: HashSet<String> = ids.iter().cloned().collect();
         let blocked_dependents = collect_direct_dependents(&storage_ctx.storage, &ids)?;
         let cascade_dependents = if args.cascade {
@@ -175,7 +187,7 @@ pub fn execute(
             return Ok(());
         }
 
-        // 5. Dry-run mode
+        // 4. Dry-run mode
         if args.dry_run {
             let cascade_ids = cascade_dependents.clone().unwrap_or_default();
             if ctx.is_json() || ctx.is_toon() {
@@ -236,16 +248,16 @@ pub fn execute(
             return Ok(());
         }
 
-        // 6. Build final delete set
+        // 5. Build final delete set
         let mut final_delete_set: HashSet<String> = delete_set;
         if let Some(cascade_ids) = &cascade_dependents {
             final_delete_set.extend(cascade_ids.iter().cloned());
         }
 
-        // 7. Get actor
+        // 6. Get actor
         let actor = config::resolve_actor(&config_layer);
 
-        // 8. Perform deletion
+        // 7. Perform deletion
         let mut result = DeleteResult::new();
 
         // First, remove all dependency links for issues being deleted
@@ -344,6 +356,349 @@ pub fn execute(
     }
 
     Ok(())
+}
+
+fn execute_routed(
+    args: &DeleteArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    routed_batches: Vec<config::routing::RoutedIssueBatch>,
+) -> Result<()> {
+    let normalized_local_beads_dir =
+        dunce::canonicalize(local_beads_dir).unwrap_or_else(|_| local_beads_dir.to_path_buf());
+    let mut prepared_routes = Vec::with_capacity(routed_batches.len());
+
+    for batch in routed_batches {
+        let normalized_batch_beads_dir =
+            dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
+        let mut batch_cli = cli.clone();
+        batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
+            cli.db.clone()
+        } else {
+            None
+        };
+        prepared_routes.push(prepare_delete_route(
+            args,
+            &batch.issue_inputs,
+            &batch.beads_dir,
+            &batch_cli,
+            batch.is_external,
+        )?);
+    }
+
+    let would_delete = sorted_unique_strings(
+        prepared_routes
+            .iter()
+            .flat_map(|route| route.resolved_ids.iter().cloned())
+            .collect(),
+    );
+    let blocked_dependents = sorted_unique_strings(
+        prepared_routes
+            .iter()
+            .flat_map(|route| route.blocked_dependents.iter().cloned())
+            .collect(),
+    );
+    let cascade_delete = sorted_unique_strings(
+        prepared_routes
+            .iter()
+            .flat_map(|route| route.cascade_delete.iter().cloned())
+            .collect(),
+    );
+
+    if !blocked_dependents.is_empty() && !args.force && !args.cascade {
+        render_routed_delete_preview(
+            ctx,
+            DeletePreviewResult {
+                preview: true,
+                would_delete,
+                cascade_delete: cascade_delete.clone(),
+                blocked_dependents: blocked_dependents.clone(),
+                orphaned_issues: Vec::new(),
+            },
+        );
+        return Ok(());
+    }
+
+    if args.dry_run {
+        let orphaned_issues = if args.force && !args.cascade {
+            blocked_dependents
+        } else {
+            Vec::new()
+        };
+        render_routed_delete_preview(
+            ctx,
+            DeletePreviewResult {
+                preview: true,
+                would_delete,
+                cascade_delete,
+                blocked_dependents: Vec::new(),
+                orphaned_issues,
+            },
+        );
+        return Ok(());
+    }
+
+    let mut result = DeleteResult::new();
+    for route in &prepared_routes {
+        let batch_result = apply_delete_route(args, route)?;
+        merge_delete_result(&mut result, batch_result);
+    }
+    finalize_delete_result(&mut result);
+    clear_last_touched_if_deleted(local_beads_dir, &result.deleted);
+
+    if ctx.is_json() || ctx.is_toon() {
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else {
+            ctx.json_pretty(&result);
+        }
+        return Ok(());
+    }
+
+    if ctx.is_quiet() {
+        return Ok(());
+    }
+
+    ctx.success(&format!("Deleted {} issue(s)", result.deleted_count));
+    for id in &result.deleted {
+        ctx.print_line(&format!("  - {id}"));
+    }
+
+    if result.dependencies_removed > 0 {
+        ctx.info(&format!(
+            "Removed {} dependency link(s)",
+            result.dependencies_removed
+        ));
+    }
+
+    if !result.orphaned_issues.is_empty() {
+        ctx.warning(&format!(
+            "Orphaned {} issue(s):",
+            result.orphaned_issues.len()
+        ));
+        for id in &result.orphaned_issues {
+            ctx.print_line(&format!("  - {id}"));
+        }
+    }
+
+    Ok(())
+}
+
+fn prepare_delete_route(
+    args: &DeleteArgs,
+    issue_inputs: &[String],
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    auto_flush_external: bool,
+) -> Result<PreparedDeleteRoute> {
+    let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let resolved_ids = sorted_unique_strings(resolve_issue_ids(
+        &storage_ctx.storage,
+        &resolver,
+        issue_inputs,
+    )?);
+    let blocked_dependents = collect_direct_dependents(&storage_ctx.storage, &resolved_ids)?;
+    let cascade_delete = collect_sorted_cascade_dependents(&storage_ctx.storage, &resolved_ids)?;
+    let final_delete_ids = if args.cascade {
+        sorted_unique_strings(
+            resolved_ids
+                .iter()
+                .chain(cascade_delete.iter())
+                .cloned()
+                .collect(),
+        )
+    } else {
+        resolved_ids.clone()
+    };
+
+    Ok(PreparedDeleteRoute {
+        beads_dir: beads_dir.to_path_buf(),
+        route_cli: cli.clone(),
+        resolved_ids,
+        blocked_dependents,
+        cascade_delete,
+        final_delete_ids,
+        auto_flush_external,
+    })
+}
+
+fn apply_delete_route(args: &DeleteArgs, route: &PreparedDeleteRoute) -> Result<DeleteResult> {
+    let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route.route_cli)?;
+    let config_layer = storage_ctx.load_config(&route.route_cli)?;
+    let actor = config::resolve_actor(&config_layer);
+
+    let mut result = DeleteResult::new();
+    let mut batch_has_mutated = false;
+    for id in &route.final_delete_ids {
+        let deps_removed = retry_mutation_with_jsonl_recovery(
+            &mut storage_ctx,
+            !batch_has_mutated,
+            "delete remove dependencies",
+            Some(id.as_str()),
+            |storage| storage.remove_all_dependencies(id, &actor),
+        )?;
+        result.dependencies_removed += deps_removed;
+        if deps_removed > 0 {
+            batch_has_mutated = true;
+        }
+    }
+
+    if args.force && !args.cascade {
+        result.orphaned_issues.clone_from(&route.blocked_dependents);
+    }
+
+    for id in &route.final_delete_ids {
+        if args.hard {
+            result.labels_removed += storage_ctx.storage.get_labels(id)?.len();
+            result.events_removed += storage_ctx.storage.count_issue_events(id)?;
+            retry_mutation_with_jsonl_recovery(
+                &mut storage_ctx,
+                !batch_has_mutated,
+                "delete purge",
+                Some(id.as_str()),
+                |storage| storage.purge_issue(id, &actor),
+            )?;
+        } else {
+            retry_mutation_with_jsonl_recovery(
+                &mut storage_ctx,
+                !batch_has_mutated,
+                "delete tombstone",
+                Some(id.as_str()),
+                |storage| storage.delete_issue(id, &actor, &args.reason, None),
+            )?;
+        }
+        batch_has_mutated = true;
+        result.deleted.push(id.clone());
+    }
+    result.deleted_count = result.deleted.len();
+
+    let deleted_ids: HashSet<String> = result.deleted.iter().cloned().collect();
+    storage_ctx.flush_no_db_then(|ctx| {
+        let last_touched = crate::util::get_last_touched_id(&ctx.paths.beads_dir);
+        if !last_touched.is_empty() && deleted_ids.contains(&last_touched) {
+            crate::util::clear_last_touched(&ctx.paths.beads_dir);
+        }
+        Ok(())
+    })?;
+    if route.auto_flush_external
+        && let Err(error) = storage_ctx.auto_flush_if_enabled()
+    {
+        tracing::debug!(
+            beads_dir = %storage_ctx.paths.beads_dir.display(),
+            error = %error,
+            "Routed auto-flush failed (non-fatal)"
+        );
+    }
+
+    Ok(result)
+}
+
+fn render_routed_delete_preview(ctx: &OutputContext, preview: DeletePreviewResult) {
+    if ctx.is_json() || ctx.is_toon() {
+        if ctx.is_toon() {
+            ctx.toon(&preview);
+        } else {
+            ctx.json_pretty(&preview);
+        }
+        return;
+    }
+
+    if ctx.is_quiet() {
+        return;
+    }
+
+    if !preview.blocked_dependents.is_empty() {
+        ctx.warning("The following issues depend on issues being deleted:");
+        for dep in &preview.blocked_dependents {
+            ctx.print_line(&format!("  - {dep}"));
+        }
+        if preview.cascade_delete.len() > preview.blocked_dependents.len() {
+            ctx.newline();
+            ctx.info(&format!(
+                "{} additional issue(s) would be transitively affected by --cascade:",
+                preview.cascade_delete.len() - preview.blocked_dependents.len()
+            ));
+            let direct_set: HashSet<&String> = preview.blocked_dependents.iter().collect();
+            for dep in &preview.cascade_delete {
+                if !direct_set.contains(dep) {
+                    ctx.print_line(&format!("  - {dep}"));
+                }
+            }
+        }
+        ctx.newline();
+        ctx.info(
+            "Use --force to orphan these dependents, or --cascade to delete them recursively.",
+        );
+        if !preview.cascade_delete.is_empty() {
+            ctx.info(&format!(
+                "--cascade would delete {} total dependent(s).",
+                preview.cascade_delete.len()
+            ));
+        }
+        ctx.info("No changes made (preview mode).");
+        return;
+    }
+
+    ctx.info(&format!(
+        "Dry-run: Would delete {} issue(s):",
+        preview.would_delete.len()
+    ));
+    for id in &preview.would_delete {
+        ctx.print_line(&format!("  - {id}"));
+    }
+    if !preview.cascade_delete.is_empty() {
+        ctx.info(&format!(
+            "Would also cascade delete {} dependent(s):",
+            preview.cascade_delete.len()
+        ));
+        for dep in &preview.cascade_delete {
+            ctx.print_line(&format!("  - {dep}"));
+        }
+    }
+    if !preview.orphaned_issues.is_empty() {
+        ctx.warning(&format!(
+            "Would orphan {} dependent(s):",
+            preview.orphaned_issues.len()
+        ));
+        for dep in &preview.orphaned_issues {
+            ctx.print_line(&format!("  - {dep}"));
+        }
+    }
+}
+
+fn merge_delete_result(result: &mut DeleteResult, mut batch_result: DeleteResult) {
+    result.deleted.append(&mut batch_result.deleted);
+    result.dependencies_removed += batch_result.dependencies_removed;
+    result.labels_removed += batch_result.labels_removed;
+    result.events_removed += batch_result.events_removed;
+    result.references_updated += batch_result.references_updated;
+    result
+        .orphaned_issues
+        .append(&mut batch_result.orphaned_issues);
+}
+
+fn finalize_delete_result(result: &mut DeleteResult) {
+    result.deleted = sorted_unique_strings(std::mem::take(&mut result.deleted));
+    result.orphaned_issues = sorted_unique_strings(std::mem::take(&mut result.orphaned_issues));
+    result.deleted_count = result.deleted.len();
+}
+
+fn clear_last_touched_if_deleted(beads_dir: &Path, deleted_ids: &[String]) {
+    let deleted_ids: HashSet<&str> = deleted_ids.iter().map(String::as_str).collect();
+    let last_touched = crate::util::get_last_touched_id(beads_dir);
+    if !last_touched.is_empty() && deleted_ids.contains(last_touched.as_str()) {
+        crate::util::clear_last_touched(beads_dir);
+    }
+}
+
+fn sorted_unique_strings(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
 }
 
 /// Read issue IDs from a file (one per line, # comments ignored).

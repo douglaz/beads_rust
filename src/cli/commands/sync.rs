@@ -1595,7 +1595,7 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
 
-        let traversal_path = PathBuf::from("../outside/issues.jsonl");
+        let traversal_path = temp.path().join("../outside/issues.jsonl");
         let err = validate_sync_paths(&beads_dir, &traversal_path, true).unwrap_err();
 
         match err {

@@ -481,7 +481,12 @@ pub fn backup_before_export(
 /// # Errors
 ///
 /// Returns an error if listing or deleting backups fails.
-fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str, file_stem: &str) -> Result<()> {
+fn rotate_history(
+    history_dir: &Path,
+    config: &HistoryConfig,
+    target_key: &str,
+    file_stem: &str,
+) -> Result<()> {
     let prefix = format!("{file_stem}.");
     let mut backups: Vec<_> = list_backups(history_dir, Some(&prefix))?
         .into_iter()
@@ -592,7 +597,11 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
     Ok(backups)
 }
 
-fn get_latest_backup(history_dir: &Path, target_key: &str, file_stem: &str) -> Result<Option<BackupEntry>> {
+fn get_latest_backup(
+    history_dir: &Path,
+    target_key: &str,
+    file_stem: &str,
+) -> Result<Option<BackupEntry>> {
     let prefix = format!("{file_stem}.");
     Ok(list_backups(history_dir, Some(&prefix))?
         .into_iter()

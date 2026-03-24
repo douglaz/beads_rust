@@ -1205,7 +1205,7 @@ fn execute_merge(
     use_json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
-    cli: &config::CliOverrides,
+    _cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting 3-way merge");
@@ -1279,34 +1279,7 @@ fn execute_merge(
         return Err(BeadsError::Config(msg));
     }
 
-    let _actor = cli.actor.as_deref().unwrap_or("br");
-
-    // Apply deletions. Base snapshots can lag behind historical ID migrations, so a
-    // merge may legitimately request deletion of an issue that is already absent from
-    // the live database. Treat that as a no-op instead of aborting the whole merge.
-    let existing_deleted_issues = storage.get_issues_by_ids(&report.deleted)?;
-    let existing_deleted_ids: std::collections::HashSet<String> =
-        existing_deleted_issues.into_iter().map(|i| i.id).collect();
-
-    for id in &report.deleted {
-        if existing_deleted_ids.contains(id) {
-            storage.delete_issue(id, "system", "merge deletion", Some(chrono::Utc::now()))?;
-        } else {
-            tracing::debug!(
-                issue_id = %id,
-                "Skipping merge deletion for issue already absent from local database"
-            );
-        }
-    }
-
-    // Apply updates/creates (upsert)
-    // We need to retrieve the actual Issue objects to upsert.
-    for issue in &report.kept {
-        storage.upsert_issue_for_import(issue)?;
-        storage.sync_labels_for_import(&issue.id, &issue.labels)?;
-        storage.sync_dependencies_for_import(&issue.id, &issue.dependencies)?;
-        storage.sync_comments_for_import(&issue.id, &issue.comments)?;
-    }
+    apply_merge_report(storage, &report)?;
 
     // Add merge notes as comments
     for (id, note) in &report.notes {
@@ -1316,12 +1289,6 @@ fn execute_merge(
             tracing::info!(issue_id = %id, note = %note, "Added merge resolution note");
         }
     }
-
-    // Rebuild cache
-    storage.rebuild_blocked_cache(true)?;
-    // Merge can introduce hierarchical IDs via upsert; refresh counters before
-    // the next child-ID allocation trusts them.
-    storage.rebuild_child_counters_in_tx()?;
 
     // Save Base Snapshot
     let new_base: HashMap<_, _> = report
@@ -1379,6 +1346,79 @@ fn execute_merge(
         println!("  Base snapshot updated.");
         println!("  JSONL exported.");
     }
+
+    Ok(())
+}
+
+fn apply_merge_report(
+    storage: &mut crate::storage::SqliteStorage,
+    report: &crate::sync::MergeReport,
+) -> Result<()> {
+    if report.total_actions() == 0 {
+        return Ok(());
+    }
+
+    let deleted_issues: HashMap<String, Issue> = storage
+        .get_issues_by_ids(&report.deleted)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+
+    storage.mutate("merge_apply", "system", |conn, ctx| {
+        let merge_deleted_at = chrono::Utc::now();
+
+        // Keep the merge mutation phase atomic so a later relation-sync error
+        // cannot leave tombstones or partially imported issues behind.
+        for id in &report.deleted {
+            if let Some(issue) = deleted_issues.get(id) {
+                let applied = crate::storage::SqliteStorage::tombstone_issue_in_tx(
+                    conn,
+                    ctx,
+                    issue,
+                    "system",
+                    "merge deletion",
+                    Some(merge_deleted_at),
+                )?;
+                if !applied {
+                    tracing::debug!(
+                        issue_id = %id,
+                        "Skipping merge deletion for issue already absent from local database"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    issue_id = %id,
+                    "Skipping merge deletion for issue already absent from local database"
+                );
+            }
+        }
+
+        for issue in &report.kept {
+            crate::storage::SqliteStorage::upsert_issue_for_import_in_tx(conn, issue)?;
+            crate::storage::SqliteStorage::sync_labels_for_import_in_tx(
+                conn,
+                &issue.id,
+                &issue.labels,
+            )?;
+            crate::storage::SqliteStorage::sync_dependencies_for_import_in_tx(
+                conn,
+                &issue.id,
+                &issue.dependencies,
+            )?;
+            crate::storage::SqliteStorage::sync_comments_for_import_in_tx(
+                conn,
+                &issue.id,
+                &issue.comments,
+            )?;
+            ctx.mark_dirty(&issue.id);
+        }
+
+        // Merge can introduce hierarchical IDs via imported issues; keep the
+        // derived child counter state atomic with the rest of the merge.
+        crate::storage::SqliteStorage::rebuild_child_counters_with_conn(conn)?;
+        ctx.invalidate_cache();
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -1484,13 +1524,13 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_prefix_from_jsonl, validate_sync_paths};
+    use super::{apply_merge_report, detect_prefix_from_jsonl, validate_sync_paths};
     use crate::error::BeadsError;
-    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
+    use crate::sync::MergeReport;
     use chrono::Utc;
     use std::fs;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn make_test_issue(id: &str, title: &str) -> Issue {
@@ -1678,6 +1718,49 @@ mod tests {
         assert_eq!(
             detect_prefix_from_jsonl(&jsonl_path),
             Some("document-intelligence".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_merge_report_is_atomic_when_relation_sync_fails() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let delete_me = make_test_issue("bd-delete", "Delete me");
+        storage.create_issue(&delete_me, "test").unwrap();
+
+        let mut incoming = make_test_issue("bd-new", "Incoming");
+        incoming.dependencies.push(Dependency {
+            issue_id: incoming.id.clone(),
+            depends_on_id: "external:parent".to_string(),
+            dep_type: DependencyType::ParentChild,
+            created_at: Utc::now(),
+            created_by: Some("test".to_string()),
+            metadata: None,
+            thread_id: None,
+        });
+
+        let report = MergeReport {
+            kept: vec![incoming],
+            deleted: vec!["bd-delete".to_string()],
+            ..MergeReport::default()
+        };
+
+        let err = apply_merge_report(&mut storage, &report).unwrap_err();
+        match err {
+            BeadsError::Validation { field, reason } => {
+                assert_eq!(field, "depends_on_id");
+                assert!(reason.contains("parent-child dependencies must link local issues"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let delete_me = storage
+            .get_issue("bd-delete")
+            .unwrap()
+            .expect("deleted issue should still exist");
+        assert_eq!(delete_me.status, Status::Open);
+        assert!(
+            storage.get_issue("bd-new").unwrap().is_none(),
+            "failed merge must not leave a partially imported issue behind"
         );
     }
 }

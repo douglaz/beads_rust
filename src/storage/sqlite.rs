@@ -1603,52 +1603,18 @@ impl SqliteStorage {
             .get_issue(id)?
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
 
-        let was_terminal = issue.status.is_terminal();
-        let original_type = issue.issue_type.as_str().to_string();
         let timestamp = deleted_at.unwrap_or_else(Utc::now);
-        let mut tombstone_issue = issue;
-        tombstone_issue.status = Status::Tombstone;
-        // Zero out closed fields when tombstoning
-        tombstone_issue.closed_at = None;
-        tombstone_issue.close_reason = None;
-        tombstone_issue.closed_by_session = None;
-        let tombstone_hash = crate::util::content_hash(&tombstone_issue);
+        let tombstone_issue = issue;
 
         self.mutate("delete_issue", actor, |conn, ctx| {
-            conn.execute_with_params(
-                "UPDATE issues SET
-                    content_hash = ?,
-                    status = 'tombstone',
-                    deleted_at = ?,
-                    deleted_by = ?,
-                    delete_reason = ?,
-                    original_type = ?,
-                    updated_at = ?,
-                    closed_at = NULL,
-                    close_reason = NULL,
-                    closed_by_session = NULL
-                 WHERE id = ?",
-                &[
-                    SqliteValue::from(tombstone_hash.as_str()),
-                    SqliteValue::from(timestamp.to_rfc3339()),
-                    SqliteValue::from(actor),
-                    SqliteValue::from(reason),
-                    SqliteValue::from(original_type.as_str()),
-                    SqliteValue::from(Utc::now().to_rfc3339()),
-                    SqliteValue::from(id),
-                ],
+            Self::tombstone_issue_in_tx(
+                conn,
+                ctx,
+                &tombstone_issue,
+                actor,
+                reason,
+                Some(timestamp),
             )?;
-
-            if !was_terminal {
-                ctx.record_event(
-                    EventType::Deleted,
-                    id,
-                    Some(format!("Deleted issue: {reason}")),
-                );
-            }
-            ctx.mark_dirty(id);
-            ctx.invalidate_cache();
-
             Ok(())
         })?;
 
@@ -2808,10 +2774,18 @@ impl SqliteStorage {
     ///
     /// Returns an error if the rebuild fails.
     pub(crate) fn rebuild_child_counters_in_tx(&self) -> Result<usize> {
-        Self::rebuild_child_counters_impl(&self.conn)
+        Self::rebuild_child_counters_with_conn(&self.conn)
     }
 
-    fn rebuild_child_counters_impl(conn: &Connection) -> Result<usize> {
+    /// Rebuild child counters using the caller's active transaction.
+    ///
+    /// This lets higher-level workflows keep issue mutations and derived child
+    /// counter state atomic in one write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rebuild fails.
+    pub(crate) fn rebuild_child_counters_with_conn(conn: &Connection) -> Result<usize> {
         // Clear existing counters
         conn.execute("DELETE FROM child_counters")?;
 
@@ -6884,6 +6858,18 @@ impl SqliteStorage {
     /// Returns an error if the database operation fails.
     #[allow(clippy::too_many_lines)]
     pub fn upsert_issue_for_import(&self, issue: &Issue) -> Result<bool> {
+        Self::upsert_issue_for_import_in_tx(&self.conn, issue)
+    }
+
+    /// Upsert an imported issue using the caller's active transaction.
+    ///
+    /// This does NOT trigger dirty tracking or events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn upsert_issue_for_import_in_tx(conn: &Connection, issue: &Issue) -> Result<bool> {
         let status_str = issue.status.as_str();
         let issue_type_str = issue.issue_type.as_str();
         let created_at_str = issue.created_at.to_rfc3339();
@@ -6896,12 +6882,12 @@ impl SqliteStorage {
 
         // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
         // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        self.conn.execute_with_params(
+        conn.execute_with_params(
             "DELETE FROM issues WHERE id = ?",
             &[SqliteValue::from(issue.id.as_str())],
         )?;
 
-        let rows = self.conn.execute_with_params(
+        let rows = conn.execute_with_params(
             r"INSERT INTO issues (
                 id, content_hash, title, description, design, acceptance_criteria, notes,
                 status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -6962,8 +6948,21 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn sync_labels_for_import(&self, issue_id: &str, labels: &[String]) -> Result<()> {
+        Self::sync_labels_for_import_in_tx(&self.conn, issue_id, labels)
+    }
+
+    /// Sync labels for an imported issue using the caller's active transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn sync_labels_for_import_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        labels: &[String],
+    ) -> Result<()> {
         // Remove existing labels
-        self.conn.execute_with_params(
+        conn.execute_with_params(
             "DELETE FROM labels WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -6998,7 +6997,7 @@ impl SqliteStorage {
                 params.push(SqliteValue::from(label.as_str()));
             }
 
-            self.conn.execute_with_params(&sql, &params)?;
+            conn.execute_with_params(&sql, &params)?;
         }
 
         Ok(())
@@ -7014,8 +7013,21 @@ impl SqliteStorage {
         issue_id: &str,
         dependencies: &[crate::model::Dependency],
     ) -> Result<()> {
+        Self::sync_dependencies_for_import_in_tx(&self.conn, issue_id, dependencies)
+    }
+
+    /// Sync dependencies for an imported issue using the caller's active transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn sync_dependencies_for_import_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        dependencies: &[crate::model::Dependency],
+    ) -> Result<()> {
         // Remove existing dependencies where this issue is the dependent
-        self.conn.execute_with_params(
+        conn.execute_with_params(
             "DELETE FROM dependencies WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -7028,6 +7040,11 @@ impl SqliteStorage {
         let mut seen_deps = HashSet::new();
         let mut unique_deps = Vec::new();
         for dep in dependencies {
+            if dep.depends_on_id == issue_id {
+                return Err(BeadsError::SelfDependency {
+                    id: issue_id.to_string(),
+                });
+            }
             Self::validate_parent_child_endpoints(
                 issue_id,
                 &dep.depends_on_id,
@@ -7067,7 +7084,7 @@ impl SqliteStorage {
                 params.push(SqliteValue::from(dep.thread_id.as_deref().unwrap_or("")));
             }
 
-            self.conn.execute_with_params(&sql, &params)?;
+            conn.execute_with_params(&sql, &params)?;
         }
 
         Ok(())
@@ -7083,8 +7100,21 @@ impl SqliteStorage {
         issue_id: &str,
         comments: &[crate::model::Comment],
     ) -> Result<()> {
+        Self::sync_comments_for_import_in_tx(&self.conn, issue_id, comments)
+    }
+
+    /// Sync comments for an imported issue using the caller's active transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn sync_comments_for_import_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        comments: &[crate::model::Comment],
+    ) -> Result<()> {
         // Remove existing comments
-        self.conn.execute_with_params(
+        conn.execute_with_params(
             "DELETE FROM comments WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -7093,31 +7123,33 @@ impl SqliteStorage {
             return Ok(());
         }
 
+        let mut seen_comment_ids = HashSet::new();
         for comment in comments {
             let created_at = comment.created_at.to_rfc3339();
+            let duplicate_in_batch = comment.id > 0 && !seen_comment_ids.insert(comment.id);
             let colliding_issue_id = if comment.id > 0 {
-                self.conn
-                    .query_with_params(
-                        "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
-                        &[SqliteValue::from(comment.id)],
-                    )?
-                    .into_iter()
-                    .next()
-                    .and_then(|row| {
-                        row.get(0)
-                            .and_then(SqliteValue::as_text)
-                            .map(str::to_string)
-                    })
+                conn.query_with_params(
+                    "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
+                    &[SqliteValue::from(comment.id)],
+                )?
+                .into_iter()
+                .next()
+                .and_then(|row| {
+                    row.get(0)
+                        .and_then(SqliteValue::as_text)
+                        .map(str::to_string)
+                })
             } else {
                 None
             };
 
-            if colliding_issue_id
-                .as_deref()
-                .is_some_and(|existing_issue_id| existing_issue_id != issue_id)
+            if duplicate_in_batch
+                || colliding_issue_id
+                    .as_deref()
+                    .is_some_and(|existing_issue_id| existing_issue_id != issue_id)
                 || comment.id <= 0
             {
-                self.conn.execute_with_params(
+                conn.execute_with_params(
                     "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
                     &[
                         SqliteValue::from(issue_id),
@@ -7127,7 +7159,7 @@ impl SqliteStorage {
                     ],
                 )?;
             } else {
-                self.conn.execute_with_params(
+                conn.execute_with_params(
                     "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
                     &[
                         SqliteValue::from(comment.id),
@@ -7141,6 +7173,69 @@ impl SqliteStorage {
         }
 
         Ok(())
+    }
+
+    /// Tombstone an issue using the caller's active transaction.
+    ///
+    /// Returns `Ok(false)` when the row no longer exists by the time the
+    /// tombstone update executes.
+    pub(crate) fn tombstone_issue_in_tx(
+        conn: &Connection,
+        ctx: &mut MutationContext,
+        issue: &Issue,
+        actor: &str,
+        reason: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let was_terminal = issue.status.is_terminal();
+        let original_type = issue.issue_type.as_str().to_string();
+        let timestamp = deleted_at.unwrap_or_else(Utc::now);
+        let mut tombstone_issue = issue.clone();
+        tombstone_issue.status = Status::Tombstone;
+        tombstone_issue.closed_at = None;
+        tombstone_issue.close_reason = None;
+        tombstone_issue.closed_by_session = None;
+        let tombstone_hash = crate::util::content_hash(&tombstone_issue);
+
+        let updated = conn.execute_with_params(
+            "UPDATE issues SET
+                content_hash = ?,
+                status = 'tombstone',
+                deleted_at = ?,
+                deleted_by = ?,
+                delete_reason = ?,
+                original_type = ?,
+                updated_at = ?,
+                closed_at = NULL,
+                close_reason = NULL,
+                closed_by_session = NULL
+             WHERE id = ?",
+            &[
+                SqliteValue::from(tombstone_hash.as_str()),
+                SqliteValue::from(timestamp.to_rfc3339()),
+                SqliteValue::from(actor),
+                SqliteValue::from(reason),
+                SqliteValue::from(original_type.as_str()),
+                SqliteValue::from(Utc::now().to_rfc3339()),
+                SqliteValue::from(issue.id.as_str()),
+            ],
+        )?;
+
+        if updated == 0 {
+            return Ok(false);
+        }
+
+        if !was_terminal {
+            ctx.record_event(
+                EventType::Deleted,
+                &issue.id,
+                Some(format!("Deleted issue: {reason}")),
+            );
+        }
+        ctx.mark_dirty(&issue.id);
+        ctx.invalidate_cache();
+
+        Ok(true)
     }
 }
 
@@ -8473,6 +8568,73 @@ mod tests {
 
         let comments_b = storage.get_comments("bd-c-import-b").unwrap();
         assert_eq!(comments_b, vec![existing_comment]);
+    }
+
+    #[test]
+    fn test_sync_comments_for_import_reassigns_duplicate_ids_within_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-c-import-dup",
+            "Duplicate comment import target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let imported_comments = vec![
+            crate::model::Comment {
+                id: 42,
+                issue_id: issue.id.clone(),
+                author: "alice".to_string(),
+                body: "First imported comment".to_string(),
+                created_at: t1 + chrono::Duration::minutes(1),
+            },
+            crate::model::Comment {
+                id: 42,
+                issue_id: issue.id.clone(),
+                author: "bob".to_string(),
+                body: "Second imported comment".to_string(),
+                created_at: t1 + chrono::Duration::minutes(2),
+            },
+        ];
+
+        storage
+            .sync_comments_for_import(&issue.id, &imported_comments)
+            .unwrap();
+
+        let comments = storage.get_comments(&issue.id).unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, 42);
+        assert_ne!(comments[1].id, 42);
+        assert_eq!(comments[0].body, "First imported comment");
+        assert_eq!(comments[1].body, "Second imported comment");
+    }
+
+    #[test]
+    fn test_sync_dependencies_for_import_rejects_self_dependency() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let dependencies = vec![crate::model::Dependency {
+            issue_id: "bd-self".to_string(),
+            depends_on_id: "bd-self".to_string(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+
+        let err = storage
+            .sync_dependencies_for_import("bd-self", &dependencies)
+            .unwrap_err();
+
+        assert!(matches!(err, BeadsError::SelfDependency { id } if id == "bd-self"));
     }
 
     #[test]

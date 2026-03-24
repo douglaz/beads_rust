@@ -758,8 +758,6 @@ mod tests {
     use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
     use chrono::Utc;
-    use std::env;
-    use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
 

@@ -314,6 +314,24 @@ mod tests {
 
     static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
 
+    struct DirGuard {
+        previous_dir: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new(path: &Path) -> Self {
+            let previous_dir = env::current_dir().expect("current dir");
+            env::set_current_dir(path).expect("set current dir");
+            Self { previous_dir }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous_dir);
+        }
+    }
+
     #[test]
     fn resolve_where_output_uses_explicit_db_override() {
         let temp = TempDir::new().expect("tempdir");
@@ -329,7 +347,8 @@ mod tests {
             ..CliOverrides::default()
         };
 
-        let output = resolve_where_output(&cli, Some(temp.path()))
+        let _guard = DirGuard::new(temp.path());
+        let output = resolve_where_output(&cli)
             .expect("where output")
             .expect("workspace output");
 
@@ -368,7 +387,8 @@ mod tests {
         )
         .expect("write jsonl");
 
-        let output = resolve_where_output(&CliOverrides::default(), Some(&source_root))
+        let _guard = DirGuard::new(&source_root);
+        let output = resolve_where_output(&CliOverrides::default())
             .expect("where output")
             .expect("workspace output");
 
@@ -409,7 +429,8 @@ mod tests {
         let beads_dir = root.join(".beads");
         fs::create_dir_all(&beads_dir).expect("create beads dir");
 
-        let output = resolve_where_output(&CliOverrides::default(), Some(&root))
+        let _guard = DirGuard::new(&root);
+        let output = resolve_where_output(&CliOverrides::default())
             .expect("where output")
             .expect("workspace output");
 
@@ -443,7 +464,8 @@ mod tests {
             ..CliOverrides::default()
         };
 
-        let output = resolve_where_output(&cli, Some(&root))
+        let _guard = DirGuard::new(&root);
+        let output = resolve_where_output(&cli)
             .expect("where output")
             .expect("workspace output");
 
@@ -541,7 +563,8 @@ mod tests {
         fs::create_dir_all(&beads_dir).expect("create beads dir");
         fs::write(beads_dir.join("config.yaml"), "prefix: proj\n").expect("write config");
 
-        let output = resolve_where_output(&CliOverrides::default(), Some(&root))
+        let _guard = DirGuard::new(&root);
+        let output = resolve_where_output(&CliOverrides::default())
             .expect("where output")
             .expect("workspace output");
 

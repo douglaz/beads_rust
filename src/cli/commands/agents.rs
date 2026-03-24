@@ -1465,12 +1465,33 @@ fn render_update_success_rich(
 mod tests {
     use super::*;
     use std::env;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DirGuard {
+        previous_dir: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new(path: &Path) -> Self {
+            let previous_dir = env::current_dir().expect("current dir");
+            env::set_current_dir(path).expect("set current dir");
+            Self { previous_dir }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous_dir);
+        }
+    }
 
     #[test]
     fn test_contains_blurb() {
-        let blurb = generate_agent_blurb("claude-code");
-        assert!(contains_blurb(&blurb, "claude-code"));
+        assert!(contains_blurb(AGENT_BLURB));
     }
 
     #[test]

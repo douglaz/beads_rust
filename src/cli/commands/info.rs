@@ -475,10 +475,7 @@ mod tests {
     use crate::cli::InfoArgs;
     use crate::config::CliOverrides;
     use crate::storage::SqliteStorage;
-    use crate::storage::sqlite::CURRENT_SCHEMA_VERSION;
-    use std::env;
-    use std::fs;
-    use std::path::{Path, PathBuf};
+    use crate::storage::schema::CURRENT_SCHEMA_VERSION;
     use tempfile::TempDir;
 
     #[test]
@@ -515,9 +512,12 @@ mod tests {
         )
         .unwrap();
 
-        let output =
-            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
-                .unwrap();
+        let output = collect_info_output(
+            &InfoArgs::default(),
+            &CliOverrides::default(),
+            Some(temp.path()),
+        )
+        .unwrap();
 
         assert!(
             !beads_dir.join("beads.db").exists(),
@@ -559,7 +559,7 @@ mod tests {
                 ..InfoArgs::default()
             },
             &CliOverrides::default(),
-            Some(&temp),
+            Some(temp.path()),
         )
         .unwrap();
 
@@ -632,7 +632,7 @@ mod tests {
                 ..InfoArgs::default()
             },
             &CliOverrides::default(),
-            Some(&temp),
+            Some(temp.path()),
         )
         .unwrap();
 
@@ -659,9 +659,12 @@ mod tests {
         let mut storage = SqliteStorage::open(&db_path).unwrap();
         storage.set_config("issue_prefix", "bd").unwrap();
 
-        let output =
-            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
-                .unwrap();
+        let output = collect_info_output(
+            &InfoArgs::default(),
+            &CliOverrides::default(),
+            Some(temp.path()),
+        )
+        .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
         assert_eq!(
@@ -699,9 +702,12 @@ mod tests {
         storage.create_issue(&issue, "test").unwrap();
         storage.delete_config("issue_prefix").unwrap();
 
-        let output =
-            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
-                .unwrap();
+        let output = collect_info_output(
+            &InfoArgs::default(),
+            &CliOverrides::default(),
+            Some(temp.path()),
+        )
+        .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
         assert!(output.schema.is_none());
@@ -730,9 +736,12 @@ mod tests {
         )
         .unwrap();
 
-        let output =
-            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
-                .unwrap();
+        let output = collect_info_output(
+            &InfoArgs::default(),
+            &CliOverrides::default(),
+            Some(temp.path()),
+        )
+        .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
         assert!(output.issue_count.is_none());
@@ -752,9 +761,12 @@ mod tests {
         .unwrap();
         std::fs::write(beads_dir.join("config.yaml"), "prefix: proj\n").unwrap();
 
-        let output =
-            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
-                .unwrap();
+        let output = collect_info_output(
+            &InfoArgs::default(),
+            &CliOverrides::default(),
+            Some(temp.path()),
+        )
+        .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
     }
@@ -774,9 +786,12 @@ mod tests {
         let mut storage = SqliteStorage::open(&db_path).unwrap();
         storage.set_config("prefix", "proj").unwrap();
 
-        let output =
-            collect_info_output(&InfoArgs::default(), &CliOverrides::default(), Some(&temp))
-                .unwrap();
+        let output = collect_info_output(
+            &InfoArgs::default(),
+            &CliOverrides::default(),
+            Some(temp.path()),
+        )
+        .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
         assert_eq!(

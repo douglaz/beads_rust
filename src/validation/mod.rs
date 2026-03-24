@@ -15,7 +15,7 @@
 use crate::error::{BeadsError, ValidationError};
 use crate::model::{Comment, Dependency, Issue, Priority, Status};
 use crate::util::id::MAX_ID_LENGTH;
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 /// Validates issue fields and invariants.
 pub struct IssueValidator;
@@ -131,10 +131,53 @@ impl IssueValidator {
             }
         }
 
+        Self::validate_embedded_labels(issue, &mut errors);
+        Self::validate_embedded_comments(issue, &mut errors);
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    fn validate_embedded_labels(issue: &Issue, errors: &mut Vec<ValidationError>) {
+        for (index, label) in issue.labels.iter().enumerate() {
+            if let Err(err) = LabelValidator::validate(label) {
+                errors.push(ValidationError::new(
+                    format!("labels[{index}]"),
+                    err.message,
+                ));
+            }
+        }
+    }
+
+    fn validate_embedded_comments(issue: &Issue, errors: &mut Vec<ValidationError>) {
+        let mut seen_comment_ids = HashSet::new();
+
+        for (index, comment) in issue.comments.iter().enumerate() {
+            if let Err(comment_errors) = CommentValidator::validate(comment) {
+                for err in comment_errors {
+                    errors.push(ValidationError::new(
+                        format!("comments[{index}].{}", err.field),
+                        err.message,
+                    ));
+                }
+            }
+
+            if comment.issue_id != issue.id {
+                errors.push(ValidationError::new(
+                    format!("comments[{index}].issue_id"),
+                    format!("must match parent issue id '{}'", issue.id),
+                ));
+            }
+
+            if comment.id > 0 && !seen_comment_ids.insert(comment.id) {
+                errors.push(ValidationError::new(
+                    format!("comments[{index}].id"),
+                    format!("duplicate embedded comment id {}", comment.id),
+                ));
+            }
         }
     }
 }
@@ -756,6 +799,61 @@ mod tests {
 
         let errors = IssueValidator::validate(&issue).unwrap_err();
         assert!(errors.iter().any(|err| err.field == "external_ref"));
+    }
+
+    #[test]
+    fn issue_validation_rejects_invalid_embedded_label() {
+        let mut issue = base_issue();
+        issue.labels = vec!["bad label".to_string()];
+
+        let errors = IssueValidator::validate(&issue).unwrap_err();
+        assert!(errors.iter().any(|err| err.field == "labels[0]"));
+    }
+
+    #[test]
+    fn issue_validation_rejects_duplicate_embedded_comment_ids() {
+        let mut issue = base_issue();
+        issue.comments = vec![
+            Comment {
+                id: 7,
+                issue_id: issue.id.clone(),
+                author: "alice".to_string(),
+                body: "first".to_string(),
+                created_at: issue.created_at,
+            },
+            Comment {
+                id: 7,
+                issue_id: issue.id.clone(),
+                author: "bob".to_string(),
+                body: "second".to_string(),
+                created_at: issue.created_at + chrono::Duration::minutes(1),
+            },
+        ];
+
+        let errors = IssueValidator::validate(&issue).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.field == "comments[1].id" && err.message.contains("duplicate"))
+        );
+    }
+
+    #[test]
+    fn issue_validation_rejects_embedded_comment_for_other_issue() {
+        let mut issue = base_issue();
+        issue.comments = vec![Comment {
+            id: 9,
+            issue_id: "bd-other".to_string(),
+            author: "alice".to_string(),
+            body: "wrong owner".to_string(),
+            created_at: issue.created_at,
+        }];
+
+        let errors = IssueValidator::validate(&issue).unwrap_err();
+        assert!(
+            errors.iter().any(|err| err.field == "comments[0].issue_id"
+                && err.message.contains("parent issue id"))
+        );
     }
 
     #[test]

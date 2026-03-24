@@ -541,8 +541,16 @@ fn execute_import(
     let layer = storage_ctx.load_config(cli)?;
 
     let id_config = config::id_config_from_layer(&layer);
-    let default_priority = config::default_priority_from_layer(&layer)?;
-    let default_issue_type = config::default_issue_type_from_layer(&layer)?;
+    let fallback_priority = if let Some(p) = &args.priority {
+        Priority::from_str(p)?
+    } else {
+        config::default_priority_from_layer(&layer)?
+    };
+    let fallback_issue_type = if let Some(t) = &args.type_ {
+        IssueType::from_str(t)?
+    } else {
+        config::default_issue_type_from_layer(&layer)?
+    };
     let actor = config::resolve_actor(&layer);
     let now = Utc::now();
     let _json_mode = cli.json.unwrap_or(false);
@@ -627,7 +635,7 @@ fn execute_import(
                     }
                 }
             } else {
-                default_priority
+                fallback_priority
             };
 
             let issue_type = if let Some(ref t) = issue_type_override {
@@ -639,7 +647,7 @@ fn execute_import(
                     }
                 }
             } else {
-                default_issue_type.clone()
+                fallback_issue_type.clone()
             };
 
             let mut issue = Issue {

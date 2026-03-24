@@ -1135,7 +1135,7 @@ impl SqliteStorage {
         dep_type: Option<&str>,
         blocking_only: bool,
     ) -> Result<bool> {
-        let (from_node, to_node) = if matches!(dep_type, Some("waits-for")) {
+        let (from_node, to_node) = if matches!(dep_type, Some("parent-child")) {
             (depends_on_id, issue_id)
         } else {
             (issue_id, depends_on_id)
@@ -1144,17 +1144,17 @@ impl SqliteStorage {
         // Build the per-node neighbor query. We only follow Must-Finish-Before (MFB) edges.
         let neighbor_sql = if blocking_only {
             "SELECT depends_on_id FROM dependencies \
-             WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'parent-child') \
+             WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'waits-for') \
              UNION \
              SELECT issue_id FROM dependencies \
-             WHERE depends_on_id = ? AND type = 'waits-for'"
+             WHERE depends_on_id = ? AND type = 'parent-child'"
                 .to_string()
         } else {
             "SELECT depends_on_id FROM dependencies \
-             WHERE issue_id = ? AND type != 'waits-for' \
+             WHERE issue_id = ? AND type != 'parent-child' \
              UNION \
              SELECT issue_id FROM dependencies \
-             WHERE depends_on_id = ? AND type = 'waits-for'"
+             WHERE depends_on_id = ? AND type = 'parent-child'"
                 .to_string()
         };
 

@@ -1158,9 +1158,34 @@ impl ToolHandler for CreateIssueTool {
         let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
         let id_gen =
             crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
-        let id = id_gen.generate(title, None, Some(&self.0.actor), now, 0, |candidate| {
-            storage.id_exists(candidate).unwrap_or(false)
-        });
+
+        // Validate parent exists BEFORE generating ID
+        let parent_id = args
+            .get("parent")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(ref pid) = parent_id {
+            require_valid_issue(&storage, pid)?;
+        }
+
+        let count = storage.count_issues().unwrap_or(0);
+        let id = if let Some(ref pid) = parent_id {
+            let next_num = storage.next_child_number(pid).unwrap_or(1);
+            let mut candidate = crate::util::id::child_id(pid, next_num);
+            let mut num = next_num;
+            while storage.id_exists(&candidate).unwrap_or(true) {
+                num += 1;
+                candidate = crate::util::id::child_id(pid, num);
+                if num > next_num + 100 {
+                    return Err(McpError::internal("Could not find available child ID"));
+                }
+            }
+            candidate
+        } else {
+            id_gen.generate(title, None, Some(&self.0.actor), now, count, |candidate| {
+                storage.id_exists(candidate).unwrap_or(false)
+            })
+        };
 
         let issue = Issue {
             id: id.clone(),
@@ -1190,6 +1215,9 @@ impl ToolHandler for CreateIssueTool {
         if let Some(ref pid) = parent_id {
             require_valid_issue(&storage, pid)?;
         }
+
+        // Compute content hash
+        issue.content_hash = Some(issue.compute_content_hash());
 
         storage
             .create_issue(&issue, &self.0.actor)

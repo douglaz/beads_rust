@@ -1132,7 +1132,7 @@ impl SqliteStorage {
         conn: &Connection,
         issue_id: &str,
         depends_on_id: &str,
-        dep_type: Option<&str>,
+        _dep_type: Option<&str>,
         blocking_only: bool,
     ) -> Result<bool> {
         let from_node = issue_id;

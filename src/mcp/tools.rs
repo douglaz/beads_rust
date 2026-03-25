@@ -992,7 +992,7 @@ impl ToolHandler for ShowIssueTool {
         let details = storage
             .get_issue_details(id, true, true, 20)
             .map_err(beads_to_mcp)?
-            .ok_or_else(|| issue_not_found_err(&storage, id))?;
+            .ok_or_else(|| issue_not_found_err(storage, id))?;
 
         let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
         if let Some(obj) = result.as_object_mut() {
@@ -1201,7 +1201,7 @@ impl ToolHandler for CreateIssueTool {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         if let Some(ref pid) = parent_id {
-            require_valid_issue(&storage, pid)?;
+            require_valid_issue(storage, pid)?;
         }
 
         let count = storage.count_issues().unwrap_or(0);
@@ -1426,7 +1426,7 @@ impl ToolHandler for UpdateIssueTool {
         let storage = &mut storage_ctx.storage;
 
         // Validate ID exists before attempting update (placeholder + existence check)
-        require_valid_issue(&storage, id)?;
+        require_valid_issue(storage, id)?;
 
         // Detect whether we have field changes vs label/comment side-effects.
         // If only side-effects (labels_add, labels_remove, comment), skip the
@@ -1454,7 +1454,7 @@ impl ToolHandler for UpdateIssueTool {
             storage
                 .get_issue_details(id, false, false, 0)
                 .map_err(beads_to_mcp)?
-                .ok_or_else(|| issue_not_found_err(&storage, id))?
+                .ok_or_else(|| issue_not_found_err(storage, id))?
                 .issue
         } else {
             return Err(McpError::with_data(
@@ -1591,7 +1591,7 @@ impl ToolHandler for CloseIssueTool {
         let storage = &mut storage_ctx.storage;
 
         // Validate ID exists (with placeholder detection + fuzzy suggestions)
-        require_valid_issue(&storage, id)?;
+        require_valid_issue(storage, id)?;
 
         // Idempotency: if already closed, return existing state without error
         if let Some(details) = storage
@@ -1850,7 +1850,7 @@ impl ToolHandler for ManageDependenciesTool {
         let storage = &mut storage_ctx.storage;
 
         // Validate source ID for all actions
-        require_valid_issue(&storage, id)?;
+        require_valid_issue(storage, id)?;
 
         match action {
             "list" => {

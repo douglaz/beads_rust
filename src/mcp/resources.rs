@@ -188,7 +188,7 @@ impl ResourceHandler for IssueResource {
         let details = storage
             .get_issue_details(id, true, true, 20)
             .map_err(to_mcp)?
-            .ok_or_else(|| issue_not_found_resource(&storage, id))?;
+            .ok_or_else(|| issue_not_found_resource(storage, id))?;
 
         let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
         if let Some(obj) = result.as_object_mut() {
@@ -533,7 +533,7 @@ impl ResourceHandler for InProgressResource {
             ..ListFilters::default()
         };
         let (count, issues) =
-            count_and_sample_issues(&storage, filters, IN_PROGRESS_RESOURCE_LIMIT)?;
+            count_and_sample_issues(storage, filters, IN_PROGRESS_RESOURCE_LIMIT)?;
 
         let result = json!({
             "count": count,
@@ -652,7 +652,7 @@ impl ResourceHandler for DeferredIssuesResource {
             include_deferred: true,
             ..ListFilters::default()
         };
-        let (count, issues) = count_and_sample_issues(&storage, filters, DEFERRED_RESOURCE_LIMIT)?;
+        let (count, issues) = count_and_sample_issues(storage, filters, DEFERRED_RESOURCE_LIMIT)?;
 
         let result = json!({
             "count": count,
@@ -854,7 +854,7 @@ impl ResourceHandler for GraphHealthResource {
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
         let storage_ctx = self.0.open_storage_ctx().map_err(to_mcp)?;
         let storage = &storage_ctx.storage;
-        let health = compute_graph_health(&storage)?;
+        let health = compute_graph_health(storage)?;
 
         Ok(vec![ResourceContent {
             uri: "beads://graph/health".into(),
@@ -953,7 +953,7 @@ impl ResourceHandler for BottlenecksResource {
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
         let storage_ctx = self.0.open_storage_ctx().map_err(to_mcp)?;
         let storage = &storage_ctx.storage;
-        let bottlenecks = compute_bottlenecks(&storage)?;
+        let bottlenecks = compute_bottlenecks(storage)?;
 
         Ok(vec![ResourceContent {
             uri: "beads://issues/bottlenecks".into(),

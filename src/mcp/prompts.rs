@@ -274,16 +274,16 @@ impl PromptHandler for TriagePrompt {
         ));
 
         if focus == "all" || focus == "blocked" {
-            parts.push(blocked_context(&storage)?);
+            parts.push(blocked_context(storage)?);
         }
         if focus == "all" || focus == "unassigned" {
-            parts.push(unassigned_context(&storage)?);
+            parts.push(unassigned_context(storage)?);
         }
         if focus == "all" || focus == "deferred" {
-            parts.push(deferred_context(&storage)?);
+            parts.push(deferred_context(storage)?);
         }
         if focus == "all" {
-            parts.push(ready_context(&storage)?);
+            parts.push(ready_context(storage)?);
         }
 
         Ok(vec![
@@ -365,7 +365,7 @@ impl PromptHandler for StatusReportPrompt {
             ..ListFilters::default()
         };
         let (in_progress_count, in_progress) = count_and_sample_issues(
-            &storage,
+            storage,
             in_progress_filters,
             STATUS_REPORT_IN_PROGRESS_LIMIT,
         )?;
@@ -595,14 +595,14 @@ impl PromptHandler for PlanNextWorkPrompt {
         ));
 
         if goal == "balanced" || goal == "unblock" {
-            parts.push(bottleneck_context(&storage)?);
-            parts.push(blocked_context(&storage)?);
+            parts.push(bottleneck_context(storage)?);
+            parts.push(blocked_context(storage)?);
         }
         if goal == "balanced" || goal == "quick-wins" {
-            parts.push(quick_wins_context(&storage)?);
+            parts.push(quick_wins_context(storage)?);
         }
         if goal == "balanced" {
-            parts.push(ready_context(&storage)?);
+            parts.push(ready_context(storage)?);
         }
 
         let instruction = match goal {
@@ -859,10 +859,10 @@ impl PromptHandler for PolishBacklogPrompt {
         ));
 
         if focus == "all" || focus == "completeness" {
-            parts.push(completeness_context(&storage)?);
+            parts.push(completeness_context(storage)?);
         }
         if focus == "all" || focus == "dependencies" {
-            parts.push(dependency_health_context(&storage)?);
+            parts.push(dependency_health_context(storage)?);
         }
 
         let instruction = match focus {

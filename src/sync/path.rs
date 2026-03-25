@@ -608,21 +608,17 @@ pub fn require_safe_sync_overwrite_path(
     allow_external: bool,
     operation: &str,
 ) -> Result<()> {
-    let canonical_beads =
-        dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
-    let is_internal = path.starts_with(beads_dir) || path.starts_with(&canonical_beads);
+    let validation = validate_sync_path(path, beads_dir);
+    if validation.is_allowed() {
+        debug!(
+            path = %path.display(),
+            operation,
+            "Sync path approved for destructive operation"
+        );
+        return Ok(());
+    }
 
-    if is_internal {
-        let validation = validate_sync_path(path, beads_dir);
-        if validation.is_allowed() {
-            debug!(
-                path = %path.display(),
-                operation,
-                "Sync path approved for destructive operation"
-            );
-            return Ok(());
-        }
-
+    if !matches!(validation, PathValidation::OutsideBeadsDir { .. }) {
         let reason = validation
             .rejection_reason()
             .unwrap_or_else(|| "Path validation failed".to_string());
@@ -1166,6 +1162,18 @@ mod tests {
         assert!(
             result.is_ok(),
             "Manifest overwrite should be allowed inside .beads"
+        );
+    }
+
+    #[test]
+    fn test_safe_overwrite_accepts_normalized_internal_path() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join("nested/../issues.jsonl");
+
+        let result = require_safe_sync_overwrite_path(&path, &beads_dir, false, "overwrite");
+        assert!(
+            result.is_ok(),
+            "Noncanonical internal overwrite path should be allowed"
         );
     }
 

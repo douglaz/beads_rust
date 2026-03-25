@@ -304,9 +304,10 @@ fn project_beads_dir(root: &Path, preferred_name: Option<&std::ffi::OsStr>) -> P
 ///
 /// Returns an error if route files cannot be read or the target doesn't exist.
 pub fn resolve_route(issue_id: &str, local_beads_dir: &Path) -> Result<RoutingResult> {
+    let normalized_local_beads_dir = normalize_local_beads_dir(local_beads_dir);
     let Some(prefix) = extract_prefix(issue_id) else {
         // No prefix, use local
-        return Ok(RoutingResult::local(local_beads_dir.to_path_buf()));
+        return Ok(RoutingResult::local(normalized_local_beads_dir));
     };
 
     // Load local routes
@@ -323,7 +324,9 @@ pub fn resolve_route(issue_id: &str, local_beads_dir: &Path) -> Result<RoutingRe
     // Find and search town root if different
     if let Some(town_root) = find_town_root(project_root) {
         let town_beads_dir = project_beads_dir(&town_root, local_beads_dir.file_name());
-        if town_beads_dir != *local_beads_dir && town_beads_dir.is_dir() {
+        if normalize_local_beads_dir(&town_beads_dir) != normalized_local_beads_dir
+            && town_beads_dir.is_dir()
+        {
             let town_routes_path = town_beads_dir.join("routes.jsonl");
             let town_routes = load_routes(&town_routes_path)?;
 
@@ -334,7 +337,11 @@ pub fn resolve_route(issue_id: &str, local_beads_dir: &Path) -> Result<RoutingRe
     }
 
     // No route found, use local
-    Ok(RoutingResult::local(local_beads_dir.to_path_buf()))
+    Ok(RoutingResult::local(normalized_local_beads_dir))
+}
+
+fn normalize_local_beads_dir(local_beads_dir: &Path) -> PathBuf {
+    dunce::canonicalize(local_beads_dir).unwrap_or_else(|_| local_beads_dir.to_path_buf())
 }
 
 /// Group issue inputs by their resolved route, preserving first-seen batch order.
@@ -774,6 +781,37 @@ mod tests {
         assert_eq!(
             batches[0].issue_inputs,
             vec!["ext-1".to_string(), "alt-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn group_issue_inputs_by_route_merges_noncanonical_local_and_self_route_batches() {
+        let dir = TempDir::new().unwrap();
+        let canonical_local_beads = dir.path().join("current/.beads");
+        fs::create_dir_all(&canonical_local_beads).unwrap();
+
+        let local_beads = canonical_local_beads.join("../.beads");
+        fs::write(
+            local_beads.join("routes.jsonl"),
+            r#"{"prefix":"self-","path":"../current"}"#,
+        )
+        .unwrap();
+
+        let batches = group_issue_inputs_by_route(
+            &["current-1".to_string(), "self-2".to_string()],
+            &local_beads,
+        )
+        .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].beads_dir,
+            dunce::canonicalize(&canonical_local_beads).unwrap()
+        );
+        assert!(!batches[0].is_external);
+        assert_eq!(
+            batches[0].issue_inputs,
+            vec!["current-1".to_string(), "self-2".to_string()]
         );
     }
 

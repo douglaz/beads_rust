@@ -1622,7 +1622,34 @@ fn should_fallback_to_workspace_jsonl(beads_dir: &Path, paths: &config::ConfigPa
 
     !has_env_override
         && paths.metadata.jsonl_export == "issues.jsonl"
-        && paths.jsonl_path == beads_dir.join("issues.jsonl")
+        && doctor_paths_equivalent(&paths.jsonl_path, &beads_dir.join("issues.jsonl"))
+}
+
+fn doctor_paths_equivalent(left: &Path, right: &Path) -> bool {
+    normalize_doctor_path(left) == normalize_doctor_path(right)
+}
+
+fn normalize_doctor_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = dunce::canonicalize(path) {
+        return canonical;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+        }
+    }
+
+    normalized
 }
 
 fn select_doctor_jsonl_path(beads_dir: &Path, paths: &config::ConfigPaths) -> Option<PathBuf> {
@@ -2881,6 +2908,35 @@ mod tests {
         assert_eq!(
             select_doctor_jsonl_path(&beads_dir, &paths),
             Some(configured_jsonl)
+        );
+    }
+
+    #[test]
+    fn test_select_doctor_jsonl_path_falls_back_for_noncanonical_default_jsonl_path() {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let beads_dir = workspace_root.join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let workspace_jsonl = beads_dir.join("issues.jsonl");
+        fs::write(&workspace_jsonl, "{\"id\":\"bd-legacy\"}\n").unwrap();
+
+        let configured_jsonl = workspace_root.join("nested/../.beads/issues.jsonl");
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path: beads_dir.join("beads.db"),
+            jsonl_path: configured_jsonl,
+            metadata: config::Metadata {
+                database: "beads.db".to_string(),
+                jsonl_export: "issues.jsonl".to_string(),
+                backend: None,
+                deletions_retention_days: None,
+            },
+        };
+
+        assert_eq!(
+            select_doctor_jsonl_path(&beads_dir, &paths),
+            Some(workspace_jsonl)
         );
     }
 

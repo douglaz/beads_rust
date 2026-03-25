@@ -1404,7 +1404,10 @@ pub fn export_to_jsonl_with_policy(
                 let display_count = missing_list.len().min(MISSING_IDS_PREVIEW_LIMIT);
                 let preview: Vec<_> = missing_list.iter().take(display_count).collect();
                 let more = if missing_list.len() > MISSING_IDS_PREVIEW_LIMIT {
-                    format!(" ... and {} more", missing_list.len() - MISSING_IDS_PREVIEW_LIMIT)
+                    format!(
+                        " ... and {} more",
+                        missing_list.len() - MISSING_IDS_PREVIEW_LIMIT
+                    )
                 } else {
                     String::new()
                 };

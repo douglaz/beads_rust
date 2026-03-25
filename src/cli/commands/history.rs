@@ -496,6 +496,7 @@ fn diff_backup(
 }
 
 /// Restore a backup.
+#[allow(clippy::too_many_arguments)]
 fn restore_backup(
     beads_dir: &Path,
     history_dir: &Path,

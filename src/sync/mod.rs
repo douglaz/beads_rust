@@ -33,6 +33,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+const JSONL_BUFREADER_CAPACITY: usize = 2 * 1024 * 1024; // 2 MB
+const ESTIMATED_BYTES_PER_ISSUE: u64 = 500;
+pub(crate) const MISSING_IDS_PREVIEW_LIMIT: usize = 10;
+
 struct TempFileGuard {
     path: PathBuf,
     persist: bool,
@@ -541,7 +545,7 @@ impl JsonlIssueValidationSummary {
 
 pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueValidationSummary> {
     let file = File::open(path)?;
-    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let reader = BufReader::with_capacity(JSONL_BUFREADER_CAPACITY, file);
     let mut summary = JsonlIssueValidationSummary::default();
 
     for (line_num, line_result) in reader.lines().enumerate() {
@@ -1137,7 +1141,7 @@ const CONFLICT_END: &str = ">>>>>>>";
 /// Returns an error if the file cannot be read.
 pub fn scan_conflict_markers(path: &Path) -> Result<Vec<ConflictMarker>> {
     let file = File::open(path)?;
-    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let reader = BufReader::with_capacity(JSONL_BUFREADER_CAPACITY, file);
     let mut markers = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
@@ -1397,10 +1401,10 @@ pub fn export_to_jsonl_with_policy(
             if !missing.is_empty() {
                 let mut missing_list = missing.into_iter().cloned().collect::<Vec<_>>();
                 missing_list.sort();
-                let display_count = missing_list.len().min(10);
+                let display_count = missing_list.len().min(MISSING_IDS_PREVIEW_LIMIT);
                 let preview: Vec<_> = missing_list.iter().take(display_count).collect();
-                let more = if missing_list.len() > 10 {
-                    format!(" ... and {} more", missing_list.len() - 10)
+                let more = if missing_list.len() > MISSING_IDS_PREVIEW_LIMIT {
+                    format!(" ... and {} more", missing_list.len() - MISSING_IDS_PREVIEW_LIMIT)
                 } else {
                     String::new()
                 };
@@ -2692,7 +2696,7 @@ pub fn auto_flush(
 pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
     let file = File::open(path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
-    let estimated_count = (file_size / 500) as usize;
+    let estimated_count = (file_size / ESTIMATED_BYTES_PER_ISSUE) as usize;
     let reader = BufReader::new(file);
     let mut issues = Vec::with_capacity(estimated_count);
 
@@ -2867,20 +2871,17 @@ fn normalize_issue(issue: &mut Issue) {
         }
     }
 
-    // Deduplicate dependencies: for each (issue_id, depends_on_id, dep_type) triple,
-    // keep only the most recent entry by created_at. This handles duplicate parent-child
-    // entries from reparenting or migration artifacts (see issue #159).
+    // Deduplicate dependencies: the schema stores at most one dependency row
+    // per (issue_id, depends_on_id) pair regardless of type, so keep only the
+    // most recent entry by created_at for each pair. This also resolves
+    // duplicate parent-child artifacts from reparenting or migration history.
     if issue.dependencies.len() > 1 {
         use std::collections::HashMap;
-        // Build a map keyed by (issue_id, depends_on_id, dep_type), keeping the entry
-        // with the latest created_at for each triple.
-        let mut best: HashMap<(String, String, String), usize> = HashMap::new();
+        // Build a map keyed by (issue_id, depends_on_id), keeping the entry
+        // with the latest created_at for each pair.
+        let mut best: HashMap<(String, String), usize> = HashMap::new();
         for (i, dep) in issue.dependencies.iter().enumerate() {
-            let key = (
-                dep.issue_id.clone(),
-                dep.depends_on_id.clone(),
-                dep.dep_type.as_str().to_string(),
-            );
+            let key = (dep.issue_id.clone(), dep.depends_on_id.clone());
             match best.get(&key) {
                 Some(&prev_idx) if issue.dependencies[prev_idx].created_at >= dep.created_at => {
                     // existing entry is newer or equal, skip
@@ -2988,8 +2989,8 @@ pub fn import_from_jsonl(
     let file = File::open(input_path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
     // Estimate ~500 bytes per issue to pre-allocate vector capacity
-    let estimated_count = (file_size / 500) as usize;
-    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let estimated_count = (file_size / ESTIMATED_BYTES_PER_ISSUE) as usize;
+    let mut reader = BufReader::with_capacity(JSONL_BUFREADER_CAPACITY, file);
     let mut issues = Vec::with_capacity(estimated_count);
     let mut id_to_index = std::collections::HashMap::with_capacity(estimated_count);
     let mut mismatches = Vec::new();
@@ -3382,8 +3383,8 @@ fn process_import_action(
 ) -> Result<()> {
     match action {
         CollisionAction::Insert => {
-            storage.upsert_issue_for_import(issue)?;
-            sync_issue_relations(storage, issue)?;
+            storage.upsert_issue_for_import_on_active_tx(issue)?;
+            sync_issue_relations_in_active_tx(storage, issue)?;
             result.imported_count += 1;
             result.created_count += 1;
         }
@@ -3391,13 +3392,13 @@ fn process_import_action(
             // When updating by external_ref or content_hash, the incoming issue may have
             // a different ID than the existing one. We need to update using the existing ID.
             if existing_id == &issue.id {
-                storage.upsert_issue_for_import(issue)?;
-                sync_issue_relations(storage, issue)?;
+                storage.upsert_issue_for_import_on_active_tx(issue)?;
+                sync_issue_relations_in_active_tx(storage, issue)?;
             } else {
                 let mut updated_issue = issue.clone();
-                updated_issue.id.clone_from(existing_id);
-                storage.upsert_issue_for_import(&updated_issue)?;
-                sync_issue_relations(storage, &updated_issue)?;
+                rewrite_issue_id_and_embedded_sources(&mut updated_issue, existing_id);
+                storage.upsert_issue_for_import_on_active_tx(&updated_issue)?;
+                sync_issue_relations_in_active_tx(storage, &updated_issue)?;
             }
             result.imported_count += 1;
             result.updated_count += 1;
@@ -3414,16 +3415,29 @@ fn process_import_action(
     Ok(())
 }
 
+fn rewrite_issue_id_and_embedded_sources(issue: &mut Issue, new_id: &str) {
+    let source_id = new_id.to_string();
+    issue.id.clone_from(&source_id);
+
+    for dependency in &mut issue.dependencies {
+        dependency.issue_id.clone_from(&source_id);
+    }
+
+    for comment in &mut issue.comments {
+        comment.issue_id.clone_from(&source_id);
+    }
+}
+
 /// Sync labels, dependencies, and comments for an imported issue.
-fn sync_issue_relations(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
+fn sync_issue_relations_in_active_tx(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
     // Sync labels
-    storage.sync_labels_for_import(&issue.id, &issue.labels)?;
+    storage.sync_labels_for_import_on_active_tx(&issue.id, &issue.labels)?;
 
     // Sync dependencies
-    storage.sync_dependencies_for_import(&issue.id, &issue.dependencies)?;
+    storage.sync_dependencies_for_import_on_active_tx(&issue.id, &issue.dependencies)?;
 
     // Sync comments
-    storage.sync_comments_for_import(&issue.id, &issue.comments)?;
+    storage.sync_comments_for_import_on_active_tx(&issue.id, &issue.comments)?;
 
     Ok(())
 }
@@ -4839,6 +4853,45 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_issue_keeps_latest_dependency_for_same_target_pair() {
+        let mut issue = make_test_issue("bd-001", "Duplicate dependency target");
+        issue.dependencies = vec![
+            crate::model::Dependency {
+                issue_id: issue.id.clone(),
+                depends_on_id: "bd-002".to_string(),
+                dep_type: crate::model::DependencyType::Blocks,
+                created_at: fixed_time(100),
+                created_by: Some("alice".to_string()),
+                metadata: Some("{\"order\":1}".to_string()),
+                thread_id: None,
+            },
+            crate::model::Dependency {
+                issue_id: issue.id.clone(),
+                depends_on_id: "bd-002".to_string(),
+                dep_type: crate::model::DependencyType::WaitsFor,
+                created_at: fixed_time(200),
+                created_by: Some("bob".to_string()),
+                metadata: Some("{\"order\":2}".to_string()),
+                thread_id: Some("br-2".to_string()),
+            },
+        ];
+
+        normalize_issue(&mut issue);
+
+        assert_eq!(issue.dependencies.len(), 1);
+        assert_eq!(
+            issue.dependencies[0].dep_type,
+            crate::model::DependencyType::WaitsFor
+        );
+        assert_eq!(issue.dependencies[0].created_by.as_deref(), Some("bob"));
+        assert_eq!(
+            issue.dependencies[0].metadata.as_deref(),
+            Some("{\"order\":2}")
+        );
+        assert_eq!(issue.dependencies[0].thread_id.as_deref(), Some("br-2"));
+    }
+
+    #[test]
     fn test_import_collision_by_id_updates_newer() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -4936,6 +4989,65 @@ mod tests {
             assert_eq!(match_type, MatchType::ExternalRef);
             assert_eq!(phase, 1);
         }
+    }
+
+    #[test]
+    fn test_import_remaps_embedded_relation_sources_when_external_ref_matches_other_id() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("issues.jsonl");
+
+        let mut existing = make_issue_at("bd-ext", "Existing", fixed_time(100));
+        existing.external_ref = Some("JIRA-1".to_string());
+        set_content_hash(&mut existing);
+        storage.upsert_issue_for_import(&existing).unwrap();
+
+        let target = make_issue_at("bd-target", "Dependency Target", fixed_time(90));
+        storage.upsert_issue_for_import(&target).unwrap();
+
+        let mut incoming = make_issue_at("bd-new", "Existing", fixed_time(200));
+        incoming.external_ref = Some("JIRA-1".to_string());
+        incoming.dependencies = vec![crate::model::Dependency {
+            issue_id: incoming.id.clone(),
+            depends_on_id: "bd-target".to_string(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: fixed_time(201),
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+        incoming.comments = vec![crate::model::Comment {
+            id: 0,
+            issue_id: incoming.id.clone(),
+            author: "tester".to_string(),
+            body: "imported comment".to_string(),
+            created_at: fixed_time(202),
+        }];
+
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&incoming).unwrap()),
+        )
+        .unwrap();
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+        assert_eq!(result.imported_count, 1);
+        assert!(storage.get_issue("bd-new").unwrap().is_none());
+
+        let updated = storage.get_issue("bd-ext").unwrap().unwrap();
+        assert_eq!(updated.title, "Existing");
+
+        let dependencies = storage.get_dependencies_full("bd-ext").unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].issue_id, "bd-ext");
+        assert_eq!(dependencies[0].depends_on_id, "bd-target");
+
+        let comments = storage.get_comments("bd-ext").unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].issue_id, "bd-ext");
+        assert_eq!(comments[0].body, "imported comment");
     }
 
     #[test]
@@ -6052,6 +6164,99 @@ mod tests {
                 .message
                 .contains("title"),
             "Expected validation failure to mention the empty title"
+        );
+    }
+
+    #[test]
+    fn test_preflight_import_rejects_invalid_embedded_comment_records() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let mut invalid_issue = make_test_issue("bd-001", "Has bad comments");
+        invalid_issue.comments = vec![
+            crate::model::Comment {
+                id: 5,
+                issue_id: invalid_issue.id.clone(),
+                author: "alice".to_string(),
+                body: "first".to_string(),
+                created_at: invalid_issue.created_at,
+            },
+            crate::model::Comment {
+                id: 5,
+                issue_id: invalid_issue.id.clone(),
+                author: "bob".to_string(),
+                body: "second".to_string(),
+                created_at: invalid_issue.created_at + chrono::Duration::minutes(1),
+            },
+        ];
+        std::fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&invalid_issue).unwrap()),
+        )
+        .unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            ..Default::default()
+        };
+
+        let result = preflight_import(&jsonl_path, &config, None).unwrap();
+
+        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
+        let failures = result.failures();
+        let json_check = failures.iter().find(|c| c.name == "json_valid");
+        assert!(json_check.is_some(), "Expected json_valid failure");
+        assert!(
+            json_check
+                .expect("json_valid failure")
+                .message
+                .contains("comments[1].id"),
+            "Expected validation failure to mention the duplicate embedded comment id"
+        );
+    }
+
+    #[test]
+    fn test_preflight_import_rejects_invalid_embedded_dependency_records() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let mut invalid_issue = make_test_issue("bd-001", "Has bad dependencies");
+        invalid_issue.dependencies = vec![crate::model::Dependency {
+            issue_id: invalid_issue.id.clone(),
+            depends_on_id: invalid_issue.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: invalid_issue.created_at,
+            created_by: Some("alice".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+        std::fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&invalid_issue).unwrap()),
+        )
+        .unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            ..Default::default()
+        };
+
+        let result = preflight_import(&jsonl_path, &config, None).unwrap();
+
+        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
+        let failures = result.failures();
+        let json_check = failures.iter().find(|c| c.name == "json_valid");
+        assert!(json_check.is_some(), "Expected json_valid failure");
+        assert!(
+            json_check
+                .expect("json_valid failure")
+                .message
+                .contains("dependencies[0].depends_on_id"),
+            "Expected validation failure to mention the invalid embedded dependency"
         );
     }
 

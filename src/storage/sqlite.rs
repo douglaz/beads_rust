@@ -22,6 +22,8 @@ use std::time::Duration;
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;
+const TX_MAX_RETRIES: u32 = 5;
+const TX_BASE_BACKOFF_MS: u64 = 10;
 // `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
 // existing `export_hashes` rows with a single multi-values INSERT. Batch the
 // DELETE side for efficiency, but re-insert one row at a time for correctness.
@@ -215,14 +217,11 @@ impl SqliteStorage {
     where
         F: FnMut(&Connection) -> Result<R>,
     {
-        const MAX_RETRIES: u32 = 5;
-        let base_backoff_ms: u64 = 10;
-
-        for attempt in 0..MAX_RETRIES {
+        for attempt in 0..TX_MAX_RETRIES {
             match conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
-                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    let backoff = base_backoff_ms * 2u64.pow(attempt);
+                Err(e) if e.is_transient() && attempt < TX_MAX_RETRIES - 1 => {
+                    let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
                     std::thread::sleep(Duration::from_millis(backoff));
                     continue;
                 }
@@ -232,14 +231,14 @@ impl SqliteStorage {
             match f(conn) {
                 Ok(result) => match conn.execute("COMMIT") {
                     Ok(_) => return Ok(result),
-                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                    Err(e) if e.is_transient() && attempt < TX_MAX_RETRIES - 1 => {
                         if let Err(rb_err) = conn.execute("ROLLBACK") {
                             tracing::warn!(
                                 error = %rb_err,
                                 "ROLLBACK failed after transient COMMIT error"
                             );
                         }
-                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                        let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                     }
                     Err(e) => {
@@ -253,8 +252,8 @@ impl SqliteStorage {
                     if let Err(rb_err) = conn.execute("ROLLBACK") {
                         tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
                     }
-                    if e.is_transient() && attempt < MAX_RETRIES - 1 {
-                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                    if e.is_transient() && attempt < TX_MAX_RETRIES - 1 {
+                        let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                     } else {
                         return Err(e);
@@ -612,14 +611,11 @@ impl SqliteStorage {
     where
         F: FnMut(&mut Self) -> Result<R>,
     {
-        const MAX_RETRIES: u32 = 5;
-        let base_backoff_ms: u64 = 10;
-
-        for attempt in 0..MAX_RETRIES {
+        for attempt in 0..TX_MAX_RETRIES {
             match self.conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
-                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    let backoff = base_backoff_ms * 2u64.pow(attempt);
+                Err(e) if e.is_transient() && attempt < TX_MAX_RETRIES - 1 => {
+                    let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
                     std::thread::sleep(Duration::from_millis(backoff));
                     continue;
                 }
@@ -638,11 +634,11 @@ impl SqliteStorage {
                             }
                             return Ok(result);
                         }
-                        Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                        Err(e) if e.is_transient() && attempt < TX_MAX_RETRIES - 1 => {
                             if let Err(rb_err) = self.conn.execute("ROLLBACK") {
                                 tracing::warn!(error = %rb_err, "ROLLBACK failed after transient COMMIT error");
                             }
-                            let backoff = base_backoff_ms * 2u64.pow(attempt);
+                            let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
                             std::thread::sleep(Duration::from_millis(backoff));
                             // retry
                         }
@@ -658,8 +654,8 @@ impl SqliteStorage {
                     if let Err(rb_err) = self.conn.execute("ROLLBACK") {
                         tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
                     }
-                    if e.is_transient() && attempt < MAX_RETRIES - 1 {
-                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                    if e.is_transient() && attempt < TX_MAX_RETRIES - 1 {
+                        let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                         // retry
                     } else {
@@ -6858,6 +6854,18 @@ impl SqliteStorage {
     /// Returns an error if the database operation fails.
     #[allow(clippy::too_many_lines)]
     pub fn upsert_issue_for_import(&self, issue: &Issue) -> Result<bool> {
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            Self::upsert_issue_for_import_in_tx(conn, issue)
+        })
+    }
+
+    /// Upsert an imported issue while participating in an already-open write
+    /// transaction on this storage handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn upsert_issue_for_import_on_active_tx(&self, issue: &Issue) -> Result<bool> {
         Self::upsert_issue_for_import_in_tx(&self.conn, issue)
     }
 
@@ -6948,6 +6956,22 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn sync_labels_for_import(&self, issue_id: &str, labels: &[String]) -> Result<()> {
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            Self::sync_labels_for_import_in_tx(conn, issue_id, labels)
+        })
+    }
+
+    /// Sync labels while participating in an already-open write transaction on
+    /// this storage handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn sync_labels_for_import_on_active_tx(
+        &self,
+        issue_id: &str,
+        labels: &[String],
+    ) -> Result<()> {
         Self::sync_labels_for_import_in_tx(&self.conn, issue_id, labels)
     }
 
@@ -7013,6 +7037,22 @@ impl SqliteStorage {
         issue_id: &str,
         dependencies: &[crate::model::Dependency],
     ) -> Result<()> {
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            Self::sync_dependencies_for_import_in_tx(conn, issue_id, dependencies)
+        })
+    }
+
+    /// Sync dependencies while participating in an already-open write
+    /// transaction on this storage handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn sync_dependencies_for_import_on_active_tx(
+        &self,
+        issue_id: &str,
+        dependencies: &[crate::model::Dependency],
+    ) -> Result<()> {
         Self::sync_dependencies_for_import_in_tx(&self.conn, issue_id, dependencies)
     }
 
@@ -7037,9 +7077,20 @@ impl SqliteStorage {
         }
 
         // Add new dependencies
-        let mut seen_deps = HashSet::new();
-        let mut unique_deps = Vec::new();
-        for dep in dependencies {
+        let mut best_dep_indices: HashMap<String, usize> = HashMap::new();
+        for (index, dep) in dependencies.iter().enumerate() {
+            if dep.issue_id != issue_id {
+                return Err(BeadsError::Validation {
+                    field: "issue_id".to_string(),
+                    reason: format!("must match parent issue id '{issue_id}'"),
+                });
+            }
+            if dep.depends_on_id.trim().is_empty() {
+                return Err(BeadsError::Validation {
+                    field: "depends_on_id".to_string(),
+                    reason: "cannot be empty".to_string(),
+                });
+            }
             if dep.depends_on_id == issue_id {
                 return Err(BeadsError::SelfDependency {
                     id: issue_id.to_string(),
@@ -7050,12 +7101,20 @@ impl SqliteStorage {
                 &dep.depends_on_id,
                 dep.dep_type.as_str(),
             )?;
-            // Deduplicate by (target, type) to allow multiple relationship types
-            // between the same issues while preventing identical duplicates.
-            if seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
-                unique_deps.push(dep);
+            match best_dep_indices.get(dep.depends_on_id.as_str()).copied() {
+                Some(prev_idx) if dependencies[prev_idx].created_at >= dep.created_at => {}
+                _ => {
+                    best_dep_indices.insert(dep.depends_on_id.clone(), index);
+                }
             }
         }
+
+        let mut keep_indices: Vec<usize> = best_dep_indices.into_values().collect();
+        keep_indices.sort_unstable();
+        let unique_deps: Vec<&crate::model::Dependency> = keep_indices
+            .into_iter()
+            .map(|idx| &dependencies[idx])
+            .collect();
 
         if unique_deps.is_empty() {
             return Ok(());
@@ -7096,6 +7155,22 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn sync_comments_for_import(
+        &self,
+        issue_id: &str,
+        comments: &[crate::model::Comment],
+    ) -> Result<()> {
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            Self::sync_comments_for_import_in_tx(conn, issue_id, comments)
+        })
+    }
+
+    /// Sync comments while participating in an already-open write transaction
+    /// on this storage handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn sync_comments_for_import_on_active_tx(
         &self,
         issue_id: &str,
         comments: &[crate::model::Comment],
@@ -8638,6 +8713,143 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_dependencies_for_import_rejects_empty_target() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let dependencies = vec![crate::model::Dependency {
+            issue_id: "bd-empty".to_string(),
+            depends_on_id: "   ".to_string(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+
+        let err = storage
+            .sync_dependencies_for_import("bd-empty", &dependencies)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "depends_on_id" && reason == "cannot be empty")
+        );
+    }
+
+    #[test]
+    fn test_sync_dependencies_for_import_keeps_latest_dependency_for_same_target() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-dep-import",
+            "Dependency import target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let target = make_issue(
+            "bd-dep-target",
+            "Dependency target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.create_issue(&target, "tester").unwrap();
+
+        let dependencies = vec![
+            crate::model::Dependency {
+                issue_id: issue.id.clone(),
+                depends_on_id: target.id.clone(),
+                dep_type: crate::model::DependencyType::Blocks,
+                created_at: t1 + chrono::Duration::minutes(1),
+                created_by: Some("alice".to_string()),
+                metadata: Some("{\"order\":1}".to_string()),
+                thread_id: None,
+            },
+            crate::model::Dependency {
+                issue_id: issue.id.clone(),
+                depends_on_id: target.id.clone(),
+                dep_type: crate::model::DependencyType::WaitsFor,
+                created_at: t1 + chrono::Duration::minutes(2),
+                created_by: Some("bob".to_string()),
+                metadata: Some("{\"order\":2}".to_string()),
+                thread_id: Some("br-200".to_string()),
+            },
+        ];
+
+        storage
+            .sync_dependencies_for_import(&issue.id, &dependencies)
+            .unwrap();
+
+        let stored = storage.get_dependencies_full(&issue.id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].depends_on_id, target.id);
+        assert_eq!(stored[0].dep_type, crate::model::DependencyType::WaitsFor);
+        assert_eq!(stored[0].created_by.as_deref(), Some("bob"));
+        assert_eq!(stored[0].metadata.as_deref(), Some("{\"order\":2}"));
+        assert_eq!(stored[0].thread_id.as_deref(), Some("br-200"));
+    }
+
+    #[test]
+    fn test_sync_dependencies_for_import_rolls_back_on_validation_error() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-dep-rollback",
+            "Dependency rollback target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let old_target = make_issue(
+            "bd-dep-old",
+            "Existing dependency target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.create_issue(&old_target, "tester").unwrap();
+        storage
+            .add_dependency(&issue.id, &old_target.id, "blocks", "tester")
+            .unwrap();
+
+        let invalid_dependencies = vec![crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: "   ".to_string(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1 + chrono::Duration::minutes(1),
+            created_by: Some("alice".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+
+        let err = storage
+            .sync_dependencies_for_import(&issue.id, &invalid_dependencies)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "depends_on_id" && reason == "cannot be empty")
+        );
+
+        let stored = storage.get_dependencies_full(&issue.id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].depends_on_id, old_target.id);
+        assert_eq!(stored[0].dep_type, crate::model::DependencyType::Blocks);
+    }
+
+    #[test]
     fn test_external_project_capabilities_ignore_tombstones() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("external.db");
@@ -9826,6 +10038,48 @@ mod tests {
     }
 
     #[test]
+    fn test_upsert_issue_for_import_rolls_back_when_insert_conflicts() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let mut keeper = make_issue(
+            "bd-import-keeper",
+            "Keeper",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        keeper.external_ref = Some("ext://shared".to_string());
+
+        let subject = make_issue(
+            "bd-import-subject",
+            "Subject",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+
+        storage.create_issue(&keeper, "tester").unwrap();
+        storage.create_issue(&subject, "tester").unwrap();
+
+        let mut conflicting_subject = subject.clone();
+        conflicting_subject.title = "Conflicting Subject".to_string();
+        conflicting_subject.external_ref = keeper.external_ref.clone();
+
+        storage
+            .upsert_issue_for_import(&conflicting_subject)
+            .unwrap_err();
+
+        let stored_subject = storage.get_issue(&subject.id).unwrap().unwrap();
+        assert_eq!(stored_subject.title, subject.title);
+        assert_eq!(stored_subject.external_ref, subject.external_ref);
+    }
+
+    #[test]
     fn test_pragmas_are_set_correctly() {
         let storage = SqliteStorage::open_memory().unwrap();
 
@@ -10175,6 +10429,7 @@ mod tests {
         let conn = fsqlite::Connection::open(":memory:".to_string()).unwrap();
 
         // Apply schema step by step, checking after each table
+        // Title limit must match validation::MAX_TITLE_CHARS (500).
         let tables = vec![(
             "issues",
             r"CREATE TABLE IF NOT EXISTS issues (

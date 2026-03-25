@@ -258,7 +258,8 @@ impl PromptHandler for TriagePrompt {
             "focus",
         );
 
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage_ctx = self.0.open_storage_ctx().map_err(to_mcp)?;
+        let storage = &storage_ctx.storage;
 
         let mut parts: Vec<String> = Vec::new();
 
@@ -347,7 +348,8 @@ impl PromptHandler for StatusReportPrompt {
             "period",
         );
 
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage_ctx = self.0.open_storage_ctx().map_err(to_mcp)?;
+        let storage = &storage_ctx.storage;
 
         let total = storage.count_all_issues().map_err(to_mcp)?;
         let active = storage.count_active_issues().map_err(to_mcp)?;
@@ -570,7 +572,8 @@ impl PromptHandler for PlanNextWorkPrompt {
             "goal",
         );
 
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage_ctx = self.0.open_storage_ctx().map_err(to_mcp)?;
+        let storage = &storage_ctx.storage;
 
         let total = storage.count_all_issues().map_err(to_mcp)?;
         let active = storage.count_active_issues().map_err(to_mcp)?;
@@ -839,7 +842,8 @@ impl PromptHandler for PolishBacklogPrompt {
             "focus",
         );
 
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage_ctx = self.0.open_storage_ctx().map_err(to_mcp)?;
+        let storage = &storage_ctx.storage;
 
         let total = storage.count_all_issues().map_err(to_mcp)?;
         let active = storage.count_active_issues().map_err(to_mcp)?;

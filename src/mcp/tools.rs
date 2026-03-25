@@ -15,12 +15,13 @@ use fastmcp_rust::{
 };
 use serde_json::json;
 
+use crate::config::OpenStorageResult;
 use crate::error::{ErrorCode, StructuredError};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::validation::MAX_TITLE_CHARS;
 
-use super::BeadsState;
+use super::{BeadsState, persist_mcp_mutation};
 
 // ---------------------------------------------------------------------------
 // Constants — pre-computed sets for O(1) placeholder detection
@@ -294,8 +295,16 @@ fn issue_not_found_err(storage: &SqliteStorage, id: &str) -> McpError {
     McpError::with_data(McpErrorCode::ToolExecutionError, structured.message, data)
 }
 
-fn open(state: &BeadsState) -> McpResult<SqliteStorage> {
-    state.open_storage().map_err(beads_to_mcp)
+fn open(state: &BeadsState) -> McpResult<OpenStorageResult> {
+    state.open_storage_ctx().map_err(beads_to_mcp)
+}
+
+fn persist_mutation(storage_ctx: &mut OpenStorageResult) -> McpResult<()> {
+    persist_mcp_mutation(storage_ctx).map_err(beads_to_mcp)
+}
+
+fn resolved_issue_prefix(state: &BeadsState, storage_ctx: &OpenStorageResult) -> McpResult<String> {
+    state.issue_prefix(storage_ctx).map_err(beads_to_mcp)
 }
 
 // ---------------------------------------------------------------------------
@@ -869,7 +878,8 @@ impl ToolHandler for ListIssuesTool {
 
     #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let storage = open(&self.0)?;
+        let storage_ctx = open(&self.0)?;
+        let storage = &storage_ctx.storage;
         let mut coercions: Vec<String> = Vec::new();
         let filters = build_list_filters(&args, &mut coercions)?;
 
@@ -976,7 +986,8 @@ impl ToolHandler for ShowIssueTool {
             return Err(err);
         }
 
-        let storage = open(&self.0)?;
+        let storage_ctx = open(&self.0)?;
+        let storage = &storage_ctx.storage;
 
         let details = storage
             .get_issue_details(id, true, true, 20)
@@ -1177,12 +1188,12 @@ impl ToolHandler for CreateIssueTool {
             coercions.push(w);
         }
 
-        let mut storage = open(&self.0)?;
-
+        let mut storage_ctx = open(&self.0)?;
         let now = chrono::Utc::now();
-        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
+        let prefix = resolved_issue_prefix(&self.0, &storage_ctx)?;
         let id_gen =
-            crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
+            crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(&prefix));
+        let storage = &mut storage_ctx.storage;
 
         // Validate parent exists BEFORE generating ID
         let parent_id = args
@@ -1287,6 +1298,8 @@ impl ToolHandler for CreateIssueTool {
         if !warnings.is_empty() {
             result["warnings"] = json!(warnings);
         }
+
+        persist_mutation(&mut storage_ctx)?;
 
         Ok(vec![Content::text(result.to_string())])
     }
@@ -1409,7 +1422,8 @@ impl ToolHandler for UpdateIssueTool {
 
         let (updates, coercions) = parse_update_fields(id, &args)?;
 
-        let mut storage = open(&self.0)?;
+        let mut storage_ctx = open(&self.0)?;
+        let storage = &mut storage_ctx.storage;
 
         // Validate ID exists before attempting update (placeholder + existence check)
         require_valid_issue(&storage, id)?;
@@ -1503,6 +1517,8 @@ impl ToolHandler for UpdateIssueTool {
             result["warnings"] = json!(warnings);
         }
 
+        persist_mutation(&mut storage_ctx)?;
+
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -1571,7 +1587,8 @@ impl ToolHandler for CloseIssueTool {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let mut storage = open(&self.0)?;
+        let mut storage_ctx = open(&self.0)?;
+        let storage = &mut storage_ctx.storage;
 
         // Validate ID exists (with placeholder detection + fuzzy suggestions)
         require_valid_issue(&storage, id)?;
@@ -1641,6 +1658,8 @@ impl ToolHandler for CloseIssueTool {
                 "Use show_issue on these to check if they're now ready for work"
             ]);
         }
+
+        persist_mutation(&mut storage_ctx)?;
 
         Ok(vec![Content::text(result.to_string())])
     }
@@ -1827,7 +1846,8 @@ impl ToolHandler for ManageDependenciesTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| McpError::invalid_params("'id' is required"))?;
 
-        let mut storage = open(&self.0)?;
+        let mut storage_ctx = open(&self.0)?;
+        let storage = &mut storage_ctx.storage;
 
         // Validate source ID for all actions
         require_valid_issue(&storage, id)?;
@@ -1851,8 +1871,16 @@ impl ToolHandler for ManageDependenciesTool {
                     .to_string(),
                 )])
             }
-            "add" => dep_add(&mut storage, &self.0.actor, id, &args),
-            "remove" => dep_remove(&mut storage, &self.0.actor, id, &args),
+            "add" => {
+                let result = dep_add(storage, &self.0.actor, id, &args)?;
+                persist_mutation(&mut storage_ctx)?;
+                Ok(result)
+            }
+            "remove" => {
+                let result = dep_remove(storage, &self.0.actor, id, &args)?;
+                persist_mutation(&mut storage_ctx)?;
+                Ok(result)
+            }
             other => Err(McpError::with_data(
                 McpErrorCode::InvalidParams,
                 format!("Unknown action '{other}'"),
@@ -1911,7 +1939,8 @@ impl ToolHandler for ProjectOverviewTool {
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let _ = args;
-        let storage = open(&self.0)?;
+        let storage_ctx = open(&self.0)?;
+        let storage = &storage_ctx.storage;
 
         let total = storage.count_all_issues().map_err(beads_to_mcp)?;
         let active = storage.count_active_issues().map_err(beads_to_mcp)?;
@@ -1948,7 +1977,7 @@ impl ToolHandler for ProjectOverviewTool {
             .list_issues(&deferred_filters)
             .map_err(beads_to_mcp)?;
 
-        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
+        let prefix = resolved_issue_prefix(&self.0, &storage_ctx)?;
 
         let result = json!({
             "project": {

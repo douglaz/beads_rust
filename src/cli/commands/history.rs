@@ -129,6 +129,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_restore_output(
     ctx: &OutputContext,
     backup_name: &str,
@@ -136,9 +137,16 @@ fn emit_restore_output(
     target_name: &str,
     beads_dir: &Path,
     command_jsonl_path: Option<&Path>,
+    command_db_path: Option<&Path>,
     db_override: Option<&Path>,
 ) {
-    let next_step = restore_next_step(beads_dir, target_path, command_jsonl_path, db_override);
+    let next_step = restore_next_step(
+        beads_dir,
+        target_path,
+        command_jsonl_path,
+        command_db_path,
+        db_override,
+    );
     let notes = [RESTORE_NOTE_DB_UNCHANGED, RESTORE_NOTE_TOMBSTONE_PROTECTION];
 
     if ctx.is_json() {
@@ -238,15 +246,16 @@ pub fn execute(args: HistoryArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
         Some(HistoryCommands::Restore { file, force }) => {
             let active_jsonl_path = config::resolve_paths(&beads_dir, cli.db.as_ref())?.jsonl_path;
-            let command_jsonl_path =
-                config::resolve_paths_without_env_jsonl(&beads_dir, cli.db.as_ref())?.jsonl_path;
+            let command_paths =
+                config::resolve_paths_without_env_jsonl(&beads_dir, cli.db.as_ref())?;
             restore_backup(
                 &beads_dir,
                 &history_dir,
                 &file,
                 force,
                 Some(&active_jsonl_path),
-                Some(&command_jsonl_path),
+                Some(&command_paths.jsonl_path),
+                Some(&command_paths.db_path),
                 cli.db.as_deref(),
                 ctx,
             )
@@ -504,6 +513,7 @@ fn restore_backup(
     force: bool,
     active_jsonl_path: Option<&Path>,
     command_jsonl_path: Option<&Path>,
+    command_db_path: Option<&Path>,
     db_override: Option<&Path>,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -578,6 +588,7 @@ fn restore_backup(
         &target_name,
         beads_dir,
         command_jsonl_path,
+        command_db_path,
         db_override,
     );
 
@@ -756,6 +767,7 @@ fn restore_next_step(
     beads_dir: &Path,
     target_path: &Path,
     command_jsonl_path: Option<&Path>,
+    command_db_path: Option<&Path>,
     db_override: Option<&Path>,
 ) -> String {
     let command_target = restore_command_jsonl_target(beads_dir, command_jsonl_path);
@@ -776,11 +788,22 @@ fn restore_next_step(
 
     command.push_str(" sync --import-only --force");
 
-    if is_external_jsonl_target(beads_dir, target_path) {
+    if requires_explicit_external_jsonl_flag(beads_dir, target_path, command_db_path) {
         command.push_str(" --allow-external-jsonl");
     }
 
     command
+}
+
+fn requires_explicit_external_jsonl_flag(
+    beads_dir: &Path,
+    target_path: &Path,
+    command_db_path: Option<&Path>,
+) -> bool {
+    is_external_jsonl_target(beads_dir, target_path)
+        && !command_db_path.is_some_and(|db_path| {
+            config::implicit_external_jsonl_allowed(beads_dir, db_path, target_path)
+        })
 }
 
 fn normalize_jsonl_match_path(path: &Path, cwd: Option<&Path>) -> PathBuf {
@@ -925,6 +948,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &ctx,
         )
         .unwrap();
@@ -1023,7 +1047,7 @@ mod tests {
         let internal_target = beads_dir.join("issues.jsonl");
 
         assert_eq!(
-            restore_next_step(&beads_dir, &internal_target, None, None),
+            restore_next_step(&beads_dir, &internal_target, None, None, None),
             "br sync --import-only --force"
         );
     }
@@ -1035,7 +1059,7 @@ mod tests {
         let custom_target = beads_dir.join("custom.jsonl");
 
         assert_eq!(
-            restore_next_step(&beads_dir, &custom_target, None, None),
+            restore_next_step(&beads_dir, &custom_target, None, None, None),
             format!(
                 "BEADS_JSONL={} br sync --import-only --force",
                 shell_quote(&custom_target.display().to_string())
@@ -1050,7 +1074,7 @@ mod tests {
         let external_target = temp.path().join("external").join("issues.jsonl");
 
         assert_eq!(
-            restore_next_step(&beads_dir, &external_target, None, None),
+            restore_next_step(&beads_dir, &external_target, None, None, None),
             format!(
                 "BEADS_JSONL={} br sync --import-only --force --allow-external-jsonl",
                 shell_quote(&external_target.display().to_string())
@@ -1074,7 +1098,7 @@ mod tests {
         symlink(&internal_target, &symlink_target).unwrap();
 
         assert_eq!(
-            restore_next_step(&beads_dir, &symlink_target, None, None),
+            restore_next_step(&beads_dir, &symlink_target, None, None, None),
             format!(
                 "BEADS_JSONL={} br sync --import-only --force",
                 shell_quote(&symlink_target.display().to_string())
@@ -1089,7 +1113,7 @@ mod tests {
         let custom_target = beads_dir.join("custom.jsonl");
 
         assert_eq!(
-            restore_next_step(&beads_dir, &custom_target, Some(&custom_target), None),
+            restore_next_step(&beads_dir, &custom_target, Some(&custom_target), None, None),
             "br sync --import-only --force"
         );
     }
@@ -1101,7 +1125,7 @@ mod tests {
         let legacy_target = beads_dir.join("beads.jsonl");
 
         assert_eq!(
-            restore_next_step(&beads_dir, &legacy_target, Some(&legacy_target), None),
+            restore_next_step(&beads_dir, &legacy_target, Some(&legacy_target), None, None),
             "br sync --import-only --force"
         );
     }
@@ -1113,8 +1137,33 @@ mod tests {
         let external_target = temp.path().join("external").join("issues.jsonl");
 
         assert_eq!(
-            restore_next_step(&beads_dir, &external_target, Some(&external_target), None),
+            restore_next_step(
+                &beads_dir,
+                &external_target,
+                Some(&external_target),
+                None,
+                None
+            ),
             "br sync --import-only --force --allow-external-jsonl"
+        );
+    }
+
+    #[test]
+    fn test_restore_next_step_omits_external_flag_for_external_db_family_target() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = temp.path().join("cache").join("beads.db");
+        let sibling_target = db_path.parent().unwrap().join("issues.jsonl");
+
+        assert_eq!(
+            restore_next_step(
+                &beads_dir,
+                &sibling_target,
+                Some(&sibling_target),
+                Some(&db_path),
+                None
+            ),
+            "br sync --import-only --force"
         );
     }
 
@@ -1130,6 +1179,7 @@ mod tests {
                 &beads_dir,
                 &sibling_target,
                 Some(&sibling_target),
+                Some(&db_override),
                 Some(&db_override)
             ),
             format!(
@@ -1147,7 +1197,13 @@ mod tests {
         let default_target = beads_dir.join("issues.jsonl");
 
         assert_eq!(
-            restore_next_step(&beads_dir, &custom_target, Some(&default_target), None),
+            restore_next_step(
+                &beads_dir,
+                &custom_target,
+                Some(&default_target),
+                None,
+                None
+            ),
             format!(
                 "BEADS_JSONL={} br sync --import-only --force",
                 shell_quote(&custom_target.display().to_string())
@@ -1163,7 +1219,13 @@ mod tests {
         let default_target = beads_dir.join("issues.jsonl");
 
         assert_eq!(
-            restore_next_step(&beads_dir, &external_target, Some(&default_target), None),
+            restore_next_step(
+                &beads_dir,
+                &external_target,
+                Some(&default_target),
+                None,
+                None
+            ),
             format!(
                 "BEADS_JSONL={} br sync --import-only --force --allow-external-jsonl",
                 shell_quote(&external_target.display().to_string())
@@ -1219,6 +1281,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &ctx,
         )
         .unwrap();
@@ -1267,6 +1330,7 @@ mod tests {
             &history_dir,
             &backup_name,
             true,
+            None,
             None,
             None,
             None,
@@ -1428,6 +1492,7 @@ mod tests {
             &history_dir,
             backup_name,
             true,
+            None,
             None,
             None,
             None,

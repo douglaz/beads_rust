@@ -1590,7 +1590,17 @@ pub fn resolve_paths_without_env_jsonl(
     beads_dir: &Path,
     db_override: Option<&PathBuf>,
 ) -> Result<ConfigPaths> {
-    ConfigPaths::resolve_without_env_jsonl(beads_dir, db_override)
+    let (legacy_user, user, project, env_layer) = load_startup_layers_for_paths(beads_dir)?;
+    let resolved_db_override = resolve_startup_db_override(
+        beads_dir,
+        db_override,
+        &legacy_user,
+        &user,
+        &project,
+        &env_layer,
+    );
+
+    ConfigPaths::resolve_without_env_jsonl(beads_dir, resolved_db_override.as_ref())
 }
 
 fn resolve_db_path(
@@ -1684,12 +1694,17 @@ impl ConfigLayer {
             // Remove any variant of this key that already exists under a
             // different spelling (e.g. hyphenated vs underscored).
             if canonical == *key {
+                // Key is already canonical (no hyphens) — remove any
+                // hyphenated form left by a lower-precedence layer.
                 let hyphenated = key.replace('_', "-");
                 if hyphenated != *key {
                     self.startup.remove(&hyphenated);
                 }
             } else {
+                // Key has hyphens — remove the canonical form AND the
+                // original hyphenated form that may exist from a prior merge.
                 self.startup.remove(&canonical);
+                self.startup.remove(key);
             }
             self.startup.insert(canonical, value.clone());
         }
@@ -1702,6 +1717,7 @@ impl ConfigLayer {
                 }
             } else {
                 self.runtime.remove(&canonical);
+                self.runtime.remove(key);
             }
             self.runtime.insert(canonical, value.clone());
         }
@@ -1891,17 +1907,10 @@ pub fn load_legacy_user_config() -> Result<ConfigLayer> {
 ///
 /// Returns an error if any config file cannot be read or parsed.
 pub fn load_startup_config(beads_dir: &Path) -> Result<ConfigLayer> {
-    let legacy_user = load_legacy_user_config()?;
-    let user = load_user_config()?;
-    let project = load_project_config(beads_dir)?;
-    let env_layer = ConfigLayer::from_env();
+    let (legacy_user, user, project, env_layer) = load_startup_layers_for_paths(beads_dir)?;
+    let layers = vec![legacy_user, user, project, env_layer];
 
-    Ok(ConfigLayer::merge_layers(&[
-        legacy_user,
-        user,
-        project,
-        env_layer,
-    ]))
+    Ok(ConfigLayer::merge_layers(&layers))
 }
 
 /// Default config layer (lowest precedence).
@@ -1978,22 +1987,15 @@ pub fn load_startup_config_with_paths(
     beads_dir: &Path,
     db_override: Option<&PathBuf>,
 ) -> Result<StartupConfig> {
-    let legacy_user = load_legacy_user_config()?;
-    let user = load_user_config()?;
-    let project = load_project_config(beads_dir)?;
-    let env_layer = ConfigLayer::from_env();
-
-    let resolved_db_override = db_override.cloned().or_else(|| {
-        [
-            resolve_db_override_from_layer(beads_dir, &env_layer),
-            resolve_db_override_from_layer(beads_dir, &project),
-            resolve_db_override_from_layer(beads_dir, &user),
-            resolve_db_override_from_layer(beads_dir, &legacy_user),
-        ]
-        .into_iter()
-        .flatten()
-        .next()
-    });
+    let (legacy_user, user, project, env_layer) = load_startup_layers_for_paths(beads_dir)?;
+    let resolved_db_override = resolve_startup_db_override(
+        beads_dir,
+        db_override,
+        &legacy_user,
+        &user,
+        &project,
+        &env_layer,
+    );
 
     let layers = vec![legacy_user, user, project, env_layer];
     let merged_startup = ConfigLayer::merge_layers(&layers);
@@ -2004,6 +2006,38 @@ pub fn load_startup_config_with_paths(
         paths,
         layers,
         merged_config: merged_startup,
+    })
+}
+
+fn load_startup_layers_for_paths(
+    beads_dir: &Path,
+) -> Result<(ConfigLayer, ConfigLayer, ConfigLayer, ConfigLayer)> {
+    let legacy_user = load_legacy_user_config()?;
+    let user = load_user_config()?;
+    let project = load_project_config(beads_dir)?;
+    let env_layer = ConfigLayer::from_env();
+
+    Ok((legacy_user, user, project, env_layer))
+}
+
+fn resolve_startup_db_override(
+    beads_dir: &Path,
+    cli_db_override: Option<&PathBuf>,
+    legacy_user: &ConfigLayer,
+    user: &ConfigLayer,
+    project: &ConfigLayer,
+    env_layer: &ConfigLayer,
+) -> Option<PathBuf> {
+    cli_db_override.cloned().or_else(|| {
+        [
+            resolve_db_override_from_layer(beads_dir, env_layer),
+            resolve_db_override_from_layer(beads_dir, project),
+            resolve_db_override_from_layer(beads_dir, user),
+            resolve_db_override_from_layer(beads_dir, legacy_user),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
     })
 }
 
@@ -3268,6 +3302,26 @@ labels:
         let resolved =
             resolve_jsonl_path(&beads_dir, &Metadata::default(), Some(&db_override), None);
         assert_eq!(resolved, beads_dir.join("beads.jsonl"));
+    }
+
+    #[test]
+    fn resolve_paths_without_env_jsonl_uses_project_db_override_for_jsonl_target() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let cache_dir = temp.path().join("cache");
+        let db_path = cache_dir.join("custom.db");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::write(
+            beads_dir.join("config.yaml"),
+            format!("db: {}\n", db_path.display()),
+        )
+        .expect("write project config");
+
+        let paths = resolve_paths_without_env_jsonl(&beads_dir, None).expect("paths");
+
+        assert_eq!(paths.db_path, db_path);
+        assert_eq!(paths.jsonl_path, cache_dir.join("issues.jsonl"));
     }
 
     #[test]

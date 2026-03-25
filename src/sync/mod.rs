@@ -1495,10 +1495,8 @@ pub fn export_to_jsonl_with_policy(
             issue.labels = labels;
         }
 
-        // Normalize for consistent round-trip hashing (matches import behavior)
-        normalize_issue_for_export(issue);
-
-        // Comments
+        // Comments — attach before normalization so normalize_issue_for_export
+        // can sort them for deterministic output.
         if let Some(ref map) = all_comments {
             if let Some(comments) = map.get(&issue.id) {
                 issue.comments = comments.clone();
@@ -1508,6 +1506,10 @@ pub fn export_to_jsonl_with_policy(
         {
             issue.comments = comments;
         }
+
+        // Normalize for consistent round-trip hashing (matches import behavior).
+        // Must run AFTER labels, deps, and comments are attached.
+        normalize_issue_for_export(issue);
     }
 
     // Write to temp file for atomic rename
@@ -1769,10 +1771,8 @@ pub fn export_to_writer_with_policy<W: Write>(
             issue.labels = labels;
         }
 
-        // Normalize for consistent round-trip hashing (matches import behavior)
-        normalize_issue_for_export(issue);
-
-        // Comments
+        // Comments — attach before normalization so normalize_issue_for_export
+        // can sort them for deterministic output.
         if let Some(ref map) = all_comments {
             if let Some(comments) = map.get(&issue.id) {
                 issue.comments = comments.clone();
@@ -1782,6 +1782,10 @@ pub fn export_to_writer_with_policy<W: Write>(
         {
             issue.comments = comments;
         }
+
+        // Normalize for consistent round-trip hashing (matches import behavior).
+        // Must run AFTER labels, deps, and comments are attached.
+        normalize_issue_for_export(issue);
     }
 
     let mut hasher = Sha256::new();
@@ -2928,9 +2932,6 @@ fn normalize_issue(issue: &mut Issue) {
         }
     }
 
-    // Recompute content hash
-    issue.content_hash = Some(content_hash(issue));
-
     // Wisp detection: if ID contains "-wisp-", mark as ephemeral
     if issue.id.contains("-wisp-") {
         issue.ephemeral = true;
@@ -2962,6 +2963,11 @@ fn normalize_issue(issue: &mut Issue) {
     if issue.updated_at < issue.created_at {
         issue.updated_at = issue.created_at;
     }
+
+    // Recompute content hash AFTER all normalization and repairs above,
+    // since the hash includes external_ref, ephemeral, closed_at, and
+    // updated_at — all of which may have changed.
+    issue.content_hash = Some(content_hash(issue));
 }
 
 /// Import issues from a JSONL file.

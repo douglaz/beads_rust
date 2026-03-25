@@ -230,7 +230,13 @@ impl SqliteStorage {
 
             match f(conn) {
                 Ok(result) => match conn.execute("COMMIT") {
-                    Ok(_) => return Ok(result),
+                    Ok(_) => {
+                        // Force fsqlite to refresh its memdb read snapshot so
+                        // subsequent reads on this connection see the committed
+                        // data (mirrors with_write_transaction, issue #204).
+                        let _ = conn.query("SELECT 1 FROM metadata LIMIT 1");
+                        return Ok(result);
+                    }
                     Err(e) if e.is_transient() && attempt < TX_MAX_RETRIES - 1 => {
                         if let Err(rb_err) = conn.execute("ROLLBACK") {
                             tracing::warn!(
@@ -5604,6 +5610,7 @@ impl SqliteStorage {
                    AND i.deleted_at IS NULL
                    AND (
                      i.id NOT IN (SELECT issue_id FROM export_hashes)
+                     OR i.content_hash IS NULL
                      OR i.content_hash != (SELECT e.content_hash FROM export_hashes e WHERE e.issue_id = i.id)
                    )
                  ORDER BY i.id",

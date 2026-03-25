@@ -846,15 +846,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.resolved_prefix.as_deref(), Some("jsonl"));
-        assert_eq!(
-            output
-                .config
-                .as_ref()
-                .and_then(|config| config.get("prefix"))
-                .map(String::as_str),
-            Some("dbpref"),
-            "serialized DB details remain informative even when no-db is active"
-        );
+        assert!(output.issue_count.is_none());
+        assert!(output.config.is_none());
+        assert!(output.schema.is_none());
     }
 
     #[test]

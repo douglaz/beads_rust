@@ -503,57 +503,26 @@ impl SyncSafetyValidator {
             return Ok(());
         }
 
-        // Canonicalize the beads directory
-        let canonical_beads =
-            dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
-
-        // Find the deepest existing ancestor for canonicalization
-        let mut path_to_check = path.to_path_buf();
-        while !path_to_check.exists() {
-            if let Some(parent) = path_to_check.parent() {
-                path_to_check = parent.to_path_buf();
-            } else {
-                break;
-            }
-        }
-
-        let canonical_path = dunce::canonicalize(&path_to_check).unwrap_or(path_to_check);
-
-        // Check if the closest existing ancestor is under beads_dir
-        if !canonical_path.starts_with(&canonical_beads) {
-            return Err(ValidationError::new(
-                "path",
-                format!(
-                    "path '{}' is outside allowed directory '{}' \
-                     (use --allow-external-jsonl to override)",
-                    path.display(),
-                    beads_dir.display()
-                ),
-            ));
-        }
-
-        // Additionally, lexically normalize the full path to catch any non-existent `..` escapes
-        let mut normalized = std::path::PathBuf::new();
-        for component in path.components() {
-            match component {
-                std::path::Component::ParentDir => {
-                    normalized.pop();
-                }
-                std::path::Component::CurDir => {}
-                _ => normalized.push(component),
-            }
-        }
-
-        if !normalized.starts_with(&canonical_beads) && !normalized.starts_with(beads_dir) {
-            return Err(ValidationError::new(
-                "path",
+        if crate::config::resolved_jsonl_path_is_external(beads_dir, path) {
+            let message = if path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
                 format!(
                     "path '{}' traverses outside allowed directory '{}' \
                      (use --allow-external-jsonl to override)",
                     path.display(),
                     beads_dir.display()
-                ),
-            ));
+                )
+            } else {
+                format!(
+                    "path '{}' is outside allowed directory '{}' \
+                     (use --allow-external-jsonl to override)",
+                    path.display(),
+                    beads_dir.display()
+                )
+            };
+            return Err(ValidationError::new("path", message));
         }
 
         Ok(())
@@ -583,6 +552,39 @@ mod tests {
     use super::*;
     use crate::model::{DependencyType, IssueType, Status};
     use chrono::{TimeZone, Utc};
+    use std::{
+        env,
+        path::{Path, PathBuf},
+        sync::{Mutex, MutexGuard, OnceLock},
+    };
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct DirGuard {
+        original: PathBuf,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl DirGuard {
+        fn set(path: &Path) -> Self {
+            let lock = cwd_lock().lock().expect("lock current_dir");
+            let original = env::current_dir().expect("current_dir");
+            env::set_current_dir(path).expect("set_current_dir");
+            Self {
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.original).expect("restore current_dir");
+        }
+    }
 
     fn base_issue() -> Issue {
         Issue {
@@ -1071,6 +1073,20 @@ mod tests {
         let jsonl_path = beads_dir.join("issues.jsonl");
         std::fs::write(&jsonl_path, "").unwrap();
 
+        let result = SyncSafetyValidator::validate_path_containment(&jsonl_path, &beads_dir, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sync_safety_containment_allows_missing_relative_beads_subpath() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let _guard = DirGuard::set(temp.path());
+
+        let jsonl_path = PathBuf::from(".beads/nested/issues.jsonl");
         let result = SyncSafetyValidator::validate_path_containment(&jsonl_path, &beads_dir, false);
         assert!(result.is_ok());
     }

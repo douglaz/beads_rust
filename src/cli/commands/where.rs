@@ -1,6 +1,7 @@
 //! Where command implementation.
 
 use crate::config;
+use crate::config::MAX_REDIRECT_DEPTH;
 use crate::config::routing::follow_redirects;
 use crate::error::BeadsError;
 use crate::error::Result;
@@ -59,11 +60,12 @@ fn resolve_where_output(cli: &config::CliOverrides) -> Result<Option<WhereOutput
         return Ok(None);
     };
 
-    let final_dir = follow_redirects(&source_dir, 10)?;
-    let redirected_from = if final_dir == source_dir {
+    let canonical_source_dir = canonicalize_lossy(&source_dir);
+    let final_dir = follow_redirects(&source_dir, MAX_REDIRECT_DEPTH)?;
+    let redirected_from = if final_dir == canonical_source_dir {
         None
     } else {
-        Some(canonicalize_lossy(&source_dir).display().to_string())
+        Some(canonical_source_dir.display().to_string())
     };
 
     let paths = config::resolve_paths(&final_dir, cli.db.as_ref())?;
@@ -484,6 +486,44 @@ mod tests {
                     .display()
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn resolve_where_output_does_not_report_redirect_for_noncanonical_db_override_path() {
+        let _lock = TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let project_root = temp.path().join("workspace");
+        let beads_dir = project_root.join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let cli = CliOverrides {
+            db: Some(PathBuf::from("workspace/../workspace/.beads/beads.db")),
+            ..CliOverrides::default()
+        };
+
+        let _guard = DirGuard::new(temp.path());
+        let output = resolve_where_output(&cli)
+            .expect("where output")
+            .expect("workspace output");
+
+        assert_eq!(
+            output.path,
+            canonicalize_lossy(&beads_dir).display().to_string()
+        );
+        assert_eq!(
+            output.database_path,
+            Some(
+                canonicalize_lossy(&project_root.join(".beads").join("beads.db"))
+                    .display()
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            output.redirected_from, None,
+            "path normalization alone must not be reported as a redirect"
         );
     }
 

@@ -86,30 +86,59 @@ enum BackupTarget {
     Absolute { path: String },
 }
 
+fn normalize_target_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return path.to_path_buf();
+                }
+            }
+        }
+    }
+
+    normalized
+}
+
 impl BackupTarget {
     fn from_target_path(beads_dir: &Path, target_path: &Path) -> Self {
-        if let Ok(relative) = target_path.strip_prefix(beads_dir) {
+        let normalized_beads_dir = normalize_target_path_lexically(beads_dir);
+        let normalized_target = normalize_target_path_lexically(target_path);
+
+        if let Ok(relative) = normalized_target.strip_prefix(&normalized_beads_dir) {
             return Self::Relative {
                 path: relative.to_string_lossy().into_owned(),
             };
         }
 
         Self::Absolute {
-            path: target_path.to_string_lossy().into_owned(),
+            path: normalized_target.to_string_lossy().into_owned(),
         }
     }
 
     fn resolve_path(&self, beads_dir: &Path) -> PathBuf {
         match self {
-            Self::Relative { path } => beads_dir.join(path),
-            Self::Absolute { path } => PathBuf::from(path),
+            Self::Relative { path } => normalize_target_path_lexically(&beads_dir.join(path)),
+            Self::Absolute { path } => normalize_target_path_lexically(Path::new(path)),
         }
     }
 
     fn key(&self) -> String {
         match self {
-            Self::Relative { path } => format!("relative:{path}"),
-            Self::Absolute { path } => format!("absolute:{path}"),
+            Self::Relative { path } => format!(
+                "relative:{}",
+                normalize_target_path_lexically(Path::new(path)).display()
+            ),
+            Self::Absolute { path } => format!(
+                "absolute:{}",
+                normalize_target_path_lexically(Path::new(path)).display()
+            ),
         }
     }
 }
@@ -816,6 +845,27 @@ mod tests {
     }
 
     #[test]
+    fn test_backup_before_export_deduplicates_noncanonical_internal_target_paths() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(beads_dir.join("nested")).unwrap();
+
+        let config = HistoryConfig::default();
+        let canonical_target = beads_dir.join("custom.jsonl");
+        let noncanonical_target = beads_dir.join("nested").join("..").join("custom.jsonl");
+        fs::write(&canonical_target, "same-content\n").unwrap();
+
+        backup_before_export(&beads_dir, &config, &canonical_target).unwrap();
+        backup_before_export(&beads_dir, &config, &noncanonical_target).unwrap();
+
+        let backups = list_backups(&history_dir, Some("custom.")).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].target_path, canonical_target);
+        assert_eq!(backups[0].target_key, "relative:custom.jsonl");
+    }
+
+    #[test]
     fn test_prune_backups_removes_metadata_sidecars() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -1078,6 +1128,34 @@ mod tests {
             backups[0].target_path,
             invalid_metadata_target_path(backup_name)
         );
+    }
+
+    #[test]
+    fn test_list_backups_normalizes_noncanonical_relative_metadata_targets() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+
+        let backup_name = "custom.20260307_120000.jsonl";
+        let backup_path = history_dir.join(backup_name);
+        fs::write(&backup_path, "backup\n").unwrap();
+        fs::write(
+            backup_metadata_path(&backup_path),
+            serde_json::json!({
+                "target": {
+                    "kind": "relative",
+                    "path": "nested/../custom.jsonl",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let backups = list_backups(&history_dir, None).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(backups[0].target_path, beads_dir.join("custom.jsonl"));
+        assert_eq!(backups[0].target_key, "relative:custom.jsonl");
     }
 
     #[cfg(unix)]

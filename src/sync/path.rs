@@ -148,6 +148,27 @@ fn normalize_path_lexically(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
+fn resolve_symlink_target(link_path: &Path, target: &Path) -> PathBuf {
+    let resolved_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link_path
+            .parent()
+            .map_or_else(|| target.to_path_buf(), |parent| parent.join(target))
+    };
+
+    dunce::canonicalize(&resolved_target)
+        .or_else(|_| {
+            normalize_path_lexically(&resolved_target).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "symlink target escapes lexical root",
+                )
+            })
+        })
+        .unwrap_or(resolved_target)
+}
+
 /// Validates that a path does not target git internals.
 ///
 /// This is a hard safety invariant: sync operations NEVER access `.git/` directories.
@@ -324,15 +345,15 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     if normalized_path.is_symlink()
         && let Ok(target) = std::fs::read_link(&normalized_path)
     {
-        let canonical_target = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
-        if !canonical_target.starts_with(&canonical_beads) {
+        let resolved_target = resolve_symlink_target(&normalized_path, &target);
+        if !resolved_target.starts_with(&canonical_beads) {
             let result = PathValidation::SymlinkEscape {
                 path: path.to_path_buf(),
-                target: canonical_target,
+                target: resolved_target.clone(),
             };
             warn!(
                 path = %path.display(),
-                target = %target.display(),
+                target = %resolved_target.display(),
                 "Symlink escape detected"
             );
             return result;
@@ -469,23 +490,13 @@ pub fn require_valid_sync_path(path: &Path, beads_dir: &Path) -> Result<()> {
     }
 }
 
-/// Checks if a path would be allowed for sync without logging.
+/// Checks if a path would be allowed for sync.
 ///
-/// This is useful for preflight checks where we want to validate paths
-/// before attempting operations.
+/// This shares the same safety rules as [`validate_sync_path`] while returning
+/// a simple boolean for preflight-style callers.
 #[must_use]
 pub fn is_sync_path_allowed(path: &Path, beads_dir: &Path) -> bool {
-    let Some(normalized_path) = normalize_path_lexically(path) else {
-        return false;
-    };
-
-    // Check if path is under beads_dir and has allowed extension
-    if normalized_path.starts_with(beads_dir) {
-        return validate_extension_and_name(&normalized_path).is_allowed();
-    }
-
-    // Full validation for edge cases
-    validate_sync_path(&normalized_path, beads_dir).is_allowed()
+    validate_sync_path(path, beads_dir).is_allowed()
 }
 
 /// Validates a path for sync operations with optional external path support.
@@ -967,6 +978,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_is_sync_path_allowed_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let outside_target = temp.path().join("secret.jsonl");
+        std::fs::write(&outside_target, "{\"secret\":true}\n").expect("write");
+
+        let symlink_path = beads_dir.join("issues.jsonl");
+        symlink(&outside_target, &symlink_path).expect("create symlink");
+
+        assert!(
+            !is_sync_path_allowed(&symlink_path, &beads_dir),
+            "Boolean preflight helper must reject symlink escapes too"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_symlink_escape_rejected() {
         use std::os::unix::fs::symlink;
 
@@ -1035,6 +1067,28 @@ mod tests {
                 .to_string()
                 .contains("must not be a symlink"),
             "Error should explain why the external path was rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_path_does_not_misclassify_relative_internal_symlink_as_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let target = beads_dir.join("issues.jsonl");
+        std::fs::write(&target, "{}").expect("write target");
+
+        let symlink_path = beads_dir.join("alias.jsonl");
+        symlink("issues.jsonl", &symlink_path).expect("create relative symlink");
+
+        let result = validate_sync_path(&symlink_path, &beads_dir);
+        assert!(
+            matches!(result, PathValidation::NonRegularFile { .. }),
+            "Relative symlinks that stay within .beads should not be reported as escapes"
         );
     }
 

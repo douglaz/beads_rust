@@ -99,8 +99,7 @@ pub fn execute_with_storage_ctx(
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<()> {
     let storage = &storage_ctx.storage;
-    let repo_root = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
-        .or_else(|| git_repo_root_for_path(beads_dir));
+    let repo_root = resolve_repo_root(beads_dir, &storage_ctx.paths.jsonl_path);
 
     let (since_dt, since_label) = resolve_since(args, repo_root.as_deref())?;
     let until = Utc::now();
@@ -455,10 +454,16 @@ fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+fn resolve_repo_root(beads_dir: &Path, jsonl_path: &Path) -> Option<PathBuf> {
+    git_repo_root_for_path(beads_dir).or_else(|| git_repo_root_for_path(jsonl_path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone};
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_resolve_since_rfc3339() {
@@ -651,8 +656,6 @@ mod tests {
 
     #[test]
     fn test_git_tag_date_errors_for_missing_tag_even_if_branch_exists() {
-        use std::fs;
-
         let temp = tempfile::TempDir::new().unwrap();
         let repo_root = temp.path().join("missing-tag-repo");
         fs::create_dir_all(&repo_root).unwrap();
@@ -673,6 +676,53 @@ mod tests {
                 .contains("Failed to resolve git tag: release"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_resolve_repo_root_prefers_workspace_repo_over_external_jsonl_repo() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        let external = TempDir::new().expect("external tempdir");
+        let beads_dir = workspace.path().join(".beads");
+        let external_jsonl = external.path().join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&external_jsonl, "{}\n").expect("write external jsonl");
+
+        let workspace_init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .output()
+            .expect("git init workspace");
+        assert!(workspace_init.status.success(), "workspace git init failed");
+
+        let external_init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(external.path())
+            .output()
+            .expect("git init external");
+        assert!(external_init.status.success(), "external git init failed");
+
+        let repo_root = resolve_repo_root(&beads_dir, &external_jsonl).expect("repo root");
+        assert_eq!(repo_root, workspace.path());
+    }
+
+    #[test]
+    fn test_resolve_repo_root_falls_back_to_jsonl_repo_when_workspace_has_no_git() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        let external = TempDir::new().expect("external tempdir");
+        let beads_dir = workspace.path().join(".beads");
+        let external_jsonl = external.path().join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&external_jsonl, "{}\n").expect("write external jsonl");
+
+        let external_init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(external.path())
+            .output()
+            .expect("git init external");
+        assert!(external_init.status.success(), "external git init failed");
+
+        let repo_root = resolve_repo_root(&beads_dir, &external_jsonl).expect("repo root");
+        assert_eq!(repo_root, external.path());
     }
 
     #[test]

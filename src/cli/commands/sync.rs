@@ -18,7 +18,7 @@ use crate::sync::{
     load_base_snapshot, read_issues_from_jsonl, require_safe_sync_overwrite_path,
     save_base_snapshot, three_way_merge, validate_sync_path_with_external,
 };
-use crate::util::id::split_prefix_remainder;
+use crate::util::id::{DEFAULT_ID_PREFIX, split_prefix_remainder};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -213,7 +213,7 @@ fn validate_sync_paths(
         )));
     }
 
-    let is_external = !jsonl_path.starts_with(&canonical_beads);
+    let is_external = config::resolved_jsonl_path_is_external(&canonical_beads, &jsonl_path);
     if is_external && !allow_external_jsonl {
         warn!(
             path = %jsonl_path.display(),
@@ -947,7 +947,7 @@ fn execute_import(
     let target_prefix = if args.rename_prefix {
         let layer = config::load_config(beads_dir, Some(storage), cli)?;
         let id_cfg = config::id_config_from_layer(&layer);
-        Some(if id_cfg.prefix == "br" {
+        Some(if id_cfg.prefix == DEFAULT_ID_PREFIX {
             // Prefix is still the default — check if we should auto-detect from JSONL
             let db_prefix = storage.get_config("issue_prefix")?;
             if let Some(p) = db_prefix {
@@ -958,7 +958,7 @@ fn execute_import(
                 storage.set_config("issue_prefix", &detected)?;
                 detected
             } else {
-                "br".to_string()
+                DEFAULT_ID_PREFIX.to_string()
             }
         } else {
             // Config layer resolved a non-default prefix — use it
@@ -1296,14 +1296,6 @@ fn execute_merge(
         }
     }
 
-    // Save Base Snapshot
-    let new_base: HashMap<_, _> = report
-        .kept
-        .iter()
-        .map(|i| (i.id.clone(), i.clone()))
-        .collect();
-    save_base_snapshot(&new_base, beads_dir)?;
-
     // Force Export to update JSONL (ensure sync)
     info!(path = %jsonl_path.display(), "Writing merged issues.jsonl");
     let export_config = ExportConfig {
@@ -1324,6 +1316,10 @@ fn execute_merge(
         Some(&export_result.issue_hashes),
         jsonl_path,
     )?;
+
+    // Snapshot the finalized exported state so the next merge uses the
+    // exact post-merge baseline, including merge-note comments.
+    save_base_snapshot_from_exported_jsonl(jsonl_path, beads_dir)?;
 
     // Output success message
     if use_json {
@@ -1354,6 +1350,27 @@ fn execute_merge(
     }
 
     Ok(())
+}
+
+fn save_base_snapshot_from_exported_jsonl(jsonl_path: &Path, beads_dir: &Path) -> Result<()> {
+    let exported_issues: HashMap<_, _> = read_issues_from_jsonl(jsonl_path)
+        .map_err(|source| BeadsError::WithContext {
+            context: format!(
+                "merge export succeeded, but reloading exported JSONL '{}' for base snapshot failed",
+                jsonl_path.display()
+            ),
+            source: Box::new(source),
+        })?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    save_base_snapshot(&exported_issues, beads_dir).map_err(|source| BeadsError::WithContext {
+        context: format!(
+            "merge export succeeded, but saving the refreshed base snapshot under '{}' failed",
+            beads_dir.display()
+        ),
+        source: Box::new(source),
+    })
 }
 
 fn apply_merge_report(
@@ -1531,11 +1548,16 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 #[cfg(test)]
 mod tests {
     use super::{apply_merge_report, detect_prefix_from_jsonl, validate_sync_paths};
+    use crate::config::CliOverrides;
     use crate::error::BeadsError;
     use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
+    use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
-    use crate::sync::MergeReport;
+    use crate::sync::{
+        MergeReport, load_base_snapshot, read_issues_from_jsonl, save_base_snapshot,
+    };
     use chrono::Utc;
+    use std::collections::HashMap;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1682,6 +1704,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_validate_sync_paths_allows_symlinked_internal_jsonl_without_opt_in() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let internal_target = beads_dir.join("issues.jsonl");
+        fs::write(&internal_target, "{}\n").unwrap();
+
+        let symlink_path = temp.path().join("linked.jsonl");
+        symlink(&internal_target, &symlink_path).unwrap();
+
+        let policy = validate_sync_paths(&beads_dir, &symlink_path, false).expect("path policy");
+
+        assert_eq!(policy.jsonl_path, symlink_path);
+        assert!(!policy.is_external);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_validate_sync_paths_rejects_git_symlinked_jsonl_even_with_opt_in() {
         use std::os::unix::fs::symlink;
 
@@ -1767,6 +1810,92 @@ mod tests {
         assert!(
             storage.get_issue("bd-new").unwrap().is_none(),
             "failed merge must not leave a partially imported issue behind"
+        );
+    }
+
+    #[test]
+    fn test_execute_merge_saves_base_snapshot_from_final_exported_state() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let path_policy = validate_sync_paths(&beads_dir, &jsonl_path, false).unwrap();
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let mut base_issue = make_test_issue("bd-001", "Base Title");
+        base_issue.created_at = Utc::now() - chrono::Duration::minutes(5);
+        base_issue.updated_at = base_issue.created_at;
+
+        let mut local_issue = base_issue.clone();
+        local_issue.title = "Local Modified".to_string();
+        local_issue.updated_at = base_issue.updated_at + chrono::Duration::minutes(1);
+        storage.create_issue(&local_issue, "test").unwrap();
+
+        let mut base_snapshot = HashMap::new();
+        base_snapshot.insert(base_issue.id.clone(), base_issue.clone());
+        save_base_snapshot(&base_snapshot, &beads_dir).unwrap();
+
+        let mut external_issue = base_issue.clone();
+        external_issue.title = "External Modified".to_string();
+        external_issue.updated_at = base_issue.updated_at + chrono::Duration::minutes(2);
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&external_issue).unwrap()),
+        )
+        .unwrap();
+
+        let args = crate::cli::SyncArgs {
+            flush_only: false,
+            import_only: false,
+            merge: true,
+            status: false,
+            force: false,
+            allow_external_jsonl: false,
+            manifest: false,
+            error_policy: None,
+            orphans: None,
+            rename_prefix: false,
+            rebuild: false,
+            robot: false,
+        };
+        let ctx = OutputContext::from_flags(false, true, false);
+        let cli = CliOverrides {
+            quiet: Some(true),
+            ..CliOverrides::default()
+        };
+
+        super::execute_merge(
+            &mut storage,
+            &path_policy,
+            &args,
+            false,
+            false,
+            None,
+            &cli,
+            &ctx,
+        )
+        .unwrap();
+
+        let exported_issue = read_issues_from_jsonl(&jsonl_path)
+            .unwrap()
+            .into_iter()
+            .find(|issue| issue.id == "bd-001")
+            .expect("merged issue should be exported");
+        assert_eq!(exported_issue.comments.len(), 1);
+        assert_eq!(exported_issue.comments[0].author, "br-sync");
+        assert!(
+            exported_issue.comments[0].body.contains("Both modified"),
+            "merge note should be exported"
+        );
+
+        let base_snapshot = load_base_snapshot(&beads_dir).unwrap();
+        let snapshot_issue = base_snapshot
+            .get("bd-001")
+            .expect("merged issue should exist in saved base snapshot");
+        assert_eq!(
+            snapshot_issue.comments, exported_issue.comments,
+            "base snapshot must reflect the finalized exported state"
         );
     }
 }

@@ -122,9 +122,7 @@ fn execute_inner(
     let config_layer = storage_ctx.load_config(cli)?;
     let prefix = config::id_config_from_layer(&config_layer).prefix;
     let render_mode = resolve_render_mode(json, ctx.mode());
-    let Some(repo_root) = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
-        .or_else(|| git_repo_root_for_path(beads_dir))
-    else {
+    let Some(repo_root) = resolve_repo_root(beads_dir, &storage_ctx.paths.jsonl_path) else {
         output_empty(render_mode, ctx);
         return Ok(());
     };
@@ -324,6 +322,10 @@ fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(root))
     }
+}
+
+fn resolve_repo_root(beads_dir: &Path, jsonl_path: &Path) -> Option<PathBuf> {
+    git_repo_root_for_path(beads_dir).or_else(|| git_repo_root_for_path(jsonl_path))
 }
 
 /// Get git commit references containing issue IDs.
@@ -605,5 +607,36 @@ ccc Oldest (bd-1)";
             resolve_render_mode(false, OutputMode::Quiet),
             OrphanRenderMode::Quiet
         );
+    }
+
+    #[test]
+    fn test_resolve_repo_root_prefers_workspace_repo_over_external_jsonl_repo() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        let external = TempDir::new().expect("external tempdir");
+        let beads_dir = workspace.path().join(".beads");
+        let external_jsonl = external.path().join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&external_jsonl, "{}\n").expect("write external jsonl");
+
+        git(workspace.path(), &["init", "-q"]);
+        git(external.path(), &["init", "-q"]);
+
+        let repo_root = resolve_repo_root(&beads_dir, &external_jsonl).expect("repo root");
+        assert_eq!(repo_root, workspace.path());
+    }
+
+    #[test]
+    fn test_resolve_repo_root_falls_back_to_jsonl_repo_when_workspace_has_no_git() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        let external = TempDir::new().expect("external tempdir");
+        let beads_dir = workspace.path().join(".beads");
+        let external_jsonl = external.path().join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&external_jsonl, "{}\n").expect("write external jsonl");
+
+        git(external.path(), &["init", "-q"]);
+
+        let repo_root = resolve_repo_root(&beads_dir, &external_jsonl).expect("repo root");
+        assert_eq!(repo_root, external.path());
     }
 }

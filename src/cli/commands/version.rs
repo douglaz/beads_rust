@@ -3,7 +3,6 @@
 use crate::cli::VersionArgs;
 use crate::error::Result;
 use crate::output::{OutputContext, OutputMode};
-use crate::{REPO_NAME, REPO_OWNER};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::fmt::Write as _;
@@ -218,7 +217,7 @@ fn render_version_rich(
 /// - 2: Error checking for updates
 fn execute_update_check(current_version: &str, ctx: &OutputContext) {
     // Try to fetch latest version from GitHub releases
-    let latest = match fetch_latest_version() {
+    let latest = match fetch_latest_version(current_version) {
         Ok(v) => v,
         Err(e) => {
             if ctx.is_toon() {
@@ -276,43 +275,18 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) {
 }
 
 /// Fetch the latest release version from GitHub.
-fn fetch_latest_version() -> Result<String> {
-    use std::io::Read;
+#[cfg(feature = "self_update")]
+fn fetch_latest_version(current_version: &str) -> Result<String> {
+    super::upgrade::fetch_latest_release_version(current_version)
+}
 
-    // Use GitHub API to get latest release
-    let url = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
-
-    // Build request with User-Agent (required by GitHub)
-    let mut handle = std::process::Command::new("curl")
-        .args(["-sS", "-H", "User-Agent: br-cli", &url])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn curl: {e}"))?;
-
-    let mut output = String::new();
-    if let Some(ref mut stdout) = handle.stdout {
-        stdout.read_to_string(&mut output)?;
-    }
-
-    let status = handle.wait()?;
-    if !status.success() {
-        return Err(anyhow::anyhow!("curl failed with status {status}").into());
-    }
-
-    // Parse JSON response
-    let json: serde_json::Value = serde_json::from_str(&output)
-        .map_err(|e| anyhow::anyhow!("Failed to parse GitHub response: {e}"))?;
-
-    // Extract tag_name (e.g., "v0.1.7")
-    let tag = json
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No tag_name in GitHub response"))?;
-
-    // Strip leading "v" if present
-    let version = tag.strip_prefix('v').unwrap_or(tag);
-    Ok(version.to_string())
+/// Fetch the latest release version from GitHub.
+#[cfg(not(feature = "self_update"))]
+fn fetch_latest_version(_current_version: &str) -> Result<String> {
+    Err(anyhow::anyhow!(
+        "update checks require the `self_update` feature; this build does not include it"
+    )
+    .into())
 }
 
 #[cfg(test)]

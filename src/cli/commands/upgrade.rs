@@ -263,6 +263,19 @@ fn resolve_auth_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// Fetch the latest GitHub release version for this crate.
+pub(crate) fn fetch_latest_release_version(current_version: &str) -> Result<String> {
+    let updater = build_updater(current_version)?;
+    let latest = updater.get_latest_release().map_err(map_update_error)?;
+    Ok(normalize_release_version_tag(&latest.version).to_string())
+}
+
+/// Normalize a GitHub release tag or version string to plain semver text.
+pub(crate) fn normalize_release_version_tag(tag: &str) -> &str {
+    let trimmed = tag.trim();
+    trimmed.strip_prefix('v').unwrap_or(trimmed)
+}
+
 /// Map the Rust target triple to the asset name fragment used in GitHub releases.
 ///
 /// Release assets follow the pattern `br-v{VERSION}-{platform}_{arch}.tar.gz`
@@ -543,5 +556,12 @@ mod tests {
     fn test_version_more_parts() {
         assert!(version_newer("0.1.0.1", "0.1.0"));
         assert!(!version_newer("0.1.0", "0.1.0.1"));
+    }
+
+    #[test]
+    fn test_normalize_release_version_tag_strips_v_prefix_and_whitespace() {
+        assert_eq!(normalize_release_version_tag("v0.2.0"), "0.2.0");
+        assert_eq!(normalize_release_version_tag("  v1.4.3  "), "1.4.3");
+        assert_eq!(normalize_release_version_tag("2.0.0"), "2.0.0");
     }
 }

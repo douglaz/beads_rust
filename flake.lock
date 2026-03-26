@@ -54,6 +54,22 @@
         "type": "github"
       }
     },
+    "frankensqlite": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1774548934,
+        "narHash": "sha256-SyREa39vwGMIguRnUzXRTDNLHyiOTVez+KwbcxNnMtQ=",
+        "owner": "Dicklesworthstone",
+        "repo": "frankensqlite",
+        "rev": "4c02c82fb20c52603167c0c64defdda7f7af2ec3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Dicklesworthstone",
+        "repo": "frankensqlite",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1774386573,
@@ -75,6 +91,7 @@
         "crane": "crane",
         "fenix": "fenix",
         "flake-utils": "flake-utils",
+        "frankensqlite": "frankensqlite",
         "nixpkgs": "nixpkgs",
         "toon_rust": "toon_rust"
       }

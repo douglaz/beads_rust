@@ -51,17 +51,30 @@
     ] (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        isLinux = pkgs.stdenv.isLinux;
+
+        # For static musl builds on Linux
+        muslTarget = {
+          "x86_64-linux" = "x86_64-unknown-linux-musl";
+          "aarch64-linux" = "aarch64-unknown-linux-musl";
+        }.${system} or null;
+
+        # Cross-compilation pkgs for musl target (provides static C libs)
+        muslPkgs = if isLinux then pkgs.pkgsCross.musl64 else null;
 
         # Stable Rust toolchain via fenix (edition 2024 is stable since 1.85)
         fenixPkgs = fenix.packages.${system};
-        rustToolchain = fenixPkgs.combine [
+        rustToolchain = fenixPkgs.combine ([
           fenixPkgs.stable.cargo
           fenixPkgs.stable.rustc
           fenixPkgs.stable.rust-src
           fenixPkgs.stable.clippy
           fenixPkgs.stable.rustfmt
-        ];
+        ] ++ pkgs.lib.optionals (muslTarget != null) [
+          fenixPkgs.targets.${muslTarget}.stable.rust-std
+        ]);
 
+        # Use host pkgs for crane (build scripts run on host)
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         # Filter source to include only what's needed for the build
@@ -116,17 +129,27 @@
             pkg-config
           ];
 
-          buildInputs = with pkgs; [
-            openssl
-          ] ++ lib.optionals stdenv.isDarwin [
-            darwin.apple_sdk.frameworks.Security
-            darwin.apple_sdk.frameworks.SystemConfiguration
-            darwin.apple_sdk.frameworks.CoreFoundation
-            libiconv
-          ];
+          buildInputs =
+            if isLinux then [
+              muslPkgs.openssl.dev
+              muslPkgs.openssl.out
+            ] else with pkgs; [
+              openssl
+              darwin.apple_sdk.frameworks.Security
+              darwin.apple_sdk.frameworks.SystemConfiguration
+              darwin.apple_sdk.frameworks.CoreFoundation
+              libiconv
+            ];
 
           # OpenSSL configuration
           OPENSSL_NO_VENDOR = "1";
+          OPENSSL_STATIC = if isLinux then "1" else "";
+        } // pkgs.lib.optionalAttrs isLinux {
+          # Static musl build on Linux
+          CARGO_BUILD_TARGET = muslTarget;
+          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static -C linker=${muslPkgs.stdenv.cc}/bin/${muslPkgs.stdenv.cc.targetPrefix}cc";
+          # Point pkg-config at musl OpenSSL
+          PKG_CONFIG_PATH = "${muslPkgs.openssl.dev}/lib/pkgconfig";
         };
 
         # Build only dependencies (cached between builds)

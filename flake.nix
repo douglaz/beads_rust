@@ -11,7 +11,7 @@
 #
 # The flake uses:
 #   - crane: Incremental Rust builds with dependency caching
-#   - fenix: Nightly Rust toolchain (required for edition 2024)
+#   - fenix: Stable Rust toolchain (edition 2024 is stable since 1.85)
 #   - flake-utils: Multi-system support
 #
 {
@@ -29,15 +29,20 @@
 
     flake-utils.url = "github:numtide/flake-utils";
 
-    # Sibling dependency: toon_rust
-    # Fetched from GitHub since Nix flakes cannot use relative path dependencies
+    # Sibling dependencies fetched from GitHub since Nix flakes
+    # cannot use relative path dependencies
     toon_rust = {
       url = "github:Dicklesworthstone/toon_rust";
       flake = false;
     };
+
+    frankensqlite = {
+      url = "github:Dicklesworthstone/frankensqlite";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, crane, fenix, flake-utils, toon_rust, ... }:
+  outputs = { self, nixpkgs, crane, fenix, flake-utils, toon_rust, frankensqlite, ... }:
     flake-utils.lib.eachSystem [
       "x86_64-linux"
       "aarch64-linux"
@@ -47,14 +52,14 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # Nightly Rust toolchain via fenix (required for Rust edition 2024)
+        # Stable Rust toolchain via fenix (edition 2024 is stable since 1.85)
         fenixPkgs = fenix.packages.${system};
         rustToolchain = fenixPkgs.combine [
-          fenixPkgs.latest.cargo
-          fenixPkgs.latest.rustc
-          fenixPkgs.latest.rust-src
-          fenixPkgs.latest.clippy
-          fenixPkgs.latest.rustfmt
+          fenixPkgs.stable.cargo
+          fenixPkgs.stable.rustc
+          fenixPkgs.stable.rust-src
+          fenixPkgs.stable.clippy
+          fenixPkgs.stable.rustfmt
         ];
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -66,10 +71,10 @@
           || builtins.match ".*\\.rs$" path != null
           || builtins.match ".*\\.sql$" path != null;
 
-        # Combined source tree with beads_rust and toon_rust
-        # Required because Cargo.toml references path = "../toon_rust"
+        # Combined source tree with beads_rust and sibling dependencies
+        # Required because Cargo.toml uses path = "../toon_rust" and "../frankensqlite"
         combinedSrc = pkgs.runCommand "beads_rust-src" { } ''
-          mkdir -p $out/beads_rust $out/toon_rust
+          mkdir -p $out/beads_rust $out/toon_rust $out/frankensqlite
 
           # Copy beads_rust
           cp ${./Cargo.toml} $out/beads_rust/Cargo.toml
@@ -81,16 +86,23 @@
           ${pkgs.lib.optionalString (builtins.pathExists ./benches) "cp -r ${./benches} $out/beads_rust/benches"}
           ${pkgs.lib.optionalString (builtins.pathExists ./tests) "cp -r ${./tests} $out/beads_rust/tests"}
 
-          # Copy toon_rust dependency
+          # Copy sibling dependencies
           cp -r ${toon_rust}/* $out/toon_rust/
+          cp -r ${frankensqlite}/* $out/frankensqlite/
         '';
+
+        # Vendor dependencies using the local Cargo.lock directly,
+        # since combinedSrc nests it under beads_rust/ where crane can't find it
+        cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
 
         # Common arguments shared between dependency and final builds
         commonArgs = {
           src = combinedSrc;
+          inherit cargoVendorDir;
+          cargoLock = ./Cargo.lock;
 
           pname = "beads_rust";
-          version = "0.1.20";
+          version = "0.1.34";
 
           strictDeps = true;
 
@@ -188,6 +200,7 @@
 
           fmt = craneLib.cargoFmt {
             src = combinedSrc;
+            inherit cargoVendorDir;
             postUnpack = ''
               cd $sourceRoot/beads_rust
               sourceRoot=$PWD

@@ -85,12 +85,17 @@
           cp -r ${toon_rust}/* $out/toon_rust/
         '';
 
+        # Vendor dependencies using the local Cargo.lock directly,
+        # since combinedSrc nests it under beads_rust/ where crane can't find it
+        cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
+
         # Common arguments shared between dependency and final builds
         commonArgs = {
           src = combinedSrc;
+          inherit cargoVendorDir;
 
           pname = "beads_rust";
-          version = "0.1.20";
+          version = "0.1.34";
 
           strictDeps = true;
 
@@ -188,6 +193,7 @@
 
           fmt = craneLib.cargoFmt {
             src = combinedSrc;
+            inherit cargoVendorDir;
             postUnpack = ''
               cd $sourceRoot/beads_rust
               sourceRoot=$PWD

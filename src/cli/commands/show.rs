@@ -7,7 +7,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueDetails, IssueWithDependencyMetadata, format_priority_label, format_status_icon_colored,
 };
-use crate::model::{Dependency, Issue, Priority, Status};
+use crate::model::{Dependency, Issue, IssueType, Priority, Status};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::sync::read_issues_from_jsonl;
@@ -789,8 +789,13 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     if let Some(ac) = &issue.acceptance_criteria
         && !ac.is_empty()
     {
+        let criteria_label = if issue.issue_type == IssueType::Epic {
+            "Success Criteria"
+        } else {
+            "Acceptance Criteria"
+        };
         output.push('\n');
-        let _ = writeln!(output, "Acceptance Criteria:");
+        let _ = writeln!(output, "{criteria_label}:");
         let _ = writeln!(output, "{ac}");
     }
 
@@ -1098,6 +1103,30 @@ mod tests {
         assert!(output.contains("Comments:"));
         assert!(output.contains("alice: Looks good"));
         info!("test_show_text_includes_dependencies_and_comments: assertions passed");
+    }
+
+    #[test]
+    fn test_show_text_uses_success_criteria_label_for_epics() {
+        init_logging();
+        info!("test_show_text_uses_success_criteria_label_for_epics: starting");
+        let mut issue = make_test_issue("bd-epic", "Epic");
+        issue.issue_type = IssueType::Epic;
+        issue.description = None;
+        issue.acceptance_criteria = Some("Ship the initiative".to_string());
+        let details = IssueDetails {
+            issue,
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            dependents: Vec::new(),
+            comments: Vec::new(),
+            events: Vec::new(),
+            parent: None,
+        };
+
+        let output = format_issue_details(&details, false);
+        assert!(output.contains("Success Criteria:"));
+        assert!(!output.contains("Acceptance Criteria:"));
+        info!("test_show_text_uses_success_criteria_label_for_epics: assertions passed");
     }
 
     #[test]

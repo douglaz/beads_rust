@@ -57,27 +57,32 @@ struct RequiredSection {
     heading: &'static str,
     #[allow(dead_code)] // Kept for future use in suggestions
     hint: &'static str,
+    allow_structured_criteria: bool,
 }
 
 const BUG_SECTIONS: [RequiredSection; 2] = [
     RequiredSection {
         heading: "## Steps to Reproduce",
         hint: "Describe how to reproduce the bug",
+        allow_structured_criteria: false,
     },
     RequiredSection {
         heading: "## Acceptance Criteria",
         hint: "Define criteria to verify the fix",
+        allow_structured_criteria: true,
     },
 ];
 
 const TASK_SECTIONS: [RequiredSection; 1] = [RequiredSection {
     heading: "## Acceptance Criteria",
     hint: "Define criteria to verify completion",
+    allow_structured_criteria: true,
 }];
 
 const EPIC_SECTIONS: [RequiredSection; 1] = [RequiredSection {
     heading: "## Success Criteria",
     hint: "Define high-level success criteria",
+    allow_structured_criteria: true,
 }];
 
 /// Execute the lint command.
@@ -369,8 +374,7 @@ fn lint_issue(issue: &Issue) -> Option<LintResult> {
         return None;
     }
 
-    let description = issue.description.as_deref().unwrap_or("");
-    let missing = missing_sections(description, required);
+    let missing = missing_sections(issue, required);
     if missing.is_empty() {
         return None;
     }
@@ -393,11 +397,14 @@ const fn required_sections(issue_type: &IssueType) -> &'static [RequiredSection]
     }
 }
 
-fn missing_sections(description: &str, required: &[RequiredSection]) -> Vec<RequiredSection> {
-    let desc_lower = description.to_lowercase();
+fn missing_sections(issue: &Issue, required: &[RequiredSection]) -> Vec<RequiredSection> {
+    let desc_lower = issue.description.as_deref().unwrap_or("").to_lowercase();
     let mut missing = Vec::new();
 
     for section in required {
+        if section.allow_structured_criteria && has_structured_criteria(issue) {
+            continue;
+        }
         let heading_text = strip_heading_prefix(section.heading);
         let heading_lower = heading_text.to_lowercase();
         if !desc_lower.contains(&heading_lower) {
@@ -406,6 +413,13 @@ fn missing_sections(description: &str, required: &[RequiredSection]) -> Vec<Requ
     }
 
     missing
+}
+
+fn has_structured_criteria(issue: &Issue) -> bool {
+    issue
+        .acceptance_criteria
+        .as_deref()
+        .is_some_and(|criteria| !criteria.trim().is_empty())
 }
 
 fn strip_heading_prefix(heading: &str) -> &str {
@@ -421,14 +435,18 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    fn make_issue(issue_type: IssueType, description: Option<&str>) -> Issue {
+    fn make_issue(
+        issue_type: IssueType,
+        description: Option<&str>,
+        acceptance_criteria: Option<&str>,
+    ) -> Issue {
         Issue {
             id: "bd-123".to_string(),
             content_hash: None,
             title: "Sample".to_string(),
             description: description.map(str::to_string),
             design: None,
-            acceptance_criteria: None,
+            acceptance_criteria: acceptance_criteria.map(str::to_string),
             notes: None,
             status: Status::Open,
             priority: crate::model::Priority::MEDIUM,
@@ -467,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_missing_sections_for_bug() {
-        let issue = make_issue(IssueType::Bug, Some("Bug report"));
+        let issue = make_issue(IssueType::Bug, Some("Bug report"), None);
         let result = lint_issue(&issue).expect("lint result");
         assert_eq!(result.warnings, 2);
         assert!(
@@ -485,15 +503,42 @@ mod tests {
     #[test]
     fn test_required_sections_present_case_insensitive() {
         let description = "## steps to reproduce\n- foo\n# acceptance criteria\n- bar";
-        let issue = make_issue(IssueType::Bug, Some(description));
+        let issue = make_issue(IssueType::Bug, Some(description), None);
         assert!(lint_issue(&issue).is_none());
     }
 
     #[test]
     fn test_exit_code_behavior() {
-        let issue = make_issue(IssueType::Task, Some("No criteria"));
+        let issue = make_issue(IssueType::Task, Some("No criteria"), None);
         let summary = lint_issues(&[issue]);
         assert_eq!(summary.exit_code(true), 0);
         assert_eq!(summary.exit_code(false), 1);
+    }
+
+    #[test]
+    fn test_task_structured_acceptance_criteria_satisfies_lint() {
+        let issue = make_issue(IssueType::Task, Some("Task body"), Some("- Done"));
+        assert!(lint_issue(&issue).is_none());
+    }
+
+    #[test]
+    fn test_bug_structured_acceptance_criteria_still_requires_steps() {
+        let issue = make_issue(IssueType::Bug, Some("Bug body"), Some("- Fixed"));
+        let result = lint_issue(&issue).expect("lint result");
+        assert_eq!(result.warnings, 1);
+        assert_eq!(result.missing, vec!["## Steps to Reproduce".to_string()]);
+    }
+
+    #[test]
+    fn test_epic_structured_acceptance_criteria_satisfies_success_criteria() {
+        let issue = make_issue(IssueType::Epic, Some("Epic body"), Some("- Ship it"));
+        assert!(lint_issue(&issue).is_none());
+    }
+
+    #[test]
+    fn test_blank_structured_acceptance_criteria_does_not_satisfy_requirement() {
+        let issue = make_issue(IssueType::Task, Some("Task body"), Some("   "));
+        let result = lint_issue(&issue).expect("lint result");
+        assert_eq!(result.missing, vec!["## Acceptance Criteria".to_string()]);
     }
 }

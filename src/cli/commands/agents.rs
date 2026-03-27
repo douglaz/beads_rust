@@ -39,6 +39,8 @@ This project uses [beads_rust]({repo_url}) (`br`/`bd`) for issue tracking. Issue
 
 ### Essential Commands
 
+Most subcommands accept multiple issue IDs in a single invocation.
+
 ```bash
 # View ready issues (open, unblocked, not deferred)
 br ready              # or: bd ready
@@ -46,6 +48,7 @@ br ready              # or: bd ready
 # List and search
 br list --status=open # All open issues
 br show <id>          # Full issue details with dependencies
+br show <id1> <id2>   # Show multiple issues at once
 br search "keyword"   # Full-text search
 
 # Create and update
@@ -53,6 +56,8 @@ br create --title="..." --description="..." --type=task --priority=2
 br update <id> --status=in_progress
 br close <id> --reason="Completed"
 br close <id1> <id2>  # Close multiple issues at once
+br reopen <id1> <id2> # Reopen multiple issues at once
+br delete <id1> <id2> # Delete multiple issues at once
 
 # Sync with git
 br sync --flush-only  # Export DB to JSONL

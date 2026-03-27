@@ -742,6 +742,8 @@ This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) 
 
 ### Essential Commands
 
+Most subcommands accept multiple issue IDs in a single invocation.
+
 ```bash
 # View issues (launches TUI - avoid in automated sessions)
 bv
@@ -750,10 +752,13 @@ bv
 br ready              # Show issues ready to work (no blockers)
 br list --status=open # All open issues
 br show <id>          # Full issue details with dependencies
+br show <id1> <id2>   # Show multiple issues at once
 br create --title="..." --type=task --priority=2
 br update <id> --status=in_progress
 br close <id> --reason "Completed"
 br close <id1> <id2>  # Close multiple issues at once
+br reopen <id1> <id2> # Reopen multiple issues at once
+br delete <id1> <id2> # Delete multiple issues at once
 br sync --flush-only  # Export to JSONL (NO git operations)
 ```
 

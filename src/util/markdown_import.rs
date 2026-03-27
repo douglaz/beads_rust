@@ -7,8 +7,9 @@
 //! - Each issue starts with an H2 line: `## Issue Title`
 //! - Per-issue sections are H3 lines: `### Section Name`
 //! - Recognized sections (case-insensitive):
-//!   - ID, Priority, Type, Description, Design, Acceptance Criteria (alias Acceptance),
-//!     Assignee, Labels, Dependencies (alias Deps)
+//!   - ID, Priority, Type, Description, Design, Acceptance Criteria
+//!     (aliases Acceptance, Success Criteria, Success), Assignee, Labels,
+//!     Dependencies (alias Deps)
 //! - Unknown sections are ignored
 //!
 //! # Intra-file Dependency References
@@ -89,7 +90,9 @@ impl Section {
             "type" => Self::Type,
             "description" => Self::Description,
             "design" => Self::Design,
-            "acceptance criteria" | "acceptance" => Self::AcceptanceCriteria,
+            "acceptance criteria" | "acceptance" | "success criteria" | "success" => {
+                Self::AcceptanceCriteria
+            }
             "assignee" => Self::Assignee,
             "labels" => Self::Labels,
             "dependencies" | "deps" => Self::Dependencies,
@@ -592,6 +595,19 @@ blocks: bd-123 related:bd-456 external:github#123
                 .as_ref()
                 .unwrap()
                 .contains("First criterion")
+        );
+    }
+
+    #[test]
+    fn test_success_criteria_alias() {
+        let content = r"## Test Epic
+### Success Criteria
+- [ ] First outcome
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(
+            issues[0].acceptance_criteria.as_deref(),
+            Some("- [ ] First outcome")
         );
     }
 

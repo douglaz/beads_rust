@@ -2,9 +2,12 @@
 //!
 //! The lint command validates issue templates by checking for required sections
 //! based on issue type:
-//! - Bug: "## Steps to Reproduce", "## Acceptance Criteria"
-//! - Task/Feature: "## Acceptance Criteria"
-//! - Epic: "## Success Criteria"
+//! - Bug: "## Steps to Reproduce", plus criteria satisfied by either
+//!   "## Acceptance Criteria" or the structured acceptance_criteria field
+//! - Task/Feature: criteria satisfied by either "## Acceptance Criteria" or
+//!   the structured acceptance_criteria field
+//! - Epic: criteria satisfied by either "## Success Criteria" or the
+//!   structured acceptance_criteria field
 //!
 //! Test coverage:
 //! - Clean workspace scenarios (no warnings)
@@ -59,6 +62,15 @@ fn create_issue_with_description(
     let create = run_br(workspace, &args, &format!("create_{issue_type}"));
     assert!(create.status.success(), "create failed: {}", create.stderr);
     parse_created_id(&create.stdout)
+}
+
+fn update_acceptance_criteria(workspace: &BrWorkspace, id: &str, acceptance_criteria: &str) {
+    let update = run_br(
+        workspace,
+        ["update", id, "--acceptance-criteria", acceptance_criteria],
+        "update_acceptance_criteria",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
 }
 
 // =============================================================================
@@ -246,6 +258,28 @@ fn e2e_lint_task_missing_acceptance_criteria() {
 }
 
 #[test]
+fn e2e_lint_task_structured_acceptance_criteria_passes() {
+    let _log = common::test_log("e2e_lint_task_structured_acceptance_criteria_passes");
+    let workspace = BrWorkspace::new();
+    init_workspace(&workspace);
+
+    let id =
+        create_issue_with_description(&workspace, "Task with structured AC", "task", Some("Body"));
+    update_acceptance_criteria(&workspace, &id, "Ship it");
+
+    let lint = run_br(&workspace, ["lint", "--json"], "lint_task_structured_ac");
+    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+
+    let json_str = extract_json_payload(&lint.stdout);
+    let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
+    let results = json["results"].as_array().unwrap();
+    assert!(
+        !results.iter().any(|r| r["id"] == id),
+        "task with structured acceptance criteria should not warn"
+    );
+}
+
+#[test]
 fn e2e_lint_epic_missing_success_criteria() {
     let _log = common::test_log("e2e_lint_epic_missing_success_criteria");
     // Epic without "Success Criteria" should warn
@@ -271,6 +305,37 @@ fn e2e_lint_epic_missing_success_criteria() {
             .iter()
             .any(|m| m.as_str().unwrap().contains("Success Criteria")),
         "expected missing 'Success Criteria', got: {missing:?}"
+    );
+}
+
+#[test]
+fn e2e_lint_epic_structured_acceptance_criteria_satisfies_success_criteria() {
+    let _log =
+        common::test_log("e2e_lint_epic_structured_acceptance_criteria_satisfies_success_criteria");
+    let workspace = BrWorkspace::new();
+    init_workspace(&workspace);
+
+    let id = create_issue_with_description(
+        &workspace,
+        "Epic with structured criteria",
+        "epic",
+        Some("Body"),
+    );
+    update_acceptance_criteria(&workspace, &id, "Rollout complete");
+
+    let lint = run_br(
+        &workspace,
+        ["lint", "--json"],
+        "lint_epic_structured_criteria",
+    );
+    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+
+    let json_str = extract_json_payload(&lint.stdout);
+    let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
+    let results = json["results"].as_array().unwrap();
+    assert!(
+        !results.iter().any(|r| r["id"] == id),
+        "epic with structured criteria should not warn"
     );
 }
 

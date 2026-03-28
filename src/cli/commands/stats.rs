@@ -289,7 +289,7 @@ fn compute_summary(
     let mut open = 0;
     let mut in_progress = 0;
     let mut closed = 0;
-    let mut blocked_by_status = 0;
+    let mut blocked_by_status_ids: HashSet<String> = HashSet::new();
     let mut deferred = 0;
     let mut draft = 0;
     let mut tombstone = 0;
@@ -332,7 +332,9 @@ fn compute_summary(
                     lead_times.push(lead_time.num_hours() as f64);
                 }
             }
-            Status::Blocked => blocked_by_status += 1,
+            Status::Blocked => {
+                blocked_by_status_ids.insert(issue.id.clone());
+            }
             Status::Deferred => deferred += 1,
             Status::Draft => draft += 1,
             Status::Tombstone => tombstone += 1,
@@ -367,8 +369,8 @@ fn compute_summary(
         })
         .count();
 
-    // Blocked count based on 'blocks' deps only (classic bd semantics).
-    let blocked = blocked_by_blocks.len();
+    // Blocked count: union of status-blocked and dependency-blocked (deduplicated).
+    let blocked = blocked_by_blocks.union(&blocked_by_status_ids).count();
 
     // Epics eligible for closure: all children closed
     let epics_eligible = count_epics_eligible_for_closure(storage, &epics)?;
@@ -386,9 +388,6 @@ fn compute_summary(
         .iter()
         .filter(|i| i.status != Status::Tombstone)
         .count();
-
-    // blocked_by_status is unused but kept for potential future use
-    let _ = blocked_by_status;
 
     Ok(StatsSummary {
         total_issues: total,

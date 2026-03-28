@@ -370,7 +370,22 @@ fn lint_issue(issue: &Issue) -> Option<LintResult> {
     }
 
     let description = issue.description.as_deref().unwrap_or("");
-    let missing = missing_sections(description, required);
+    let mut missing = missing_sections(description, required);
+
+    // If the structured acceptance_criteria field is populated, don't flag
+    // "Acceptance Criteria" or "Success Criteria" headings as missing from
+    // the description — the data exists, just in a different field.
+    let has_structured_criteria = issue
+        .acceptance_criteria
+        .as_ref()
+        .is_some_and(|ac| !ac.trim().is_empty());
+    if has_structured_criteria {
+        missing.retain(|section| {
+            let heading = strip_heading_prefix(section.heading).to_lowercase();
+            heading != "acceptance criteria" && heading != "success criteria"
+        });
+    }
+
     if missing.is_empty() {
         return None;
     }
@@ -495,5 +510,56 @@ mod tests {
         let summary = lint_issues(&[issue]);
         assert_eq!(summary.exit_code(true), 0);
         assert_eq!(summary.exit_code(false), 1);
+    }
+
+    #[test]
+    fn test_structured_acceptance_criteria_suppresses_warning() {
+        // Bug with no criteria in description but structured field populated
+        let mut issue = make_issue(IssueType::Bug, Some("Bug report"));
+        issue.acceptance_criteria = Some("- Fix is verified".to_string());
+        let result = lint_issue(&issue).expect("lint result");
+        // Should only warn about Steps to Reproduce, not Acceptance Criteria
+        assert_eq!(result.warnings, 1);
+        assert!(
+            result
+                .missing
+                .contains(&"## Steps to Reproduce".to_string())
+        );
+        assert!(
+            !result
+                .missing
+                .contains(&"## Acceptance Criteria".to_string())
+        );
+    }
+
+    #[test]
+    fn test_structured_acceptance_criteria_clears_task_lint() {
+        // Task with no criteria in description but structured field populated
+        let mut issue = make_issue(IssueType::Task, Some("Do the thing"));
+        issue.acceptance_criteria = Some("- Thing is done".to_string());
+        // Should produce no warnings at all
+        assert!(lint_issue(&issue).is_none());
+    }
+
+    #[test]
+    fn test_empty_acceptance_criteria_still_warns() {
+        // Structured field present but empty/whitespace-only should still warn
+        let mut issue = make_issue(IssueType::Task, Some("Do the thing"));
+        issue.acceptance_criteria = Some("   ".to_string());
+        let result = lint_issue(&issue).expect("lint result");
+        assert_eq!(result.warnings, 1);
+        assert!(
+            result
+                .missing
+                .contains(&"## Acceptance Criteria".to_string())
+        );
+    }
+
+    #[test]
+    fn test_structured_criteria_suppresses_epic_success_criteria() {
+        let mut issue = make_issue(IssueType::Epic, Some("Big project"));
+        issue.acceptance_criteria = Some("- Delivered on time".to_string());
+        // Should produce no warnings — Success Criteria is satisfied
+        assert!(lint_issue(&issue).is_none());
     }
 }

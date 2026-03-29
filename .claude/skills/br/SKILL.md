@@ -5,7 +5,7 @@ description: >-
   managing dependencies, finding ready work, or syncing issues to git via JSONL.
 ---
 
-<!-- TOC: Critical Rules | Quick Workflow | Essential Commands | bv Integration | References -->
+<!-- TOC: Critical Rules | Quick Workflow | Essential Commands | bv Integration | Redirect/Worktree | Troubleshooting | References -->
 
 # br — Beads Rust Issue Tracker
 
@@ -132,6 +132,125 @@ git status  # Verify clean
 └── config.yaml     # Optional config
 ```
 
+## Redirect / Worktree Workflow
+
+### What Redirects Are
+
+A `.beads/redirect` file is a plain text file containing a single path that
+points to another `.beads/` (or `_beads/`) directory. When br discovers a
+redirect, it follows the chain until it reaches a terminal beads directory.
+All reads and writes (SQLite DB, JSONL) happen in the **target** directory,
+not the one containing the redirect file.
+
+This lets multiple working trees share one beads store so issues, history,
+and dependencies stay unified.
+
+### When to Use
+
+- **Git worktrees** -- the primary use case. Each worktree gets its own
+  `.beads/` from git, but you want all of them to operate on the same
+  underlying database.
+- **PR-only workflows** -- temporary feature branches that should not
+  maintain their own beads state.
+- **Ephemeral checkouts** -- CI or review checkouts that need read access
+  to issues without duplicating the store.
+
+### Setup
+
+Create a `redirect` file inside the worktree's `.beads/` directory. The
+path is resolved **relative to the `.beads/` directory itself**, not the
+project root.
+
+```bash
+# Example: main repo at /code/myproject, worktree at /code/myproject/.worktrees/feat
+# The worktree's .beads/ is at .worktrees/feat/.beads/
+# From there, ../../../.beads reaches the main repo's .beads/
+
+echo "../../../.beads" > /code/myproject/.worktrees/feat/.beads/redirect
+```
+
+Absolute paths also work:
+
+```bash
+echo "/code/myproject/.beads" > /code/myproject/.worktrees/feat/.beads/redirect
+```
+
+Verify with `br where`:
+
+```bash
+cd /code/myproject/.worktrees/feat
+br where
+# Output shows the target path and "(via redirect from ...)"
+
+br where --json
+# { "path": "/code/myproject/.beads", "redirected_from": ".../feat/.beads", ... }
+```
+
+### Path Resolution Rules
+
+| Aspect | Behavior |
+|--------|----------|
+| Relative paths | Resolved from the `.beads/` dir containing the redirect file |
+| Absolute paths | Used as-is |
+| Target validation | Must be a `.beads` or `_beads` directory that exists on disk |
+| Chain following | Redirects can chain (A -> B -> C) up to 10 hops |
+| Loop detection | Paths are canonicalized; revisiting any path in the chain is an error |
+| Self-redirect (`.`) | Legal -- resolves to the current `.beads/` dir and stops |
+
+### Effect on Commands
+
+With a redirect active, **all br commands** operate on the target directory:
+
+- `br create`, `br update`, `br close` -- write to the target DB and JSONL
+- `br sync --flush-only` -- flushes inline (writes already landed in the
+  target); typically reports "nothing to export"
+- `br list`, `br ready`, `br show` -- read from the target
+- `br doctor` -- checks the target store
+
+### JSONL Commits in PR-Gated Repos
+
+Because writes land in the **main repo's** `.beads/` directory, JSONL changes
+only appear in `git status` from the main repo, not from the worktree. This
+creates a commit-path question for projects that require PRs to merge to `main`.
+
+Recommended approaches:
+
+1. **Treat JSONL as infrastructure** -- commit `.beads/` changes directly to
+   `main` from the main repo working tree, outside the PR flow. JSONL updates
+   are mechanical bookkeeping, not feature code, so many teams exempt them
+   from PR review.
+
+2. **Periodic sync from main** -- after merging a feature PR, run
+   `br sync --flush-only` from the main repo on `main` and commit the
+   resulting JSONL changes as a separate housekeeping commit.
+
+3. **Dedicated beads-sync branch** -- configure `br config set sync.branch
+   beads-sync` and commit JSONL to that branch, then merge it to `main`
+   through your normal PR process.
+
+### Quick Setup Recipe
+
+```bash
+# 1. Create worktree
+git worktree add .worktrees/feat -b feat/my-feature
+
+# 2. Add redirect (count "../" hops from .worktrees/feat/.beads/ to project root)
+echo "../../../.beads" > .worktrees/feat/.beads/redirect
+
+# 3. Verify
+cd .worktrees/feat && br where && cd -
+
+# 4. Work normally from the worktree
+cd .worktrees/feat
+br create "New task" -p 1 -t task
+br ready --json
+
+# 5. Commit JSONL from the main repo
+cd /code/myproject
+br sync --flush-only
+git add .beads/ && git commit -m "chore: update beads JSONL"
+```
+
 ## Troubleshooting
 
 ```bash
@@ -145,6 +264,16 @@ br config --list             # Check settings
 git branch beads-sync main
 br config set sync.branch beads-sync
 ```
+
+**Redirect target not found**: The path in `.beads/redirect` does not resolve
+to an existing directory. Check that relative paths are counted from the
+`.beads/` directory, not the project root.
+
+**Redirect loop detected**: Two or more redirect files point at each other.
+Run `br where` from each location to trace the chain, then fix the cycle.
+
+**Redirect chain exceeds max depth**: More than 10 redirect hops. Simplify
+the chain -- most setups need exactly one hop.
 
 ---
 

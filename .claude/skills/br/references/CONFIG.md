@@ -43,6 +43,7 @@ sync:
 
 | Variable | Description |
 |----------|-------------|
+| `BR_ACTOR` | Default actor identity for audit trail |
 | `BEADS_DB` | Override database path |
 | `BEADS_JSONL` | Override JSONL path (requires `--allow-external-jsonl`) |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
@@ -52,9 +53,9 @@ sync:
 ## Config Commands
 
 ```bash
-br config --list                     # Show all config
-br config --get id.prefix            # Get specific value
-br config --set defaults.priority=1  # Set value
+br config list                       # Show all config
+br config get id.prefix              # Get specific value
+br config set defaults.priority=1    # Set value
 ```
 
 ---
@@ -65,10 +66,10 @@ Default storage is in `.beads/` relative to project root:
 
 ```
 .beads/
-├── beads.db        # SQLite database (primary storage)
-├── beads.db-shm    # SQLite shared memory (WAL mode)
-├── beads.db-wal    # SQLite write-ahead log
-├── issues.jsonl    # JSONL export (for git)
-├── config.yaml     # Project configuration
-└── metadata.json   # Workspace metadata
+  beads.db        # SQLite database (primary storage)
+  beads.db-shm    # SQLite shared memory (WAL mode)
+  beads.db-wal    # SQLite write-ahead log
+  issues.jsonl    # JSONL export (for git)
+  config.yaml     # Project configuration
+  metadata.json   # Workspace metadata
 ```

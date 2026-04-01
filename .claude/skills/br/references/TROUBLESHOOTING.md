@@ -31,17 +31,17 @@ br sync --status  # Safe read-only check
 
 ```bash
 # Check if issue exists
-br list --json | jq '.[] | select(.id == "bd-abc123")'
+br list --json | jq '.issues[] | select(.id == "<id>")'
 
 # Check for similar IDs
-br list | grep -i "abc"
+br search "keyword" --json
 ```
 
 ### "Prefix mismatch"
 
 ```bash
 # Check your prefix
-br config --get id.prefix
+br config get id.prefix
 
 # Import with validation skip (careful!)
 br sync --import-only --skip-prefix-validation
@@ -83,7 +83,7 @@ br -v list
 # Debug output
 br -vv list
 
-# Check RUST_LOG for detailed logs
+# Full trace logs
 RUST_LOG=debug br list
 ```
 
@@ -94,6 +94,7 @@ RUST_LOG=debug br list
 ```bash
 br doctor                    # Full diagnostics
 br dep cycles                # Must be empty
-br config --list             # Check settings
+br config list               # Check settings
 which br                     # Verify br is installed
+br version                   # Check version
 ```

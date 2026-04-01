@@ -283,31 +283,6 @@ cargo build --release --no-default-features
 cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --no-default-features
 ```
 
-### Building on Windows (MinGW)
-
-Release binaries for Windows are cross-compiled from Linux using the GNU/MinGW
-toolchain (`x86_64-pc-windows-gnu`). To reproduce this locally:
-
-```bash
-# Install the MinGW cross-compiler and Rust target
-sudo apt-get install mingw-w64
-rustup target add x86_64-pc-windows-gnu
-
-# Tell Cargo which linker to use
-export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
-
-# Fix the libKernel32.a case-sensitivity gotcha (one-time)
-# Some MinGW packages ship libkernel32.a (lowercase) but Rust expects libKernel32.a.
-libkernel32="$(x86_64-w64-mingw32-gcc -print-file-name=libkernel32.a)"
-sudo ln -sf "$libkernel32" "$(dirname "$libkernel32")/libKernel32.a"
-
-# Build
-cargo build --release --target x86_64-pc-windows-gnu
-```
-
-The CI does this same symlink step automatically (see commit `2760166`). If the
-link step is skipped, the build fails with an `unable to find library -lKernel32` error.
-
 ### Verify Installation
 
 ```bash
@@ -381,11 +356,11 @@ git commit -m "Fix: login timeout (bd-a1b2c3)"
 | `init` | Initialize workspace | `br init` |
 | `create` | Create issue | `br create "Title" -p 1 --type bug` |
 | `q` | Quick capture (ID only) | `br q "Fix typo"` |
-| `show` | Show issue details | `br show bd-abc123` or `br show id1 id2` |
+| `show` | Show issue details | `br show bd-abc123` |
 | `update` | Update issue | `br update bd-abc123 --priority 0` |
-| `close` | Close issue(s) | `br close bd-abc123 --reason "Done"` or `br close id1 id2` |
-| `reopen` | Reopen closed issue(s) | `br reopen bd-abc123` or `br reopen id1 id2` |
-| `delete` | Delete issue(s) (tombstone) | `br delete bd-abc123` or `br delete id1 id2` |
+| `close` | Close issue | `br close bd-abc123 --reason "Done"` |
+| `reopen` | Reopen closed issue | `br reopen bd-abc123` |
+| `delete` | Delete issue (tombstone) | `br delete bd-abc123` |
 
 ### Querying
 

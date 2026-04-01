@@ -6,7 +6,7 @@ use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, 
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
-    apply_runtime_compatible_schema, apply_schema, runtime_schema_compatible,
+    apply_runtime_compatible_schema, apply_schema, execute_batch, runtime_schema_compatible,
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -22,8 +22,6 @@ use std::time::Duration;
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;
-const TX_MAX_RETRIES: u32 = 5;
-const TX_BASE_BACKOFF_MS: u64 = 10;
 // `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
 // existing `export_hashes` rows with a single multi-values INSERT. Batch the
 // DELETE side for efficiency, but re-insert one row at a time for correctness.
@@ -217,11 +215,14 @@ impl SqliteStorage {
     where
         F: FnMut(&Connection) -> Result<R>,
     {
-        for attempt in 0..TX_MAX_RETRIES {
+        const MAX_RETRIES: u32 = 5;
+        let base_backoff_ms: u64 = 10;
+
+        for attempt in 0..MAX_RETRIES {
             match conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
-                Err(e) if e.is_transient() && attempt < TX_MAX_RETRIES - 1 => {
-                    let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
+                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                    let backoff = base_backoff_ms * 2u64.pow(attempt);
                     std::thread::sleep(Duration::from_millis(backoff));
                     continue;
                 }
@@ -230,21 +231,15 @@ impl SqliteStorage {
 
             match f(conn) {
                 Ok(result) => match conn.execute("COMMIT") {
-                    Ok(_) => {
-                        // Force fsqlite to refresh its memdb read snapshot so
-                        // subsequent reads on this connection see the committed
-                        // data (mirrors with_write_transaction, issue #204).
-                        let _ = conn.query("SELECT 1 FROM metadata LIMIT 1");
-                        return Ok(result);
-                    }
-                    Err(e) if e.is_transient() && attempt < TX_MAX_RETRIES - 1 => {
+                    Ok(_) => return Ok(result),
+                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
                         if let Err(rb_err) = conn.execute("ROLLBACK") {
                             tracing::warn!(
                                 error = %rb_err,
                                 "ROLLBACK failed after transient COMMIT error"
                             );
                         }
-                        let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
+                        let backoff = base_backoff_ms * 2u64.pow(attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                     }
                     Err(e) => {
@@ -258,8 +253,8 @@ impl SqliteStorage {
                     if let Err(rb_err) = conn.execute("ROLLBACK") {
                         tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
                     }
-                    if e.is_transient() && attempt < TX_MAX_RETRIES - 1 {
-                        let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
+                    if e.is_transient() && attempt < MAX_RETRIES - 1 {
+                        let backoff = base_backoff_ms * 2u64.pow(attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                     } else {
                         return Err(e);
@@ -617,11 +612,14 @@ impl SqliteStorage {
     where
         F: FnMut(&mut Self) -> Result<R>,
     {
-        for attempt in 0..TX_MAX_RETRIES {
+        const MAX_RETRIES: u32 = 5;
+        let base_backoff_ms: u64 = 10;
+
+        for attempt in 0..MAX_RETRIES {
             match self.conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
-                Err(e) if e.is_transient() && attempt < TX_MAX_RETRIES - 1 => {
-                    let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
+                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                    let backoff = base_backoff_ms * 2u64.pow(attempt);
                     std::thread::sleep(Duration::from_millis(backoff));
                     continue;
                 }
@@ -632,12 +630,6 @@ impl SqliteStorage {
                 Ok(result) => {
                     match self.conn.execute("COMMIT") {
                         Ok(_) => {
-                            // Force fsqlite to refresh its memdb read snapshot so
-                            // subsequent reads on this connection see the committed
-                            // data.  Without this probe, auto-flush after close can
-                            // export stale pre-mutation values (issue #204).
-                            let _ = self.conn.query("SELECT 1 FROM metadata LIMIT 1");
-
                             // Periodic WAL checkpoint to prevent unbounded WAL growth
                             self.mutation_count += 1;
                             if self.mutation_count >= WAL_CHECKPOINT_INTERVAL {
@@ -646,11 +638,11 @@ impl SqliteStorage {
                             }
                             return Ok(result);
                         }
-                        Err(e) if e.is_transient() && attempt < TX_MAX_RETRIES - 1 => {
+                        Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
                             if let Err(rb_err) = self.conn.execute("ROLLBACK") {
                                 tracing::warn!(error = %rb_err, "ROLLBACK failed after transient COMMIT error");
                             }
-                            let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
+                            let backoff = base_backoff_ms * 2u64.pow(attempt);
                             std::thread::sleep(Duration::from_millis(backoff));
                             // retry
                         }
@@ -666,8 +658,8 @@ impl SqliteStorage {
                     if let Err(rb_err) = self.conn.execute("ROLLBACK") {
                         tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
                     }
-                    if e.is_transient() && attempt < TX_MAX_RETRIES - 1 {
-                        let backoff = TX_BASE_BACKOFF_MS * 2u64.pow(attempt);
+                    if e.is_transient() && attempt < MAX_RETRIES - 1 {
+                        let backoff = base_backoff_ms * 2u64.pow(attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
                         // retry
                     } else {
@@ -1054,7 +1046,7 @@ impl SqliteStorage {
                 Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
                 // Check cycle if blocking
                 if dep.dep_type.is_blocking()
-                    && Self::check_cycle(conn, &issue.id, &dep.depends_on_id, Some(dep.dep_type.as_str()), true)?
+                    && Self::check_cycle(conn, &issue.id, &dep.depends_on_id, true)?
                 {
                     return Err(BeadsError::DependencyCycle {
                         path: format!(
@@ -1140,18 +1132,12 @@ impl SqliteStorage {
         conn: &Connection,
         issue_id: &str,
         depends_on_id: &str,
-        _dep_type: Option<&str>,
         blocking_only: bool,
     ) -> Result<bool> {
-        let from_node = issue_id;
-        let to_node = depends_on_id;
-
-        // Build the per-node neighbor query. We follow edges in the
-        // "blocking" direction which, for standard deps, is forward
-        // (issue_id -> depends_on_id) and for parent-child is reverse
-        // (depends_on_id -> issue_id, because a child blocks its parent
-        // from completing). This matches the graph model used by
-        // `detect_all_cycles`.
+        // Build the per-node neighbor query.  We UNION two directions:
+        //   (a) standard deps: given node as issue_id, follow to depends_on_id
+        //   (b) parent-child reversed: given node as depends_on_id (parent),
+        //       follow to issue_id (child) -- because parent is blocked by child
         let neighbor_sql = if blocking_only {
             "SELECT depends_on_id FROM dependencies \
              WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'waits-for') \
@@ -1173,10 +1159,8 @@ impl SqliteStorage {
         let mut visited = HashSet::new();
         // Level-synchronous BFS: process all nodes at one depth before moving
         // to the next, so we can enforce a depth cap cleanly.
-        // We are adding an edge `from_node -> to_node`. A cycle exists if
-        // there is already a path `to_node -> ... -> from_node`.
-        let mut frontier: Vec<String> = vec![to_node.to_string()];
-        visited.insert(to_node.to_string());
+        let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
+        visited.insert(depends_on_id.to_string());
 
         for _depth in 0..DEPENDENCY_TRAVERSAL_MAX_DEPTH {
             if frontier.is_empty() {
@@ -1193,7 +1177,7 @@ impl SqliteStorage {
 
                 for row in &rows {
                     if let Some(neighbor) = row.get(0).and_then(SqliteValue::as_text) {
-                        if neighbor == from_node {
+                        if neighbor == issue_id {
                             return Ok(true); // Cycle detected -- early exit
                         }
                         if visited.insert(neighbor.to_string()) {
@@ -1611,18 +1595,45 @@ impl SqliteStorage {
             .get_issue(id)?
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
 
+        let was_terminal = issue.status.is_terminal();
+        let original_type = issue.issue_type.as_str().to_string();
         let timestamp = deleted_at.unwrap_or_else(Utc::now);
-        let tombstone_issue = issue;
+        let mut tombstone_issue = issue;
+        tombstone_issue.status = Status::Tombstone;
+        let tombstone_hash = crate::util::content_hash(&tombstone_issue);
 
         self.mutate("delete_issue", actor, |conn, ctx| {
-            Self::tombstone_issue_in_tx(
-                conn,
-                ctx,
-                &tombstone_issue,
-                actor,
-                reason,
-                Some(timestamp),
+            conn.execute_with_params(
+                "UPDATE issues SET
+                    content_hash = ?,
+                    status = 'tombstone',
+                    deleted_at = ?,
+                    deleted_by = ?,
+                    delete_reason = ?,
+                    original_type = ?,
+                    updated_at = ?
+                 WHERE id = ?",
+                &[
+                    SqliteValue::from(tombstone_hash.as_str()),
+                    SqliteValue::from(timestamp.to_rfc3339()),
+                    SqliteValue::from(actor),
+                    SqliteValue::from(reason),
+                    SqliteValue::from(original_type.as_str()),
+                    SqliteValue::from(Utc::now().to_rfc3339()),
+                    SqliteValue::from(id),
+                ],
             )?;
+
+            if !was_terminal {
+                ctx.record_event(
+                    EventType::Deleted,
+                    id,
+                    Some(format!("Deleted issue: {reason}")),
+                );
+            }
+            ctx.mark_dirty(id);
+            ctx.invalidate_cache();
+
             Ok(())
         })?;
 
@@ -1645,15 +1656,6 @@ impl SqliteStorage {
         }
 
         self.mutate("purge_issue", actor, |conn, ctx| {
-            let affected_rows = conn.query_with_params(
-                "SELECT DISTINCT issue_id FROM dependencies WHERE depends_on_id = ?",
-                &[SqliteValue::from(id)],
-            )?;
-            let affected: Vec<String> = affected_rows
-                .iter()
-                .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
-                .collect();
-
             conn.execute_with_params(
                 "DELETE FROM comments WHERE issue_id = ?",
                 &[SqliteValue::from(id)],
@@ -1691,22 +1693,6 @@ impl SqliteStorage {
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
-
-            if !affected.is_empty() {
-                let now = Utc::now().to_rfc3339();
-                for chunk in affected.chunks(400) {
-                    for affected_id in chunk {
-                        conn.execute_with_params(
-                            "UPDATE issues SET updated_at = ? WHERE id = ?",
-                            &[
-                                SqliteValue::from(now.as_str()),
-                                SqliteValue::from(affected_id.as_str()),
-                            ],
-                        )?;
-                        ctx.mark_dirty(affected_id);
-                    }
-                }
-            }
 
             ctx.invalidate_cache();
             ctx.force_flush = true;
@@ -2284,11 +2270,6 @@ impl SqliteStorage {
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
-            if let Some(offset) = filters.offset
-                && offset > 0
-            {
-                let _ = write!(sql, " OFFSET {offset}");
-            }
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
@@ -2787,18 +2768,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if the rebuild fails.
     pub(crate) fn rebuild_child_counters_in_tx(&self) -> Result<usize> {
-        Self::rebuild_child_counters_with_conn(&self.conn)
+        Self::rebuild_child_counters_impl(&self.conn)
     }
 
-    /// Rebuild child counters using the caller's active transaction.
-    ///
-    /// This lets higher-level workflows keep issue mutations and derived child
-    /// counter state atomic in one write transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the rebuild fails.
-    pub(crate) fn rebuild_child_counters_with_conn(conn: &Connection) -> Result<usize> {
+    fn rebuild_child_counters_impl(conn: &Connection) -> Result<usize> {
         // Clear existing counters
         conn.execute("DELETE FROM child_counters")?;
 
@@ -2944,21 +2917,10 @@ impl SqliteStorage {
     fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
         let blocked_issues_map = Self::compute_blocked_issues_map_impl(conn)?;
 
-        // Avoid DROP TABLE (which causes "database schema has changed" for concurrent readers).
-        // Instead, find entries that are no longer blocked and delete them individually.
-        let existing_rows = conn.query("SELECT issue_id FROM blocked_issues_cache")?;
-        for row in &existing_rows {
-            if let Some(id) = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|id| !blocked_issues_map.contains_key(*id))
-            {
-                conn.execute_with_params(
-                    "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
-                    &[SqliteValue::from(id)],
-                )?;
-            }
-        }
+        // `fsqlite` can surface false UNIQUE conflicts while repopulating the
+        // blocked-cache index after a full-table DELETE. Recreate the cache
+        // table instead so the subsequent inserts start from a fresh btree.
+        Self::reset_blocked_cache_table(conn)?;
 
         let mut entries = Vec::with_capacity(blocked_issues_map.len());
 
@@ -2982,6 +2944,28 @@ impl SqliteStorage {
         Ok(count)
     }
 
+    fn reset_blocked_cache_table(conn: &Connection) -> Result<()> {
+        execute_batch(
+            conn,
+            r"
+            DROP TABLE IF EXISTS blocked_issues_cache;
+            CREATE TABLE blocked_issues_cache (
+                issue_id TEXT PRIMARY KEY,
+                blocked_by TEXT NOT NULL,
+                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at
+                ON blocked_issues_cache(blocked_at);
+            ",
+        )
+    }
+
+    /// Incremental blocked-cache update: recompute only the entries for the
+    /// given seed issue IDs and their transitive parent-child descendants.
+    ///
+    /// This avoids the full DELETE + INSERT cycle of `rebuild_blocked_cache_impl`
+    /// when only a small number of dependency edges changed.
     fn incremental_blocked_cache_update(
         conn: &Connection,
         seed_ids: &HashSet<String>,
@@ -3057,9 +3041,8 @@ impl SqliteStorage {
         conn: &Connection,
         entries: &[(String, String)],
     ) -> Result<usize> {
-        let unique_entries = Self::dedupe_blocked_cache_batch(entries);
         let mut count = 0;
-        for (issue_id, blockers_json) in &unique_entries {
+        for (issue_id, blockers_json) in entries {
             // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
             // fsqlite does not reliably support UNIQUE constraint upserts.
             conn.execute_with_params(
@@ -3076,22 +3059,6 @@ impl SqliteStorage {
             count += 1;
         }
         Ok(count)
-    }
-
-    fn dedupe_blocked_cache_batch(entries: &[(String, String)]) -> Vec<(String, String)> {
-        let mut deduped: Vec<(String, String)> = Vec::with_capacity(entries.len());
-        let mut positions: HashMap<String, usize> = HashMap::with_capacity(entries.len());
-
-        for (issue_id, blockers_json) in entries {
-            if let Some(position) = positions.get(issue_id).copied() {
-                deduped[position].1.clone_from(blockers_json);
-            } else {
-                positions.insert(issue_id.clone(), deduped.len());
-                deduped.push((issue_id.clone(), blockers_json.clone()));
-            }
-        }
-
-        deduped
     }
 
     fn load_direct_blockers_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
@@ -3891,7 +3858,7 @@ impl SqliteStorage {
             // edge between our check and our INSERT.
             if let Ok(dt) = dep_type.parse::<DependencyType>()
                 && dt.is_blocking()
-                && Self::check_cycle(conn, issue_id, depends_on_id, Some(dep_type), true)?
+                && Self::check_cycle(conn, issue_id, depends_on_id, true)?
             {
                 return Err(BeadsError::DependencyCycle {
                     path: format!(
@@ -4158,7 +4125,7 @@ impl SqliteStorage {
                 Self::validate_parent_child_endpoints(issue_id, pid, "parent-child")?;
                 Self::ensure_dependency_target_exists_in_tx(conn, pid)?;
 
-                if Self::check_cycle(conn, issue_id, pid, Some("parent-child"), true)? {
+                if Self::check_cycle(conn, issue_id, pid, true)? {
                     return Err(BeadsError::DependencyCycle {
                         path: format!("Setting parent of {issue_id} to {pid} would create a cycle"),
                     });
@@ -5610,7 +5577,6 @@ impl SqliteStorage {
                    AND i.deleted_at IS NULL
                    AND (
                      i.id NOT IN (SELECT issue_id FROM export_hashes)
-                     OR i.content_hash IS NULL
                      OR i.content_hash != (SELECT e.content_hash FROM export_hashes e WHERE e.issue_id = i.id)
                    )
                  ORDER BY i.id",
@@ -5828,7 +5794,7 @@ impl SqliteStorage {
             closed_by_session: get_non_empty_str(18),
             due_at: get_opt_datetime(19)?,
             defer_until: get_opt_datetime(20)?,
-            external_ref: get_non_empty_str(21),
+            external_ref: get_opt_str(21),
             source_system: get_non_empty_str(22),
             source_repo: get_non_empty_str(23),
             deleted_at: get_opt_datetime(24)?,
@@ -6711,10 +6677,9 @@ impl SqliteStorage {
         &self,
         issue_id: &str,
         depends_on_id: &str,
-        dep_type: Option<&str>,
         blocking_only: bool,
     ) -> Result<bool> {
-        Self::check_cycle(&self.conn, issue_id, depends_on_id, dep_type, blocking_only)
+        Self::check_cycle(&self.conn, issue_id, depends_on_id, blocking_only)
     }
 
     /// Detect all cycles in the dependency graph.
@@ -6889,30 +6854,6 @@ impl SqliteStorage {
     /// Returns an error if the database operation fails.
     #[allow(clippy::too_many_lines)]
     pub fn upsert_issue_for_import(&self, issue: &Issue) -> Result<bool> {
-        Self::with_connection_write_transaction(&self.conn, |conn| {
-            Self::upsert_issue_for_import_in_tx(conn, issue)
-        })
-    }
-
-    /// Upsert an imported issue while participating in an already-open write
-    /// transaction on this storage handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operation fails.
-    pub(crate) fn upsert_issue_for_import_on_active_tx(&self, issue: &Issue) -> Result<bool> {
-        Self::upsert_issue_for_import_in_tx(&self.conn, issue)
-    }
-
-    /// Upsert an imported issue using the caller's active transaction.
-    ///
-    /// This does NOT trigger dirty tracking or events.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operation fails.
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn upsert_issue_for_import_in_tx(conn: &Connection, issue: &Issue) -> Result<bool> {
         let status_str = issue.status.as_str();
         let issue_type_str = issue.issue_type.as_str();
         let created_at_str = issue.created_at.to_rfc3339();
@@ -6925,12 +6866,12 @@ impl SqliteStorage {
 
         // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
         // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        conn.execute_with_params(
+        self.conn.execute_with_params(
             "DELETE FROM issues WHERE id = ?",
             &[SqliteValue::from(issue.id.as_str())],
         )?;
 
-        let rows = conn.execute_with_params(
+        let rows = self.conn.execute_with_params(
             r"INSERT INTO issues (
                 id, content_hash, title, description, design, acceptance_criteria, notes,
                 status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -6991,37 +6932,8 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn sync_labels_for_import(&self, issue_id: &str, labels: &[String]) -> Result<()> {
-        Self::with_connection_write_transaction(&self.conn, |conn| {
-            Self::sync_labels_for_import_in_tx(conn, issue_id, labels)
-        })
-    }
-
-    /// Sync labels while participating in an already-open write transaction on
-    /// this storage handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operation fails.
-    pub(crate) fn sync_labels_for_import_on_active_tx(
-        &self,
-        issue_id: &str,
-        labels: &[String],
-    ) -> Result<()> {
-        Self::sync_labels_for_import_in_tx(&self.conn, issue_id, labels)
-    }
-
-    /// Sync labels for an imported issue using the caller's active transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operation fails.
-    pub(crate) fn sync_labels_for_import_in_tx(
-        conn: &Connection,
-        issue_id: &str,
-        labels: &[String],
-    ) -> Result<()> {
         // Remove existing labels
-        conn.execute_with_params(
+        self.conn.execute_with_params(
             "DELETE FROM labels WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -7056,7 +6968,7 @@ impl SqliteStorage {
                 params.push(SqliteValue::from(label.as_str()));
             }
 
-            conn.execute_with_params(&sql, &params)?;
+            self.conn.execute_with_params(&sql, &params)?;
         }
 
         Ok(())
@@ -7072,37 +6984,8 @@ impl SqliteStorage {
         issue_id: &str,
         dependencies: &[crate::model::Dependency],
     ) -> Result<()> {
-        Self::with_connection_write_transaction(&self.conn, |conn| {
-            Self::sync_dependencies_for_import_in_tx(conn, issue_id, dependencies)
-        })
-    }
-
-    /// Sync dependencies while participating in an already-open write
-    /// transaction on this storage handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operation fails.
-    pub(crate) fn sync_dependencies_for_import_on_active_tx(
-        &self,
-        issue_id: &str,
-        dependencies: &[crate::model::Dependency],
-    ) -> Result<()> {
-        Self::sync_dependencies_for_import_in_tx(&self.conn, issue_id, dependencies)
-    }
-
-    /// Sync dependencies for an imported issue using the caller's active transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operation fails.
-    pub(crate) fn sync_dependencies_for_import_in_tx(
-        conn: &Connection,
-        issue_id: &str,
-        dependencies: &[crate::model::Dependency],
-    ) -> Result<()> {
         // Remove existing dependencies where this issue is the dependent
-        conn.execute_with_params(
+        self.conn.execute_with_params(
             "DELETE FROM dependencies WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -7112,44 +6995,20 @@ impl SqliteStorage {
         }
 
         // Add new dependencies
-        let mut best_dep_indices: HashMap<String, usize> = HashMap::new();
-        for (index, dep) in dependencies.iter().enumerate() {
-            if dep.issue_id != issue_id {
-                return Err(BeadsError::Validation {
-                    field: "issue_id".to_string(),
-                    reason: format!("must match parent issue id '{issue_id}'"),
-                });
-            }
-            if dep.depends_on_id.trim().is_empty() {
-                return Err(BeadsError::Validation {
-                    field: "depends_on_id".to_string(),
-                    reason: "cannot be empty".to_string(),
-                });
-            }
-            if dep.depends_on_id == issue_id {
-                return Err(BeadsError::SelfDependency {
-                    id: issue_id.to_string(),
-                });
-            }
+        let mut seen_deps = HashSet::new();
+        let mut unique_deps = Vec::new();
+        for dep in dependencies {
             Self::validate_parent_child_endpoints(
                 issue_id,
                 &dep.depends_on_id,
                 dep.dep_type.as_str(),
             )?;
-            match best_dep_indices.get(dep.depends_on_id.as_str()).copied() {
-                Some(prev_idx) if dependencies[prev_idx].created_at >= dep.created_at => {}
-                _ => {
-                    best_dep_indices.insert(dep.depends_on_id.clone(), index);
-                }
+            // Deduplicate by (target, type) to allow multiple relationship types
+            // between the same issues while preventing identical duplicates.
+            if seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
+                unique_deps.push(dep);
             }
         }
-
-        let mut keep_indices: Vec<usize> = best_dep_indices.into_values().collect();
-        keep_indices.sort_unstable();
-        let unique_deps: Vec<&crate::model::Dependency> = keep_indices
-            .into_iter()
-            .map(|idx| &dependencies[idx])
-            .collect();
 
         if unique_deps.is_empty() {
             return Ok(());
@@ -7178,7 +7037,7 @@ impl SqliteStorage {
                 params.push(SqliteValue::from(dep.thread_id.as_deref().unwrap_or("")));
             }
 
-            conn.execute_with_params(&sql, &params)?;
+            self.conn.execute_with_params(&sql, &params)?;
         }
 
         Ok(())
@@ -7194,37 +7053,8 @@ impl SqliteStorage {
         issue_id: &str,
         comments: &[crate::model::Comment],
     ) -> Result<()> {
-        Self::with_connection_write_transaction(&self.conn, |conn| {
-            Self::sync_comments_for_import_in_tx(conn, issue_id, comments)
-        })
-    }
-
-    /// Sync comments while participating in an already-open write transaction
-    /// on this storage handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operation fails.
-    pub(crate) fn sync_comments_for_import_on_active_tx(
-        &self,
-        issue_id: &str,
-        comments: &[crate::model::Comment],
-    ) -> Result<()> {
-        Self::sync_comments_for_import_in_tx(&self.conn, issue_id, comments)
-    }
-
-    /// Sync comments for an imported issue using the caller's active transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operation fails.
-    pub(crate) fn sync_comments_for_import_in_tx(
-        conn: &Connection,
-        issue_id: &str,
-        comments: &[crate::model::Comment],
-    ) -> Result<()> {
         // Remove existing comments
-        conn.execute_with_params(
+        self.conn.execute_with_params(
             "DELETE FROM comments WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -7233,33 +7063,31 @@ impl SqliteStorage {
             return Ok(());
         }
 
-        let mut seen_comment_ids = HashSet::new();
         for comment in comments {
             let created_at = comment.created_at.to_rfc3339();
-            let duplicate_in_batch = comment.id > 0 && !seen_comment_ids.insert(comment.id);
             let colliding_issue_id = if comment.id > 0 {
-                conn.query_with_params(
-                    "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
-                    &[SqliteValue::from(comment.id)],
-                )?
-                .into_iter()
-                .next()
-                .and_then(|row| {
-                    row.get(0)
-                        .and_then(SqliteValue::as_text)
-                        .map(str::to_string)
-                })
+                self.conn
+                    .query_with_params(
+                        "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
+                        &[SqliteValue::from(comment.id)],
+                    )?
+                    .into_iter()
+                    .next()
+                    .and_then(|row| {
+                        row.get(0)
+                            .and_then(SqliteValue::as_text)
+                            .map(str::to_string)
+                    })
             } else {
                 None
             };
 
-            if duplicate_in_batch
-                || colliding_issue_id
-                    .as_deref()
-                    .is_some_and(|existing_issue_id| existing_issue_id != issue_id)
+            if colliding_issue_id
+                .as_deref()
+                .is_some_and(|existing_issue_id| existing_issue_id != issue_id)
                 || comment.id <= 0
             {
-                conn.execute_with_params(
+                self.conn.execute_with_params(
                     "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
                     &[
                         SqliteValue::from(issue_id),
@@ -7269,7 +7097,7 @@ impl SqliteStorage {
                     ],
                 )?;
             } else {
-                conn.execute_with_params(
+                self.conn.execute_with_params(
                     "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
                     &[
                         SqliteValue::from(comment.id),
@@ -7283,69 +7111,6 @@ impl SqliteStorage {
         }
 
         Ok(())
-    }
-
-    /// Tombstone an issue using the caller's active transaction.
-    ///
-    /// Returns `Ok(false)` when the row no longer exists by the time the
-    /// tombstone update executes.
-    pub(crate) fn tombstone_issue_in_tx(
-        conn: &Connection,
-        ctx: &mut MutationContext,
-        issue: &Issue,
-        actor: &str,
-        reason: &str,
-        deleted_at: Option<DateTime<Utc>>,
-    ) -> Result<bool> {
-        let was_terminal = issue.status.is_terminal();
-        let original_type = issue.issue_type.as_str().to_string();
-        let timestamp = deleted_at.unwrap_or_else(Utc::now);
-        let mut tombstone_issue = issue.clone();
-        tombstone_issue.status = Status::Tombstone;
-        tombstone_issue.closed_at = None;
-        tombstone_issue.close_reason = None;
-        tombstone_issue.closed_by_session = None;
-        let tombstone_hash = crate::util::content_hash(&tombstone_issue);
-
-        let updated = conn.execute_with_params(
-            "UPDATE issues SET
-                content_hash = ?,
-                status = 'tombstone',
-                deleted_at = ?,
-                deleted_by = ?,
-                delete_reason = ?,
-                original_type = ?,
-                updated_at = ?,
-                closed_at = NULL,
-                close_reason = NULL,
-                closed_by_session = NULL
-             WHERE id = ?",
-            &[
-                SqliteValue::from(tombstone_hash.as_str()),
-                SqliteValue::from(timestamp.to_rfc3339()),
-                SqliteValue::from(actor),
-                SqliteValue::from(reason),
-                SqliteValue::from(original_type.as_str()),
-                SqliteValue::from(Utc::now().to_rfc3339()),
-                SqliteValue::from(issue.id.as_str()),
-            ],
-        )?;
-
-        if updated == 0 {
-            return Ok(false);
-        }
-
-        if !was_terminal {
-            ctx.record_event(
-                EventType::Deleted,
-                &issue.id,
-                Some(format!("Deleted issue: {reason}")),
-            );
-        }
-        ctx.mark_dirty(&issue.id);
-        ctx.invalidate_cache();
-
-        Ok(true)
     }
 }
 
@@ -7367,9 +7132,8 @@ impl crate::validation::DependencyStore for SqliteStorage {
         &self,
         issue_id: &str,
         depends_on_id: &str,
-        dep_type: Option<&str>,
     ) -> std::result::Result<bool, crate::error::BeadsError> {
-        Self::check_cycle(&self.conn, issue_id, depends_on_id, dep_type, true)
+        Self::check_cycle(&self.conn, issue_id, depends_on_id, true)
     }
 }
 
@@ -8413,7 +8177,7 @@ mod tests {
             .unwrap();
 
         let creates_cycle = storage
-            .would_create_cycle("bd-cy3", "bd-cy1", Some("blocks"), true)
+            .would_create_cycle("bd-cy3", "bd-cy1", true)
             .unwrap();
         assert!(creates_cycle);
     }
@@ -8678,210 +8442,6 @@ mod tests {
 
         let comments_b = storage.get_comments("bd-c-import-b").unwrap();
         assert_eq!(comments_b, vec![existing_comment]);
-    }
-
-    #[test]
-    fn test_sync_comments_for_import_reassigns_duplicate_ids_within_issue() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
-
-        let issue = make_issue(
-            "bd-c-import-dup",
-            "Duplicate comment import target",
-            Status::Open,
-            2,
-            None,
-            t1,
-            None,
-        );
-        storage.create_issue(&issue, "tester").unwrap();
-
-        let imported_comments = vec![
-            crate::model::Comment {
-                id: 42,
-                issue_id: issue.id.clone(),
-                author: "alice".to_string(),
-                body: "First imported comment".to_string(),
-                created_at: t1 + chrono::Duration::minutes(1),
-            },
-            crate::model::Comment {
-                id: 42,
-                issue_id: issue.id.clone(),
-                author: "bob".to_string(),
-                body: "Second imported comment".to_string(),
-                created_at: t1 + chrono::Duration::minutes(2),
-            },
-        ];
-
-        storage
-            .sync_comments_for_import(&issue.id, &imported_comments)
-            .unwrap();
-
-        let comments = storage.get_comments(&issue.id).unwrap();
-        assert_eq!(comments.len(), 2);
-        assert_eq!(comments[0].id, 42);
-        assert_ne!(comments[1].id, 42);
-        assert_eq!(comments[0].body, "First imported comment");
-        assert_eq!(comments[1].body, "Second imported comment");
-    }
-
-    #[test]
-    fn test_sync_dependencies_for_import_rejects_self_dependency() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
-
-        let dependencies = vec![crate::model::Dependency {
-            issue_id: "bd-self".to_string(),
-            depends_on_id: "bd-self".to_string(),
-            dep_type: crate::model::DependencyType::Blocks,
-            created_at: t1,
-            created_by: Some("tester".to_string()),
-            metadata: None,
-            thread_id: None,
-        }];
-
-        let err = storage
-            .sync_dependencies_for_import("bd-self", &dependencies)
-            .unwrap_err();
-
-        assert!(matches!(err, BeadsError::SelfDependency { id } if id == "bd-self"));
-    }
-
-    #[test]
-    fn test_sync_dependencies_for_import_rejects_empty_target() {
-        let storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
-
-        let dependencies = vec![crate::model::Dependency {
-            issue_id: "bd-empty".to_string(),
-            depends_on_id: "   ".to_string(),
-            dep_type: crate::model::DependencyType::Blocks,
-            created_at: t1,
-            created_by: Some("tester".to_string()),
-            metadata: None,
-            thread_id: None,
-        }];
-
-        let err = storage
-            .sync_dependencies_for_import("bd-empty", &dependencies)
-            .unwrap_err();
-
-        assert!(
-            matches!(err, BeadsError::Validation { field, reason } if field == "depends_on_id" && reason == "cannot be empty")
-        );
-    }
-
-    #[test]
-    fn test_sync_dependencies_for_import_keeps_latest_dependency_for_same_target() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
-
-        let issue = make_issue(
-            "bd-dep-import",
-            "Dependency import target",
-            Status::Open,
-            2,
-            None,
-            t1,
-            None,
-        );
-        let target = make_issue(
-            "bd-dep-target",
-            "Dependency target",
-            Status::Open,
-            2,
-            None,
-            t1,
-            None,
-        );
-        storage.create_issue(&issue, "tester").unwrap();
-        storage.create_issue(&target, "tester").unwrap();
-
-        let dependencies = vec![
-            crate::model::Dependency {
-                issue_id: issue.id.clone(),
-                depends_on_id: target.id.clone(),
-                dep_type: crate::model::DependencyType::Blocks,
-                created_at: t1 + chrono::Duration::minutes(1),
-                created_by: Some("alice".to_string()),
-                metadata: Some("{\"order\":1}".to_string()),
-                thread_id: None,
-            },
-            crate::model::Dependency {
-                issue_id: issue.id.clone(),
-                depends_on_id: target.id.clone(),
-                dep_type: crate::model::DependencyType::WaitsFor,
-                created_at: t1 + chrono::Duration::minutes(2),
-                created_by: Some("bob".to_string()),
-                metadata: Some("{\"order\":2}".to_string()),
-                thread_id: Some("br-200".to_string()),
-            },
-        ];
-
-        storage
-            .sync_dependencies_for_import(&issue.id, &dependencies)
-            .unwrap();
-
-        let stored = storage.get_dependencies_full(&issue.id).unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].depends_on_id, target.id);
-        assert_eq!(stored[0].dep_type, crate::model::DependencyType::WaitsFor);
-        assert_eq!(stored[0].created_by.as_deref(), Some("bob"));
-        assert_eq!(stored[0].metadata.as_deref(), Some("{\"order\":2}"));
-        assert_eq!(stored[0].thread_id.as_deref(), Some("br-200"));
-    }
-
-    #[test]
-    fn test_sync_dependencies_for_import_rolls_back_on_validation_error() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
-
-        let issue = make_issue(
-            "bd-dep-rollback",
-            "Dependency rollback target",
-            Status::Open,
-            2,
-            None,
-            t1,
-            None,
-        );
-        let old_target = make_issue(
-            "bd-dep-old",
-            "Existing dependency target",
-            Status::Open,
-            2,
-            None,
-            t1,
-            None,
-        );
-        storage.create_issue(&issue, "tester").unwrap();
-        storage.create_issue(&old_target, "tester").unwrap();
-        storage
-            .add_dependency(&issue.id, &old_target.id, "blocks", "tester")
-            .unwrap();
-
-        let invalid_dependencies = vec![crate::model::Dependency {
-            issue_id: issue.id.clone(),
-            depends_on_id: "   ".to_string(),
-            dep_type: crate::model::DependencyType::Blocks,
-            created_at: t1 + chrono::Duration::minutes(1),
-            created_by: Some("alice".to_string()),
-            metadata: None,
-            thread_id: None,
-        }];
-
-        let err = storage
-            .sync_dependencies_for_import(&issue.id, &invalid_dependencies)
-            .unwrap_err();
-
-        assert!(
-            matches!(err, BeadsError::Validation { field, reason } if field == "depends_on_id" && reason == "cannot be empty")
-        );
-
-        let stored = storage.get_dependencies_full(&issue.id).unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].depends_on_id, old_target.id);
-        assert_eq!(stored[0].dep_type, crate::model::DependencyType::Blocks);
     }
 
     #[test]
@@ -9385,48 +8945,6 @@ mod tests {
         let rebuilt = SqliteStorage::rebuild_blocked_cache_impl(&storage.conn).unwrap();
         assert_eq!(rebuilt, 1);
         assert_eq!(storage.get_blockers(&blocked.id).unwrap(), vec![blocker.id]);
-    }
-
-    #[test]
-    fn test_insert_blocked_cache_entries_deduplicates_duplicate_issue_ids_last_value_wins() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let issue = make_issue(
-            "bd-cache-dup",
-            "Cache target",
-            Status::Open,
-            2,
-            None,
-            Utc::now(),
-            None,
-        );
-        storage.create_issue(&issue, "tester").unwrap();
-
-        let inserted = SqliteStorage::insert_blocked_cache_entries(
-            &storage.conn,
-            &[
-                (issue.id.clone(), "[\"bd-blocker-old:open\"]".to_string()),
-                (issue.id.clone(), "[\"bd-blocker-new:open\"]".to_string()),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            inserted, 1,
-            "duplicate blocked-cache rows should collapse to one write"
-        );
-
-        let blocked_by = storage
-            .conn
-            .query_row_with_params(
-                "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
-                &[SqliteValue::from(issue.id.as_str())],
-            )
-            .unwrap()
-            .get(0)
-            .and_then(SqliteValue::as_text)
-            .unwrap()
-            .to_string();
-        assert_eq!(blocked_by, "[\"bd-blocker-new:open\"]");
     }
 
     #[test]
@@ -10115,48 +9633,6 @@ mod tests {
     }
 
     #[test]
-    fn test_upsert_issue_for_import_rolls_back_when_insert_conflicts() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
-
-        let mut keeper = make_issue(
-            "bd-import-keeper",
-            "Keeper",
-            Status::Open,
-            2,
-            None,
-            t1,
-            None,
-        );
-        keeper.external_ref = Some("ext://shared".to_string());
-
-        let subject = make_issue(
-            "bd-import-subject",
-            "Subject",
-            Status::Open,
-            2,
-            None,
-            t1,
-            None,
-        );
-
-        storage.create_issue(&keeper, "tester").unwrap();
-        storage.create_issue(&subject, "tester").unwrap();
-
-        let mut conflicting_subject = subject.clone();
-        conflicting_subject.title = "Conflicting Subject".to_string();
-        conflicting_subject.external_ref = keeper.external_ref.clone();
-
-        storage
-            .upsert_issue_for_import(&conflicting_subject)
-            .unwrap_err();
-
-        let stored_subject = storage.get_issue(&subject.id).unwrap().unwrap();
-        assert_eq!(stored_subject.title, subject.title);
-        assert_eq!(stored_subject.external_ref, subject.external_ref);
-    }
-
-    #[test]
     fn test_pragmas_are_set_correctly() {
         let storage = SqliteStorage::open_memory().unwrap();
 
@@ -10506,7 +9982,6 @@ mod tests {
         let conn = fsqlite::Connection::open(":memory:".to_string()).unwrap();
 
         // Apply schema step by step, checking after each table
-        // Title limit must match validation::MAX_TITLE_CHARS (500).
         let tables = vec![(
             "issues",
             r"CREATE TABLE IF NOT EXISTS issues (

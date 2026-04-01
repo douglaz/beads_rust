@@ -4,8 +4,6 @@ use rich_rust::prelude::*;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
-const DEFAULT_MAX_TREE_DEPTH: usize = 10;
-
 /// Renders a dependency tree for an issue.
 pub struct DependencyTree<'a> {
     root_issue: &'a Issue,
@@ -21,7 +19,7 @@ impl<'a> DependencyTree<'a> {
             root_issue: root,
             all_issues: all,
             theme,
-            max_depth: DEFAULT_MAX_TREE_DEPTH,
+            max_depth: 10,
         }
     }
 

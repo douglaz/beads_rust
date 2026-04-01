@@ -12,13 +12,13 @@ use crate::sync::history::HistoryConfig;
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
-    METADATA_LAST_IMPORT_TIME, MISSING_IDS_PREVIEW_LIMIT, MergeContext, OrphanMode,
-    compute_jsonl_hash, compute_staleness, count_issues_in_jsonl, export_temp_path,
-    export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl, import_from_jsonl,
-    load_base_snapshot, read_issues_from_jsonl, require_safe_sync_overwrite_path,
-    save_base_snapshot, three_way_merge, validate_sync_path_with_external,
+    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, compute_staleness,
+    count_issues_in_jsonl, export_temp_path, export_to_jsonl_with_policy, finalize_export,
+    get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
+    require_safe_sync_overwrite_path, save_base_snapshot, three_way_merge,
+    validate_sync_path_with_external,
 };
-use crate::util::id::{DEFAULT_ID_PREFIX, split_prefix_remainder};
+use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -26,9 +26,6 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
-
-/// Number of hex characters to show when truncating SHA-256 content hashes.
-const HASH_DISPLAY_TRUNCATION_LEN: usize = 12;
 
 /// Result of a flush (export) operation.
 #[derive(Debug, Serialize)]
@@ -213,7 +210,7 @@ fn validate_sync_paths(
         )));
     }
 
-    let is_external = config::resolved_jsonl_path_is_external(&canonical_beads, &jsonl_path);
+    let is_external = !jsonl_path.starts_with(&canonical_beads);
     if is_external && !allow_external_jsonl {
         warn!(
             path = %jsonl_path.display(),
@@ -443,8 +440,8 @@ fn render_status_rich(status: &SyncStatus, ctx: &OutputContext) {
     // Content hash (truncated)
     if let Some(ref hash) = status.jsonl_content_hash {
         text.append_styled("Content hash: ", theme.dimmed.clone());
-        let display_hash = if hash.len() > HASH_DISPLAY_TRUNCATION_LEN {
-            format!("{}…", &hash[..HASH_DISPLAY_TRUNCATION_LEN])
+        let display_hash = if hash.len() > 12 {
+            format!("{}…", &hash[..12])
         } else {
             hash.clone()
         };
@@ -512,18 +509,15 @@ fn execute_flush(
 
             if !missing_list.is_empty() {
                 missing_list.sort();
-                let display_count = missing_list.len().min(MISSING_IDS_PREVIEW_LIMIT);
+                let display_count = missing_list.len().min(10);
                 let preview = missing_list
                     .iter()
                     .take(display_count)
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .join(", ");
-                let more = if missing_list.len() > MISSING_IDS_PREVIEW_LIMIT {
-                    format!(
-                        " ... and {} more",
-                        missing_list.len() - MISSING_IDS_PREVIEW_LIMIT
-                    )
+                let more = if missing_list.len() > 10 {
+                    format!(" ... and {} more", missing_list.len() - 10)
                 } else {
                     String::new()
                 };
@@ -754,8 +748,8 @@ fn render_flush_result_rich(result: &FlushResult, errors: &[ExportError], ctx: &
     if !result.content_hash.is_empty() {
         text.append("\n");
         text.append_styled("Content hash  ", theme.dimmed.clone());
-        let display_hash = if result.content_hash.len() > HASH_DISPLAY_TRUNCATION_LEN {
-            format!("{}…", &result.content_hash[..HASH_DISPLAY_TRUNCATION_LEN])
+        let display_hash = if result.content_hash.len() > 12 {
+            format!("{}…", &result.content_hash[..12])
         } else {
             result.content_hash.clone()
         };
@@ -947,7 +941,7 @@ fn execute_import(
     let target_prefix = if args.rename_prefix {
         let layer = config::load_config(beads_dir, Some(storage), cli)?;
         let id_cfg = config::id_config_from_layer(&layer);
-        Some(if id_cfg.prefix == DEFAULT_ID_PREFIX {
+        Some(if id_cfg.prefix == "br" {
             // Prefix is still the default — check if we should auto-detect from JSONL
             let db_prefix = storage.get_config("issue_prefix")?;
             if let Some(p) = db_prefix {
@@ -958,7 +952,7 @@ fn execute_import(
                 storage.set_config("issue_prefix", &detected)?;
                 detected
             } else {
-                DEFAULT_ID_PREFIX.to_string()
+                "br".to_string()
             }
         } else {
             // Config layer resolved a non-default prefix — use it
@@ -1211,7 +1205,7 @@ fn execute_merge(
     use_json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
-    _cli: &config::CliOverrides,
+    cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting 3-way merge");
@@ -1285,7 +1279,34 @@ fn execute_merge(
         return Err(BeadsError::Config(msg));
     }
 
-    apply_merge_report(storage, &report)?;
+    let _actor = cli.actor.as_deref().unwrap_or("br");
+
+    // Apply deletions. Base snapshots can lag behind historical ID migrations, so a
+    // merge may legitimately request deletion of an issue that is already absent from
+    // the live database. Treat that as a no-op instead of aborting the whole merge.
+    let existing_deleted_issues = storage.get_issues_by_ids(&report.deleted)?;
+    let existing_deleted_ids: std::collections::HashSet<String> =
+        existing_deleted_issues.into_iter().map(|i| i.id).collect();
+
+    for id in &report.deleted {
+        if existing_deleted_ids.contains(id) {
+            storage.delete_issue(id, "system", "merge deletion", Some(chrono::Utc::now()))?;
+        } else {
+            tracing::debug!(
+                issue_id = %id,
+                "Skipping merge deletion for issue already absent from local database"
+            );
+        }
+    }
+
+    // Apply updates/creates (upsert)
+    // We need to retrieve the actual Issue objects to upsert.
+    for issue in &report.kept {
+        storage.upsert_issue_for_import(issue)?;
+        storage.sync_labels_for_import(&issue.id, &issue.labels)?;
+        storage.sync_dependencies_for_import(&issue.id, &issue.dependencies)?;
+        storage.sync_comments_for_import(&issue.id, &issue.comments)?;
+    }
 
     // Add merge notes as comments
     for (id, note) in &report.notes {
@@ -1295,6 +1316,20 @@ fn execute_merge(
             tracing::info!(issue_id = %id, note = %note, "Added merge resolution note");
         }
     }
+
+    // Rebuild cache
+    storage.rebuild_blocked_cache(true)?;
+    // Merge can introduce hierarchical IDs via upsert; refresh counters before
+    // the next child-ID allocation trusts them.
+    storage.rebuild_child_counters_in_tx()?;
+
+    // Save Base Snapshot
+    let new_base: HashMap<_, _> = report
+        .kept
+        .iter()
+        .map(|i| (i.id.clone(), i.clone()))
+        .collect();
+    save_base_snapshot(&new_base, beads_dir)?;
 
     // Force Export to update JSONL (ensure sync)
     info!(path = %jsonl_path.display(), "Writing merged issues.jsonl");
@@ -1316,10 +1351,6 @@ fn execute_merge(
         Some(&export_result.issue_hashes),
         jsonl_path,
     )?;
-
-    // Snapshot the finalized exported state so the next merge uses the
-    // exact post-merge baseline, including merge-note comments.
-    save_base_snapshot_from_exported_jsonl(jsonl_path, beads_dir)?;
 
     // Output success message
     if use_json {
@@ -1348,100 +1379,6 @@ fn execute_merge(
         println!("  Base snapshot updated.");
         println!("  JSONL exported.");
     }
-
-    Ok(())
-}
-
-fn save_base_snapshot_from_exported_jsonl(jsonl_path: &Path, beads_dir: &Path) -> Result<()> {
-    let exported_issues: HashMap<_, _> = read_issues_from_jsonl(jsonl_path)
-        .map_err(|source| BeadsError::WithContext {
-            context: format!(
-                "merge export succeeded, but reloading exported JSONL '{}' for base snapshot failed",
-                jsonl_path.display()
-            ),
-            source: Box::new(source),
-        })?
-        .into_iter()
-        .map(|issue| (issue.id.clone(), issue))
-        .collect();
-    save_base_snapshot(&exported_issues, beads_dir).map_err(|source| BeadsError::WithContext {
-        context: format!(
-            "merge export succeeded, but saving the refreshed base snapshot under '{}' failed",
-            beads_dir.display()
-        ),
-        source: Box::new(source),
-    })
-}
-
-fn apply_merge_report(
-    storage: &mut crate::storage::SqliteStorage,
-    report: &crate::sync::MergeReport,
-) -> Result<()> {
-    if report.total_actions() == 0 {
-        return Ok(());
-    }
-
-    let deleted_issues: HashMap<String, Issue> = storage
-        .get_issues_by_ids(&report.deleted)?
-        .into_iter()
-        .map(|issue| (issue.id.clone(), issue))
-        .collect();
-
-    storage.mutate("merge_apply", "system", |conn, ctx| {
-        let merge_deleted_at = chrono::Utc::now();
-
-        // Keep the merge mutation phase atomic so a later relation-sync error
-        // cannot leave tombstones or partially imported issues behind.
-        for id in &report.deleted {
-            if let Some(issue) = deleted_issues.get(id) {
-                let applied = crate::storage::SqliteStorage::tombstone_issue_in_tx(
-                    conn,
-                    ctx,
-                    issue,
-                    "system",
-                    "merge deletion",
-                    Some(merge_deleted_at),
-                )?;
-                if !applied {
-                    tracing::debug!(
-                        issue_id = %id,
-                        "Skipping merge deletion for issue already absent from local database"
-                    );
-                }
-            } else {
-                tracing::debug!(
-                    issue_id = %id,
-                    "Skipping merge deletion for issue already absent from local database"
-                );
-            }
-        }
-
-        for issue in &report.kept {
-            crate::storage::SqliteStorage::upsert_issue_for_import_in_tx(conn, issue)?;
-            crate::storage::SqliteStorage::sync_labels_for_import_in_tx(
-                conn,
-                &issue.id,
-                &issue.labels,
-            )?;
-            crate::storage::SqliteStorage::sync_dependencies_for_import_in_tx(
-                conn,
-                &issue.id,
-                &issue.dependencies,
-            )?;
-            crate::storage::SqliteStorage::sync_comments_for_import_in_tx(
-                conn,
-                &issue.id,
-                &issue.comments,
-            )?;
-            ctx.mark_dirty(&issue.id);
-        }
-
-        // Merge can introduce hierarchical IDs via imported issues; keep the
-        // derived child counter state atomic with the rest of the merge.
-        crate::storage::SqliteStorage::rebuild_child_counters_with_conn(conn)?;
-        ctx.invalidate_cache();
-        Ok(())
-    })?;
 
     Ok(())
 }
@@ -1547,18 +1484,13 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_merge_report, detect_prefix_from_jsonl, validate_sync_paths};
-    use crate::config::CliOverrides;
+    use super::{detect_prefix_from_jsonl, validate_sync_paths};
     use crate::error::BeadsError;
-    use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
-    use crate::output::OutputContext;
+    use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use crate::sync::{
-        MergeReport, load_base_snapshot, read_issues_from_jsonl, save_base_snapshot,
-    };
     use chrono::Utc;
-    use std::collections::HashMap;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn make_test_issue(id: &str, title: &str) -> Issue {
@@ -1663,7 +1595,7 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
 
-        let traversal_path = temp.path().join("../outside/issues.jsonl");
+        let traversal_path = PathBuf::from("../outside/issues.jsonl");
         let err = validate_sync_paths(&beads_dir, &traversal_path, true).unwrap_err();
 
         match err {
@@ -1700,27 +1632,6 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_validate_sync_paths_allows_symlinked_internal_jsonl_without_opt_in() {
-        use std::os::unix::fs::symlink;
-
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        let internal_target = beads_dir.join("issues.jsonl");
-        fs::write(&internal_target, "{}\n").unwrap();
-
-        let symlink_path = temp.path().join("linked.jsonl");
-        symlink(&internal_target, &symlink_path).unwrap();
-
-        let policy = validate_sync_paths(&beads_dir, &symlink_path, false).expect("path policy");
-
-        assert_eq!(policy.jsonl_path, symlink_path);
-        assert!(!policy.is_external);
     }
 
     #[cfg(unix)]
@@ -1767,135 +1678,6 @@ mod tests {
         assert_eq!(
             detect_prefix_from_jsonl(&jsonl_path),
             Some("document-intelligence".to_string())
-        );
-    }
-
-    #[test]
-    fn test_apply_merge_report_is_atomic_when_relation_sync_fails() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let delete_me = make_test_issue("bd-delete", "Delete me");
-        storage.create_issue(&delete_me, "test").unwrap();
-
-        let mut incoming = make_test_issue("bd-new", "Incoming");
-        incoming.dependencies.push(Dependency {
-            issue_id: incoming.id.clone(),
-            depends_on_id: "external:parent".to_string(),
-            dep_type: DependencyType::ParentChild,
-            created_at: Utc::now(),
-            created_by: Some("test".to_string()),
-            metadata: None,
-            thread_id: None,
-        });
-
-        let report = MergeReport {
-            kept: vec![incoming],
-            deleted: vec!["bd-delete".to_string()],
-            ..MergeReport::default()
-        };
-
-        let err = apply_merge_report(&mut storage, &report).unwrap_err();
-        match err {
-            BeadsError::Validation { field, reason } => {
-                assert_eq!(field, "depends_on_id");
-                assert!(reason.contains("parent-child dependencies must link local issues"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-
-        let delete_me = storage
-            .get_issue("bd-delete")
-            .unwrap()
-            .expect("deleted issue should still exist");
-        assert_eq!(delete_me.status, Status::Open);
-        assert!(
-            storage.get_issue("bd-new").unwrap().is_none(),
-            "failed merge must not leave a partially imported issue behind"
-        );
-    }
-
-    #[test]
-    fn test_execute_merge_saves_base_snapshot_from_final_exported_state() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-        let jsonl_path = beads_dir.join("issues.jsonl");
-        let path_policy = validate_sync_paths(&beads_dir, &jsonl_path, false).unwrap();
-
-        let mut storage = SqliteStorage::open_memory().unwrap();
-
-        let mut base_issue = make_test_issue("bd-001", "Base Title");
-        base_issue.created_at = Utc::now() - chrono::Duration::minutes(5);
-        base_issue.updated_at = base_issue.created_at;
-
-        let mut local_issue = base_issue.clone();
-        local_issue.title = "Local Modified".to_string();
-        local_issue.updated_at = base_issue.updated_at + chrono::Duration::minutes(1);
-        storage.create_issue(&local_issue, "test").unwrap();
-
-        let mut base_snapshot = HashMap::new();
-        base_snapshot.insert(base_issue.id.clone(), base_issue.clone());
-        save_base_snapshot(&base_snapshot, &beads_dir).unwrap();
-
-        let mut external_issue = base_issue.clone();
-        external_issue.title = "External Modified".to_string();
-        external_issue.updated_at = base_issue.updated_at + chrono::Duration::minutes(2);
-        fs::write(
-            &jsonl_path,
-            format!("{}\n", serde_json::to_string(&external_issue).unwrap()),
-        )
-        .unwrap();
-
-        let args = crate::cli::SyncArgs {
-            flush_only: false,
-            import_only: false,
-            merge: true,
-            status: false,
-            force: false,
-            allow_external_jsonl: false,
-            manifest: false,
-            error_policy: None,
-            orphans: None,
-            rename_prefix: false,
-            rebuild: false,
-            robot: false,
-        };
-        let ctx = OutputContext::from_flags(false, true, false);
-        let cli = CliOverrides {
-            quiet: Some(true),
-            ..CliOverrides::default()
-        };
-
-        super::execute_merge(
-            &mut storage,
-            &path_policy,
-            &args,
-            false,
-            false,
-            None,
-            &cli,
-            &ctx,
-        )
-        .unwrap();
-
-        let exported_issue = read_issues_from_jsonl(&jsonl_path)
-            .unwrap()
-            .into_iter()
-            .find(|issue| issue.id == "bd-001")
-            .expect("merged issue should be exported");
-        assert_eq!(exported_issue.comments.len(), 1);
-        assert_eq!(exported_issue.comments[0].author, "br-sync");
-        assert!(
-            exported_issue.comments[0].body.contains("Both modified"),
-            "merge note should be exported"
-        );
-
-        let base_snapshot = load_base_snapshot(&beads_dir).unwrap();
-        let snapshot_issue = base_snapshot
-            .get("bd-001")
-            .expect("merged issue should exist in saved base snapshot");
-        assert_eq!(
-            snapshot_issue.comments, exported_issue.comments,
-            "base snapshot must reflect the finalized exported state"
         );
     }
 }

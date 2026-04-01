@@ -12,8 +12,6 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
-const SYNC_LOCK_FILENAME: &str = ".sync.lock";
-
 #[allow(clippy::too_many_lines)]
 fn main() {
     CompleteEnv::with_factory(Cli::command).complete();
@@ -205,7 +203,7 @@ fn main() {
         }
         Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
-        Commands::Info(args) => commands::info::execute(&args, &output_ctx, &overrides),
+        Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
@@ -332,7 +330,7 @@ fn main() {
 /// `None` (non-blocking).
 #[allow(clippy::incompatible_msrv)]
 fn try_sync_lock(beads_dir: &Path) -> Option<File> {
-    let lock_path = beads_dir.join(SYNC_LOCK_FILENAME);
+    let lock_path = beads_dir.join(".sync.lock");
     let file = OpenOptions::new()
         .read(true)
         .write(true)

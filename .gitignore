@@ -139,9 +139,3 @@ report.json
 .codex-local-check/
 .codex-bench/
 .codex-tmp/
-
-# Ephemeral test/debug files at repo root
-/child.json
-/parent.json
-/test_cycle.rs
-/test_jc1j.sh

@@ -78,7 +78,7 @@ pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let route_cli = routed_cli_for_graph(cli, args, &beads_dir)?;
     let storage_ctx = open_storage_for_graph(args, &route_cli, &beads_dir)?;
-    execute_graph_with_storage_ctx(args, &route_cli, ctx, &storage_ctx)
+    execute_with_storage_ctx(args, &route_cli, ctx, &beads_dir, &storage_ctx)
 }
 
 fn routed_cli_for_graph(
@@ -131,7 +131,7 @@ pub fn execute_with_storage_ctx(
         && !args.all
     {
         let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-        if route.is_external && !storage_ctx_targets_beads_dir(storage_ctx, &route.beads_dir) {
+        if route.is_external {
             let mut route_cli = cli.clone();
             route_cli.db = None;
             let mut routed_storage_ctx =
@@ -142,17 +142,6 @@ pub fn execute_with_storage_ctx(
     }
 
     execute_graph_with_storage_ctx(args, cli, ctx, storage_ctx)
-}
-
-fn storage_ctx_targets_beads_dir(
-    storage_ctx: &config::OpenStorageResult,
-    beads_dir: &std::path::Path,
-) -> bool {
-    normalize_beads_dir(&storage_ctx.paths.beads_dir) == normalize_beads_dir(beads_dir)
-}
-
-fn normalize_beads_dir(path: &std::path::Path) -> std::path::PathBuf {
-    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn execute_graph_with_storage_ctx(
@@ -1217,8 +1206,6 @@ fn status_style(status: &str, theme: &crate::output::Theme) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
 
     #[test]
     fn test_graph_node_serialization() {
@@ -1909,53 +1896,5 @@ mod tests {
             ordered_ids,
             vec!["root", "branch-a", "middle", "leaf", "branch-b"]
         );
-    }
-
-    #[test]
-    fn test_storage_ctx_targets_beads_dir_matches_routed_external_context() {
-        let dir = TempDir::new().expect("tempdir");
-        let local_beads = dir.path().join("current/.beads");
-        let external_beads = dir.path().join("external/.beads");
-        fs::create_dir_all(&local_beads).expect("create local beads dir");
-        fs::create_dir_all(&external_beads).expect("create external beads dir");
-        fs::write(
-            local_beads.join("routes.jsonl"),
-            r#"{"prefix":"ext-","path":"../external"}"#,
-        )
-        .expect("write routes");
-
-        let route = config::routing::resolve_route("ext-1", &local_beads).expect("route");
-        let storage_ctx =
-            config::open_storage_with_cli(&route.beads_dir, &config::CliOverrides::default())
-                .expect("open routed storage");
-
-        assert!(storage_ctx_targets_beads_dir(
-            &storage_ctx,
-            &route.beads_dir
-        ));
-    }
-
-    #[test]
-    fn test_storage_ctx_targets_beads_dir_rejects_local_context_for_external_route() {
-        let dir = TempDir::new().expect("tempdir");
-        let local_beads = dir.path().join("current/.beads");
-        let external_beads = dir.path().join("external/.beads");
-        fs::create_dir_all(&local_beads).expect("create local beads dir");
-        fs::create_dir_all(&external_beads).expect("create external beads dir");
-        fs::write(
-            local_beads.join("routes.jsonl"),
-            r#"{"prefix":"ext-","path":"../external"}"#,
-        )
-        .expect("write routes");
-
-        let route = config::routing::resolve_route("ext-1", &local_beads).expect("route");
-        let storage_ctx =
-            config::open_storage_with_cli(&local_beads, &config::CliOverrides::default())
-                .expect("open local storage");
-
-        assert!(!storage_ctx_targets_beads_dir(
-            &storage_ctx,
-            &route.beads_dir
-        ));
     }
 }

@@ -50,7 +50,7 @@ impl ConfigSource {
             Self::Db => "db",
             Self::LegacyUser => "legacy user",
             Self::User => "user config",
-            Self::Project => "project config",
+            Self::Project => ".beads/config",
             Self::Environment => "environment",
             Self::Cli => "cli",
         }
@@ -204,17 +204,10 @@ fn build_layers(
     let db_overrides = overrides_without_no_db(overrides);
 
     let (jsonl_inferred_layer, db_layer) = if let Some(dir) = beads_dir {
-        let startup = config::load_startup_config_with_paths(dir, db_overrides.db.as_ref())?;
-        let mut effective_startup = startup.merged_config.clone();
-        effective_startup.merge_from(&overrides.as_layer());
-        let no_db = config::no_db_from_layer(&effective_startup).unwrap_or(false);
+        let paths = config::resolve_paths(dir, db_overrides.db.as_ref())?;
         (
-            load_jsonl_inferred_layer(&startup.paths)?,
-            if no_db {
-                ConfigLayer::default()
-            } else {
-                load_db_layer_without_recovery(&startup.paths)
-            },
+            load_jsonl_inferred_layer(&paths)?,
+            load_db_layer_without_recovery(&paths),
         )
     } else {
         (ConfigLayer::default(), ConfigLayer::default())
@@ -944,7 +937,7 @@ fn show_config(
             return Ok(());
         } else if ctx.is_rich() {
             let theme = ctx.theme();
-            let panel = Panel::from_text("No project config (no beads workspace found).")
+            let panel = Panel::from_text("No project config (no .beads directory found).")
                 .title(Text::styled(
                     "Project Configuration",
                     theme.panel_title.clone(),
@@ -953,7 +946,7 @@ fn show_config(
                 .border_style(theme.panel_border.clone());
             ctx.render(&panel);
         } else {
-            println!("No project config (no beads workspace found)");
+            println!("No project config (no .beads directory found)");
         }
         return Ok(());
     }
@@ -1187,11 +1180,6 @@ mod tests {
     }
 
     #[test]
-    fn test_project_config_source_label_is_workspace_neutral() {
-        assert_eq!(ConfigSource::Project.label(), "project config");
-    }
-
-    #[test]
     fn test_nested_key_parsing() {
         // Test the key parsing logic - "display.color" should have 2 parts
         let parts: Vec<&str> = "display.color".split('.').collect();
@@ -1338,55 +1326,6 @@ mod tests {
                 .map(String::as_str),
             Some("proj"),
             "JSONL layer should infer prefix from issue IDs"
-        );
-    }
-
-    #[test]
-    fn test_build_layers_skips_db_layer_when_cli_no_db_is_true() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let beads_dir = dir.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        let db_path = beads_dir.join("beads.db");
-        let mut storage = crate::storage::SqliteStorage::open(&db_path).unwrap();
-        storage.set_config("default_priority", "4").unwrap();
-
-        let overrides = CliOverrides {
-            no_db: Some(true),
-            ..CliOverrides::default()
-        };
-        let layers = build_layers(Some(&beads_dir), &overrides).unwrap();
-        let db_layer = layers
-            .iter()
-            .find(|layer| matches!(layer.source, ConfigSource::Db))
-            .expect("db layer");
-
-        assert!(
-            !db_layer.layer.runtime.contains_key("default_priority"),
-            "effective --no-db mode should hide DB-backed runtime config"
-        );
-    }
-
-    #[test]
-    fn test_build_layers_skips_db_layer_when_startup_no_db_is_true() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let beads_dir = dir.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-        fs::write(beads_dir.join("config.yaml"), "no-db: true\n").unwrap();
-
-        let db_path = beads_dir.join("beads.db");
-        let mut storage = crate::storage::SqliteStorage::open(&db_path).unwrap();
-        storage.set_config("default_priority", "4").unwrap();
-
-        let layers = build_layers(Some(&beads_dir), &CliOverrides::default()).unwrap();
-        let db_layer = layers
-            .iter()
-            .find(|layer| matches!(layer.source, ConfigSource::Db))
-            .expect("db layer");
-
-        assert!(
-            !db_layer.layer.runtime.contains_key("default_priority"),
-            "startup no-db mode should hide DB-backed runtime config"
         );
     }
 

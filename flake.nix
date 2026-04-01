@@ -29,20 +29,15 @@
 
     flake-utils.url = "github:numtide/flake-utils";
 
-    # Sibling dependencies fetched from GitHub since Nix flakes
-    # cannot use relative path dependencies
+    # Sibling dependency: toon_rust
+    # Fetched from GitHub since Nix flakes cannot use relative path dependencies
     toon_rust = {
       url = "github:Dicklesworthstone/toon_rust";
       flake = false;
     };
-
-    frankensqlite = {
-      url = "github:Dicklesworthstone/frankensqlite";
-      flake = false;
-    };
   };
 
-  outputs = { self, nixpkgs, crane, fenix, flake-utils, toon_rust, frankensqlite, ... }:
+  outputs = { self, nixpkgs, crane, fenix, flake-utils, toon_rust, ... }:
     flake-utils.lib.eachSystem [
       "x86_64-linux"
       "aarch64-linux"
@@ -71,10 +66,10 @@
           || builtins.match ".*\\.rs$" path != null
           || builtins.match ".*\\.sql$" path != null;
 
-        # Combined source tree with beads_rust and sibling dependencies
-        # Required because Cargo.toml uses path = "../toon_rust" and "../frankensqlite"
+        # Combined source tree with beads_rust and toon_rust
+        # Required because Cargo.toml references path = "../toon_rust"
         combinedSrc = pkgs.runCommand "beads_rust-src" { } ''
-          mkdir -p $out/beads_rust $out/toon_rust $out/frankensqlite
+          mkdir -p $out/beads_rust $out/toon_rust
 
           # Copy beads_rust
           cp ${./Cargo.toml} $out/beads_rust/Cargo.toml
@@ -86,23 +81,16 @@
           ${pkgs.lib.optionalString (builtins.pathExists ./benches) "cp -r ${./benches} $out/beads_rust/benches"}
           ${pkgs.lib.optionalString (builtins.pathExists ./tests) "cp -r ${./tests} $out/beads_rust/tests"}
 
-          # Copy sibling dependencies
+          # Copy toon_rust dependency
           cp -r ${toon_rust}/* $out/toon_rust/
-          cp -r ${frankensqlite}/* $out/frankensqlite/
         '';
-
-        # Vendor dependencies using the local Cargo.lock directly,
-        # since combinedSrc nests it under beads_rust/ where crane can't find it
-        cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
 
         # Common arguments shared between dependency and final builds
         commonArgs = {
           src = combinedSrc;
-          inherit cargoVendorDir;
-          cargoLock = ./Cargo.lock;
 
           pname = "beads_rust";
-          version = "0.1.34";
+          version = "0.1.20";
 
           strictDeps = true;
 
@@ -200,7 +188,6 @@
 
           fmt = craneLib.cargoFmt {
             src = combinedSrc;
-            inherit cargoVendorDir;
             postUnpack = ''
               cd $sourceRoot/beads_rust
               sourceRoot=$PWD

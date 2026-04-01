@@ -49,19 +49,13 @@ impl From<&CliCloseArgs> for CloseArgs {
 ///
 /// Returns an error if database operations fail or IDs cannot be resolved.
 pub fn execute_cli(
-    args: &crate::cli::CloseArgs,
-    use_json: bool,
+    cli_args: &CliCloseArgs,
+    json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let internal_args = CloseArgs {
-        ids: args.ids.clone(),
-        reason: args.reason.clone(),
-        force: args.force,
-        session: args.session.clone(),
-        suggest_next: args.suggest_next,
-    };
-    execute_with_args(&internal_args, use_json, cli, ctx, None)
+    let args = CloseArgs::from(cli_args);
+    execute_with_args(&args, json, cli, ctx)
 }
 
 /// Result of a close operation for JSON output.
@@ -317,7 +311,7 @@ pub fn execute(
         suggest_next: false,
     };
 
-    execute_with_args(&args, json, cli, ctx, None)
+    execute_with_args(&args, json, cli, ctx)
 }
 
 /// Execute the close command with full arguments.
@@ -331,12 +325,11 @@ pub fn execute_with_args(
     use_json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
-    start: Option<&std::path::Path>,
 ) -> Result<()> {
     tracing::info!("Executing close command");
     let use_structured_output = use_json || ctx.is_json() || ctx.is_toon();
 
-    let beads_dir = config::discover_beads_dir_with_cli_and_start(start, cli)?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
     if target_inputs.is_empty() {
         let last_touched = crate::util::get_last_touched_id(&beads_dir);
@@ -758,10 +751,30 @@ mod tests {
     use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
     use chrono::Utc;
+    use std::env;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DirGuard {
+        previous: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new(target: &std::path::Path) -> Self {
+            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+            env::set_current_dir(target).expect("set current dir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous);
+        }
+    }
 
     fn make_issue(id: &str, title: &str) -> Issue {
         let now = Utc::now();
@@ -1176,18 +1189,12 @@ mod tests {
         storage.rebuild_blocked_cache(true).expect("rebuild cache");
         drop(storage);
 
+        let _guard = DirGuard::new(temp.path());
         let args = CloseArgs {
             ids: vec!["bd-blocked".to_string(), "bd-blocker".to_string()],
             ..CloseArgs::default()
         };
-        execute_with_args(
-            &args,
-            false,
-            &CliOverrides::default(),
-            &ctx,
-            Some(temp.path()),
-        )
-        .expect("close batch");
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx).expect("close batch");
 
         let storage = SqliteStorage::open(&db_path).expect("reopen storage");
         let blocker = storage
@@ -1222,19 +1229,14 @@ mod tests {
             .create_issue(&issue, "tester")
             .expect("create closed issue");
 
+        let _guard = DirGuard::new(temp.path());
         let args = CloseArgs {
             ids: vec!["bd-closed".to_string()],
             ..CloseArgs::default()
         };
 
-        let err = execute_with_args(
-            &args,
-            true,
-            &CliOverrides::default(),
-            &ctx,
-            Some(temp.path()),
-        )
-        .expect_err("all-skipped close should fail");
+        let err = execute_with_args(&args, true, &CliOverrides::default(), &ctx)
+            .expect_err("all-skipped close should fail");
         assert!(matches!(err, BeadsError::NothingToDo { .. }));
     }
 }

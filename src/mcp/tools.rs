@@ -15,15 +15,11 @@ use fastmcp_rust::{
 };
 use serde_json::json;
 
-use crate::config::OpenStorageResult;
 use crate::error::{ErrorCode, StructuredError};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
-use crate::validation::{
-    MAX_DESCRIPTION_BYTES, MAX_ESTIMATED_MINUTES, MAX_EXTERNAL_REF_CHARS, MAX_TITLE_CHARS,
-};
 
-use super::{BeadsState, persist_mcp_mutation};
+use super::BeadsState;
 
 // ---------------------------------------------------------------------------
 // Constants — pre-computed sets for O(1) placeholder detection
@@ -86,23 +82,6 @@ const PLACEHOLDER_EXACT: &[&str] = &[
     "undefined",
     "n/a",
 ];
-
-// ---------------------------------------------------------------------------
-// Display and query limits
-// ---------------------------------------------------------------------------
-
-/// Default number of issues returned by list_issues.
-const DEFAULT_LIST_LIMIT: u64 = 50;
-/// Maximum number of issues a single list_issues call may return.
-const MAX_LIST_LIMIT: u64 = 500;
-/// Recent events shown in issue detail responses.
-const RECENT_EVENTS_DISPLAY_LIMIT: usize = 10;
-/// Top labels shown in project overview.
-const TOP_LABELS_DISPLAY_LIMIT: usize = 15;
-/// Blocked issues shown in project overview.
-const BLOCKED_ISSUES_DISPLAY_LIMIT: usize = 10;
-/// Ready issues shown in project overview.
-const READY_ISSUES_DISPLAY_LIMIT: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Placeholder detection
@@ -297,16 +276,8 @@ fn issue_not_found_err(storage: &SqliteStorage, id: &str) -> McpError {
     McpError::with_data(McpErrorCode::ToolExecutionError, structured.message, data)
 }
 
-fn open(state: &BeadsState) -> McpResult<OpenStorageResult> {
-    state.open_storage_ctx().map_err(beads_to_mcp)
-}
-
-fn persist_mutation(storage_ctx: &mut OpenStorageResult) -> McpResult<()> {
-    persist_mcp_mutation(storage_ctx).map_err(beads_to_mcp)
-}
-
-fn resolved_issue_prefix(state: &BeadsState, storage_ctx: &OpenStorageResult) -> McpResult<String> {
-    state.issue_prefix(storage_ctx).map_err(beads_to_mcp)
+fn open(state: &BeadsState) -> McpResult<SqliteStorage> {
+    state.open_storage().map_err(beads_to_mcp)
 }
 
 // ---------------------------------------------------------------------------
@@ -506,10 +477,7 @@ fn parse_timestamp(s: &str) -> McpResult<(chrono::DateTime<chrono::Utc>, Option<
 
     // Try parsing date-only (YYYY-MM-DD → start of day UTC)
     if let Ok(date) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
-        let dt = date
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always a valid time")
-            .and_utc();
+        let dt = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
         return Ok((
             dt,
             Some(format!("'{s}' interpreted as '{}'", dt.to_rfc3339())),
@@ -579,21 +547,12 @@ fn parse_update_fields(
     let mut updates = IssueUpdate::default();
 
     if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
-            return Err(McpError::invalid_params(format!(
-                "Title must be 1-{MAX_TITLE_CHARS} characters",
-            )));
+        if title.is_empty() || title.len() > 500 {
+            return Err(McpError::invalid_params("Title must be 1-500 characters"));
         }
         updates.title = Some(title.to_string());
     }
     updates.description = nullable_str(args, "description")?;
-    if let Some(Some(ref desc)) = updates.description
-        && desc.len() > MAX_DESCRIPTION_BYTES
-    {
-        return Err(McpError::invalid_params(format!(
-            "description exceeds maximum size of {MAX_DESCRIPTION_BYTES} bytes"
-        )));
-    }
     if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
         let (status, warning) = parse_status(s)?;
 
@@ -671,11 +630,6 @@ fn parse_update_fields(
         } else if let Some(n) = v.as_i64() {
             let mins = i32::try_from(n)
                 .map_err(|_| McpError::invalid_params("estimated_minutes must fit in i32"))?;
-            if !(0..=MAX_ESTIMATED_MINUTES).contains(&mins) {
-                return Err(McpError::invalid_params(format!(
-                    "estimated_minutes must be 0-{MAX_ESTIMATED_MINUTES}"
-                )));
-            }
             updates.estimated_minutes = Some(Some(mins));
         } else if let Some(s) = v.as_str() {
             // Forgive by Default: coerce string → integer
@@ -684,11 +638,6 @@ fn parse_update_fields(
                     "'estimated_minutes' must be an integer, got string '{s}'"
                 ))
             })?;
-            if !(0..=MAX_ESTIMATED_MINUTES).contains(&mins) {
-                return Err(McpError::invalid_params(format!(
-                    "estimated_minutes must be 0-{MAX_ESTIMATED_MINUTES}"
-                )));
-            }
             coercions.push(format!(
                 "estimated_minutes: string '{s}' coerced to integer {mins}"
             ));
@@ -700,18 +649,6 @@ fn parse_update_fields(
         }
     }
     updates.external_ref = nullable_str(args, "external_ref")?;
-    if let Some(Some(ref ext_ref)) = updates.external_ref {
-        if ext_ref.chars().count() > MAX_EXTERNAL_REF_CHARS {
-            return Err(McpError::invalid_params(format!(
-                "external_ref exceeds {MAX_EXTERNAL_REF_CHARS} characters"
-            )));
-        }
-        if ext_ref.chars().any(char::is_whitespace) {
-            return Err(McpError::invalid_params(
-                "external_ref cannot contain whitespace",
-            ));
-        }
-    }
 
     Ok((updates, coercions))
 }
@@ -788,8 +725,8 @@ fn build_list_filters(
     let raw_limit = args
         .get("limit")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(DEFAULT_LIST_LIMIT);
-    let limit = Some(raw_limit.min(MAX_LIST_LIMIT) as usize);
+        .unwrap_or(50);
+    let limit = Some(raw_limit.min(500) as usize);
 
     let sort = args.get("sort").and_then(|v| v.as_str()).map(String::from);
 
@@ -907,10 +844,8 @@ impl ToolHandler for ListIssuesTool {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let storage_ctx = open(&self.0)?;
-        let storage = &storage_ctx.storage;
+        let storage = open(&self.0)?;
         let mut coercions: Vec<String> = Vec::new();
         let filters = build_list_filters(&args, &mut coercions)?;
 
@@ -1017,13 +952,12 @@ impl ToolHandler for ShowIssueTool {
             return Err(err);
         }
 
-        let storage_ctx = open(&self.0)?;
-        let storage = &storage_ctx.storage;
+        let storage = open(&self.0)?;
 
         let details = storage
             .get_issue_details(id, true, true, 20)
             .map_err(beads_to_mcp)?
-            .ok_or_else(|| issue_not_found_err(storage, id))?;
+            .ok_or_else(|| issue_not_found_err(&storage, id))?;
 
         let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
         if let Some(obj) = result.as_object_mut() {
@@ -1072,7 +1006,7 @@ impl ToolHandler for ShowIssueTool {
                     details
                         .events
                         .iter()
-                        .take(RECENT_EVENTS_DISPLAY_LIMIT)
+                        .take(10)
                         .map(|e| {
                             json!({
                                 "type": e.event_type,
@@ -1130,7 +1064,7 @@ impl ToolHandler for CreateIssueTool {
                  Discovery: See beads://schema for valid types/priorities, beads://labels for labels.\n\
                  When to use: Recording a new bug, feature, task, or work item.\n\
                  NOT for: Updating existing issues — use update_issue instead.\n\
-                 Do: Provide a clear title (1-500 chars, see validation::MAX_TITLE_CHARS). Search with list_issues first to avoid dupes.\n\
+                 Do: Provide a clear title (1-500 chars). Search with list_issues first to avoid dupes.\n\
                  Don't: Create duplicate issues — search first.\n\
                  Inputs auto-corrected: 'urgent' → critical, 'feat' → feature, etc.\n\
                  Idempotency: NOT idempotent — each call creates a new issue."
@@ -1141,7 +1075,6 @@ impl ToolHandler for CreateIssueTool {
                 "properties": {
                     "title": {
                         "type": "string",
-                        // Must match validation::MAX_TITLE_CHARS
                         "description": "Issue title (1-500 chars). REQUIRED."
                     },
                     "description": {
@@ -1186,25 +1119,14 @@ impl ToolHandler for CreateIssueTool {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let title = args
             .get("title")
             .and_then(|v| v.as_str())
             .ok_or_else(|| McpError::invalid_params("'title' is required"))?;
 
-        if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
-            return Err(McpError::invalid_params(format!(
-                "Title must be 1-{MAX_TITLE_CHARS} characters",
-            )));
-        }
-
-        if let Some(desc) = args.get("description").and_then(|v| v.as_str())
-            && desc.len() > MAX_DESCRIPTION_BYTES
-        {
-            return Err(McpError::invalid_params(format!(
-                "description exceeds maximum size of {MAX_DESCRIPTION_BYTES} bytes"
-            )));
+        if title.is_empty() || title.len() > 500 {
+            return Err(McpError::invalid_params("Title must be 1-500 characters"));
         }
 
         let mut coercions: Vec<String> = Vec::new();
@@ -1227,44 +1149,17 @@ impl ToolHandler for CreateIssueTool {
             coercions.push(w);
         }
 
-        let mut storage_ctx = open(&self.0)?;
+        let mut storage = open(&self.0)?;
+
         let now = chrono::Utc::now();
-        let prefix = resolved_issue_prefix(&self.0, &storage_ctx)?;
+        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
         let id_gen =
-            crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(&prefix));
-        let storage = &mut storage_ctx.storage;
+            crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
+        let id = id_gen.generate(title, None, Some(&self.0.actor), now, 0, |candidate| {
+            storage.id_exists(candidate).unwrap_or(false)
+        });
 
-        // Validate parent exists BEFORE generating ID
-        let parent_id = args
-            .get("parent")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        if let Some(ref pid) = parent_id {
-            require_valid_issue(storage, pid)?;
-        }
-
-        let count = storage.count_issues().unwrap_or(0);
-        let id = if let Some(ref pid) = parent_id {
-            let next_num = storage.next_child_number(pid).unwrap_or(1);
-            let mut candidate = crate::util::id::child_id(pid, next_num);
-            let mut num = next_num;
-            while storage.id_exists(&candidate).unwrap_or(true) {
-                num += 1;
-                candidate = crate::util::id::child_id(pid, num);
-                if num > next_num + 100 {
-                    return Err(McpError::internal_error(
-                        "Could not find available child ID",
-                    ));
-                }
-            }
-            candidate
-        } else {
-            id_gen.generate(title, None, Some(&self.0.actor), now, count, |candidate| {
-                storage.id_exists(candidate).unwrap_or(false)
-            })
-        };
-
-        let mut issue = Issue {
+        let issue = Issue {
             id: id.clone(),
             title: title.to_string(),
             description: args
@@ -1284,8 +1179,14 @@ impl ToolHandler for CreateIssueTool {
             ..Issue::default()
         };
 
-        // Compute content hash
-        issue.content_hash = Some(issue.compute_content_hash());
+        // Validate parent exists BEFORE creating the issue to avoid orphans
+        let parent_id = args
+            .get("parent")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(ref pid) = parent_id {
+            require_valid_issue(&storage, pid)?;
+        }
 
         storage
             .create_issue(&issue, &self.0.actor)
@@ -1338,8 +1239,6 @@ impl ToolHandler for CreateIssueTool {
             result["warnings"] = json!(warnings);
         }
 
-        persist_mutation(&mut storage_ctx)?;
-
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -1379,7 +1278,6 @@ impl ToolHandler for UpdateIssueTool {
                     },
                     "title": {
                         "type": "string",
-                        // Must match validation::MAX_TITLE_CHARS
                         "description": "New title (1-500 chars)"
                     },
                     "description": {
@@ -1461,11 +1359,10 @@ impl ToolHandler for UpdateIssueTool {
 
         let (updates, coercions) = parse_update_fields(id, &args)?;
 
-        let mut storage_ctx = open(&self.0)?;
-        let storage = &mut storage_ctx.storage;
+        let mut storage = open(&self.0)?;
 
         // Validate ID exists before attempting update (placeholder + existence check)
-        require_valid_issue(storage, id)?;
+        require_valid_issue(&storage, id)?;
 
         // Detect whether we have field changes vs label/comment side-effects.
         // If only side-effects (labels_add, labels_remove, comment), skip the
@@ -1493,7 +1390,7 @@ impl ToolHandler for UpdateIssueTool {
             storage
                 .get_issue_details(id, false, false, 0)
                 .map_err(beads_to_mcp)?
-                .ok_or_else(|| issue_not_found_err(storage, id))?
+                .ok_or_else(|| issue_not_found_err(&storage, id))?
                 .issue
         } else {
             return Err(McpError::with_data(
@@ -1555,8 +1452,6 @@ impl ToolHandler for UpdateIssueTool {
         if !warnings.is_empty() {
             result["warnings"] = json!(warnings);
         }
-
-        persist_mutation(&mut storage_ctx)?;
 
         Ok(vec![Content::text(result.to_string())])
     }
@@ -1626,11 +1521,10 @@ impl ToolHandler for CloseIssueTool {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let mut storage_ctx = open(&self.0)?;
-        let storage = &mut storage_ctx.storage;
+        let mut storage = open(&self.0)?;
 
         // Validate ID exists (with placeholder detection + fuzzy suggestions)
-        require_valid_issue(storage, id)?;
+        require_valid_issue(&storage, id)?;
 
         // Idempotency: if already closed, return existing state without error
         if let Some(details) = storage
@@ -1698,8 +1592,6 @@ impl ToolHandler for CloseIssueTool {
             ]);
         }
 
-        persist_mutation(&mut storage_ctx)?;
-
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -1730,12 +1622,9 @@ fn dep_add(
     let (dep_type_str, dep_coercion) = parse_dep_type(dep_type_raw)?;
 
     // Check for cycles with structured error
-    if dep_type_str
-        .parse::<crate::model::DependencyType>()
-        .is_ok_and(|dep_type| dep_type.is_blocking())
-        && storage
-            .would_create_cycle(id, depends_on, Some(dep_type_str.as_str()), true)
-            .map_err(beads_to_mcp)?
+    if storage
+        .would_create_cycle(id, depends_on, true)
+        .map_err(beads_to_mcp)?
     {
         return Err(McpError::with_data(
             McpErrorCode::ToolExecutionError,
@@ -1885,11 +1774,10 @@ impl ToolHandler for ManageDependenciesTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| McpError::invalid_params("'id' is required"))?;
 
-        let mut storage_ctx = open(&self.0)?;
-        let storage = &mut storage_ctx.storage;
+        let mut storage = open(&self.0)?;
 
         // Validate source ID for all actions
-        require_valid_issue(storage, id)?;
+        require_valid_issue(&storage, id)?;
 
         match action {
             "list" => {
@@ -1910,16 +1798,8 @@ impl ToolHandler for ManageDependenciesTool {
                     .to_string(),
                 )])
             }
-            "add" => {
-                let result = dep_add(storage, &self.0.actor, id, &args)?;
-                persist_mutation(&mut storage_ctx)?;
-                Ok(result)
-            }
-            "remove" => {
-                let result = dep_remove(storage, &self.0.actor, id, &args)?;
-                persist_mutation(&mut storage_ctx)?;
-                Ok(result)
-            }
+            "add" => dep_add(&mut storage, &self.0.actor, id, &args),
+            "remove" => dep_remove(&mut storage, &self.0.actor, id, &args),
             other => Err(McpError::with_data(
                 McpErrorCode::InvalidParams,
                 format!("Unknown action '{other}'"),
@@ -1978,8 +1858,7 @@ impl ToolHandler for ProjectOverviewTool {
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let _ = args;
-        let storage_ctx = open(&self.0)?;
-        let storage = &storage_ctx.storage;
+        let storage = open(&self.0)?;
 
         let total = storage.count_all_issues().map_err(beads_to_mcp)?;
         let active = storage.count_active_issues().map_err(beads_to_mcp)?;
@@ -2016,7 +1895,7 @@ impl ToolHandler for ProjectOverviewTool {
             .list_issues(&deferred_filters)
             .map_err(beads_to_mcp)?;
 
-        let prefix = resolved_issue_prefix(&self.0, &storage_ctx)?;
+        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
 
         let result = json!({
             "project": {
@@ -2032,17 +1911,17 @@ impl ToolHandler for ProjectOverviewTool {
                 "deferred": deferred.len(),
                 "dirty_unsaved": dirty,
             },
-            "top_labels": labels.iter().take(TOP_LABELS_DISPLAY_LIMIT).map(|(name, count)| {
+            "top_labels": labels.iter().take(15).map(|(name, count)| {
                 json!({"label": name, "count": count})
             }).collect::<Vec<_>>(),
-            "blocked_issues": blocked.iter().take(BLOCKED_ISSUES_DISPLAY_LIMIT).map(|(issue, blockers)| {
+            "blocked_issues": blocked.iter().take(10).map(|(issue, blockers)| {
                 json!({
                     "id": issue.id,
                     "title": issue.title,
                     "blocked_by": blockers,
                 })
             }).collect::<Vec<_>>(),
-            "ready_issues": ready.iter().take(READY_ISSUES_DISPLAY_LIMIT).map(|issue| {
+            "ready_issues": ready.iter().take(10).map(|issue| {
                 json!({
                     "id": issue.id,
                     "title": issue.title,

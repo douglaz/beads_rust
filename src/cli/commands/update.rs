@@ -699,18 +699,7 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
     let status = if args.claim {
         Some(Status::InProgress)
     } else {
-        let parsed = args
-            .status
-            .as_ref()
-            .map(|s| s.parse::<Status>())
-            .transpose()?;
-        if parsed == Some(Status::Tombstone) {
-            return Err(BeadsError::validation(
-                "status",
-                "cannot manually update status to tombstone; use 'br delete' instead",
-            ));
-        }
-        parsed
+        args.status.as_ref().map(|s| s.parse()).transpose()?
     };
 
     let priority = args.priority.as_ref().map(|p| p.parse()).transpose()?;
@@ -854,7 +843,7 @@ fn validate_parent_updates(
             });
         }
 
-        if storage.would_create_cycle(issue_id, parent_id, Some("parent-child"), true)? {
+        if storage.would_create_cycle(issue_id, parent_id, true)? {
             return Err(BeadsError::DependencyCycle {
                 path: format!("Setting parent of {issue_id} to {parent_id} would create a cycle"),
             });

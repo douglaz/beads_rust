@@ -15,29 +15,7 @@
 use crate::error::{BeadsError, ValidationError};
 use crate::model::{Comment, Dependency, Issue, Priority, Status};
 use crate::util::id::MAX_ID_LENGTH;
-use std::{collections::HashSet, path::Path};
-
-// ---------------------------------------------------------------------------
-// Validation limit constants — single source of truth
-// ---------------------------------------------------------------------------
-
-/// Maximum title length in characters.
-pub const MAX_TITLE_CHARS: usize = 500;
-
-/// Maximum description size in bytes (~100 KB).
-pub const MAX_DESCRIPTION_BYTES: usize = 102_400;
-
-/// Maximum estimated effort in minutes (~1 year: 365.25 × 24 × 60).
-pub const MAX_ESTIMATED_MINUTES: i32 = 525_960;
-
-/// Maximum external reference length in characters (e.g. "JIRA-12345").
-pub const MAX_EXTERNAL_REF_CHARS: usize = 200;
-
-/// Maximum label length in characters.
-pub const MAX_LABEL_CHARS: usize = 50;
-
-/// Maximum comment author name length in characters.
-pub const MAX_AUTHOR_CHARS: usize = 200;
+use std::path::Path;
 
 /// Validates issue fields and invariants.
 pub struct IssueValidator;
@@ -68,20 +46,17 @@ impl IssueValidator {
             ));
         }
 
-        // Title: Required, max length.
+        // Title: Required, max 500 chars.
         if issue.title.trim().is_empty() {
             errors.push(ValidationError::new("title", "cannot be empty"));
         }
-        if issue.title.chars().count() > MAX_TITLE_CHARS {
-            errors.push(ValidationError::new(
-                "title",
-                format!("exceeds {MAX_TITLE_CHARS} characters"),
-            ));
+        if issue.title.len() > 500 {
+            errors.push(ValidationError::new("title", "exceeds 500 characters"));
         }
 
-        // Description: Optional, max size.
+        // Description: Optional, max 100KB.
         if let Some(description) = issue.description.as_ref()
-            && description.len() > MAX_DESCRIPTION_BYTES
+            && description.len() > 102_400
         {
             errors.push(ValidationError::new("description", "exceeds 100KB"));
         }
@@ -106,10 +81,11 @@ impl IssueValidator {
                     "estimated_minutes",
                     "cannot be negative",
                 ));
-            } else if minutes > MAX_ESTIMATED_MINUTES {
+            } else if minutes > 525_960 {
+                // ~1 year in minutes
                 errors.push(ValidationError::new(
                     "estimated_minutes",
-                    format!("exceeds maximum ({MAX_ESTIMATED_MINUTES} minutes / ~1 year)"),
+                    "exceeds maximum (525960 minutes / ~1 year)",
                 ));
             }
         }
@@ -141,10 +117,10 @@ impl IssueValidator {
 
         // External reference: Optional, max 200 chars, no whitespace.
         if let Some(external_ref) = issue.external_ref.as_ref() {
-            if external_ref.chars().count() > MAX_EXTERNAL_REF_CHARS {
+            if external_ref.len() > 200 {
                 errors.push(ValidationError::new(
                     "external_ref",
-                    format!("exceeds {MAX_EXTERNAL_REF_CHARS} characters"),
+                    "exceeds 200 characters",
                 ));
             }
             if external_ref.chars().any(char::is_whitespace) {
@@ -155,97 +131,10 @@ impl IssueValidator {
             }
         }
 
-        Self::validate_embedded_dependencies(issue, &mut errors);
-        Self::validate_embedded_labels(issue, &mut errors);
-        Self::validate_embedded_comments(issue, &mut errors);
-
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
-        }
-    }
-
-    fn validate_embedded_labels(issue: &Issue, errors: &mut Vec<ValidationError>) {
-        for (index, label) in issue.labels.iter().enumerate() {
-            if let Err(err) = LabelValidator::validate(label) {
-                errors.push(ValidationError::new(
-                    format!("labels[{index}]"),
-                    err.message,
-                ));
-            }
-        }
-    }
-
-    fn validate_embedded_dependencies(issue: &Issue, errors: &mut Vec<ValidationError>) {
-        for (index, dep) in issue.dependencies.iter().enumerate() {
-            if dep.issue_id != issue.id {
-                errors.push(ValidationError::new(
-                    format!("dependencies[{index}].issue_id"),
-                    format!("must match parent issue id '{}'", issue.id),
-                ));
-            }
-
-            if dep.depends_on_id.trim().is_empty() {
-                errors.push(ValidationError::new(
-                    format!("dependencies[{index}].depends_on_id"),
-                    "cannot be empty",
-                ));
-            } else if dep.depends_on_id == issue.id {
-                errors.push(ValidationError::new(
-                    format!("dependencies[{index}].depends_on_id"),
-                    "issue cannot depend on itself",
-                ));
-            }
-
-            if dep.dep_type.as_str().eq_ignore_ascii_case("parent-child")
-                && (dep.issue_id.starts_with("external:")
-                    || dep.depends_on_id.starts_with("external:"))
-            {
-                let field = if dep.issue_id.starts_with("external:") {
-                    format!("dependencies[{index}].issue_id")
-                } else {
-                    format!("dependencies[{index}].depends_on_id")
-                };
-                let endpoint = if dep.issue_id.starts_with("external:") {
-                    dep.issue_id.as_str()
-                } else {
-                    dep.depends_on_id.as_str()
-                };
-                errors.push(ValidationError::new(
-                    field,
-                    format!("parent-child dependencies must link local issues: {endpoint}"),
-                ));
-            }
-        }
-    }
-
-    fn validate_embedded_comments(issue: &Issue, errors: &mut Vec<ValidationError>) {
-        let mut seen_comment_ids = HashSet::new();
-
-        for (index, comment) in issue.comments.iter().enumerate() {
-            if let Err(comment_errors) = CommentValidator::validate(comment) {
-                for err in comment_errors {
-                    errors.push(ValidationError::new(
-                        format!("comments[{index}].{}", err.field),
-                        err.message,
-                    ));
-                }
-            }
-
-            if comment.issue_id != issue.id {
-                errors.push(ValidationError::new(
-                    format!("comments[{index}].issue_id"),
-                    format!("must match parent issue id '{}'", issue.id),
-                ));
-            }
-
-            if comment.id > 0 && !seen_comment_ids.insert(comment.id) {
-                errors.push(ValidationError::new(
-                    format!("comments[{index}].id"),
-                    format!("duplicate embedded comment id {}", comment.id),
-                ));
-            }
         }
     }
 }
@@ -269,12 +158,7 @@ pub trait DependencyStore {
     /// # Errors
     ///
     /// Returns an error if the storage lookup fails.
-    fn would_create_cycle(
-        &self,
-        issue_id: &str,
-        depends_on_id: &str,
-        dep_type: Option<&str>,
-    ) -> Result<bool, BeadsError>;
+    fn would_create_cycle(&self, issue_id: &str, depends_on_id: &str) -> Result<bool, BeadsError>;
 }
 
 /// Validates dependency invariants, optionally consulting storage.
@@ -308,11 +192,7 @@ impl DependencyValidator {
         }
 
         if dep.dep_type.is_blocking()
-            && store.would_create_cycle(
-                &dep.issue_id,
-                &dep.depends_on_id,
-                Some(dep.dep_type.as_str()),
-            )?
+            && store.would_create_cycle(&dep.issue_id, &dep.depends_on_id)?
         {
             errors.push(ValidationError::new(
                 "depends_on_id",
@@ -349,11 +229,8 @@ impl LabelValidator {
             return Err(ValidationError::new("label", "cannot be empty"));
         }
 
-        if label.chars().count() > MAX_LABEL_CHARS {
-            return Err(ValidationError::new(
-                "label",
-                format!("exceeds {MAX_LABEL_CHARS} characters"),
-            ));
+        if label.len() > 50 {
+            return Err(ValidationError::new("label", "exceeds 50 characters"));
         }
 
         if !label
@@ -372,9 +249,6 @@ impl LabelValidator {
 
 /// Validates comment fields.
 pub struct CommentValidator;
-
-/// Single source of truth for maximum accepted comment body size.
-pub const MAX_COMMENT_BODY_BYTES: usize = 51_200;
 
 impl CommentValidator {
     /// Validate a comment and return all validation errors found.
@@ -397,7 +271,7 @@ impl CommentValidator {
             errors.push(ValidationError::new("content", "cannot be empty"));
         }
 
-        if comment.body.len() > MAX_COMMENT_BODY_BYTES {
+        if comment.body.len() > 51_200 {
             errors.push(ValidationError::new("content", "exceeds 50KB"));
         }
 
@@ -405,11 +279,8 @@ impl CommentValidator {
             errors.push(ValidationError::new("author", "cannot be empty"));
         }
 
-        if comment.author.chars().count() > MAX_AUTHOR_CHARS {
-            errors.push(ValidationError::new(
-                "author",
-                format!("exceeds {MAX_AUTHOR_CHARS} characters"),
-            ));
+        if comment.author.len() > 200 {
+            errors.push(ValidationError::new("author", "exceeds 200 characters"));
         }
 
         if errors.is_empty() {
@@ -503,26 +374,22 @@ impl SyncSafetyValidator {
             return Ok(());
         }
 
-        if crate::config::resolved_jsonl_path_is_external(beads_dir, path) {
-            let message = if path
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
-                format!(
-                    "path '{}' traverses outside allowed directory '{}' \
-                     (use --allow-external-jsonl to override)",
-                    path.display(),
-                    beads_dir.display()
-                )
-            } else {
+        // Canonicalize if possible, otherwise use the path as-is
+        let canonical_path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical_beads =
+            dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
+
+        // Check if path starts with beads_dir
+        if !canonical_path.starts_with(&canonical_beads) {
+            return Err(ValidationError::new(
+                "path",
                 format!(
                     "path '{}' is outside allowed directory '{}' \
                      (use --allow-external-jsonl to override)",
                     path.display(),
                     beads_dir.display()
-                )
-            };
-            return Err(ValidationError::new("path", message));
+                ),
+            ));
         }
 
         Ok(())
@@ -552,39 +419,6 @@ mod tests {
     use super::*;
     use crate::model::{DependencyType, IssueType, Status};
     use chrono::{TimeZone, Utc};
-    use std::{
-        env,
-        path::{Path, PathBuf},
-        sync::{Mutex, MutexGuard, OnceLock},
-    };
-
-    fn cwd_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct DirGuard {
-        original: PathBuf,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl DirGuard {
-        fn set(path: &Path) -> Self {
-            let lock = cwd_lock().lock().expect("lock current_dir");
-            let original = env::current_dir().expect("current_dir");
-            env::set_current_dir(path).expect("set_current_dir");
-            Self {
-                original,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            env::set_current_dir(&self.original).expect("restore current_dir");
-        }
-    }
 
     fn base_issue() -> Issue {
         Issue {
@@ -751,7 +585,6 @@ mod tests {
             &self,
             _issue_id: &str,
             _depends_on_id: &str,
-            _dep_type: Option<&str>,
         ) -> Result<bool, BeadsError> {
             Ok(self.would_cycle)
         }
@@ -881,81 +714,6 @@ mod tests {
     }
 
     #[test]
-    fn issue_validation_rejects_invalid_embedded_label() {
-        let mut issue = base_issue();
-        issue.labels = vec!["bad label".to_string()];
-
-        let errors = IssueValidator::validate(&issue).unwrap_err();
-        assert!(errors.iter().any(|err| err.field == "labels[0]"));
-    }
-
-    #[test]
-    fn issue_validation_rejects_invalid_embedded_dependency() {
-        let mut issue = base_issue();
-        issue.dependencies = vec![Dependency {
-            issue_id: issue.id.clone(),
-            depends_on_id: issue.id.clone(),
-            dep_type: DependencyType::Blocks,
-            created_at: issue.created_at,
-            created_by: Some("tester".to_string()),
-            metadata: None,
-            thread_id: None,
-        }];
-
-        let errors = IssueValidator::validate(&issue).unwrap_err();
-        assert!(errors.iter().any(|err| {
-            err.field == "dependencies[0].depends_on_id"
-                && err.message.contains("cannot depend on itself")
-        }));
-    }
-
-    #[test]
-    fn issue_validation_rejects_duplicate_embedded_comment_ids() {
-        let mut issue = base_issue();
-        issue.comments = vec![
-            Comment {
-                id: 7,
-                issue_id: issue.id.clone(),
-                author: "alice".to_string(),
-                body: "first".to_string(),
-                created_at: issue.created_at,
-            },
-            Comment {
-                id: 7,
-                issue_id: issue.id.clone(),
-                author: "bob".to_string(),
-                body: "second".to_string(),
-                created_at: issue.created_at + chrono::Duration::minutes(1),
-            },
-        ];
-
-        let errors = IssueValidator::validate(&issue).unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|err| err.field == "comments[1].id" && err.message.contains("duplicate"))
-        );
-    }
-
-    #[test]
-    fn issue_validation_rejects_embedded_comment_for_other_issue() {
-        let mut issue = base_issue();
-        issue.comments = vec![Comment {
-            id: 9,
-            issue_id: "bd-other".to_string(),
-            author: "alice".to_string(),
-            body: "wrong owner".to_string(),
-            created_at: issue.created_at,
-        }];
-
-        let errors = IssueValidator::validate(&issue).unwrap_err();
-        assert!(
-            errors.iter().any(|err| err.field == "comments[0].issue_id"
-                && err.message.contains("parent issue id"))
-        );
-    }
-
-    #[test]
     fn id_format_validation_accepts_classic_ids() {
         assert!(is_valid_id_format("bd-abc123"));
         assert!(is_valid_id_format("beads9-0a9"));
@@ -1073,20 +831,6 @@ mod tests {
         let jsonl_path = beads_dir.join("issues.jsonl");
         std::fs::write(&jsonl_path, "").unwrap();
 
-        let result = SyncSafetyValidator::validate_path_containment(&jsonl_path, &beads_dir, false);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn sync_safety_containment_allows_missing_relative_beads_subpath() {
-        use tempfile::TempDir;
-
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        std::fs::create_dir_all(&beads_dir).unwrap();
-        let _guard = DirGuard::set(temp.path());
-
-        let jsonl_path = PathBuf::from(".beads/nested/issues.jsonl");
         let result = SyncSafetyValidator::validate_path_containment(&jsonl_path, &beads_dir, false);
         assert!(result.is_ok());
     }

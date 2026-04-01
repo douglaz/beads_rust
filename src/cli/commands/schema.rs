@@ -13,7 +13,7 @@ use crate::format::{
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
-use crate::{BIN_NAME, config, output};
+use crate::{config, output};
 use chrono::{DateTime, Utc};
 use schemars::Schema;
 use schemars::schema_for;
@@ -72,7 +72,7 @@ pub fn execute(
 
     let schemas = build_schemas(args.target);
     let payload = SchemaOutput {
-        tool: BIN_NAME,
+        tool: "br",
         generated_at: Utc::now(),
         schemas,
     };

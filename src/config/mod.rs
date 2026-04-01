@@ -18,9 +18,7 @@ use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, auto_flush, compute_jsonl_hash,
     export_to_jsonl_with_policy, finalize_export, import_from_jsonl, preflight_import,
 };
-use crate::util::id::{
-    DEFAULT_ID_PREFIX, IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder,
-};
+use crate::util::id::{IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder};
 use chrono::Utc;
 use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
@@ -32,9 +30,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tempfile::tempdir;
 use tracing::warn;
-
-/// Maximum number of redirect hops to follow when resolving `.beads` routing.
-pub(crate) const MAX_REDIRECT_DEPTH: usize = 10;
 
 /// Check whether a directory name is a valid beads directory name.
 ///
@@ -165,40 +160,9 @@ impl ConfigPaths {
     ///
     /// Returns an error if metadata cannot be read.
     pub fn resolve(beads_dir: &Path, db_override: Option<&PathBuf>) -> Result<Self> {
-        Self::resolve_internal(beads_dir, db_override, true)
-    }
-
-    /// Resolve database + JSONL paths while ignoring any transient
-    /// `BEADS_JSONL` environment override.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if metadata cannot be read.
-    pub fn resolve_without_env_jsonl(
-        beads_dir: &Path,
-        db_override: Option<&PathBuf>,
-    ) -> Result<Self> {
-        Self::resolve_internal(beads_dir, db_override, false)
-    }
-
-    fn resolve_internal(
-        beads_dir: &Path,
-        db_override: Option<&PathBuf>,
-        include_env_jsonl: bool,
-    ) -> Result<Self> {
         let metadata = Metadata::load(beads_dir)?;
         let db_path = resolve_db_path(beads_dir, &metadata, db_override);
-        let env_jsonl_override = if include_env_jsonl {
-            current_env_jsonl_override()
-        } else {
-            None
-        };
-        let jsonl_path = resolve_jsonl_path(
-            beads_dir,
-            &metadata,
-            db_override,
-            env_jsonl_override.as_deref(),
-        );
+        let jsonl_path = resolve_jsonl_path(beads_dir, &metadata, db_override);
 
         Ok(Self {
             beads_dir: beads_dir.to_path_buf(),
@@ -264,7 +228,7 @@ fn discover_beads_dir_with_env(
     }
 
     let candidate = discover_beads_dir_candidate_with_env(start, None)?;
-    routing::follow_redirects(&candidate, MAX_REDIRECT_DEPTH)
+    routing::follow_redirects(&candidate, 10)
 }
 
 fn discover_beads_dir_candidate_with_env(
@@ -320,13 +284,6 @@ fn discover_beads_dir_candidate_with_env(
 /// - No beads directory found (when `--db` not provided)
 pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
     discover_beads_dir_with_cli_from(None, cli, None, None)
-}
-
-pub(crate) fn discover_beads_dir_with_cli_and_start(
-    start: Option<&Path>,
-    cli: &CliOverrides,
-) -> Result<PathBuf> {
-    discover_beads_dir_with_cli_from(start, cli, None, None)
 }
 
 /// Discover the active `.beads` directory, but allow "no workspace" when no
@@ -496,11 +453,9 @@ fn validate_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
 
 fn resolve_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
     let candidate = validate_explicit_beads_dir(path, source)?;
-    routing::follow_redirects(&candidate, MAX_REDIRECT_DEPTH).map_err(|err| {
-        BeadsError::WithContext {
-            context: format!("{source} is invalid"),
-            source: Box::new(err),
-        }
+    routing::follow_redirects(&candidate, 10).map_err(|err| BeadsError::WithContext {
+        context: format!("{source} is invalid"),
+        source: Box::new(err),
     })
 }
 
@@ -1401,7 +1356,7 @@ pub fn no_auto_import_from_layer(layer: &ConfigLayer) -> Option<bool> {
     .and_then(|value| parse_bool(value))
 }
 
-pub(crate) fn resolve_bootstrap_issue_prefix(
+fn resolve_bootstrap_issue_prefix(
     bootstrap_layer: &ConfigLayer,
     beads_dir: &Path,
     jsonl_path: &Path,
@@ -1427,7 +1382,7 @@ pub(crate) fn resolve_bootstrap_issue_prefix(
         return Ok(abbreviate_prefix(name));
     }
 
-    Ok(DEFAULT_ID_PREFIX.to_string())
+    Ok("br".to_string())
 }
 
 fn import_config_for_resolved_jsonl(
@@ -1462,41 +1417,8 @@ pub fn implicit_external_jsonl_allowed(
 ) -> bool {
     resolved_jsonl_path_is_external(beads_dir, jsonl_path)
         && !path_is_within_beads_dir(db_path, beads_dir)
-        && parent_dirs_match(db_path, jsonl_path)
-}
-
-fn parent_dirs_match(left: &Path, right: &Path) -> bool {
-    let Some(left_parent) = left.parent() else {
-        return false;
-    };
-    let Some(right_parent) = right.parent() else {
-        return false;
-    };
-
-    normalize_path_for_comparison(left_parent) == normalize_path_for_comparison(right_parent)
-}
-
-fn normalize_path_for_comparison(path: &Path) -> PathBuf {
-    if let Ok(canonical) = dunce::canonicalize(path) {
-        return canonical;
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-        }
-    }
-
-    normalized
+        && db_path.parent().is_some()
+        && db_path.parent() == jsonl_path.parent()
 }
 
 fn path_is_within_beads_dir(path: &Path, beads_dir: &Path) -> bool {
@@ -1504,21 +1426,15 @@ fn path_is_within_beads_dir(path: &Path, beads_dir: &Path) -> bool {
         dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
 
     let effective_path = if path.exists() {
-        dunce::canonicalize(path).unwrap_or_else(|_| normalize_path_for_comparison(path))
+        dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     } else if let Some(parent) = path.parent().filter(|parent| parent.exists()) {
-        let canonical_parent =
-            dunce::canonicalize(parent).unwrap_or_else(|_| normalize_path_for_comparison(parent));
+        let canonical_parent = dunce::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
         path.file_name().map_or_else(
             || canonical_parent.clone(),
             |name| canonical_parent.join(name),
         )
-    } else if path.is_relative() {
-        std::env::current_dir().map_or_else(
-            |_| normalize_path_for_comparison(path),
-            |cwd| normalize_path_for_comparison(&cwd.join(path)),
-        )
     } else {
-        normalize_path_for_comparison(path)
+        path.to_path_buf()
     };
 
     effective_path.starts_with(beads_dir) || effective_path.starts_with(&canonical_beads)
@@ -1580,29 +1496,6 @@ pub fn resolve_paths(beads_dir: &Path, db_override: Option<&PathBuf>) -> Result<
     Ok(startup.paths)
 }
 
-/// Resolve config paths while ignoring the transient `BEADS_JSONL`
-/// environment override.
-///
-/// # Errors
-///
-/// Returns an error if metadata cannot be read.
-pub fn resolve_paths_without_env_jsonl(
-    beads_dir: &Path,
-    db_override: Option<&PathBuf>,
-) -> Result<ConfigPaths> {
-    let (legacy_user, user, project, env_layer) = load_startup_layers_for_paths(beads_dir)?;
-    let resolved_db_override = resolve_startup_db_override(
-        beads_dir,
-        db_override,
-        &legacy_user,
-        &user,
-        &project,
-        &env_layer,
-    );
-
-    ConfigPaths::resolve_without_env_jsonl(beads_dir, resolved_db_override.as_ref())
-}
-
 fn resolve_db_path(
     beads_dir: &Path,
     metadata: &Metadata,
@@ -1627,11 +1520,12 @@ fn resolve_jsonl_path(
     beads_dir: &Path,
     metadata: &Metadata,
     db_override: Option<&PathBuf>,
-    env_jsonl_override: Option<&Path>,
 ) -> PathBuf {
     // Priority 1: BEADS_JSONL environment variable (highest priority)
-    if let Some(env_jsonl_override) = env_jsonl_override {
-        return env_jsonl_override.to_path_buf();
+    if let Ok(env_path) = env::var("BEADS_JSONL")
+        && !env_path.trim().is_empty()
+    {
+        return PathBuf::from(env_path);
     }
 
     // Priority 2: metadata.json override (if explicitly set to non-default)
@@ -1667,14 +1561,6 @@ fn resolve_jsonl_path(
     beads_dir.join(DEFAULT_JSONL_FILENAME)
 }
 
-fn current_env_jsonl_override() -> Option<PathBuf> {
-    env::var("BEADS_JSONL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
 /// A configuration layer split into startup-only and runtime (DB) keys.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigLayer {
@@ -1694,17 +1580,12 @@ impl ConfigLayer {
             // Remove any variant of this key that already exists under a
             // different spelling (e.g. hyphenated vs underscored).
             if canonical == *key {
-                // Key is already canonical (no hyphens) — remove any
-                // hyphenated form left by a lower-precedence layer.
                 let hyphenated = key.replace('_', "-");
                 if hyphenated != *key {
                     self.startup.remove(&hyphenated);
                 }
             } else {
-                // Key has hyphens — remove the canonical form AND the
-                // original hyphenated form that may exist from a prior merge.
                 self.startup.remove(&canonical);
-                self.startup.remove(key);
             }
             self.startup.insert(canonical, value.clone());
         }
@@ -1717,7 +1598,6 @@ impl ConfigLayer {
                 }
             } else {
                 self.runtime.remove(&canonical);
-                self.runtime.remove(key);
             }
             self.runtime.insert(canonical, value.clone());
         }
@@ -1907,10 +1787,17 @@ pub fn load_legacy_user_config() -> Result<ConfigLayer> {
 ///
 /// Returns an error if any config file cannot be read or parsed.
 pub fn load_startup_config(beads_dir: &Path) -> Result<ConfigLayer> {
-    let (legacy_user, user, project, env_layer) = load_startup_layers_for_paths(beads_dir)?;
-    let layers = vec![legacy_user, user, project, env_layer];
+    let legacy_user = load_legacy_user_config()?;
+    let user = load_user_config()?;
+    let project = load_project_config(beads_dir)?;
+    let env_layer = ConfigLayer::from_env();
 
-    Ok(ConfigLayer::merge_layers(&layers))
+    Ok(ConfigLayer::merge_layers(&[
+        legacy_user,
+        user,
+        project,
+        env_layer,
+    ]))
 }
 
 /// Default config layer (lowest precedence).
@@ -1919,7 +1806,7 @@ pub fn default_config_layer() -> ConfigLayer {
     let mut layer = ConfigLayer::default();
     layer
         .runtime
-        .insert("issue_prefix".to_string(), DEFAULT_ID_PREFIX.to_string());
+        .insert("issue_prefix".to_string(), "br".to_string());
     layer
 }
 
@@ -1987,15 +1874,22 @@ pub fn load_startup_config_with_paths(
     beads_dir: &Path,
     db_override: Option<&PathBuf>,
 ) -> Result<StartupConfig> {
-    let (legacy_user, user, project, env_layer) = load_startup_layers_for_paths(beads_dir)?;
-    let resolved_db_override = resolve_startup_db_override(
-        beads_dir,
-        db_override,
-        &legacy_user,
-        &user,
-        &project,
-        &env_layer,
-    );
+    let legacy_user = load_legacy_user_config()?;
+    let user = load_user_config()?;
+    let project = load_project_config(beads_dir)?;
+    let env_layer = ConfigLayer::from_env();
+
+    let resolved_db_override = db_override.cloned().or_else(|| {
+        [
+            resolve_db_override_from_layer(beads_dir, &env_layer),
+            resolve_db_override_from_layer(beads_dir, &project),
+            resolve_db_override_from_layer(beads_dir, &user),
+            resolve_db_override_from_layer(beads_dir, &legacy_user),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+    });
 
     let layers = vec![legacy_user, user, project, env_layer];
     let merged_startup = ConfigLayer::merge_layers(&layers);
@@ -2006,38 +1900,6 @@ pub fn load_startup_config_with_paths(
         paths,
         layers,
         merged_config: merged_startup,
-    })
-}
-
-fn load_startup_layers_for_paths(
-    beads_dir: &Path,
-) -> Result<(ConfigLayer, ConfigLayer, ConfigLayer, ConfigLayer)> {
-    let legacy_user = load_legacy_user_config()?;
-    let user = load_user_config()?;
-    let project = load_project_config(beads_dir)?;
-    let env_layer = ConfigLayer::from_env();
-
-    Ok((legacy_user, user, project, env_layer))
-}
-
-fn resolve_startup_db_override(
-    beads_dir: &Path,
-    cli_db_override: Option<&PathBuf>,
-    legacy_user: &ConfigLayer,
-    user: &ConfigLayer,
-    project: &ConfigLayer,
-    env_layer: &ConfigLayer,
-) -> Option<PathBuf> {
-    cli_db_override.cloned().or_else(|| {
-        [
-            resolve_db_override_from_layer(beads_dir, env_layer),
-            resolve_db_override_from_layer(beads_dir, project),
-            resolve_db_override_from_layer(beads_dir, user),
-            resolve_db_override_from_layer(beads_dir, legacy_user),
-        ]
-        .into_iter()
-        .flatten()
-        .next()
     })
 }
 
@@ -2060,10 +1922,7 @@ pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
     let prefix = get_value(layer, &["issue_prefix", "issue-prefix", "prefix"])
         .cloned()
         .filter(|p| !p.trim().is_empty())
-        .map_or_else(
-            || DEFAULT_ID_PREFIX.to_string(),
-            |prefix| normalize_prefix(&prefix),
-        );
+        .map_or_else(|| "br".to_string(), |prefix| normalize_prefix(&prefix));
 
     let min_hash_length = parse_usize(layer, &["min_hash_length", "min-hash-length"]).unwrap_or(3);
     let max_hash_length = parse_usize(layer, &["max_hash_length", "max-hash-length"]).unwrap_or(8);
@@ -2440,27 +2299,8 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
-    use std::env;
     use std::process::Command;
     use tempfile::TempDir;
-
-    struct DirGuard {
-        previous_dir: PathBuf,
-    }
-
-    impl DirGuard {
-        fn new(path: &Path) -> Self {
-            let previous_dir = env::current_dir().expect("current dir");
-            env::set_current_dir(path).expect("set current dir");
-            Self { previous_dir }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous_dir);
-        }
-    }
 
     fn write_issue_jsonl(path: &Path, issue: &Issue) {
         let json = serde_json::to_string(&issue).expect("serialize issue");
@@ -3256,7 +3096,7 @@ labels:
             deletions_retention_days: None,
         };
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
         assert_eq!(resolved, PathBuf::from(absolute_path));
     }
 
@@ -3273,7 +3113,7 @@ labels:
             deletions_retention_days: None,
         };
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
         assert_eq!(resolved, beads_dir.join("relative.jsonl"));
     }
 
@@ -3286,7 +3126,7 @@ labels:
         let metadata = Metadata::default();
         let db_override = PathBuf::from("/some/path/custom.db");
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override), None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override));
         assert_eq!(resolved, PathBuf::from("/some/path/issues.jsonl"));
     }
 
@@ -3299,29 +3139,8 @@ labels:
         let db_override = beads_dir.join("custom.db");
         fs::write(beads_dir.join("beads.jsonl"), "{}\n").expect("write legacy jsonl");
 
-        let resolved =
-            resolve_jsonl_path(&beads_dir, &Metadata::default(), Some(&db_override), None);
+        let resolved = resolve_jsonl_path(&beads_dir, &Metadata::default(), Some(&db_override));
         assert_eq!(resolved, beads_dir.join("beads.jsonl"));
-    }
-
-    #[test]
-    fn resolve_paths_without_env_jsonl_uses_project_db_override_for_jsonl_target() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        let cache_dir = temp.path().join("cache");
-        let db_path = cache_dir.join("custom.db");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-        fs::create_dir_all(&cache_dir).expect("create cache dir");
-        fs::write(
-            beads_dir.join("config.yaml"),
-            format!("db: {}\n", db_path.display()),
-        )
-        .expect("write project config");
-
-        let paths = resolve_paths_without_env_jsonl(&beads_dir, None).expect("paths");
-
-        assert_eq!(paths.db_path, db_path);
-        assert_eq!(paths.jsonl_path, cache_dir.join("issues.jsonl"));
     }
 
     #[test]
@@ -3845,7 +3664,7 @@ routing:
         fs::write(beads_dir.join("beads.jsonl"), "{}").expect("write beads");
 
         let metadata = Metadata::default();
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
 
         // Should discover beads.jsonl since issues.jsonl doesn't exist
         assert_eq!(resolved, beads_dir.join("beads.jsonl"));
@@ -3868,7 +3687,7 @@ routing:
             deletions_retention_days: None,
         };
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
         // Metadata override should win over discovered legacy/default filenames.
         assert_eq!(resolved, beads_dir.join("custom.jsonl"));
     }
@@ -3890,7 +3709,7 @@ routing:
             deletions_retention_days: None,
         };
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
         // Should fall through to discovery, find issues.jsonl
         assert_eq!(resolved, beads_dir.join("issues.jsonl"));
     }
@@ -3903,7 +3722,7 @@ routing:
 
         // No JSONL files exist
         let metadata = Metadata::default();
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
 
         // Should return default for writing
         assert_eq!(resolved, beads_dir.join("issues.jsonl"));
@@ -3923,7 +3742,7 @@ routing:
         let metadata = Metadata::default();
         let db_override = custom_dir.join("custom.db");
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override), None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override));
         // Should derive sibling from db_override path
         assert_eq!(resolved, custom_dir.join("issues.jsonl"));
     }
@@ -3964,29 +3783,6 @@ routing:
     }
 
     #[test]
-    fn resolve_jsonl_path_allows_explicit_env_override_to_be_ignored() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-
-        fs::write(
-            beads_dir.join("metadata.json"),
-            r#"{"database": "beads.db", "jsonl_export": "my-export.jsonl"}"#,
-        )
-        .expect("write metadata");
-
-        let env_jsonl = beads_dir.join("env-override.jsonl");
-        let metadata = Metadata::load(&beads_dir).expect("metadata");
-
-        let resolved_with_env =
-            resolve_jsonl_path(&beads_dir, &metadata, None, Some(env_jsonl.as_path()));
-        let resolved_without_env = resolve_jsonl_path(&beads_dir, &metadata, None, None);
-
-        assert_eq!(resolved_with_env, env_jsonl);
-        assert_eq!(resolved_without_env, beads_dir.join("my-export.jsonl"));
-    }
-
-    #[test]
     fn metadata_jsonl_override_respected_even_with_db_override() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -4001,7 +3797,7 @@ routing:
 
         let db_override = beads_dir.join("beads.db");
         let metadata = Metadata::load(&beads_dir).expect("metadata");
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override), None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override));
 
         // Metadata override should still win when the database path is explicit.
         assert_eq!(
@@ -4527,44 +4323,6 @@ routing:
             &external_db,
             &external_jsonl
         ));
-    }
-
-    #[test]
-    fn implicit_external_jsonl_allowed_accepts_noncanonical_external_db_parent() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join("project").join(".beads");
-        let external_dir = temp.path().join("external-store");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-        fs::create_dir_all(&external_dir).expect("create external dir");
-
-        let db_path = temp
-            .path()
-            .join("external-store")
-            .join("..")
-            .join("external-store")
-            .join("beads.db");
-        let jsonl_path = external_dir.join("issues.jsonl");
-
-        assert!(
-            implicit_external_jsonl_allowed(&beads_dir, &db_path, &jsonl_path),
-            "same external DB family should stay implicitly allowed even when the DB path is non-canonical"
-        );
-    }
-
-    #[test]
-    fn resolved_jsonl_path_is_external_treats_missing_relative_internal_path_as_internal() {
-        let temp = TempDir::new().expect("tempdir");
-        let project_root = temp.path().join("project");
-        let beads_dir = project_root.join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-
-        let _guard = DirGuard::new(&project_root);
-        let jsonl_path = PathBuf::from(".beads").join("nested").join("issues.jsonl");
-
-        assert!(
-            !resolved_jsonl_path_is_external(&beads_dir, &jsonl_path),
-            "relative paths targeting a missing child under .beads should still classify as internal"
-        );
     }
 
     #[test]

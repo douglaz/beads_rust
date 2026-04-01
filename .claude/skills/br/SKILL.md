@@ -1,13 +1,31 @@
 ---
 name: br
 description: >-
-  Local-first issue tracker (beads_rust) for AI agents. Use when tracking tasks,
-  managing dependencies, finding ready work, or syncing issues to git via JSONL.
+  Official skill for beads_rust (`br`), a local-first, dependency-aware issue
+  tracker for AI agents. Use when creating issues, triaging backlogs, managing
+  dependencies, finding ready work, updating status, or syncing to git via JSONL.
+license: MIT
+domain: project-management
+role: specialist
+scope: operations
+output-format: commands
+triggers:
+  - br
+  - beads
+  - beads_rust
+  - issue tracker
+  - issue triage
+  - backlog
+  - dependencies
+  - ready work
+metadata:
+  author: Dicklesworthstone
+  version: 1.0.0
 ---
 
-<!-- TOC: Critical Rules | Quick Workflow | Essential Commands | bv Integration | Redirect/Worktree | Troubleshooting | References -->
+<!-- TOC: Critical Rules | Quick Workflow | Essential Commands | Dependencies | Sync | bv Integration | Agent Mail | Troubleshooting | References -->
 
-# br — Beads Rust Issue Tracker
+# br -- Beads Rust Issue Tracker (Official Skill)
 
 > **Non-invasive:** br NEVER runs git commands. Sync and commit are YOUR responsibility.
 
@@ -15,104 +33,281 @@ description: >-
 
 | Rule | Why |
 |------|-----|
-| **ALWAYS use `--json`** | Structured output for parsing |
-| **NEVER run bare `bv`** | Blocks session in TUI mode |
-| **Sync is EXPLICIT** | `br sync --flush-only` after changes |
-| **Git is YOUR job** | br only touches `.beads/` directory |
+| **Binary is `br`** | NEVER `bd` (that is the old Go version) |
+| **ALWAYS use `--json`** | Structured output for parsing; `--format toon` for reduced tokens |
+| **NEVER run bare `bv`** | Blocks session in interactive TUI mode |
+| **Sync is EXPLICIT** | `br sync --flush-only` exports DB to JSONL only |
+| **Git is YOUR job** | br only touches `.beads/` -- you must `git add .beads/ && git commit` |
 | **No cycles allowed** | `br dep cycles` must return empty |
+| **Resolve actor at runtime** | Use `ACTOR="${BR_ACTOR:-assistant}"` and pass `--actor "$ACTOR"` |
 
 ## Quick Workflow
 
 ```bash
+ACTOR="${BR_ACTOR:-assistant}"
+
 # 1. Find work
 br ready --json
 
 # 2. Claim it
-br update bd-abc123 --status in_progress
+br update --actor "$ACTOR" <id> --status in_progress
 
 # 3. Do work...
 
 # 4. Complete
-br close bd-abc123 --reason "Implemented X"
+br close --actor "$ACTOR" <id> --reason "Implemented X"
 
 # 5. Sync to git (EXPLICIT!)
 br sync --flush-only
-git add .beads/ && git commit -m "feat: X (bd-abc123)"
+git add .beads/ && git commit -m "feat: X (<id>)"
 ```
 
 ## Essential Commands
 
+### Issue Lifecycle
+
 ```bash
-# Lifecycle
-br init                              # Initialize .beads/
-br create "Title" -p 1 -t task       # Create (priority 0-4)
-br update <id> --status in_progress  # Claim work
-br close <id> --reason "Done"        # Complete
-br reopen <id>                       # Reopen if needed
+ACTOR="${BR_ACTOR:-assistant}"
 
-# Querying (always use --json for agents)
-br ready --json                      # Actionable work (not blocked)
+br init                                              # Initialize .beads/ workspace
+br create --actor "$ACTOR" "Title" -p 1 -t task      # Create issue (priority 0-4)
+br q --actor "$ACTOR" "Quick note"                   # Quick capture (ID only output)
+br show <id> --json                                  # Show issue details
+br update --actor "$ACTOR" <id> --status in_progress # Update status
+br update --actor "$ACTOR" <id> --priority 0         # Change priority
+br close --actor "$ACTOR" <id> --reason "Done"       # Close with reason
+br close --actor "$ACTOR" <id1> <id2> --reason "..."  # Close multiple at once
+br reopen --actor "$ACTOR" <id>                      # Reopen closed issue
+```
+
+### Create Options
+
+```bash
+br create --actor "$ACTOR" "Title" \
+  --priority 1 \             # 0-4 scale (0=critical, 4=backlog)
+  --type task \              # task, bug, feature, epic, question, docs
+  --assignee "user@..." \    # Optional assignee
+  --labels backend,auth \    # Comma-separated labels
+  --description "..."        # Detailed description
+```
+
+### Update Options
+
+```bash
+br update --actor "$ACTOR" <id> \
+  --title "New title" \
+  --priority 0 \
+  --status in_progress \     # open, in_progress, closed
+  --assignee "new@..." \
+  --add-label reliability \
+  --parent <parent-id> \
+  --claim                    # Shorthand for claim-and-start
+```
+
+Bulk update (batch triage):
+```bash
+br update --actor "$ACTOR" <id1> <id2> <id3> --priority 2 --add-label triage-reviewed --json
+```
+
+### Querying (always use --json for agents)
+
+```bash
+br ready --json                      # Actionable work (no blockers)
 br list --json                       # All issues
-br blocked --json                    # What's blocked
-br search "keyword"                  # Full-text search
-br show <id> --json                  # Issue details
+br list --status open --sort priority --json  # Filter and sort
+br list --priority 0-1 --json        # Filter by priority range
+br list --assignee alice --json      # Filter by assignee
+br blocked --json                    # Show blocked issues
+br search "keyword" --json           # Full-text search
+br show <id> --json                  # Issue details with dependencies
+br stale --days 30 --json            # Stale issues
+br count --by status --json          # Count with grouping
+```
 
-# Dependencies
+### Dependencies
+
+```bash
 br dep add <child> <parent>          # child depends on parent
-br dep cycles                        # MUST be empty!
-br dep tree <id>                     # Visualize dependencies
+br dep add <id> <depends-on> --type blocks  # Explicit block type
+br dep remove <child> <parent>       # Remove dependency
+br dep list <id> --json              # List dependencies for issue
+br dep tree <id> --json              # Show dependency tree
+br dep cycles --json                 # Find circular deps (MUST be empty!)
+```
 
-# Sync (EXPLICIT - never automatic)
-br sync --flush-only                 # DB → JSONL (before git commit)
-br sync --import-only                # JSONL → DB (after git pull)
+**Critical:** `br dep cycles` must return empty. Circular dependencies break the dependency graph and make `br ready` unreliable.
 
-# System
-br doctor                            # Health check
-br config --list                     # Show configuration
+### Labels
+
+```bash
+br label add <id> backend auth       # Add multiple labels
+br label remove <id> urgent          # Remove label
+br label list <id>                   # List issue's labels
+br label list-all                    # All labels in project
+```
+
+### Comments
+
+```bash
+ACTOR="${BR_ACTOR:-assistant}"
+br comments add --actor "$ACTOR" <id> --message "Triage note" --json
+br comments list <id> --json
+```
+
+### Sync (EXPLICIT -- never automatic)
+
+```bash
+br sync --flush-only                 # Export DB to JSONL (before git commit)
+br sync --import-only                # Import JSONL to DB (after git pull)
+br sync --status                     # Check sync status
+```
+
+Workflow after making changes:
+```bash
+br sync --flush-only
+git add .beads/ && git commit -m "Update issues"
+```
+
+Workflow after pulling:
+```bash
+git pull
+br sync --import-only
+```
+
+### System and Diagnostics
+
+```bash
+br doctor                            # Full diagnostics
+br stats --json                      # Project statistics
+br config list                       # Show all configuration
+br config get id.prefix              # Get specific value
+br config set defaults.priority=1    # Set value
+br where                             # Show workspace location
+br version                           # Show version
+br upgrade                           # Self-update (if enabled)
+br lint --json                       # Lint issues for problems
 ```
 
 ## Priority Scale
 
-| Priority | Meaning |
-|----------|---------|
-| 0 | Critical |
-| 1 | High |
-| 2 | Medium (default) |
-| 3 | Low |
-| 4 | Backlog |
+| Priority | Meaning | Use numbers, not words |
+|----------|---------|------------------------|
+| 0 | Critical | Immediate action required |
+| 1 | High | Important, do soon |
+| 2 | Medium (default) | Normal priority |
+| 3 | Low | When time permits |
+| 4 | Backlog | Future consideration |
+
+## Issue Types
+
+`task`, `bug`, `feature`, `epic`, `question`, `docs`
+
+## Output Formats
+
+| Flag | Use case |
+|------|----------|
+| `--json` | Default for agents -- full structured data |
+| `--format toon` | Token-optimized alternative for context-window-sensitive agents |
+| (no flag) | Human-readable terminal output with colors |
 
 ## bv Integration
 
-**CRITICAL:** Never run bare `bv` — it launches interactive TUI and blocks.
+**CRITICAL:** Never run bare `bv` -- it launches interactive TUI and blocks.
 
 ```bash
 # Always use --robot-* flags:
-bv --robot-next                      # Single top pick
-bv --robot-triage                    # Full triage
+bv --robot-next                      # Single top pick + claim command
+bv --robot-triage                    # Full triage with recommendations
 bv --robot-plan                      # Parallel execution tracks
-bv --robot-insights | jq '.Cycles'   # Check graph health
+bv --robot-insights | jq '.Cycles'   # Check graph health (must be empty)
+bv --robot-priority                  # Priority misalignment detection
+bv --robot-alerts                    # Stale issues, blocking cascades
 ```
 
 ## Agent Mail Coordination
 
 Use bead ID as thread_id for multi-agent coordination:
 
+| Concept | Value |
+|---------|-------|
+| Mail `thread_id` | `bd-###` (the issue ID) |
+| Mail subject | `[bd-###] ...` |
+| File reservation `reason` | `bd-###` |
+| Commit messages | Include `bd-###` for traceability |
+
 ```python
+# 1. Reserve files for bead
 file_reservation_paths(..., reason="bd-123")
+
+# 2. Announce work in thread
 send_message(..., thread_id="bd-123", subject="[bd-123] Starting...")
-# Work...
+
+# 3. Do work...
+
+# 4. Close bead and release
 br close bd-123 --reason "Completed"
 release_file_reservations(...)
 ```
 
 ## Session Ending Pattern
 
+Before ending any work session:
+
 ```bash
 git pull --rebase
 br sync --flush-only
 git add .beads/ && git commit -m "Update issues"
 git push
-git status  # Verify clean
+git status  # MUST show "up to date with origin"
+```
+
+## Standard Agent Workflow (Full)
+
+```bash
+ACTOR="${BR_ACTOR:-assistant}"
+
+# 1. Verify workspace
+br where
+br ready --json
+br blocked --json
+br list --status open --sort priority --json
+
+# 2. Pick highest-priority ready work
+br show <id> --json
+
+# 3. Claim it
+br update --actor "$ACTOR" <id> --status in_progress --claim
+
+# 4. Do work...
+
+# 5. Close with evidence
+br close --actor "$ACTOR" <id> --reason "Implemented X in commit abc123"
+
+# 6. Check queue impact
+br ready --json
+br blocked --json
+
+# 7. Sync to git
+br sync --flush-only
+git add .beads/ && git commit -m "feat: X (<id>)"
+git push
+```
+
+## Triage Decision Matrix
+
+Classify each issue into exactly one category:
+
+| Classification | Action |
+|---------------|--------|
+| `implemented` | Close with evidence (commit/PR/file/behavior) |
+| `out-of-scope` | Close with explicit boundary reason |
+| `needs-clarification` | Comment with specific unanswered questions |
+| `actionable` | Keep open, correct status/priority/labels/deps |
+
+During large triage efforts, checkpoint every few updates:
+```bash
+br ready --json
+br blocked --json
 ```
 
 ## Anti-Patterns
@@ -120,135 +315,22 @@ git status  # Verify clean
 - Running `br sync` without `--flush-only` or `--import-only`
 - Forgetting sync before git commit
 - Creating circular dependencies
-- Running bare `bv`
-- Assuming auto-commit behavior
+- Running bare `bv` (blocks session)
+- Assuming auto-commit behavior (br NEVER auto-commits)
+- Inventing evidence for closure -- if unsure, comment instead
+- Modifying unrelated issues during triage
+- Adding speculative dependencies
 
-## Storage
+## Storage Layout
 
 ```
 .beads/
-├── beads.db        # SQLite (primary)
-├── issues.jsonl    # Git-friendly export
-└── config.yaml     # Optional config
-```
-
-## Redirect / Worktree Workflow
-
-### What Redirects Are
-
-A `.beads/redirect` file is a plain text file containing a single path that
-points to another `.beads/` (or `_beads/`) directory. When br discovers a
-redirect, it follows the chain until it reaches a terminal beads directory.
-All reads and writes (SQLite DB, JSONL) happen in the **target** directory,
-not the one containing the redirect file.
-
-This lets multiple working trees share one beads store so issues, history,
-and dependencies stay unified.
-
-### When to Use
-
-- **Git worktrees** -- the primary use case. Each worktree gets its own
-  `.beads/` from git, but you want all of them to operate on the same
-  underlying database.
-- **PR-only workflows** -- temporary feature branches that should not
-  maintain their own beads state.
-- **Ephemeral checkouts** -- CI or review checkouts that need read access
-  to issues without duplicating the store.
-
-### Setup
-
-Create a `redirect` file inside the worktree's `.beads/` directory. The
-path is resolved **relative to the `.beads/` directory itself**, not the
-project root.
-
-```bash
-# Example: main repo at /code/myproject, worktree at /code/myproject/.worktrees/feat
-# The worktree's .beads/ is at .worktrees/feat/.beads/
-# From there, ../../../.beads reaches the main repo's .beads/
-
-echo "../../../.beads" > /code/myproject/.worktrees/feat/.beads/redirect
-```
-
-Absolute paths also work:
-
-```bash
-echo "/code/myproject/.beads" > /code/myproject/.worktrees/feat/.beads/redirect
-```
-
-Verify with `br where`:
-
-```bash
-cd /code/myproject/.worktrees/feat
-br where
-# Output shows the target path and "(via redirect from ...)"
-
-br where --json
-# { "path": "/code/myproject/.beads", "redirected_from": ".../feat/.beads", ... }
-```
-
-### Path Resolution Rules
-
-| Aspect | Behavior |
-|--------|----------|
-| Relative paths | Resolved from the `.beads/` dir containing the redirect file |
-| Absolute paths | Used as-is |
-| Target validation | Must be a `.beads` or `_beads` directory that exists on disk |
-| Chain following | Redirects can chain (A -> B -> C) up to 10 hops |
-| Loop detection | Paths are canonicalized; revisiting any path in the chain is an error |
-| Self-redirect (`.`) | Legal -- resolves to the current `.beads/` dir and stops |
-
-### Effect on Commands
-
-With a redirect active, **all br commands** operate on the target directory:
-
-- `br create`, `br update`, `br close` -- write to the target DB and JSONL
-- `br sync --flush-only` -- flushes inline (writes already landed in the
-  target); typically reports "nothing to export"
-- `br list`, `br ready`, `br show` -- read from the target
-- `br doctor` -- checks the target store
-
-### JSONL Commits in PR-Gated Repos
-
-Because writes land in the **main repo's** `.beads/` directory, JSONL changes
-only appear in `git status` from the main repo, not from the worktree. This
-creates a commit-path question for projects that require PRs to merge to `main`.
-
-Recommended approaches:
-
-1. **Treat JSONL as infrastructure** -- commit `.beads/` changes directly to
-   `main` from the main repo working tree, outside the PR flow. JSONL updates
-   are mechanical bookkeeping, not feature code, so many teams exempt them
-   from PR review.
-
-2. **Periodic sync from main** -- after merging a feature PR, run
-   `br sync --flush-only` from the main repo on `main` and commit the
-   resulting JSONL changes as a separate housekeeping commit.
-
-3. **Dedicated beads-sync branch** -- configure `br config set sync.branch
-   beads-sync` and commit JSONL to that branch, then merge it to `main`
-   through your normal PR process.
-
-### Quick Setup Recipe
-
-```bash
-# 1. Create worktree
-git worktree add .worktrees/feat -b feat/my-feature
-
-# 2. Add redirect (count "../" hops from .worktrees/feat/.beads/ to project root)
-echo "../../../.beads" > .worktrees/feat/.beads/redirect
-
-# 3. Verify
-cd .worktrees/feat && br where && cd -
-
-# 4. Work normally from the worktree
-cd .worktrees/feat
-br create "New task" -p 1 -t task
-br ready --json
-
-# 5. Commit JSONL from the main repo
-cd /code/myproject
-br sync --flush-only
-git add .beads/ && git commit -m "chore: update beads JSONL"
+  beads.db        # SQLite database (primary storage)
+  beads.db-shm    # SQLite shared memory (WAL mode)
+  beads.db-wal    # SQLite write-ahead log
+  issues.jsonl    # JSONL export (for git)
+  config.yaml     # Project configuration
+  metadata.json   # Workspace metadata
 ```
 
 ## Troubleshooting
@@ -256,8 +338,11 @@ git add .beads/ && git commit -m "chore: update beads JSONL"
 ```bash
 br doctor                    # Full diagnostics
 br dep cycles                # Must be empty
-br config --list             # Check settings
+br config list               # Check settings
+which br                     # Verify br is installed
 ```
+
+**"Database locked"**: Check for other `br` processes with `pgrep -f "br "`.
 
 **Worktree error** (`'main' is already checked out`):
 ```bash
@@ -265,23 +350,18 @@ git branch beads-sync main
 br config set sync.branch beads-sync
 ```
 
-**Redirect target not found**: The path in `.beads/redirect` does not resolve
-to an existing directory. Check that relative paths are counted from the
-`.beads/` directory, not the project root.
-
-**Redirect loop detected**: Two or more redirect files point at each other.
-Run `br where` from each location to trace the chain, then fix the cycle.
-
-**Redirect chain exceeds max depth**: More than 10 redirect hops. Simplify
-the chain -- most setups need exactly one hop.
-
----
+**Verbose debugging:**
+```bash
+br -v list                   # Verbose
+br -vv list                  # Debug
+RUST_LOG=debug br list       # Detailed trace logs
+```
 
 ## References
 
 | Topic | File |
 |-------|------|
-| Full command reference | [COMMANDS.md](references/COMMANDS.md) |
-| Configuration details | [CONFIG.md](references/CONFIG.md) |
-| Troubleshooting guide | [TROUBLESHOOTING.md](references/TROUBLESHOOTING.md) |
-| Multi-agent patterns | [INTEGRATION.md](references/INTEGRATION.md) |
+| Command cookbook | [references/COMMANDS.md](references/COMMANDS.md) |
+| Configuration details | [references/CONFIG.md](references/CONFIG.md) |
+| Troubleshooting guide | [references/TROUBLESHOOTING.md](references/TROUBLESHOOTING.md) |
+| Multi-agent integration | [references/INTEGRATION.md](references/INTEGRATION.md) |

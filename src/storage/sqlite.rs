@@ -295,7 +295,7 @@ impl SqliteStorage {
                 Self::incremental_blocked_cache_update(conn, ids)
             }
             // Deferred plan is never applied eagerly; the stale marker already
-            // set inside the write transaction will trigger a lazy rebuild.
+            // set inside the write transaction signals reads to compute in-memory.
             BlockedCacheRefreshPlan::Deferred => Ok(0),
         }
     }
@@ -8800,7 +8800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_issue_skip_cache_rebuild_marks_cache_stale_for_lazy_refresh() {
+    fn test_update_issue_skip_cache_rebuild_marks_cache_stale_reads_compute_in_memory() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("beads.db");
         let mut storage = SqliteStorage::open(&db_path).unwrap();
@@ -8862,7 +8862,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_parent_skip_cache_rebuild_marks_cache_stale_for_lazy_refresh() {
+    fn test_set_parent_skip_cache_rebuild_marks_cache_stale_reads_compute_in_memory() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("beads.db");
         let mut storage = SqliteStorage::open(&db_path).unwrap();

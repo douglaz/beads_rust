@@ -125,6 +125,10 @@ sample_beads_db_files/**/*.db-wal
 /test_file.rs
 /test_lock
 /test_lock.rs
+/test_cycle.rs
+/test_*.sh
+/child.json
+/parent.json
 
 # Beads snapshot backups (timestamped)
 .beads.snapshot_*/

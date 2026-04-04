@@ -766,15 +766,17 @@ fn list_with_limit_zero_unlimited() {
 
 #[test]
 fn list_text_output_format() {
-    let (workspace, _ids) = setup_diverse_workspace();
+    let (workspace, ids) = setup_diverse_workspace();
 
     let list = run_br(&workspace, ["list"], "list_text");
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    // Text output should contain issue IDs (bd-xxxx format)
+    // Text output should contain at least one of the created issue IDs
+    let has_any_id = ids.iter().any(|id| list.stdout.contains(id));
     assert!(
-        list.stdout.contains("bd-") || list.stdout.contains("beads_rust-"),
-        "Text output should contain issue IDs"
+        has_any_id,
+        "Text output should contain issue IDs, got: {}",
+        list.stdout
     );
     // Should also contain some issue content
     assert!(!list.stdout.is_empty(), "Text output should not be empty");

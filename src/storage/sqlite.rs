@@ -2731,9 +2731,7 @@ impl SqliteStorage {
         if self.blocked_cache_marked_stale()? {
             let blocked_issues_map = match Self::compute_blocked_issues_map_impl(&self.conn) {
                 Ok(map) => map,
-                Err(error) => {
-                    self.recover_blocked_issues_map("get_blockers_stale", &error)?
-                }
+                Err(error) => self.recover_blocked_issues_map("get_blockers_stale", &error)?,
             };
             return Ok(Self::blocker_refs_to_issue_ids(
                 blocked_issues_map

@@ -700,7 +700,7 @@ impl SqliteStorage {
         unreachable!("Retry loop exited without returning")
     }
 
-    /// Compute exponential backoff with random jitter to prevent
+    /// Compute exponential backoff with random jitter (+/-25%) to prevent
     /// thundering-herd synchronization across concurrent agents.
     fn jittered_backoff(base_ms: u64, attempt: u32) -> u64 {
         let deterministic = base_ms * 2u64.pow(attempt);
@@ -714,8 +714,9 @@ impl SqliteStorage {
         if jitter_range == 0 {
             return deterministic;
         }
-        let jitter = (nanos % (jitter_range * 2)).saturating_sub(jitter_range);
-        deterministic.saturating_add(jitter)
+        // Map nanos into [-jitter_range, +jitter_range) via wrapping arithmetic.
+        let raw = (nanos % (jitter_range * 2)) as i64 - jitter_range as i64;
+        (deterministic as i64 + raw).max(1) as u64
     }
 
     /// Set export hashes using the caller's active transaction.

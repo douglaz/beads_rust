@@ -473,7 +473,7 @@ pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn table_exists(conn: &Connection, table: &str) -> bool {
+pub(crate) fn table_exists(conn: &Connection, table: &str) -> bool {
     let escaped_table = table.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='table' AND name='{escaped_table}'");
     conn.query(&sql).is_ok_and(|rows| !rows.is_empty())

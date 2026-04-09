@@ -7,6 +7,7 @@ use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
     apply_runtime_compatible_schema, apply_schema, execute_batch, runtime_schema_compatible,
+    table_exists,
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -3045,20 +3046,34 @@ impl SqliteStorage {
     }
 
     fn reset_blocked_cache_table(conn: &Connection) -> Result<()> {
-        execute_batch(
-            conn,
-            r"
-            DROP TABLE IF EXISTS blocked_issues_cache;
-            CREATE TABLE blocked_issues_cache (
-                issue_id TEXT PRIMARY KEY,
-                blocked_by TEXT NOT NULL,
-                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at
-                ON blocked_issues_cache(blocked_at);
-            ",
-        )
+        // Use DELETE FROM instead of DROP TABLE + CREATE TABLE to avoid
+        // frankensqlite page leak (#224): DROP TABLE leaves old root pages
+        // unreachable, causing integrity_check to report 'Page N: never used'.
+        //
+        // The table and index are guaranteed to exist (created at schema apply
+        // time via SCHEMA_SQL).  Per-entry DELETE+INSERT in
+        // insert_blocked_cache_entries handles any phantom B-tree entries that
+        // fsqlite may retain after bulk DELETE (#215).
+        if table_exists(conn, "blocked_issues_cache") {
+            conn.execute("DELETE FROM blocked_issues_cache")?;
+        } else {
+            // Table doesn't exist yet (fresh DB before schema fully applied,
+            // or recovery scenario).  Fall back to CREATE.
+            execute_batch(
+                conn,
+                r"
+                CREATE TABLE blocked_issues_cache (
+                    issue_id TEXT PRIMARY KEY,
+                    blocked_by TEXT NOT NULL,
+                    blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at
+                    ON blocked_issues_cache(blocked_at);
+                ",
+            )?;
+        }
+        Ok(())
     }
 
     /// Incremental blocked-cache update: recompute only the entries for the

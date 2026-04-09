@@ -3018,9 +3018,10 @@ impl SqliteStorage {
     fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
         let blocked_issues_map = Self::compute_blocked_issues_map_impl(conn)?;
 
-        // `fsqlite` can surface false UNIQUE conflicts while repopulating the
-        // blocked-cache index after a full-table DELETE. Recreate the cache
-        // table instead so the subsequent inserts start from a fresh btree.
+        // Clear the cache table before repopulating.  We use DELETE FROM
+        // rather than DROP+CREATE to avoid frankensqlite page leaks (#224).
+        // Per-entry DELETE+INSERT in insert_blocked_cache_entries handles any
+        // phantom B-tree entries fsqlite may retain after bulk DELETE (#215).
         Self::reset_blocked_cache_table(conn)?;
 
         let mut entries = Vec::with_capacity(blocked_issues_map.len());

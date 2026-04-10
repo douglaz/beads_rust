@@ -420,6 +420,31 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         e
     })?;
 
+    // On a truly fresh bootstrap, run a defensive `wal_checkpoint(TRUNCATE)`
+    // to reclaim any transient pages frankensqlite allocated while
+    // executing SCHEMA_SQL (CREATE TABLE + ~15 CREATE INDEX statements,
+    // several of which are partial indexes on columns of empty tables).
+    // Without this, a fresh `br init; br create one; br create two`
+    // leaves the database with unreachable pages that sqlite3's
+    // `PRAGMA integrity_check` surfaces as `Page N: never used` — see
+    // issue #225.
+    //
+    // The checkpoint is a no-op when there is nothing to reclaim, so it
+    // is safe to run unconditionally on fresh bootstrap.  We intentionally
+    // do *not* run a full `VACUUM` here: VACUUM rewrites the entire file
+    // and would obscure page allocation bugs we want the regression
+    // check to continue to catch in `br doctor`.  The TRUNCATE-mode
+    // checkpoint is the narrowest repair that matches the workaround the
+    // reporter verified in the upstream bug.
+    if is_fresh
+        && let Err(e) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    {
+        tracing::debug!(
+            error = %e,
+            "wal_checkpoint(TRUNCATE) after fresh bootstrap failed (non-fatal)"
+        );
+    }
+
     Ok(())
 }
 

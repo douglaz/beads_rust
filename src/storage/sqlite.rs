@@ -1839,10 +1839,22 @@ impl SqliteStorage {
             FROM issues WHERE id = ?
         ";
 
-        match conn.query_row_with_params(sql, &[SqliteValue::from(id)]) {
-            Ok(row) => Ok(Some(Self::issue_from_row(&row)?)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+        // Issue #226: use `query_with_params` instead of `query_row_with_params`
+        // to bypass frankensqlite's prepared-statement fast path for single-row
+        // reads.  The fast path (see `query_row_with_params` →
+        // `ad_hoc_query_supports_prepared_reuse` in fsqlite-core) can route
+        // through a cached plan that, for pre-existing beads imported from
+        // JSONL, silently returns zero rows while the equivalent multi-row
+        // SELECT on the same parameter returns the correct row — that divergence
+        // was the mechanism behind `br update` reporting "Issue not found" on
+        // rows that `br show`, `br list`, and the sqlite3 CLI could all find.
+        // Taking the first row manually after `query_with_params` forces the
+        // standard execute_statement dispatch path which does not have that
+        // divergence.
+        let rows = conn.query_with_params(sql, &[SqliteValue::from(id)])?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(Some(Self::issue_from_row(&row)?)),
+            None => Ok(None),
         }
     }
 

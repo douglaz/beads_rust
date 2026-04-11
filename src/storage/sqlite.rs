@@ -4911,13 +4911,15 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_parent_id(&self, issue_id: &str) -> Result<Option<String>> {
-        match self.conn.query_row_with_params(
+        // Issue #229: use `query_with_params` to avoid the single-row
+        // prepared-statement fast path (same rationale as get_issue_from_conn).
+        let rows = self.conn.query_with_params(
             "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(issue_id)],
-        ) {
-            Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+        )?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
+            None => Ok(None),
         }
     }
 
@@ -5316,13 +5318,15 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
-        match self.conn.query_row_with_params(
+        // Issue #229: use `query_with_params` to avoid the single-row
+        // prepared-statement fast path (same rationale as get_metadata).
+        let rows = self.conn.query_with_params(
             "SELECT value FROM config WHERE key = ?",
             &[SqliteValue::from(key)],
-        ) {
-            Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+        )?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
+            None => Ok(None),
         }
     }
 
@@ -5626,11 +5630,14 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_export_hash(&self, issue_id: &str) -> Result<Option<(String, String)>> {
-        match self.conn.query_row_with_params(
+        // Issue #229: use `query_with_params` to avoid the single-row
+        // prepared-statement fast path (same rationale as get_metadata).
+        let rows = self.conn.query_with_params(
             "SELECT content_hash, exported_at FROM export_hashes WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
-        ) {
-            Ok(row) => {
+        )?;
+        match rows.into_iter().next() {
+            Some(row) => {
                 let hash = row
                     .get(0)
                     .and_then(SqliteValue::as_text)
@@ -5643,8 +5650,7 @@ impl SqliteStorage {
                     .to_string();
                 Ok(Some((hash, exported)))
             }
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(BeadsError::Database(e)),
+            None => Ok(None),
         }
     }
 
@@ -5750,13 +5756,17 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
-        match self.conn.query_row_with_params(
+        // Issue #229: use `query_with_params` instead of `query_row_with_params`
+        // to avoid frankensqlite's single-row prepared-statement fast path, which
+        // can silently return zero rows on in-memory databases after bulk import
+        // operations.  Same root cause as the `get_issue_from_conn` fix in #226.
+        let rows = self.conn.query_with_params(
             "SELECT value FROM metadata WHERE key = ?",
             &[SqliteValue::from(key)],
-        ) {
-            Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(BeadsError::Database(e)),
+        )?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
+            None => Ok(None),
         }
     }
 
@@ -6929,7 +6939,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn find_by_external_ref(&self, external_ref: &str) -> Result<Option<Issue>> {
-        match self.conn.query_row_with_params(
+        // Issue #229: use `query_with_params` to avoid the single-row
+        // prepared-statement fast path (same rationale as get_issue_from_conn).
+        let rows = self.conn.query_with_params(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
@@ -6939,10 +6951,10 @@ impl SqliteStorage {
                      pinned, is_template
                FROM issues WHERE external_ref = ?",
             &[SqliteValue::from(external_ref)],
-        ) {
-            Ok(row) => Ok(Some(Self::issue_from_row(&row)?)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(BeadsError::Database(e)),
+        )?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(Some(Self::issue_from_row(&row)?)),
+            None => Ok(None),
         }
     }
 
@@ -6952,7 +6964,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn find_by_content_hash(&self, content_hash: &str) -> Result<Option<Issue>> {
-        match self.conn.query_row_with_params(
+        // Issue #229: use `query_with_params` to avoid the single-row
+        // prepared-statement fast path (same rationale as get_issue_from_conn).
+        let rows = self.conn.query_with_params(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
@@ -6962,10 +6976,10 @@ impl SqliteStorage {
                      pinned, is_template
                FROM issues WHERE content_hash = ?",
             &[SqliteValue::from(content_hash)],
-        ) {
-            Ok(row) => Ok(Some(Self::issue_from_row(&row)?)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(BeadsError::Database(e)),
+        )?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(Some(Self::issue_from_row(&row)?)),
+            None => Ok(None),
         }
     }
 
@@ -6975,16 +6989,18 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn is_tombstone(&self, id: &str) -> Result<bool> {
-        match self.conn.query_row_with_params(
+        // Issue #229: use `query_with_params` to avoid the single-row
+        // prepared-statement fast path (same rationale as get_issue_from_conn).
+        let rows = self.conn.query_with_params(
             "SELECT status FROM issues WHERE id = ?",
             &[SqliteValue::from(id)],
-        ) {
-            Ok(row) => {
+        )?;
+        match rows.into_iter().next() {
+            Some(row) => {
                 let status = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
                 Ok(status == "tombstone")
             }
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(false),
-            Err(e) => Err(BeadsError::Database(e)),
+            None => Ok(false),
         }
     }
 
@@ -7308,10 +7324,15 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
 }
 
 fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
-    let row = conn.query_row_with_params(
+    // Issue #229: use `query_with_params` to avoid the single-row
+    // prepared-statement fast path.
+    let rows = conn.query_with_params(
         "SELECT id, issue_id, author, text, created_at FROM comments WHERE id = ?",
         &[SqliteValue::from(comment_id)],
     )?;
+    let row = rows.into_iter().next().ok_or_else(|| {
+        BeadsError::Config(format!("comment {comment_id} not found after insert"))
+    })?;
     comment_from_row(&row)
 }
 

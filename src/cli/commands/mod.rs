@@ -201,6 +201,21 @@ pub(super) fn auto_import_storage_ctx_if_stale(
     storage_ctx: &mut OpenStorageResult,
     cli: &crate::config::CliOverrides,
 ) -> crate::Result<()> {
+    // Issue #229: skip auto-import in --no-db mode.  The in-memory database
+    // was just populated from the JSONL file during `open_storage_with_cli`,
+    // so there is no staleness to detect.  Running the staleness probe here
+    // is actively harmful because `compute_staleness_refreshing_witnesses`
+    // calls `get_metadata` via `query_row_with_params`, which routes through
+    // frankensqlite's prepared-statement fast path.  On in-memory databases
+    // that fast path can warm up cached root-page references that become
+    // stale after the bulk import's DELETE + INSERT cycle, causing subsequent
+    // `get_issue_from_conn` calls inside write transactions to silently
+    // return zero rows — the mechanism behind the "Issue not found" errors
+    // on `br --no-db update`.
+    if storage_ctx.no_db {
+        return Ok(());
+    }
+
     let config_layer = storage_ctx.load_config(cli)?;
     let no_auto_import = crate::config::no_auto_import_from_layer(&config_layer).unwrap_or(false);
     let allow_external_jsonl = crate::config::implicit_external_jsonl_allowed(

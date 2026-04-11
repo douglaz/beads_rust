@@ -497,6 +497,25 @@ fn open_sqlite_storage_with_recovery(
         return rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer);
     }
 
+    // Issue #228: proactively remove truncated WAL sidecar files before
+    // opening.  A WAL file that exists but is shorter than 32 bytes (the WAL
+    // header size) cannot be valid and will cause frankensqlite to return
+    // WalCorrupt during rebuild.  Removing it is safe — SQLite recreates the
+    // WAL on the next write, and the main DB file already contains all
+    // committed data (the adaptive checkpoint drains frames continuously).
+    let wal_path = paths.db_path.with_extension("db-wal");
+    if let Ok(meta) = fs::metadata(&wal_path) {
+        if meta.len() < 32 {
+            tracing::warn!(
+                wal_path = %wal_path.display(),
+                wal_size = meta.len(),
+                "removing truncated WAL sidecar (< 32 bytes) before open"
+            );
+            let _ = fs::remove_file(&wal_path);
+            let _ = fs::remove_file(paths.db_path.with_extension("db-shm"));
+        }
+    }
+
     match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
             Ok(None) => Ok(storage),

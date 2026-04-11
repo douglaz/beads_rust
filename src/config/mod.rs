@@ -503,7 +503,7 @@ fn open_sqlite_storage_with_recovery(
     // WalCorrupt during rebuild.  Removing it is safe — SQLite recreates the
     // WAL on the next write, and the main DB file already contains all
     // committed data (the adaptive checkpoint drains frames continuously).
-    let wal_path = paths.db_path.with_extension("db-wal");
+    let wal_path = PathBuf::from(format!("{}-wal", paths.db_path.to_string_lossy()));
     if let Ok(meta) = fs::metadata(&wal_path) {
         if meta.len() < 32 {
             tracing::warn!(
@@ -512,7 +512,10 @@ fn open_sqlite_storage_with_recovery(
                 "removing truncated WAL sidecar (< 32 bytes) before open"
             );
             let _ = fs::remove_file(&wal_path);
-            let _ = fs::remove_file(paths.db_path.with_extension("db-shm"));
+            let _ = fs::remove_file(PathBuf::from(format!(
+                "{}-shm",
+                paths.db_path.to_string_lossy()
+            )));
         }
     }
 

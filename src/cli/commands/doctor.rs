@@ -64,6 +64,7 @@ struct LocalRepairResult {
     blocked_cache_rebuilt: bool,
     wal_checkpoint_completed: bool,
     indexes_reindexed: bool,
+    vacuumed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     quarantined_artifacts: Vec<String>,
 }
@@ -110,6 +111,7 @@ impl LocalRepairResult {
         self.blocked_cache_rebuilt
             || self.wal_checkpoint_completed
             || self.indexes_reindexed
+            || self.vacuumed
             || !self.quarantined_artifacts.is_empty()
     }
 }
@@ -191,6 +193,55 @@ fn report_has_sidecar_anomaly(report: &DoctorReport) -> bool {
         .any(|check| check.name == "db.sidecars" && matches!(check.status, CheckStatus::Error))
 }
 
+/// Return true if any integrity check reported non-benign page corruption
+/// (e.g., "free space corruption") that VACUUM can fix by rewriting all pages.
+fn report_has_page_corruption(report: &DoctorReport) -> bool {
+    report.checks.iter().any(|check| {
+        if !matches!(check.status, CheckStatus::Error) {
+            return false;
+        }
+        if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
+            return false;
+        }
+        check
+            .message
+            .as_deref()
+            .is_some_and(|msg| msg.to_lowercase().contains("free space corruption"))
+    })
+}
+
+/// Compact the database via VACUUM to fix page-level anomalies (free space
+/// corruption, freeblock chain inconsistencies) that arise from frankensqlite's
+/// B-tree layer.  VACUUM rewrites every page from scratch, eliminating any
+/// internal accounting discrepancies.
+fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
+    if !db_path.is_file() {
+        tracing::debug!(
+            path = %db_path.display(),
+            "Skipping VACUUM because the database file is missing"
+        );
+        return;
+    }
+    match Connection::open(db_path.to_string_lossy().into_owned()) {
+        Ok(conn) => match conn.execute("VACUUM") {
+            Ok(_) => {
+                repair.vacuumed = true;
+                tracing::info!(path = %db_path.display(), "VACUUM completed successfully");
+            }
+            Err(err) => {
+                tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Skipping VACUUM because the database could not be opened"
+            );
+        }
+    }
+}
+
 /// Return true if any integrity check reported partial-index row mismatches
 /// ("row N missing from index") as a warning.  These can be repaired via `REINDEX`.
 fn report_has_partial_index_warnings(report: &DoctorReport) -> bool {
@@ -218,6 +269,9 @@ fn local_repair_message(local_repair: &LocalRepairResult) -> String {
     }
     if local_repair.indexes_reindexed {
         actions.push("rebuilt all indexes via REINDEX".to_string());
+    }
+    if local_repair.vacuumed {
+        actions.push("compacted database via VACUUM to fix page-level anomalies".to_string());
     }
     if !local_repair.quarantined_artifacts.is_empty() {
         actions.push(format!(
@@ -2294,6 +2348,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     if report_has_partial_index_warnings(&initial.report) {
         repair_partial_indexes(&paths.db_path, &mut local_repair);
     }
+
+    // VACUUM to fix page-level anomalies (free space corruption) caused by
+    // frankensqlite freeblock accounting differences with C sqlite3 (#237).
+    // This is much faster than a full JSONL rebuild and fixes the page
+    // structures in-place.
+    if report_has_page_corruption(&initial.report) {
+        repair_via_vacuum(&paths.db_path, &mut local_repair);
+    }
+
     let after_local_repair = if local_repair.applied() {
         collect_doctor_report(&beads_dir, &paths)?
     } else {

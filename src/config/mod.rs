@@ -811,6 +811,15 @@ fn rebuild_database_family(
     let mut storage = SqliteStorage::open_with_timeout(db_path, lock_timeout)?;
     storage.set_config("issue_prefix", prefix)?;
     let import_result = import_from_jsonl(&mut storage, jsonl_path, import_config, Some(prefix))?;
+
+    // Post-rebuild VACUUM to eliminate freeblock accounting anomalies that
+    // frankensqlite's B-tree layer may leave behind during bulk import.
+    // Without this, C sqlite3's `PRAGMA integrity_check` can report
+    // "free space corruption" even though the data is intact (issue #237).
+    if let Err(e) = storage.execute_raw("VACUUM") {
+        tracing::debug!(error = %e, "VACUUM after rebuild failed (non-fatal)");
+    }
+
     Ok((storage, import_result))
 }
 

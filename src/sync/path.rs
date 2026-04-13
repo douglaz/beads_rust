@@ -623,7 +623,20 @@ pub fn require_safe_sync_overwrite_path(
 ) -> Result<()> {
     let canonical_beads =
         dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
-    let is_internal = path.starts_with(beads_dir) || path.starts_with(&canonical_beads);
+
+    // Resolve relative paths against cwd so that `.beads/issues.jsonl.<pid>.tmp`
+    // is correctly recognized as internal when beads_dir is absolute (#238).
+    let resolved_path = if path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let is_internal = resolved_path.starts_with(beads_dir)
+        || resolved_path.starts_with(&canonical_beads)
+        || path.starts_with(beads_dir)
+        || path.starts_with(&canonical_beads);
 
     if is_internal {
         let validation = validate_sync_path(path, beads_dir);

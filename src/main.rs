@@ -40,6 +40,18 @@ fn main() {
         }
     };
 
+    // Phase 1.5: Acquire exclusive write lock for mutating commands.
+    //
+    // Issue #243: frankensqlite deadlocks when multiple processes attempt
+    // concurrent writes to the same database file. Serialize all mutating
+    // operations through a blocking flock on `.beads/.write.lock`. Read-only
+    // commands skip this lock entirely. The lock is held until main() exits.
+    let _write_lock = if is_mutating && ctx.is_initialized() {
+        ctx.beads_dir.as_deref().and_then(blocking_write_lock)
+    } else {
+        None
+    };
+
     // Phase 2: Open Storage (One-time)
     let storage_enabled = ctx.is_initialized() && !ctx.no_db();
     let should_auto_flush_now = is_mutating && !ctx.no_auto_flush();
@@ -109,7 +121,14 @@ fn main() {
             force,
             backend: _,
         } => commands::init::execute(prefix, force, None, &output_ctx),
-        Commands::Create(args) => commands::create::execute(&args, &overrides, &output_ctx),
+        Commands::Create(args) => {
+            commands::create::execute_with_storage(
+                &args,
+                &overrides,
+                &output_ctx,
+                storage_result.take(),
+            )
+        }
         Commands::Update(args) => commands::update::execute(&args, &overrides, &output_ctx),
         Commands::Delete(args) => {
             commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
@@ -321,6 +340,44 @@ fn main() {
             debug!(?e, "Auto-flush failed (non-fatal)");
         }
     }
+}
+
+/// Acquire a blocking exclusive lock on `.beads/.write.lock`.
+///
+/// This serializes all mutating `br` operations across processes, preventing
+/// the frankensqlite concurrent-write deadlock (#243). The lock blocks (with
+/// exponential backoff) until it is acquired or 10 seconds elapse.
+/// Returns `Some(File)` on success; the lock is held until the File drops.
+fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
+    let lock_path = beads_dir.join(".write.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+
+    // Try non-blocking first for the fast path.
+    if file.try_lock().is_ok() {
+        return Some(file);
+    }
+
+    // Blocking retry with exponential backoff (50ms → 800ms, ~6 attempts in ~3s).
+    let mut delay = std::time::Duration::from_millis(50);
+    for _ in 0..12 {
+        std::thread::sleep(delay);
+        if file.try_lock().is_ok() {
+            return Some(file);
+        }
+        delay = delay.min(std::time::Duration::from_millis(800));
+        delay = delay.mul_f32(1.5);
+    }
+
+    // Last attempt: log a warning and proceed without the lock rather than
+    // failing hard. The SQLite retry loop provides a secondary safety net.
+    debug!("could not acquire .write.lock after retries; proceeding without lock");
+    None
 }
 
 /// Try to acquire an exclusive advisory lock on `.beads/.sync.lock`.

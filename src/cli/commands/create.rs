@@ -37,6 +37,20 @@ struct NewIdInput<'a> {
 /// Returns an error if validation fails, the database cannot be opened, or the issue cannot be created.
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    execute_with_storage(args, cli, ctx, None)
+}
+
+/// Execute the create command, optionally reusing a pre-opened storage
+/// connection. When `pre_opened` is `Some`, the caller's connection is used
+/// directly, avoiding a redundant second open that would compete for the
+/// WAL write lock under concurrent access.
+#[allow(clippy::too_many_lines)]
+pub fn execute_with_storage(
+    args: &CreateArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    pre_opened: Option<config::OpenStorageResult>,
+) -> Result<()> {
     if let Some(ref file_path) = args.file {
         if args.title.is_some() || args.title_flag.is_some() {
             return Err(BeadsError::validation(
@@ -53,11 +67,13 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return execute_import(file_path, args, cli, ctx);
     }
 
-    // 1. Open storage (unless dry run without DB)
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-
-    // We open storage even for dry-run to check ID collisions.
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    // 1. Open storage (reuse pre-opened if available)
+    let mut storage_ctx = if let Some(ctx) = pre_opened {
+        ctx
+    } else {
+        let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+        config::open_storage_with_cli(&beads_dir, cli)?
+    };
     let layer = storage_ctx.load_config(cli)?;
 
     let config = CreateConfig {

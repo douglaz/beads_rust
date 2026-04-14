@@ -26,7 +26,16 @@ use std::time::Duration;
 
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
-const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;
+/// Per-statement busy spin timeout before SQLite returns SQLITE_BUSY.
+///
+/// Set to 0 (#243): frankensqlite's busy_timeout implementation uses a
+/// hot spin loop (not sleep-based) that consumes 100% CPU and prevents
+/// the competing writer from making progress. With busy_timeout=0,
+/// `BEGIN IMMEDIATE` returns SQLITE_BUSY immediately when the write lock
+/// is held, allowing the application-level retry loop (8 attempts with
+/// jittered exponential backoff via thread::sleep) to provide proper
+/// desynchronization. This is critical for multi-agent concurrent access.
+const DEFAULT_BUSY_TIMEOUT_MS: u64 = 0;
 // `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
 // existing `export_hashes` rows with a single multi-values INSERT. Batch the
 // DELETE side for efficiency, but re-insert one row at a time for correctness.
@@ -310,17 +319,22 @@ impl SqliteStorage {
     }
 
     fn ensure_known_metadata_defaults(conn: &Connection) -> Result<()> {
-        Self::with_connection_write_transaction(conn, |conn| {
-            for (key, default_value) in KNOWN_METADATA_DEFAULTS {
-                if !Self::metadata_key_exists(conn, key)? {
-                    conn.execute_with_params(
-                        "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                        &[SqliteValue::from(key), SqliteValue::from(default_value)],
-                    )?;
-                }
-            }
-            Ok(())
-        })
+        // Each INSERT is atomic (auto-commit) and idempotent via the WHERE
+        // NOT EXISTS guard. This avoids an explicit BEGIN IMMEDIATE that would
+        // hold the write lock across all keys and block concurrent openers
+        // under multi-agent workloads (#243).
+        for (key, default_value) in KNOWN_METADATA_DEFAULTS {
+            conn.execute_with_params(
+                "INSERT INTO metadata (key, value) \
+                 SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM metadata WHERE key = ?)",
+                &[
+                    SqliteValue::from(key),
+                    SqliteValue::from(default_value),
+                    SqliteValue::from(key),
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     fn metadata_equals(conn: &Connection, key: &str, expected: &str) -> Result<bool> {
@@ -675,17 +689,12 @@ impl SqliteStorage {
     where
         F: FnMut(&mut Self) -> Result<R>,
     {
-        // Issue #219: parallel `br close` from multiple agents caused "database
-        // is busy" errors.  The previous retry loop (5 retries, 10ms base
-        // backoff, max ~310ms additional wait) was too aggressive — after the
-        // PRAGMA busy_timeout exhausts its 30s spin, the tiny inter-retry
-        // sleeps rarely give the competing writer enough time to finish.
-        //
-        // New parameters: 8 retries with 50ms base (50, 100, 200, 400, 800,
-        // 1600, 3200, 6400ms) plus random jitter.  This gives ~12.7s of
-        // inter-retry sleep on top of the per-attempt busy_timeout spin,
-        // and the jitter prevents thundering-herd synchronization when many
-        // agents retry at the same instant.
+        // Issue #219/#243: parallel agents caused "database is busy" errors
+        // or deadlocks.  With busy_timeout=0 (see DEFAULT_BUSY_TIMEOUT_MS),
+        // BEGIN IMMEDIATE returns SQLITE_BUSY immediately, and all retry
+        // timing happens here via thread::sleep with jittered exponential
+        // backoff. 8 retries × (50ms → 6400ms) gives ~12.7s total wait with
+        // good desynchronization under concurrent access.
         const MAX_RETRIES: u32 = 8;
         let base_backoff_ms: u64 = 50;
 

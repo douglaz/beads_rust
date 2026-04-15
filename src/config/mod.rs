@@ -820,6 +820,15 @@ fn rebuild_database_family(
         tracing::debug!(error = %e, "VACUUM after rebuild failed (non-fatal)");
     }
 
+    // Post-rebuild REINDEX to fix partial-index row mismatches that
+    // frankensqlite's B-tree layer can introduce during bulk insert.
+    // VACUUM rewrites pages but does not rebuild index entries; without
+    // REINDEX, `PRAGMA integrity_check` reports "row N missing from index"
+    // for partial indexes like idx_issues_list_active_order (issue #246).
+    if let Err(e) = storage.execute_raw("REINDEX") {
+        tracing::debug!(error = %e, "REINDEX after rebuild failed (non-fatal)");
+    }
+
     Ok((storage, import_result))
 }
 

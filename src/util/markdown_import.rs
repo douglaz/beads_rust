@@ -307,10 +307,8 @@ fn split_dependency_content(content: &str) -> Vec<String> {
             // Treat the whole stripped line as a single dependency reference.
             // This allows title-based refs like "- Build Database Schema".
             // Note: `line` already has bullets and checkboxes stripped via
-            // `strip_markdown_list_prefix`, so we use it directly.
-            if !line.is_empty() {
-                result.push(line.to_string());
-            }
+            // `strip_markdown_list_prefix`, and emptiness was checked above.
+            result.push(line.to_string());
         } else if line.contains(',') {
             result.extend(
                 line.split(',')

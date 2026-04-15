@@ -787,7 +787,8 @@ fn execute_import(
         if let Some(ref sid) = parsed.stand_in_id {
             let sid_trimmed = sid.trim().to_string();
             if !sid_trimmed.is_empty() {
-                standin_to_id.insert(sid_trimmed, id.clone());
+                // Case-insensitive, consistent with title-based resolution.
+                standin_to_id.insert(sid_trimmed.to_lowercase(), id.clone());
             }
         }
 
@@ -817,7 +818,8 @@ fn execute_import(
                 }
 
                 // Resolution order: stand-in ID → title → storage ID
-                let resolved_dep_id = if let Some(id) = standin_to_id.get(&dep_id) {
+                // All intra-file lookups are case-insensitive.
+                let resolved_dep_id = if let Some(id) = standin_to_id.get(&dep_id.to_lowercase()) {
                     id.clone()
                 } else if let Some(id) = title_to_id.get(&dep_id.to_lowercase()) {
                     id.clone()

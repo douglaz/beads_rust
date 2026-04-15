@@ -141,7 +141,15 @@ bug
 
     let payload = extract_json_payload(&list.stdout);
     let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
-    let issues = json.as_array().expect("json array");
+    // Handle both bare array and paginated {"issues": [...]} formats
+    let issues = if let Some(arr) = json.as_array() {
+        arr.clone()
+    } else {
+        json["issues"]
+            .as_array()
+            .expect("json issues array")
+            .clone()
+    };
     let second = issues
         .iter()
         .find(|issue| issue["title"] == "Second imported")
@@ -241,7 +249,7 @@ task
 }
 
 #[test]
-fn test_markdown_import_rejects_parent_argument() {
+fn test_markdown_import_parent_argument_sets_global_default() {
     let workspace = BrWorkspace::new();
 
     let output = run_br(&workspace, ["init"], "init_parent_arg");
@@ -273,16 +281,33 @@ task
 ";
     fs::write(&md_path, content).expect("write md");
 
+    // --parent with --file sets a global default parent for imported issues
     let output = run_br(
         &workspace,
-        ["create", "--file", "issues.md", "--parent", &parent_id],
+        ["create", "--file", "issues.md", "--parent", &parent_id, "--json"],
         "create_parent_arg",
     );
-    assert!(!output.status.success(), "--parent should fail with --file");
     assert!(
-        output
-            .stderr
-            .contains("--parent is not supported with --file")
+        output.status.success(),
+        "--parent with --file should work: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 1);
+
+    // Verify the imported issue has a parent-child dependency on the parent
+    let deps = issues[0]["dependencies"]
+        .as_array()
+        .expect("dependencies array");
+    assert!(
+        deps.iter().any(|d| {
+            d["depends_on_id"].as_str() == Some(parent_id.as_str())
+                && d["type"].as_str() == Some("parent-child")
+        }),
+        "imported issue should have parent-child dep on {parent_id}, got: {deps:?}"
     );
 }
 

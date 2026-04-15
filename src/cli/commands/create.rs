@@ -65,6 +65,12 @@ pub fn execute_with_storage(
                 "--external-ref is not supported with --file",
             ));
         }
+        if args.dry_run {
+            return Err(BeadsError::validation(
+                "dry_run",
+                "--dry-run is not supported with --file",
+            ));
+        }
         return execute_import(file_path, args, cli, ctx);
     }
 

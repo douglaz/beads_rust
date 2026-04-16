@@ -82,10 +82,11 @@ if [[ -z "${BR_INSTALLER_SELF_REEXEC:-}" ]] \
     if [[ "$__br_self_fetched" -eq 1 ]] && [[ -s "$__br_self_tmp" ]]; then
         chmod 0700 "$__br_self_tmp" 2>/dev/null || true
         export BR_INSTALLER_SELF_REEXEC=1
-        # Route interactive input to the controlling tty if one exists so
-        # `read -r ans` prompts work; otherwise close stdin so reads fail
-        # fast instead of eating script bytes.
-        if [[ -r /dev/tty ]]; then
+        # Route interactive input to the controlling tty if one is usable.
+        # `[[ -r /dev/tty ]]` returns true in some CI harnesses where
+        # opening /dev/tty actually fails with "No such device or address",
+        # so probe by opening it in a subshell first.
+        if ( : </dev/tty ) 2>/dev/null; then
             exec bash "$__br_self_tmp" "$@" </dev/tty
         else
             exec bash "$__br_self_tmp" "$@" </dev/null

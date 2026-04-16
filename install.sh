@@ -26,6 +26,79 @@ umask 022
 shopt -s lastpipe 2>/dev/null || true
 
 # ============================================================================
+# Curl|bash self-protection: re-download and re-exec from an on-disk copy
+# (issue #250)
+# ============================================================================
+# When invoked via `curl … | bash`, bash reads the script progressively from
+# its own stdin.  Bugs cascade from that:
+#
+#   1. Any later `read -r` (interactive prompts), heredoc, or command that
+#      the script itself tries to consume from stdin will steal bytes bash
+#      still needs to parse — producing confusing errors like
+#         "line 32: syntax error near unexpected token '1334'"
+#      that cite a line nowhere near the actual text they reference
+#      (issue #250 bug 2).
+#   2. If the TCP connection stalls or is truncated, bash may parse a
+#      partial script and run half of it.
+#   3. macOS Homebrew bash 5.3+ has tightened its piped-stdin parser, making
+#      patterns that worked on older bash fail on current Apple Silicon
+#      hardware.
+#
+# The fix is a two-step bootstrap: when we detect that this script is
+# running from a pipe (no file path AND stdin is not a terminal), we
+# download a fresh copy of install.sh to a temp file with curl/wget and
+# re-exec bash against that file.  From that point on `$0` is a real path,
+# `BASH_SOURCE[0]` is populated, interactive `read` can route to the
+# controlling tty, and parsing errors disappear.
+#
+# Re-exec is guarded by BR_INSTALLER_SELF_REEXEC=1 to prevent infinite
+# recursion if for some reason the on-disk copy still looks piped (e.g.
+# `exec` with no tty on an exotic runtime).
+if [[ -z "${BR_INSTALLER_SELF_REEXEC:-}" ]] \
+    && [[ -z "${BASH_SOURCE[0]:-}" || ! -r "${BASH_SOURCE[0]:-}" ]]; then
+    __br_self_owner="${OWNER:-Dicklesworthstone}"
+    __br_self_repo="${REPO:-beads_rust}"
+    __br_self_branch="${BR_INSTALLER_BRANCH:-main}"
+    __br_self_url="${BR_INSTALLER_URL:-https://raw.githubusercontent.com/${__br_self_owner}/${__br_self_repo}/${__br_self_branch}/install.sh}"
+    __br_self_tmp="$(mktemp -t br-installer.XXXXXX 2>/dev/null || mktemp 2>/dev/null || echo "/tmp/br-installer.$$.sh")"
+
+    __br_self_fetched=0
+    if command -v curl >/dev/null 2>&1; then
+        # Cache-bust with a query param to sidestep stale CDN copies; the
+        # server ignores unknown query strings on raw.githubusercontent.com.
+        if curl -fsSL --retry 3 --max-time 60 \
+            "${__br_self_url}?$(date +%s 2>/dev/null || echo self)" \
+            -o "$__br_self_tmp" 2>/dev/null; then
+            __br_self_fetched=1
+        fi
+    fi
+    if [[ "$__br_self_fetched" -eq 0 ]] && command -v wget >/dev/null 2>&1; then
+        if wget -qO "$__br_self_tmp" \
+            "${__br_self_url}?$(date +%s 2>/dev/null || echo self)" 2>/dev/null; then
+            __br_self_fetched=1
+        fi
+    fi
+
+    if [[ "$__br_self_fetched" -eq 1 ]] && [[ -s "$__br_self_tmp" ]]; then
+        chmod 0700 "$__br_self_tmp" 2>/dev/null || true
+        export BR_INSTALLER_SELF_REEXEC=1
+        # Route interactive input to the controlling tty if one exists so
+        # `read -r ans` prompts work; otherwise close stdin so reads fail
+        # fast instead of eating script bytes.
+        if [[ -r /dev/tty ]]; then
+            exec bash "$__br_self_tmp" "$@" </dev/tty
+        else
+            exec bash "$__br_self_tmp" "$@" </dev/null
+        fi
+    fi
+    # Fall through: if the self-download failed we still try to run what
+    # we have.  This preserves the old curl|bash behavior for environments
+    # without curl/wget, at the cost of the known piped-stdin hazards.
+    rm -f "$__br_self_tmp" 2>/dev/null || true
+    unset __br_self_owner __br_self_repo __br_self_branch __br_self_url __br_self_tmp __br_self_fetched
+fi
+
+# ============================================================================
 # Configuration
 # ============================================================================
 VERSION="${VERSION:-}"

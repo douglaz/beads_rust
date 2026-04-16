@@ -1,4 +1,5 @@
-# Local contributor template: sibling-checkout frankensqlite override.
+# Local contributor template: sibling-checkout path overrides for
+# frankensqlite (and, optionally, fastmcp_rust).
 #
 # Usage (from the beads_rust repo root):
 #   mkdir -p .cargo
@@ -7,13 +8,15 @@
 # Requirements:
 #   - frankensqlite must be checked out as a sibling directory
 #     (`../frankensqlite/crates/fsqlite` and friends must exist)
+#   - fastmcp_rust is optional — uncomment the last line only if you
+#     also want to hack on it locally
 #
 # Effects:
 #   - Every `fsqlite*` crate resolves to the sibling path instead of
 #     crates.io, so edits to frankensqlite are picked up on the next
 #     `cargo build`.
-#   - `cargo install --git` users are unaffected — they install from
-#     crates.io without this file.
+#   - `cargo install --git` / `cargo install beads_rust` users are
+#     unaffected — they install from crates.io without this file.
 #
 # Keep this file in `scripts/` (not `.cargo/`) so it doesn't accidentally
 # ship with the published crate.
@@ -39,4 +42,5 @@ fsqlite-vfs           = { path = "../frankensqlite/crates/fsqlite-vfs" }
 fsqlite-wal           = { path = "../frankensqlite/crates/fsqlite-wal" }
 fsqlite-ext-icu       = { path = "../frankensqlite/crates/fsqlite-ext-icu" }
 fsqlite-ext-misc      = { path = "../frankensqlite/crates/fsqlite-ext-misc" }
-fastmcp-rust          = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }
+# fastmcp-rust is on crates.io at 0.2.1+; uncomment to hack locally:
+# fastmcp-rust          = { path = "../fastmcp_rust/crates/fastmcp" }

@@ -1,0 +1,42 @@
+# Local contributor template: sibling-checkout frankensqlite override.
+#
+# Usage (from the beads_rust repo root):
+#   mkdir -p .cargo
+#   cp scripts/dev-local-frankensqlite.toml .cargo/config.toml
+#
+# Requirements:
+#   - frankensqlite must be checked out as a sibling directory
+#     (`../frankensqlite/crates/fsqlite` and friends must exist)
+#
+# Effects:
+#   - Every `fsqlite*` crate resolves to the sibling path instead of
+#     crates.io, so edits to frankensqlite are picked up on the next
+#     `cargo build`.
+#   - `cargo install --git` users are unaffected — they install from
+#     crates.io without this file.
+#
+# Keep this file in `scripts/` (not `.cargo/`) so it doesn't accidentally
+# ship with the published crate.
+
+[patch.crates-io]
+fsqlite               = { path = "../frankensqlite/crates/fsqlite" }
+fsqlite-ast           = { path = "../frankensqlite/crates/fsqlite-ast" }
+fsqlite-btree         = { path = "../frankensqlite/crates/fsqlite-btree" }
+fsqlite-core          = { path = "../frankensqlite/crates/fsqlite-core" }
+fsqlite-error         = { path = "../frankensqlite/crates/fsqlite-error" }
+fsqlite-ext-fts5      = { path = "../frankensqlite/crates/fsqlite-ext-fts5" }
+fsqlite-ext-json      = { path = "../frankensqlite/crates/fsqlite-ext-json" }
+fsqlite-ext-rtree     = { path = "../frankensqlite/crates/fsqlite-ext-rtree" }
+fsqlite-func          = { path = "../frankensqlite/crates/fsqlite-func" }
+fsqlite-mvcc          = { path = "../frankensqlite/crates/fsqlite-mvcc" }
+fsqlite-observability = { path = "../frankensqlite/crates/fsqlite-observability" }
+fsqlite-pager         = { path = "../frankensqlite/crates/fsqlite-pager" }
+fsqlite-parser        = { path = "../frankensqlite/crates/fsqlite-parser" }
+fsqlite-planner       = { path = "../frankensqlite/crates/fsqlite-planner" }
+fsqlite-types         = { path = "../frankensqlite/crates/fsqlite-types" }
+fsqlite-vdbe          = { path = "../frankensqlite/crates/fsqlite-vdbe" }
+fsqlite-vfs           = { path = "../frankensqlite/crates/fsqlite-vfs" }
+fsqlite-wal           = { path = "../frankensqlite/crates/fsqlite-wal" }
+fsqlite-ext-icu       = { path = "../frankensqlite/crates/fsqlite-ext-icu" }
+fsqlite-ext-misc      = { path = "../frankensqlite/crates/fsqlite-ext-misc" }
+fastmcp-rust          = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }

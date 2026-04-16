@@ -338,9 +338,10 @@ fn main() {
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
 ///
 /// This serializes all mutating `br` operations across processes, preventing
-/// the frankensqlite concurrent-write deadlock (#243). The lock blocks (with
-/// exponential backoff, 12 attempts over ~6 seconds) until acquired.
-/// Returns `Some(File)` on success; the lock is held until the File drops.
+/// the frankensqlite concurrent-write deadlock (#243). Uses a fast-path
+/// `try_lock()` for the uncontended case, then falls back to a true blocking
+/// `lock()` that waits indefinitely until the holder releases. The lock is
+/// held until the returned `File` drops.
 fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
     let lock_path = beads_dir.join(".write.lock");
     let file = OpenOptions::new()
@@ -351,26 +352,22 @@ fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
         .open(&lock_path)
         .ok()?;
 
-    // Try non-blocking first for the fast path.
+    // Fast path: non-blocking try for the common uncontended case.
     if file.try_lock().is_ok() {
         return Some(file);
     }
 
-    // Blocking retry with exponential backoff (50ms → 800ms cap, 12 attempts,
-    // total worst-case ~8s).
-    let mut delay = std::time::Duration::from_millis(50);
-    for _ in 0..12 {
-        std::thread::sleep(delay);
-        if file.try_lock().is_ok() {
-            return Some(file);
+    // Contended: block until the current holder releases. This is a true
+    // OS-level blocking wait (flock LOCK_EX on Linux / fcntl on macOS),
+    // so it doesn't spin and releases as soon as the holder drops.
+    debug!(".write.lock is held by another process; waiting for release");
+    match file.lock() {
+        Ok(()) => Some(file),
+        Err(e) => {
+            debug!("failed to acquire .write.lock: {e}; proceeding without lock");
+            None
         }
-        delay = delay.mul_f32(1.5).min(std::time::Duration::from_millis(800));
     }
-
-    // Last attempt: log a warning and proceed without the lock rather than
-    // failing hard. The SQLite retry loop provides a secondary safety net.
-    debug!("could not acquire .write.lock after retries; proceeding without lock");
-    None
 }
 
 /// Try to acquire an exclusive advisory lock on `.beads/.sync.lock`.

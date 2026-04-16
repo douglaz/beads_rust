@@ -675,7 +675,7 @@ fn e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar() {
     }
 
     let repair_workspace = BrWorkspace::new();
-    let wal_path = seed_sidecar_anomaly(&repair_workspace, "repair");
+    let _wal_path = seed_sidecar_anomaly(&repair_workspace, "repair");
     let repair_beads_dir = repair_workspace.root.join(".beads");
 
     let repaired = run_br(

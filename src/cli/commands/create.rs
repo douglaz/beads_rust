@@ -816,8 +816,9 @@ fn execute_import(
                 // This handles titles containing colons (e.g., "Step 1: Setup Database")
                 // that would otherwise be misinterpreted as typed dependencies.
                 let raw_lower = dep_str.to_lowercase();
-                let (type_str, resolved_dep_id) = if let Some(id) =
-                    standin_to_id.get(&raw_lower).or_else(|| title_to_id.get(&raw_lower))
+                let (type_str, resolved_dep_id) = if let Some(id) = standin_to_id
+                    .get(&raw_lower)
+                    .or_else(|| title_to_id.get(&raw_lower))
                 {
                     ("blocks".to_string(), id.clone())
                 } else {

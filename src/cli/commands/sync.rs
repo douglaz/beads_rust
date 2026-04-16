@@ -1019,6 +1019,31 @@ fn execute_import(
         }
     }
 
+    // Post-rebuild VACUUM + REINDEX to eliminate B-tree/index corruption
+    // artifacts that frankensqlite's bulk-insert path can leave behind after
+    // `reset_data_tables()` + bulk import.  This mirrors what
+    // `rebuild_database_family` (used by `br doctor --repair` and auto
+    // recovery) does at the equivalent chokepoint.
+    //
+    // Without this, `br sync --import-only --force` / `--rebuild` can produce
+    // a DB where C sqlite3's `PRAGMA integrity_check` reports
+    // "database disk image is malformed" and where later write-transaction
+    // reads (inside `update_issue`) silently return zero rows for an ID that
+    // `br show` can still find — leading to the "Issue not found" error and
+    // secondary on-disk corruption seen in issue #248.
+    //
+    // The non-force import path does not drop/recreate tables, so it does
+    // not need this hardening.  Keeping the VACUUM/REINDEX scoped to the
+    // force/rebuild branch avoids paying the cost on every `br sync` run.
+    if args.force || args.rebuild {
+        if let Err(e) = storage.execute_raw("VACUUM") {
+            debug!(error = %e, "VACUUM after force/rebuild import failed (non-fatal)");
+        }
+        if let Err(e) = storage.execute_raw("REINDEX") {
+            debug!(error = %e, "REINDEX after force/rebuild import failed (non-fatal)");
+        }
+    }
+
     // Update content hash
     let content_hash = compute_jsonl_hash(jsonl_path)?;
     storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &content_hash)?;

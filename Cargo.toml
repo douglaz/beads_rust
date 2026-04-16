@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.1.40"
+version = "0.1.41"
 edition = "2024"
 rust-version = "1.88"
 description = "Agent-first issue tracker (SQLite + JSONL)"
@@ -188,3 +188,12 @@ missing_const_for_fn = { level = "allow", priority = 1 }
 uninlined_format_args = { level = "allow", priority = 1 }
 useless_let_if_seq = { level = "allow", priority = 1 }
 format_push_string = { level = "allow", priority = 1 }
+# Stylistic nursery/pedantic lints that don't reflect real defects
+option_if_let_else = { level = "allow", priority = 1 }
+map_unwrap_or = { level = "allow", priority = 1 }
+similar_names = { level = "allow", priority = 1 }
+too_long_first_doc_paragraph = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+redundant_clone = { level = "allow", priority = 1 }
+struct_excessive_bools = { level = "allow", priority = 1 }
+if_not_else = { level = "allow", priority = 1 }

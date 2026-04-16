@@ -284,7 +284,14 @@ task
     // --parent with --file sets a global default parent for imported issues
     let output = run_br(
         &workspace,
-        ["create", "--file", "issues.md", "--parent", &parent_id, "--json"],
+        [
+            "create",
+            "--file",
+            "issues.md",
+            "--parent",
+            &parent_id,
+            "--json",
+        ],
         "create_parent_arg",
     );
     assert!(

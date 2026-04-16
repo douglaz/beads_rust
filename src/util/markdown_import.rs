@@ -296,9 +296,8 @@ fn split_dependency_content(content: &str) -> Vec<String> {
     let mut result = Vec::new();
     for raw_line in content.lines() {
         let trimmed = raw_line.trim_start();
-        let is_bulleted = trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || trimmed.starts_with("+ ");
+        let is_bulleted =
+            trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ");
         let line = strip_markdown_list_prefix(raw_line).trim();
         if line.is_empty() || is_marker_only_token(line) {
             continue;
@@ -675,10 +674,7 @@ db-1
 ";
         let issues = parse_markdown_content(content).unwrap();
         assert_eq!(issues.len(), 2);
-        assert_eq!(
-            issues[0].stand_in_id,
-            Some("db-1".to_string())
-        );
+        assert_eq!(issues[0].stand_in_id, Some("db-1".to_string()));
         assert_eq!(issues[0].title, "Build Database Schema");
         assert_eq!(issues[1].dependencies, vec!["db-1"]);
     }
@@ -698,10 +694,7 @@ task
         let issues = parse_markdown_content(content).unwrap();
         assert_eq!(issues.len(), 2);
         // Bulleted line is preserved as a single dependency reference
-        assert_eq!(
-            issues[0].dependencies,
-            vec!["Build Database Schema"]
-        );
+        assert_eq!(issues[0].dependencies, vec!["Build Database Schema"]);
     }
 
     #[test]

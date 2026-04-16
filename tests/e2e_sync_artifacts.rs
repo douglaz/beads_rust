@@ -990,7 +990,14 @@ fn e2e_staleness_detects_real_content_change() {
 ///   2. A subsequent `br close` on a non-zero-blocker issue succeeds and
 ///      the DB still passes `integrity_check` afterwards.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_import_force_preserves_integrity_and_close_works() {
+    // Create enough issues to cross the bulk-insert threshold where
+    // frankensqlite's B-tree layer stops cleaning up after itself reliably.
+    // 220 is comfortably above the 200 seen in empirical repros for #248
+    // and well under any test-timeout budget.
+    const ISSUE_COUNT: usize = 220;
+
     let _log = common::test_log("e2e_sync_import_force_preserves_integrity_and_close_works");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_import_force_preserves_integrity");
@@ -1000,11 +1007,6 @@ fn e2e_sync_import_force_preserves_integrity_and_close_works() {
     let init = run_br(&workspace, ["init", "--prefix", "rr"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // Create enough issues to cross the bulk-insert threshold where
-    // frankensqlite's B-tree layer stops cleaning up after itself reliably.
-    // 220 is comfortably above the 200 seen in empirical repros for #248
-    // and well under any test-timeout budget.
-    const ISSUE_COUNT: usize = 220;
     let mut last_id: String = String::new();
     for i in 0..ISSUE_COUNT {
         let title = format!("issue {i}");

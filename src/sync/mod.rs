@@ -33,6 +33,63 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+/// Acquire a blocking exclusive lock on `.beads/.write.lock`.
+///
+/// This serializes all mutating operations across processes, preventing
+/// concurrent-write deadlocks in the underlying SQLite engine. Uses a fast-path
+/// `try_lock()` for the uncontended case, then falls back to a true blocking
+/// `lock()` that waits indefinitely until the holder releases. The lock is
+/// held until the returned `File` drops.
+#[allow(clippy::incompatible_msrv)]
+#[must_use]
+pub fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
+    let lock_path = beads_dir.join(".write.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+
+    // Fast path: non-blocking try for the common uncontended case.
+    if file.try_lock().is_ok() {
+        return Some(file);
+    }
+
+    // Contended: block until the current holder releases.
+    tracing::debug!(".write.lock is held by another process; waiting for release");
+    match file.lock() {
+        Ok(()) => Some(file),
+        Err(e) => {
+            tracing::debug!("failed to acquire .write.lock: {e}; proceeding without lock");
+            None
+        }
+    }
+}
+
+/// Try to acquire an exclusive advisory lock on `.beads/.sync.lock`.
+///
+/// Returns the lock file on success. The lock is held until the returned
+/// `File` is dropped. If another process already holds the lock, returns
+/// `None` (non-blocking).
+#[allow(clippy::incompatible_msrv)]
+#[must_use]
+pub fn try_sync_lock(beads_dir: &Path) -> Option<File> {
+    let lock_path = beads_dir.join(".sync.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(_) => None,
+    }
+}
+
 struct TempFileGuard {
     path: PathBuf,
     persist: bool,

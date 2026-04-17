@@ -7,9 +7,8 @@ use beads_rust::sync::{auto_flush, auto_import_if_stale, compute_staleness_refre
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
-use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::debug;
 
 #[allow(clippy::too_many_lines)]
@@ -46,8 +45,8 @@ fn main() {
     // concurrent writes to the same database file. Serialize all mutating
     // operations through a blocking flock on `.beads/.write.lock`. Read-only
     // commands skip this lock entirely. The lock is held until main() exits.
-    let _write_lock = if is_mutating && ctx.is_initialized() {
-        ctx.beads_dir.as_deref().and_then(blocking_write_lock)
+    let _write_lock = if needs_write_lock(&cli.command) && ctx.is_initialized() {
+        ctx.beads_dir.as_deref().and_then(beads_rust::sync::blocking_write_lock)
     } else {
         None
     };
@@ -86,7 +85,7 @@ fn main() {
                 .map_or(true, |staleness| staleness.jsonl_newer);
 
         if should_attempt_auto_import {
-            let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);
+            let _sync_lock = ctx.beads_dir.as_deref().and_then(beads_rust::sync::try_sync_lock);
             let allow_external_jsonl = config::implicit_external_jsonl_allowed(
                 &paths.beads_dir,
                 &paths.db_path,
@@ -317,7 +316,7 @@ fn main() {
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
     if is_mutating && !ctx.no_auto_flush() {
-        let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);
+        let _sync_lock = ctx.beads_dir.as_deref().and_then(beads_rust::sync::try_sync_lock);
         if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
             && let Err(e) = auto_flush(
                 &mut res.storage,
@@ -332,65 +331,6 @@ fn main() {
         {
             debug!(?e, "Auto-flush failed (non-fatal)");
         }
-    }
-}
-
-/// Acquire a blocking exclusive lock on `.beads/.write.lock`.
-///
-/// This serializes all mutating `br` operations across processes, preventing
-/// the frankensqlite concurrent-write deadlock (#243). Uses a fast-path
-/// `try_lock()` for the uncontended case, then falls back to a true blocking
-/// `lock()` that waits indefinitely until the holder releases. The lock is
-/// held until the returned `File` drops.
-#[allow(clippy::incompatible_msrv)]
-fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
-    let lock_path = beads_dir.join(".write.lock");
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .ok()?;
-
-    // Fast path: non-blocking try for the common uncontended case.
-    if file.try_lock().is_ok() {
-        return Some(file);
-    }
-
-    // Contended: block until the current holder releases. This is a true
-    // OS-level blocking wait (flock LOCK_EX on Linux / fcntl on macOS),
-    // so it doesn't spin and releases as soon as the holder drops.
-    debug!(".write.lock is held by another process; waiting for release");
-    match file.lock() {
-        Ok(()) => Some(file),
-        Err(e) => {
-            debug!("failed to acquire .write.lock: {e}; proceeding without lock");
-            None
-        }
-    }
-}
-
-/// Try to acquire an exclusive advisory lock on `.beads/.sync.lock`.
-///
-/// Returns the lock file on success. The lock is held until the returned
-/// `File` is dropped.  If another process already holds the lock, returns
-/// `None` (non-blocking).
-#[allow(clippy::incompatible_msrv)]
-fn try_sync_lock(beads_dir: &Path) -> Option<File> {
-    let lock_path = beads_dir.join(".sync.lock");
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .ok()?;
-    // `try_lock()` is non-blocking: returns `Ok(())` if we got the exclusive
-    // lock, or `Err(WouldBlock)` if another process already holds it.
-    match file.try_lock() {
-        Ok(()) => Some(file),
-        Err(_) => None,
     }
 }
 
@@ -474,7 +414,7 @@ const fn should_preopen_storage(
     storage_enabled && (needs_bootstrap_context || should_auto_flush_now)
 }
 
-/// Determine if a command potentially mutates data.
+/// Determine if a command potentially mutates data and triggers auto-flush.
 const fn is_mutating_command(cmd: &Commands) -> bool {
     match cmd {
         Commands::Create(_)
@@ -503,6 +443,29 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
+        _ => false,
+    }
+}
+
+/// Determine if a command modifies the SQLite database and requires the `.write.lock`.
+const fn needs_write_lock(cmd: &Commands) -> bool {
+    if is_mutating_command(cmd) {
+        return true;
+    }
+    match cmd {
+        Commands::Sync(args) => !args.flush_only && !args.status,
+        Commands::Config { command } => matches!(
+            command,
+            beads_rust::cli::ConfigCommands::Set { .. }
+                | beads_rust::cli::ConfigCommands::Delete { .. }
+        ),
+        Commands::History(args) => matches!(
+            args.command,
+            Some(beads_rust::cli::HistoryCommands::Restore { .. }
+                | beads_rust::cli::HistoryCommands::Prune { .. })
+        ),
+        Commands::Doctor(args) => args.repair,
+        Commands::Init { .. } => true,
         _ => false,
     }
 }

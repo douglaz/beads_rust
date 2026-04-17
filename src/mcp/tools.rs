@@ -1149,86 +1149,95 @@ impl ToolHandler for CreateIssueTool {
             coercions.push(w);
         }
 
-        let mut storage = open(&self.0)?;
-
-        let now = chrono::Utc::now();
-        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
-        let id_gen =
-            crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
-        let id = id_gen.generate(title, None, Some(&self.0.actor), now, 0, |candidate| {
-            storage.id_exists(candidate).unwrap_or(false)
-        });
-
-        let issue = Issue {
-            id: id.clone(),
-            title: title.to_string(),
-            description: args
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            status: Status::Open,
-            priority,
-            issue_type,
-            assignee: args
-                .get("assignee")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            created_by: Some(self.0.actor.clone()),
-            created_at: now,
-            updated_at: now,
-            ..Issue::default()
-        };
-
-        // Validate parent exists BEFORE creating the issue to avoid orphans
         let parent_id = args
             .get("parent")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        if let Some(ref pid) = parent_id {
-            require_valid_issue(&storage, pid)?;
-        }
 
-        storage
-            .create_issue(&issue, &self.0.actor)
-            .map_err(beads_to_mcp)?;
+        let labels_to_add: Vec<String> = args
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|val| val.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let id = self.0.with_mutation(|storage| {
+            let now = chrono::Utc::now();
+            let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
+
+            // Validate parent exists BEFORE creating the issue
+            if let Some(ref pid) = parent_id {
+                require_valid_issue(storage, pid)?;
+            }
+
+            let id = if let Some(ref pid) = parent_id {
+                let next_num = storage.next_child_number(pid)?;
+                let mut candidate = crate::util::id::child_id(pid, next_num);
+                // Handle rare hash/id collision safely under the transaction lock
+                let mut num = next_num + 1;
+                while storage.id_exists(&candidate).unwrap_or(false) {
+                    candidate = crate::util::id::child_id(pid, num);
+                    num += 1;
+                }
+                candidate
+            } else {
+                let id_gen =
+                    crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
+                id_gen.generate(title, None, Some(&self.0.actor), now, 0, |candidate| {
+                    storage.id_exists(candidate).unwrap_or(false)
+                })
+            };
+
+            let issue = Issue {
+                id: id.clone(),
+                title: title.to_string(),
+                description: args
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                status: Status::Open,
+                priority,
+                issue_type,
+                assignee: args
+                    .get("assignee")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                created_by: Some(self.0.actor.clone()),
+                created_at: now,
+                updated_at: now,
+                ..Issue::default()
+            };
+
+            storage.create_issue(&issue, &self.0.actor)?;
+
+            for label in &labels_to_add {
+                let _ = storage.add_label(&id, label, &self.0.actor);
+            }
+
+            if let Some(ref pid) = parent_id {
+                let _ = storage.add_dependency(&id, pid, "parent-child", &self.0.actor);
+            }
+
+            Ok(id)
+        })?;
 
         let mut warnings: Vec<String> = Vec::new();
-
-        // Attach labels
-        if let Some(labels) = args.get("labels").and_then(|v| v.as_array()) {
-            for label_val in labels {
-                if let Some(label) = label_val.as_str()
-                    && let Err(e) = storage.add_label(&id, label, &self.0.actor)
-                {
-                    warnings.push(format!("failed to add label '{label}': {e}"));
-                }
-            }
-        }
-
-        // Create parent-child dependency (parent already validated above)
-        let mut parent_linked = false;
-        if let Some(ref pid) = parent_id {
-            if let Err(e) = storage.add_dependency(&id, pid, "parent-child", &self.0.actor) {
-                warnings.push(format!("failed to link parent '{pid}': {e}"));
-            } else {
-                parent_linked = true;
-            }
-        }
+        // Warn if coercions happened
+        warnings.extend(coercions);
 
         let mut result = json!({
             "id": id,
-            "title": issue.title,
+            "title": title,
             "status": "open",
-            "priority": issue.priority,
-            "type": issue.issue_type,
+            "priority": priority.as_str(),
+            "type": issue_type.as_str(),
             "next_actions": [
                 "Use update_issue to add details or change fields",
                 "Use manage_dependencies to link to other issues"
             ]
         });
 
-        if parent_linked {
-            result["parent"] = json!(parent_id);
+        if let Some(ref pid) = parent_id {
+            result["parent"] = json!(pid);
         }
 
         if !coercions.is_empty() {
@@ -1359,83 +1368,74 @@ impl ToolHandler for UpdateIssueTool {
 
         let (updates, coercions) = parse_update_fields(id, &args)?;
 
-        let mut storage = open(&self.0)?;
+        let issue = self.0.with_mutation(|storage| {
+            // Validate ID exists before attempting update (placeholder + existence check)
+            require_valid_issue(storage, id)?;
 
-        // Validate ID exists before attempting update (placeholder + existence check)
-        require_valid_issue(&storage, id)?;
-
-        // Detect whether we have field changes vs label/comment side-effects.
-        // If only side-effects (labels_add, labels_remove, comment), skip the
-        // update_issue call which would fail with NothingToDo.
-        let has_field_updates = UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
-        let has_side_effects = args
-            .get("labels_add")
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| !a.is_empty())
-            || args
-                .get("labels_remove")
+            let has_field_updates = UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
+            let has_side_effects = args
+                .get("labels_add")
                 .and_then(|v| v.as_array())
                 .is_some_and(|a| !a.is_empty())
-            || args
-                .get("comment")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty());
+                || args
+                    .get("labels_remove")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| !a.is_empty())
+                || args
+                    .get("comment")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty());
 
-        let issue = if has_field_updates {
-            storage
-                .update_issue(id, &updates, &self.0.actor)
-                .map_err(beads_to_mcp)?
-        } else if has_side_effects {
-            // No field changes but labels/comments to process — read current state
-            storage
-                .get_issue_details(id, false, false, 0)
-                .map_err(beads_to_mcp)?
-                .ok_or_else(|| issue_not_found_err(&storage, id))?
-                .issue
-        } else {
-            return Err(McpError::with_data(
-                McpErrorCode::ToolExecutionError,
-                "No changes specified",
-                json!({
-                    "error_type": "NOTHING_TO_DO",
-                    "recoverable": true,
-                    "hint": "Provide at least one field to update, a label operation, or a comment",
-                    "suggested_tool_calls": [
-                        {"tool": "show_issue", "arguments": {"id": id}}
-                    ]
-                }),
-            ));
-        };
+            let issue = if has_field_updates {
+                storage.update_issue(id, &updates, &self.0.actor)?
+            } else if has_side_effects {
+                storage
+                    .get_issue_details(id, false, false, 0)?
+                    .ok_or_else(|| issue_not_found_err(storage, id))?
+                    .issue
+            } else {
+                return Err(McpError::with_data(
+                    McpErrorCode::ToolExecutionError,
+                    "No changes specified",
+                    json!({
+                        "error_type": "NOTHING_TO_DO",
+                        "recoverable": true,
+                        "hint": "Provide at least one field to update, a label operation, or a comment",
+                        "suggested_tool_calls": [
+                            {"tool": "show_issue", "arguments": {"id": id}}
+                        ]
+                    }),
+                ).into());
+            };
+
+            // Handle label mutations
+            if let Some(labels) = args.get("labels_add").and_then(|v| v.as_array()) {
+                for label_val in labels {
+                    if let Some(label) = label_val.as_str() {
+                        let _ = storage.add_label(id, label, &self.0.actor);
+                    }
+                }
+            }
+            if let Some(labels) = args.get("labels_remove").and_then(|v| v.as_array()) {
+                for label_val in labels {
+                    if let Some(label) = label_val.as_str() {
+                        let _ = storage.remove_label(id, label, &self.0.actor);
+                    }
+                }
+            }
+
+            // Add comment if provided
+            if let Some(comment) = args.get("comment").and_then(|v| v.as_str()) {
+                if !comment.is_empty() {
+                    let _ = storage.add_comment(id, &self.0.actor, comment);
+                }
+            }
+
+            Ok(issue)
+        })?;
 
         let mut warnings: Vec<String> = Vec::new();
-
-        // Handle label mutations
-        if let Some(labels) = args.get("labels_add").and_then(|v| v.as_array()) {
-            for label_val in labels {
-                if let Some(label) = label_val.as_str()
-                    && let Err(e) = storage.add_label(id, label, &self.0.actor)
-                {
-                    warnings.push(format!("failed to add label '{label}': {e}"));
-                }
-            }
-        }
-        if let Some(labels) = args.get("labels_remove").and_then(|v| v.as_array()) {
-            for label_val in labels {
-                if let Some(label) = label_val.as_str()
-                    && let Err(e) = storage.remove_label(id, label, &self.0.actor)
-                {
-                    warnings.push(format!("failed to remove label '{label}': {e}"));
-                }
-            }
-        }
-
-        // Add comment if provided
-        if let Some(comment) = args.get("comment").and_then(|v| v.as_str())
-            && !comment.is_empty()
-            && let Err(e) = storage.add_comment(id, &self.0.actor, comment)
-        {
-            warnings.push(format!("failed to add comment: {e}"));
-        }
+        warnings.extend(coercions);
 
         let mut result = json!({
             "id": issue.id,
@@ -1521,24 +1521,45 @@ impl ToolHandler for CloseIssueTool {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let mut storage = open(&self.0)?;
+        let (issue, our_blockers, dependents) = self.0.with_mutation(|storage| {
+            // Validate ID exists (with placeholder detection + fuzzy suggestions)
+            require_valid_issue(storage, id)?;
 
-        // Validate ID exists (with placeholder detection + fuzzy suggestions)
-        require_valid_issue(&storage, id)?;
+            // Idempotency: if already closed, return existing state without error
+            if let Some(details) = storage
+                .get_issue_details(id, false, false, 0)?
+                && details.issue.status == Status::Closed
+            {
+                return Ok((details.issue, None, None));
+            }
 
-        // Idempotency: if already closed, return existing state without error
-        if let Some(details) = storage
-            .get_issue_details(id, false, false, 0)
-            .map_err(beads_to_mcp)?
-            && details.issue.status == Status::Closed
-        {
+            let now = chrono::Utc::now();
+            let close_update = IssueUpdate {
+                status: Some(Status::Closed),
+                closed_at: Some(Some(now)),
+                close_reason: Some(reason.clone()),
+                ..IssueUpdate::default()
+            };
+
+            let issue = storage.update_issue(id, &close_update, &self.0.actor)?;
+
+            // Check for blockers this issue had (warn about closing a blocked issue)
+            let our_blockers = storage.get_blockers(id).unwrap_or_default();
+            
+            // Check what this issue was blocking (now potentially unblocked)
+            let dependents = storage.get_blocked_issue_ids(id).unwrap_or_default();
+
+            Ok((issue, Some(our_blockers), Some(dependents)))
+        })?;
+
+        if our_blockers.is_none() {
             return Ok(vec![Content::text(
                 json!({
-                    "id": details.issue.id,
-                    "title": details.issue.title,
+                    "id": issue.id,
+                    "title": issue.title,
                     "status": "closed",
-                    "closed_at": details.issue.closed_at,
-                    "close_reason": details.issue.close_reason,
+                    "closed_at": issue.closed_at,
+                    "close_reason": issue.close_reason,
                     "already_closed": true,
                     "next_actions": ["Issue was already closed. Use list_issues to find open work."]
                 })
@@ -1546,29 +1567,15 @@ impl ToolHandler for CloseIssueTool {
             )]);
         }
 
-        let now = chrono::Utc::now();
-        let close_update = IssueUpdate {
-            status: Some(Status::Closed),
-            closed_at: Some(Some(now)),
-            close_reason: Some(reason.clone()),
-            ..IssueUpdate::default()
-        };
-
-        let issue = storage
-            .update_issue(id, &close_update, &self.0.actor)
-            .map_err(beads_to_mcp)?;
-
         let mut result = json!({
             "id": issue.id,
             "title": issue.title,
             "status": "closed",
-            "closed_at": now,
+            "closed_at": issue.closed_at,
             "close_reason": reason,
         });
 
-        // Check for blockers this issue had (warn about closing a blocked issue)
-        let our_blockers = storage.get_blockers(id).unwrap_or_default();
-        if !our_blockers.is_empty() {
+        if let Some(our_blockers) = our_blockers && !our_blockers.is_empty() {
             result["warning"] = json!(format!(
                 "This issue was blocked by {} issue(s): {}. Consider whether those blockers are still relevant.",
                 our_blockers.len(),
@@ -1576,20 +1583,20 @@ impl ToolHandler for CloseIssueTool {
             ));
         }
 
-        // Check what this issue was blocking (now potentially unblocked)
-        let dependents = storage.get_blocked_issue_ids(id).unwrap_or_default();
-        if dependents.is_empty() {
-            result["next_actions"] = json!(["Issue closed successfully."]);
-        } else {
-            result["unblocked_candidates"] = json!(dependents);
-            result["next_actions"] = json!([
-                format!(
-                    "{} dependent issue(s) may now be unblocked: {}",
-                    dependents.len(),
-                    dependents.join(", ")
-                ),
-                "Use show_issue on these to check if they're now ready for work"
-            ]);
+        if let Some(dependents) = dependents {
+            if dependents.is_empty() {
+                result["next_actions"] = json!(["Issue closed successfully."]);
+            } else {
+                result["unblocked_candidates"] = json!(dependents);
+                result["next_actions"] = json!([
+                    format!(
+                        "{} dependent issue(s) may now be unblocked: {}",
+                        dependents.len(),
+                        dependents.join(", ")
+                    ),
+                    "Use show_issue on these to check if they're now ready for work"
+                ]);
+            }
         }
 
         Ok(vec![Content::text(result.to_string())])
@@ -1774,13 +1781,10 @@ impl ToolHandler for ManageDependenciesTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| McpError::invalid_params("'id' is required"))?;
 
-        let mut storage = open(&self.0)?;
-
-        // Validate source ID for all actions
-        require_valid_issue(&storage, id)?;
-
         match action {
             "list" => {
+                let mut storage = open(&self.0)?;
+                require_valid_issue(&storage, id)?;
                 let deps = storage.get_dependencies_full(id).map_err(beads_to_mcp)?;
                 let dependents = storage.get_dependents(id).map_err(beads_to_mcp)?;
 
@@ -1798,8 +1802,14 @@ impl ToolHandler for ManageDependenciesTool {
                     .to_string(),
                 )])
             }
-            "add" => dep_add(&mut storage, &self.0.actor, id, &args),
-            "remove" => dep_remove(&mut storage, &self.0.actor, id, &args),
+            "add" => self.0.with_mutation(|storage| {
+                require_valid_issue(storage, id)?;
+                dep_add(storage, &self.0.actor, id, &args)
+            }),
+            "remove" => self.0.with_mutation(|storage| {
+                require_valid_issue(storage, id)?;
+                dep_remove(storage, &self.0.actor, id, &args)
+            }),
             other => Err(McpError::with_data(
                 McpErrorCode::InvalidParams,
                 format!("Unknown action '{other}'"),
@@ -1809,7 +1819,7 @@ impl ToolHandler for ManageDependenciesTool {
                     "available_options": ["add", "remove", "list"],
                     "fix_hint": "Use 'list' to view dependencies, 'add' to create, 'remove' to delete"
                 }),
-            )),
+            ).into()),
         }
     }
 }

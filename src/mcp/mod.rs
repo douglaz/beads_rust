@@ -34,6 +34,8 @@ pub(super) fn to_mcp(err: impl std::fmt::Display) -> McpError {
 pub struct BeadsState {
     pub db_path: PathBuf,
     pub beads_dir: PathBuf,
+    pub jsonl_path: PathBuf,
+    pub allow_external_jsonl: bool,
     pub actor: String,
     pub issue_prefix: Option<String>,
 }
@@ -46,6 +48,35 @@ impl BeadsState {
     /// Returns an error if the database file cannot be opened.
     pub fn open_storage(&self) -> crate::Result<SqliteStorage> {
         SqliteStorage::open(&self.db_path)
+    }
+
+    /// Execute a mutating closure against the storage, acquiring the cross-process
+    /// write lock and triggering an auto-flush upon success.
+    pub fn with_mutation<F, R>(&self, mut f: F) -> McpResult<R>
+    where
+        F: FnMut(&mut SqliteStorage) -> crate::Result<R>,
+    {
+        // 1. Acquire the cross-process write lock.
+        let _write_lock = crate::sync::blocking_write_lock(&self.beads_dir);
+
+        // 2. Open storage.
+        let mut storage = self.open_storage().map_err(to_mcp)?;
+
+        // 3. Execute the mutation.
+        let result = f(&mut storage).map_err(to_mcp)?;
+
+        // 4. Auto-flush.
+        let _sync_lock = crate::sync::try_sync_lock(&self.beads_dir);
+        if let Err(e) = crate::sync::auto_flush(
+            &mut storage,
+            &self.beads_dir,
+            &self.jsonl_path,
+            self.allow_external_jsonl,
+        ) {
+            tracing::debug!(?e, "MCP auto-flush failed (non-fatal)");
+        }
+
+        Ok(result)
     }
 }
 
@@ -69,6 +100,12 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
 
     let prefix = res.storage.get_config("issue_prefix")?;
     let db_path = res.paths.db_path.clone();
+    let jsonl_path = res.paths.jsonl_path.clone();
+    let allow_external_jsonl = config::implicit_external_jsonl_allowed(
+        &beads_dir,
+        &db_path,
+        &jsonl_path,
+    );
 
     // Eagerly drop the bootstrap connection; handlers will open their own.
     drop(res.storage);
@@ -76,6 +113,8 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
     let state = std::sync::Arc::new(BeadsState {
         db_path,
         beads_dir,
+        jsonl_path,
+        allow_external_jsonl,
         actor: args.actor.clone(),
         issue_prefix: prefix,
     });

@@ -316,6 +316,8 @@ fn write_backup_metadata(beads_dir: &Path, target_path: &Path, backup_path: &Pat
         Ok(())
     })();
 
+    drop(file);
+
     if let Err(err) = write_result {
         if let Err(cleanup_err) = fs::remove_file(&metadata_path) {
             tracing::warn!(

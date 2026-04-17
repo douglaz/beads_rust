@@ -93,9 +93,12 @@ fn hash_computation_base36_fixture() {
     assert_eq!(compute_id_hash(input, 3), hash3);
     assert_eq!(compute_id_hash(input, 8), hash8);
 
-    // Verify prefix relationship (longer hashes should be extensions)
-    assert!(hash4.starts_with(&hash3), "hash4 should extend hash3");
-    assert!(hash8.starts_with(&hash4), "hash8 should extend hash4");
+    // Verify suffix relationship: `compute_id_hash` truncates from the
+    // front (takes the last `length` base36 digits for full entropy from
+    // the least-significant bits), so a longer hash ENDS WITH the shorter
+    // one rather than starting with it.
+    assert!(hash4.ends_with(&hash3), "hash4 should end with hash3");
+    assert!(hash8.ends_with(&hash4), "hash8 should end with hash4");
 }
 
 /// Test optimal length calculation follows birthday problem math.
@@ -134,12 +137,15 @@ fn optimal_length_birthday_problem() {
 fn prefix_configuration_fixture() {
     let created_at = Utc.with_ymd_and_hms(2026, 1, 15, 10, 30, 0).unwrap();
 
-    // Default prefix
+    // Default prefix (the Rust port uses `br-`; the old Go prototype was
+    // `bd-`).  Assert against the actual configured default so the test
+    // stays honest if the default ever changes again.
     let default_gen = IdGenerator::with_defaults();
     let id_default = default_gen.generate("Test", None, None, created_at, 0, |_| false);
+    let expected = format!("{}-", IdConfig::default().prefix);
     assert!(
-        id_default.starts_with("bd-"),
-        "Default prefix should be bd-"
+        id_default.starts_with(&expected),
+        "Default prefix should be {expected}, got id {id_default}"
     );
     assert!(is_valid_id_format(&id_default));
 

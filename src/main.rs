@@ -342,6 +342,7 @@ fn main() {
 /// `try_lock()` for the uncontended case, then falls back to a true blocking
 /// `lock()` that waits indefinitely until the holder releases. The lock is
 /// held until the returned `File` drops.
+#[allow(clippy::incompatible_msrv)]
 fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
     let lock_path = beads_dir.join(".write.lock");
     let file = OpenOptions::new()

@@ -582,7 +582,14 @@ fn list_filters_include_closed() {
     assert!(!ids.contains(&closed.id));
     assert!(!ids.contains(&tombstone.id));
 
-    // Include closed
+    // Include closed (but not tombstones).  Tombstones represent deleted
+    // issues and `list_issues` intentionally keeps them out of listings
+    // even when `include_closed = true` — callers have to opt in
+    // explicitly by passing a `statuses` filter that includes
+    // `Tombstone`.  That exclusion is enforced in the dynamic SQL
+    // (`AND status != 'tombstone'`) when no explicit statuses filter is
+    // present, so a prior test expectation that `include_closed` alone
+    // would surface tombstones was incorrect.
     let filters = ListFilters {
         include_closed: true,
         ..Default::default()
@@ -591,7 +598,23 @@ fn list_filters_include_closed() {
     let ids = issue_ids(&issues);
     assert!(ids.contains(&open.id));
     assert!(ids.contains(&closed.id));
-    assert!(ids.contains(&tombstone.id));
+    assert!(
+        !ids.contains(&tombstone.id),
+        "tombstones should stay hidden unless explicitly requested via a statuses filter"
+    );
+
+    // Explicit request for tombstones returns them.
+    let filters = ListFilters {
+        include_closed: true,
+        statuses: Some(vec![Status::Tombstone]),
+        ..Default::default()
+    };
+    let issues = storage.list_issues(&filters).unwrap();
+    let ids = issue_ids(&issues);
+    assert!(
+        ids.contains(&tombstone.id),
+        "tombstones should be listed when the statuses filter includes them"
+    );
 }
 
 #[test]

@@ -279,19 +279,19 @@ fn test_cargo_metadata() {
 /// otherwise fail on every pre-release commit.
 #[test]
 fn test_version_consistency() {
+    fn parse_version(raw: &str, source: &str) -> semver::Version {
+        semver::Version::parse(raw.trim())
+            .unwrap_or_else(|e| panic!("{source} version '{raw}' is not valid semver: {e}"))
+    }
+
     let cargo_toml = fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
     let cargo_version_str = cargo_toml
         .lines()
         .find(|line| line.starts_with("version = "))
         .and_then(|line| line.split('"').nth(1))
         .expect("Could not find version in Cargo.toml");
-    let cargo_version = semver::Version::parse(cargo_version_str)
-        .expect("Cargo.toml version must be valid semver");
-
-    fn parse_version(raw: &str, source: &str) -> semver::Version {
-        semver::Version::parse(raw.trim())
-            .unwrap_or_else(|e| panic!("{source} version '{raw}' is not valid semver: {e}"))
-    }
+    let cargo_version =
+        semver::Version::parse(cargo_version_str).expect("Cargo.toml version must be valid semver");
 
     let formula_path = Path::new("packaging/homebrew/br.rb");
     if formula_path.exists() {

@@ -305,16 +305,14 @@ impl SqliteStorage {
     }
 
     fn upsert_metadata_key_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
-        let updated = conn.execute_with_params(
-            "UPDATE metadata SET value = ? WHERE key = ?",
-            &[SqliteValue::from(value), SqliteValue::from(key)],
+        conn.execute_with_params(
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(key)],
         )?;
-        if updated == 0 {
-            conn.execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                &[SqliteValue::from(key), SqliteValue::from(value)],
-            )?;
-        }
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
+            &[SqliteValue::from(key), SqliteValue::from(value)],
+        )?;
         Ok(())
     }
 
@@ -331,8 +329,8 @@ impl SqliteStorage {
                 continue;
             }
             match conn.execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                &[SqliteValue::from(key), SqliteValue::from(default_value)],
+                "INSERT INTO metadata (key, value) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM metadata WHERE key = ?)",
+                &[SqliteValue::from(key), SqliteValue::from(default_value), SqliteValue::from(key)],
             ) {
                 Ok(_) => {}
                 Err(e) if e.is_transient() => {
@@ -2418,7 +2416,11 @@ impl SqliteStorage {
                     let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}");
                 }
                 _ => {
-                    sql.push_str(" ORDER BY priority ASC, created_at DESC");
+                    if filters.reverse {
+                        sql.push_str(" ORDER BY priority DESC, created_at ASC");
+                    } else {
+                        sql.push_str(" ORDER BY priority ASC, created_at DESC");
+                    }
                 }
             }
         } else if filters.reverse {
@@ -3451,18 +3453,36 @@ impl SqliteStorage {
     fn load_local_open_child_blockers_impl(
         conn: &Connection,
     ) -> Result<HashMap<String, Vec<String>>> {
-        // Join on the parent issue (p) to guarantee depends_on_id exists in
-        // the issues table.  The dependencies.depends_on_id column has no
-        // foreign key (intentionally, for external refs), so dangling rows
-        // can accumulate.  Without this guard the subsequent INSERT into
-        // blocked_issues_cache (which *does* have a FK on issue_id) fails
-        // with "FOREIGN KEY constraint failed" (#215).
+        // Parents are treated as "blocked by open children" ONLY when the
+        // parent is an epic.  For epics that is the natural semantics: the
+        // epic aggregates its children and cannot itself be closed (or
+        // meaningfully worked on) while any child is still open.  For plain
+        // task/feature/bug/etc. parents in a parent-child chain, the
+        // tests (`parent_child_transitive_blocking`,
+        // `deep_parent_child_chain_blocking`,
+        // `deep_chain_beyond_50_levels_blocks_all_descendants`) and the
+        // `conformance.rs` docstring describe the opposite direction:
+        // children inherit a parent's *blocked* state via
+        // `propagate_blocked_parents`, but an open, unblocked non-epic
+        // parent does not itself become blocked just because it has open
+        // children.  Restricting this rule to `p.issue_type = 'epic'`
+        // preserves the epic-rollup behaviour while avoiding the
+        // every-parent-with-open-kids false-blocked that was masking
+        // genuine unblock transitions along a parent-child chain.
+        //
+        // Join on the parent issue (p) to guarantee `depends_on_id` exists
+        // in the `issues` table.  The `dependencies.depends_on_id` column
+        // has no foreign key (intentionally, for external refs), so
+        // dangling rows can accumulate.  Without this guard the subsequent
+        // INSERT into `blocked_issues_cache` (which *does* have a FK on
+        // `issue_id`) fails with "FOREIGN KEY constraint failed" (#215).
         let rows = conn.query(
             "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
              FROM dependencies d
              JOIN issues i ON d.issue_id = i.id
              JOIN issues p ON d.depends_on_id = p.id
              WHERE d.type = 'parent-child'
+               AND p.issue_type = 'epic'
                AND i.status NOT IN ('closed', 'tombstone')
                AND (i.is_template = 0 OR i.is_template IS NULL)
                AND d.depends_on_id NOT LIKE 'external:%'
@@ -3501,6 +3521,9 @@ impl SqliteStorage {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             // Join on the parent issue (p) to guarantee depends_on_id exists
             // in the issues table — same guard as the non-ids variant (#215).
+            // Epic-only scoping matches the non-ids variant: the "parent
+            // blocked by open children" rollup is epic-specific, not a
+            // property of every parent-child edge.
             let sql = format!(
                 "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
                  FROM dependencies d
@@ -3508,6 +3531,7 @@ impl SqliteStorage {
                  JOIN issues p ON d.depends_on_id = p.id
                  WHERE d.depends_on_id IN ({})
                    AND d.type = 'parent-child'
+                   AND p.issue_type = 'epic'
                    AND i.status NOT IN ('closed', 'tombstone')
                    AND (i.is_template = 0 OR i.is_template IS NULL)
                    AND d.depends_on_id NOT LIKE 'external:%'
@@ -9103,8 +9127,18 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc::now();
 
+        // `bd-parent` is an Epic so that the "parent blocked by open
+        // children" rollup applies: the incremental update is specifically
+        // exercising the epic-child aggregation path, where removing a
+        // direct blocker on the epic should not unblock the epic as long
+        // as its children remain open.  Non-epic parents intentionally do
+        // not carry that blocker (see `parent_child_transitive_blocking`
+        // in `tests/storage_blocked_cache.rs`), so the test would be
+        // testing semantics that no longer apply to plain tasks.
+        let mut parent = make_issue("bd-parent", "Parent", Status::Open, 2, None, now, None);
+        parent.issue_type = IssueType::Epic;
         for issue in [
-            make_issue("bd-parent", "Parent", Status::Open, 2, None, now, None),
+            parent,
             make_issue("bd-parent.1", "Child 1", Status::Open, 2, None, now, None),
             make_issue("bd-parent.2", "Child 2", Status::Open, 2, None, now, None),
             make_issue("bd-blocker", "Blocker", Status::Open, 2, None, now, None),
@@ -11137,12 +11171,23 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc::now();
 
-        // Create parent epic
-        let parent = make_issue("bd-epic", "Parent Epic", Status::Open, 1, None, t1, None);
+        // Create parent epic.  `bd-epic` and `bd-epic.1` are typed as Epic
+        // so the epic-rollup "parent blocked by open children" rule applies
+        // to them; that is what the later "only non-blocked descendants are
+        // ready" assertion exercises.  Non-epic parents intentionally do
+        // NOT inherit a child-open blocker (see
+        // `parent_child_transitive_blocking` in
+        // `tests/storage_blocked_cache.rs`), so typing these as Task would
+        // make every parent-child node trivially ready, defeating the
+        // point of the recursive-ready test.
+        let mut parent = make_issue("bd-epic", "Parent Epic", Status::Open, 1, None, t1, None);
+        parent.issue_type = IssueType::Epic;
         storage.create_issue(&parent, "tester").unwrap();
 
-        // Create direct children of the epic
-        let child1 = make_issue("bd-epic.1", "Child 1", Status::Open, 2, None, t1, None);
+        // Create direct children of the epic.  `bd-epic.1` is itself an
+        // epic so it can be rolled-up-blocked by its grandchild below.
+        let mut child1 = make_issue("bd-epic.1", "Child 1", Status::Open, 2, None, t1, None);
+        child1.issue_type = IssueType::Epic;
         let child2 = make_issue("bd-epic.2", "Child 2", Status::Open, 2, None, t1, None);
         storage.create_issue(&child1, "tester").unwrap();
         storage.create_issue(&child2, "tester").unwrap();

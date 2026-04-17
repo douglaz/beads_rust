@@ -1897,29 +1897,33 @@ impl SqliteStorage {
     }
 
     fn get_issue_from_conn(conn: &Connection, id: &str) -> Result<Option<Issue>> {
+        // Issues #226 / #252: force frankensqlite's planner onto the
+        // `prepared_select_requires_dispatch` slow path so this lookup never
+        // reuses a cached fast-path plan.  The previous workaround (switching
+        // `query_row_with_params` → `query_with_params`) did NOT bypass the
+        // fast path — both entry points call `ad_hoc_query_supports_prepared_reuse`
+        // and route through `query_prepared_*_after_background_status` when the
+        // plain `SELECT … FROM issues WHERE id = ?` satisfies the reuse
+        // predicate.  On darwin_arm64 under #252 that fast path still
+        // occasionally returned zero rows for beads that `br list`
+        // (which uses a more complex SELECT) could resolve.  Wrapping the
+        // SELECT in a CTE makes `select.with.is_some()` true in
+        // `prepared_select_requires_dispatch`, forcing `execute_statement`
+        // dispatch and the uncached B-tree walk — which `br list` already
+        // proves to be reliable for freshly-inserted rows.
         let sql = r"
-            SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
-                   status, priority, issue_type, assignee, owner, estimated_minutes,
-                   created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                   due_at, defer_until, external_ref, source_system, source_repo,
-                   deleted_at, deleted_by, delete_reason, original_type,
-                   compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template
-            FROM issues WHERE id = ?
+            WITH target(id_value) AS (SELECT ?)
+            SELECT i.id, i.content_hash, i.title, i.description, i.design,
+                   i.acceptance_criteria, i.notes, i.status, i.priority, i.issue_type,
+                   i.assignee, i.owner, i.estimated_minutes, i.created_at, i.created_by,
+                   i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
+                   i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
+                   i.deleted_at, i.deleted_by, i.delete_reason, i.original_type,
+                   i.compaction_level, i.compacted_at, i.compacted_at_commit, i.original_size,
+                   i.sender, i.ephemeral, i.pinned, i.is_template
+            FROM issues AS i, target AS t
+            WHERE i.id = t.id_value
         ";
-
-        // Issue #226: use `query_with_params` instead of `query_row_with_params`
-        // to bypass frankensqlite's prepared-statement fast path for single-row
-        // reads.  The fast path (see `query_row_with_params` →
-        // `ad_hoc_query_supports_prepared_reuse` in fsqlite-core) can route
-        // through a cached plan that, for pre-existing beads imported from
-        // JSONL, silently returns zero rows while the equivalent multi-row
-        // SELECT on the same parameter returns the correct row — that divergence
-        // was the mechanism behind `br update` reporting "Issue not found" on
-        // rows that `br show`, `br list`, and the sqlite3 CLI could all find.
-        // Taking the first row manually after `query_with_params` forces the
-        // standard execute_statement dispatch path which does not have that
-        // divergence.
         let rows = conn.query_with_params(sql, &[SqliteValue::from(id)])?;
         match rows.into_iter().next() {
             Some(row) => Ok(Some(Self::issue_from_row(&row)?)),

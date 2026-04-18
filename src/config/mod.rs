@@ -812,12 +812,26 @@ fn rebuild_database_family(
     storage.set_config("issue_prefix", prefix)?;
     let import_result = import_from_jsonl(&mut storage, jsonl_path, import_config, Some(prefix))?;
 
+    // After a large bulk import, fsqlite's pager/MVCC state can lag behind
+    // what was actually written: VACUUM/REINDEX run against an old snapshot
+    // and fail with "database is busy (snapshot conflict on pages: page N >
+    // snapshot db_size M)", while the next cursor OpenRead refuses freshly
+    // allocated root pages as "invalid transaction-backed root page". Dropping
+    // this connection and reopening a fresh one at the same path forces
+    // fsqlite to reload its view from disk, so the post-rebuild cleanup
+    // actually runs and subsequent reads succeed.
+    storage.reopen_at(db_path, lock_timeout)?;
+
     // Post-rebuild VACUUM to eliminate freeblock accounting anomalies that
     // frankensqlite's B-tree layer may leave behind during bulk import.
     // Without this, C sqlite3's `PRAGMA integrity_check` can report
     // "free space corruption" even though the data is intact (issue #237).
     if let Err(e) = storage.execute_raw("VACUUM") {
-        tracing::debug!(error = %e, "VACUUM after rebuild failed (non-fatal)");
+        tracing::warn!(
+            error = %e,
+            db_path = %db_path.display(),
+            "VACUUM after rebuild failed (non-fatal); on-disk DB may still contain free-space corruption"
+        );
     }
 
     // Post-rebuild REINDEX to fix partial-index row mismatches that
@@ -826,7 +840,11 @@ fn rebuild_database_family(
     // REINDEX, `PRAGMA integrity_check` reports "row N missing from index"
     // for partial indexes like idx_issues_list_active_order (issue #246).
     if let Err(e) = storage.execute_raw("REINDEX") {
-        tracing::debug!(error = %e, "REINDEX after rebuild failed (non-fatal)");
+        tracing::warn!(
+            error = %e,
+            db_path = %db_path.display(),
+            "REINDEX after rebuild failed (non-fatal); partial-index entries may be inconsistent"
+        );
     }
 
     Ok((storage, import_result))

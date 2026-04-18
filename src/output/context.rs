@@ -412,8 +412,7 @@ impl OutputContext {
     pub fn section(&self, title: &str) {
         if self.is_rich() {
             let rule = Rule::with_title(Text::new(title))
-                // .style(self.theme.section.clone())
-                ;
+                .style(self.theme().section.clone());
             self.console().print_renderable(&rule);
         } else if self.is_plain() {
             println!("\n─── {} ───\n", title);

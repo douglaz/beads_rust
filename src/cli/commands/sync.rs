@@ -1288,8 +1288,18 @@ fn execute_import(
         "Import complete"
     );
 
-    // --rebuild: remove DB entries not present in JSONL
-    if args.rebuild {
+    // --rebuild: remove DB entries not present in JSONL.
+    //
+    // Skip this entirely when `--rename-prefix` is also set: the import just
+    // rewrote every JSONL ID into the configured prefix, so `db_ids` are
+    // post-rename (e.g. "newpref-xre") while `jsonl_ids` are pre-rename
+    // (e.g. "oldpref-001"). The set-difference would classify every
+    // newly-imported issue as an orphan and wipe the DB — exactly the
+    // opposite of what the user asked for. With `reset_data_tables` having
+    // cleared everything beforehand, the post-import DB contents already
+    // mirror the JSONL (modulo the prefix rewrite), so the orphan pass has
+    // nothing legitimate to remove anyway.
+    if args.rebuild && !args.rename_prefix {
         let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
         let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
         let orphan_ids: Vec<String> = db_ids.difference(&jsonl_ids).cloned().collect();
@@ -1311,6 +1321,10 @@ fn execute_import(
                 "Rebuild orphan cleanup complete"
             );
         }
+    } else if args.rebuild {
+        debug!(
+            "Skipping --rebuild orphan cleanup: --rename-prefix rewrote IDs, so JSONL IDs no longer match DB IDs and the set-difference would be incorrect"
+        );
     }
 
     // Post-rebuild VACUUM + REINDEX to eliminate B-tree/index corruption

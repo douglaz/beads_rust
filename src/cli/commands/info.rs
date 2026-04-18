@@ -479,10 +479,10 @@ mod tests {
     use std::env;
     use std::path::Path;
     use std::path::PathBuf;
-    use std::sync::{LazyLock, Mutex};
+    
     use tempfile::TempDir;
 
-    static TEST_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    
 
     struct DirGuard {
         previous: PathBuf,
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_does_not_create_missing_db() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_reads_existing_db_without_recovery() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_reports_actual_schema_snapshot() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_prefers_startup_issue_prefix_over_db_config() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_detects_prefix_without_schema_flag() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_uses_jsonl_prefix_when_db_is_missing() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_accepts_startup_prefix_alias() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
@@ -805,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_collect_info_output_accepts_db_prefix_alias() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();

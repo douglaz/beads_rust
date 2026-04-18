@@ -309,10 +309,10 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    
     use tempfile::TempDir;
 
-    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+    
 
     struct DirGuard {
         previous: PathBuf,
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn resolve_where_output_preserves_redirect_origin() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn resolve_where_output_does_not_create_missing_db() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn resolve_where_output_falls_back_for_external_db_override() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn resolve_where_output_accepts_startup_prefix_alias() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");

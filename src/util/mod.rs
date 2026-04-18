@@ -127,6 +127,12 @@ pub fn clear_last_touched(beads_dir: &Path) {
 }
 
 #[cfg(test)]
+pub mod test_helpers {
+    use std::sync::{LazyLock, Mutex};
+    pub static TEST_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

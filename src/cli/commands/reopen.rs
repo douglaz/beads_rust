@@ -429,10 +429,10 @@ mod tests {
     use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
     use chrono::{Duration, Utc};
-    use std::sync::Mutex;
+    
     use tempfile::TempDir;
 
-    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+    
 
     fn make_closed_deferred_issue(id: &str, title: &str) -> Issue {
         let now = Utc::now();
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn execute_clears_defer_until_when_reopening_closed_deferred_issue() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn execute_reopen_tombstone_skips_without_resurrecting_it() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");

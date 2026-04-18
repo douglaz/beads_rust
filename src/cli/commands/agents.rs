@@ -1466,10 +1466,10 @@ mod tests {
     use super::*;
     use crate::output::OutputContext;
     use std::env;
-    use std::sync::Mutex;
+    
     use tempfile::TempDir;
 
-    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+    
 
     struct DirGuard {
         previous: PathBuf,
@@ -1761,7 +1761,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_force_creates_file() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
@@ -1785,7 +1785,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_requires_force() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
@@ -1810,7 +1810,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_dry_run_does_not_require_force() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
@@ -1833,7 +1833,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_remove_dry_run_without_file_errors() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
@@ -1859,7 +1859,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_update_dry_run_without_file_errors() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);

@@ -726,10 +726,10 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::{Datelike, Duration, Local, Utc};
-    use std::sync::Mutex;
+    
     use tempfile::TempDir;
 
-    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+    
 
     fn make_issue(id: &str, title: &str) -> Issue {
         let now = Utc::now();
@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     fn execute_defer_sets_status_and_until() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     fn execute_defer_without_until_sets_indefinite() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -948,7 +948,7 @@ mod tests {
 
     #[test]
     fn execute_undefer_clears_defer_until() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -997,7 +997,7 @@ mod tests {
 
     #[test]
     fn execute_undefer_preserves_non_deferred_status_for_soft_defer() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");

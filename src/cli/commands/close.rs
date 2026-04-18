@@ -753,10 +753,10 @@ mod tests {
     use chrono::Utc;
     use std::env;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    
     use tempfile::TempDir;
 
-    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+    
 
     struct DirGuard {
         previous: PathBuf,
@@ -1162,7 +1162,7 @@ mod tests {
 
     #[test]
     fn execute_with_args_closes_requested_blocker_chain_in_one_batch() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -1212,7 +1212,7 @@ mod tests {
 
     #[test]
     fn execute_with_args_returns_nothing_to_do_when_all_requested_issues_are_skipped() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");

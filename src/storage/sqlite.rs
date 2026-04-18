@@ -911,6 +911,32 @@ impl SqliteStorage {
         }
     }
 
+    /// Force a full WAL checkpoint that drains every pending frame back into
+    /// the main database file.
+    ///
+    /// Called at quiescent points (post-rebuild, before VACUUM/REINDEX) where
+    /// we hold the `.write.lock` exclusively and can safely take the DB's
+    /// internal exclusive lock that TRUNCATE mode requires. The passive
+    /// checkpoint used during normal mutation can leave WAL frames behind
+    /// that VACUUM/REINDEX later trip over ("database is busy (snapshot
+    /// conflict on pages: page N > snapshot db_size M)"), so we need a
+    /// stronger guarantee here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if even a PASSIVE checkpoint fails. TRUNCATE
+    /// failure is downgraded to a warning because it is best-effort.
+    pub fn checkpoint_full(&self) -> Result<()> {
+        if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+            tracing::debug!(
+                error = %e,
+                "TRUNCATE checkpoint failed; falling back to PASSIVE"
+            );
+            self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")?;
+        }
+        Ok(())
+    }
+
     /// Get audit events for a specific issue.
     ///
     /// # Errors

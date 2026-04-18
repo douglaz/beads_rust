@@ -816,10 +816,19 @@ fn rebuild_database_family(
     // what was actually written: VACUUM/REINDEX run against an old snapshot
     // and fail with "database is busy (snapshot conflict on pages: page N >
     // snapshot db_size M)", while the next cursor OpenRead refuses freshly
-    // allocated root pages as "invalid transaction-backed root page". Dropping
-    // this connection and reopening a fresh one at the same path forces
-    // fsqlite to reload its view from disk, so the post-rebuild cleanup
-    // actually runs and subsequent reads succeed.
+    // allocated root pages as "invalid transaction-backed root page". Drain
+    // the WAL to the main DB file (TRUNCATE checkpoint, safe here because we
+    // hold the `.write.lock` exclusively) and then reopen a fresh connection
+    // at the same path so the pager reloads its view from disk. Without this
+    // pair, the post-rebuild cleanup below silently fails and leaves the DB
+    // in a state that the next reader cannot open.
+    if let Err(e) = storage.checkpoint_full() {
+        tracing::warn!(
+            error = %e,
+            db_path = %db_path.display(),
+            "Full WAL checkpoint after rebuild failed (non-fatal)"
+        );
+    }
     storage.reopen_at(db_path, lock_timeout)?;
 
     // Post-rebuild VACUUM to eliminate freeblock accounting anomalies that

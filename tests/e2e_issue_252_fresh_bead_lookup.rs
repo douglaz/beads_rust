@@ -2,14 +2,12 @@
 //! `br sync --flush-only` intermittently reported "Issue not found" for
 //! freshly-created beads that `br list` resolved cleanly.
 //!
-//! Root cause: frankensqlite's prepared-statement fast path (see
-//! `ad_hoc_query_supports_prepared_reuse` in `fsqlite-core`) was occasionally
-//! returning zero rows for the simple `SELECT … FROM issues WHERE id = ?`
-//! lookup that `get_issue_from_conn` used, even though the row was visible
-//! to the equivalent `br list` query.  The fix forces the planner onto the
-//! slow dispatch path by wrapping the lookup in a `WITH target AS (SELECT ?)`
-//! CTE — `select.with.is_some()` makes `prepared_select_requires_dispatch`
-//! return true, bypassing the fast path.
+//! This test is intentionally phrased in behavioral terms rather than
+//! implementation details. The original failure mode involved freshly-created
+//! IDs becoming invisible to direct lookup-style commands while still showing
+//! up in broader scans. The storage layer has since been simplified back to
+//! direct keyed reads, so this file now serves as a guard that those lookup
+//! and mutation paths stay correct regardless of the internal query strategy.
 //!
 //! This test creates a batch of beads in one process and then, in a second
 //! process, calls every ID-lookup CLI entry point on every bead.  Any
@@ -38,9 +36,8 @@ fn parse_created_id(stdout: &str) -> String {
 }
 
 /// Issue #252 primary repro: create N beads back-to-back, then resolve each
-/// via `show`, `update`, and `defer`.  Prior to the fix every fresh bead had
-/// a chance of hitting the fast-path miss; with the CTE-wrapped lookup none
-/// should.
+/// via `show`, `update`, and `defer`. Any fresh-ID lookup failure should
+/// immediately fail the regression.
 #[test]
 fn e2e_issue_252_show_update_defer_find_all_freshly_created_beads() {
     const N: usize = 60;

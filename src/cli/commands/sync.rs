@@ -132,11 +132,15 @@ pub fn execute(
     // `execute_import`: `--rebuild` without `--status`, and not alongside
     // `--flush-only`/`--merge` (already rejected above). `--status` must
     // stay read-only even when the caller also passed `--rebuild`, so skip
-    // the rebuild if status was requested.
+    // the rebuild if status was requested. Also require the JSONL to exist
+    // — `recover_database_from_jsonl` runs a preflight that fails hard if
+    // the file is missing, whereas `execute_import` already handles a
+    // missing JSONL gracefully, so leave that case to the normal path.
     if args.rebuild
         && !args.status
         && !open_result.no_db
         && !open_result.auto_rebuilt
+        && open_result.paths.jsonl_path.is_file()
     {
         info!(
             db_path = %open_result.paths.db_path.display(),
@@ -1065,7 +1069,7 @@ fn execute_import(
     // (issue #248). When the target is already empty, we can INSERT directly
     // and skip the leak entirely.
     if args.force || args.rebuild {
-        let existing_issue_count = storage.count_all_issues().unwrap_or(usize::MAX);
+        let existing_issue_count = storage.count_all_issues()?;
         if existing_issue_count == 0 && preserved_tombstones.is_empty() {
             debug!(
                 "Force/rebuild import: target DB already empty, skipping reset_data_tables to avoid fsqlite freelist leak"

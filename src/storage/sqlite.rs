@@ -1077,20 +1077,18 @@ impl SqliteStorage {
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
         self.mutate("create_issue", actor, |conn, ctx| {
             // Explicit duplicate check since fsqlite does not enforce
-            // UNIQUE constraints on non-rowid columns. CTE-wrapped per #254
-            // to keep the lookup off the fsqlite prepared-statement
-            // fast-path cache.
-            let existing = conn.query_with_params(
-                "WITH target(id_value) AS (SELECT ?) \
-                 SELECT 1 FROM issues AS i, target AS t \
-                 WHERE i.id = t.id_value \
-                 LIMIT 1",
+            // UNIQUE constraints on non-rowid columns.
+            match conn.query_row_with_params(
+                "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
                 &[SqliteValue::from(issue.id.as_str())],
-            )?;
-            if !existing.is_empty() {
-                return Err(BeadsError::IdCollision {
-                    id: issue.id.clone(),
-                });
+            ) {
+                Ok(_) => {
+                    return Err(BeadsError::IdCollision {
+                        id: issue.id.clone(),
+                    });
+                }
+                Err(FrankenError::QueryReturnedNoRows) => {}
+                Err(error) => return Err(error.into()),
             }
 
             // Check for external_ref collision
@@ -1389,18 +1387,14 @@ impl SqliteStorage {
             // Atomic claim guard: check assignee INSIDE the CONCURRENT transaction
             // to prevent TOCTOU races where two agents both see "unassigned".
             if updates.expect_unassigned {
-                // #254: CTE-wrap so the planner cannot hand us a stale
-                // assignee from a cached fast-path plan for this TOCTOU
-                // claim guard.
-                let rows = conn.query_with_params(
-                    "WITH target(id_value) AS (SELECT ?) \
-                     SELECT i.assignee FROM issues AS i, target AS t \
-                     WHERE i.id = t.id_value",
+                let current_assignee = match conn.query_row_with_params(
+                    "SELECT assignee FROM issues WHERE id = ?",
                     &[SqliteValue::from(id)],
-                )?;
-                let current_assignee: Option<String> = rows
-                    .first()
-                    .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from));
+                ) {
+                    Ok(row) => row.get(0).and_then(SqliteValue::as_text).map(String::from),
+                    Err(FrankenError::QueryReturnedNoRows) => None,
+                    Err(error) => return Err(error.into()),
+                };
                 let trimmed = current_assignee
                     .as_deref()
                     .map(str::trim)
@@ -1735,20 +1729,22 @@ impl SqliteStorage {
             let updated_rows = conn.execute_with_params(&sql, &params)?;
             if updated_rows == 0 {
                 if updates.expect_unassigned {
-                    // #254: CTE-wrap for consistency with the pre-update
-                    // claim guard above.
-                    let rows = conn.query_with_params(
-                        "WITH target(id_value) AS (SELECT ?) \
-                         SELECT i.assignee FROM issues AS i, target AS t \
-                         WHERE i.id = t.id_value",
+                    let current_assignee = match conn.query_row_with_params(
+                        "SELECT assignee FROM issues WHERE id = ?",
                         &[SqliteValue::from(id)],
-                    )?;
-                    let current_assignee = rows
-                        .first()
-                        .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
-                        .map(str::trim)
-                        .filter(|assignee| !assignee.is_empty())
-                        .unwrap_or("<unknown>");
+                    ) {
+                        Ok(row) => row
+                            .get(0)
+                            .and_then(SqliteValue::as_text)
+                            .map(String::from)
+                            .and_then(|assignee| {
+                                let trimmed = assignee.trim().to_string();
+                                (!trimmed.is_empty()).then_some(trimmed)
+                            })
+                            .unwrap_or_else(|| "<unknown>".to_string()),
+                        Err(FrankenError::QueryReturnedNoRows) => "<unknown>".to_string(),
+                        Err(error) => return Err(error.into()),
+                    };
                     return Err(BeadsError::validation(
                         "claim",
                         format!("issue {id} already assigned to {current_assignee}"),
@@ -1940,108 +1936,32 @@ impl SqliteStorage {
         Ok(metas)
     }
 
-    fn scan_issue_from_conn(conn: &Connection, id: &str) -> Result<Option<Issue>> {
-        // Issues #252 / #256: when the direct keyed lookup goes sideways we
-        // need one planner-independent path that behaves like `br list`.
-        // A full table scan is intentionally blunt: it avoids the fragile
-        // single-row lookup shape entirely and proves whether the row is
-        // actually absent versus merely invisible to the primary query path.
-        let sql = r"
-            SELECT i.id, i.content_hash, i.title, i.description, i.design,
-                   i.acceptance_criteria, i.notes, i.status, i.priority, i.issue_type,
-                   i.assignee, i.owner, i.estimated_minutes, i.created_at, i.created_by,
-                   i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
-                   i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
-                   i.deleted_at, i.deleted_by, i.delete_reason, i.original_type,
-                   i.compaction_level, i.compacted_at, i.compacted_at_commit, i.original_size,
-                   i.sender, i.ephemeral, i.pinned, i.is_template
-            FROM issues AS i
-            ORDER BY i.rowid DESC
-        ";
-        let rows = conn.query(sql)?;
-        for row in rows {
-            let issue = Self::issue_from_row(&row)?;
-            if issue.id == id {
-                return Ok(Some(issue));
-            }
-        }
-        Ok(None)
-    }
-
-    fn recover_issue_lookup_via_scan(
-        conn: &Connection,
-        id: &str,
-        primary_outcome: &str,
-    ) -> Result<Option<Issue>> {
-        let recovered = Self::scan_issue_from_conn(conn, id)?;
-        if let Some(issue) = recovered {
-            tracing::warn!(
-                id = %id,
-                primary_outcome,
-                "primary issue lookup missed a row; full-scan fallback recovered it"
-            );
-            Ok(Some(issue))
-        } else {
-            tracing::debug!(
-                id = %id,
-                primary_outcome,
-                "primary issue lookup had no row and full-scan fallback also found nothing"
-            );
-            Ok(None)
-        }
-    }
-
     fn get_issue_from_conn(conn: &Connection, id: &str) -> Result<Option<Issue>> {
-        // Issues #226 / #252: force frankensqlite's planner onto the
-        // `prepared_select_requires_dispatch` slow path so this lookup never
-        // reuses a cached fast-path plan.  The previous workaround (switching
-        // `query_row_with_params` → `query_with_params`) did NOT bypass the
-        // fast path — both entry points call `ad_hoc_query_supports_prepared_reuse`
-        // and route through `query_prepared_*_after_background_status` when the
-        // plain `SELECT … FROM issues WHERE id = ?` satisfies the reuse
-        // predicate.  On darwin_arm64 under #252 that fast path still
-        // occasionally returned zero rows for beads that `br list`
-        // (which uses a more complex SELECT) could resolve.  Wrapping the
-        // SELECT in a CTE makes `select.with.is_some()` true in
-        // `prepared_select_requires_dispatch`, forcing `execute_statement`
-        // dispatch and the uncached B-tree walk — which `br list` already
-        // proves to be reliable for freshly-inserted rows.
         let sql = r"
-            WITH target(id_value) AS (SELECT ?)
-            SELECT i.id, i.content_hash, i.title, i.description, i.design,
-                   i.acceptance_criteria, i.notes, i.status, i.priority, i.issue_type,
-                   i.assignee, i.owner, i.estimated_minutes, i.created_at, i.created_by,
-                   i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
-                   i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
-                   i.deleted_at, i.deleted_by, i.delete_reason, i.original_type,
-                   i.compaction_level, i.compacted_at, i.compacted_at_commit, i.original_size,
-                   i.sender, i.ephemeral, i.pinned, i.is_template
-            FROM issues AS i, target AS t
-            WHERE i.id = t.id_value
+            SELECT id, content_hash, title, description, design,
+                   acceptance_criteria, notes, status, priority, issue_type,
+                   assignee, owner, estimated_minutes, created_at, created_by,
+                   updated_at, closed_at, close_reason, closed_by_session,
+                   due_at, defer_until, external_ref, source_system, source_repo,
+                   deleted_at, deleted_by, delete_reason, original_type,
+                   compaction_level, compacted_at, compacted_at_commit, original_size,
+                   sender, ephemeral, pinned, is_template
+            FROM issues
+            WHERE id = ?
         ";
-        let rows = conn.query_with_params(sql, &[SqliteValue::from(id)])?;
-        match rows.into_iter().next() {
-            Some(row) => {
-                let issue = Self::issue_from_row(&row)?;
-                // Issue #255: defensive invariant — if the planner ever returns a
-                // row whose id does not match the requested id, convert the
-                // silent wrong-row bug into a loud recovery path rather than
-                // surfacing a foreign issue through `br show` / `br update`.
-                if issue.id != id {
-                    if let Some(recovered) =
-                        Self::recover_issue_lookup_via_scan(conn, id, "wrong_row")?
-                    {
-                        return Ok(Some(recovered));
-                    }
-                    return Err(BeadsError::Other(anyhow::anyhow!(
-                        "storage consistency: get_issue_from_conn requested {id:?} but row returned id {:?}",
-                        issue.id
-                    )));
-                }
-                Ok(Some(issue))
-            }
-            None => Self::recover_issue_lookup_via_scan(conn, id, "missing_row"),
+        let row = match conn.query_row_with_params(sql, &[SqliteValue::from(id)]) {
+            Ok(row) => row,
+            Err(FrankenError::QueryReturnedNoRows) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let issue = Self::issue_from_row(&row)?;
+        if issue.id != id {
+            return Err(BeadsError::Other(anyhow::anyhow!(
+                "storage consistency: get_issue_from_conn requested {id:?} but row returned id {:?}",
+                issue.id
+            )));
         }
+        Ok(Some(issue))
     }
 
     /// Get multiple issues by ID.
@@ -5101,15 +5021,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_parent_id(&self, issue_id: &str) -> Result<Option<String>> {
-        // Issue #229: use `query_with_params` to avoid the single-row
-        // prepared-statement fast path (same rationale as get_issue_from_conn).
-        let rows = self.conn.query_with_params(
+        match self.conn.query_row_with_params(
             "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(issue_id)],
-        )?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
-            None => Ok(None),
+        ) {
+            Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -5508,15 +5426,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
-        // Issue #229: use `query_with_params` to avoid the single-row
-        // prepared-statement fast path (same rationale as get_metadata).
-        let rows = self.conn.query_with_params(
+        match self.conn.query_row_with_params(
             "SELECT value FROM config WHERE key = ?",
             &[SqliteValue::from(key)],
-        )?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
-            None => Ok(None),
+        ) {
+            Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -5820,14 +5736,11 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_export_hash(&self, issue_id: &str) -> Result<Option<(String, String)>> {
-        // Issue #229: use `query_with_params` to avoid the single-row
-        // prepared-statement fast path (same rationale as get_metadata).
-        let rows = self.conn.query_with_params(
+        match self.conn.query_row_with_params(
             "SELECT content_hash, exported_at FROM export_hashes WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
-        )?;
-        match rows.into_iter().next() {
-            Some(row) => {
+        ) {
+            Ok(row) => {
                 let hash = row
                     .get(0)
                     .and_then(SqliteValue::as_text)
@@ -5840,7 +5753,8 @@ impl SqliteStorage {
                     .to_string();
                 Ok(Some((hash, exported)))
             }
-            None => Ok(None),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -5946,21 +5860,17 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
-        // Issue #229: use `query_with_params` instead of `query_row_with_params`
-        // to avoid frankensqlite's single-row prepared-statement fast path, which
-        // can silently return zero rows on in-memory databases after bulk import
-        // operations.  Same root cause as the `get_issue_from_conn` fix in #226.
-        let rows = self.conn.query_with_params(
+        match self.conn.query_row_with_params(
             "SELECT value FROM metadata WHERE key = ?",
             &[SqliteValue::from(key)],
-        )?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(row
+        ) {
+            Ok(row) => Ok(row
                 .get(0)
                 .and_then(SqliteValue::as_text)
                 .filter(|value| !value.is_empty())
                 .map(String::from)),
-            None => Ok(None),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -7102,9 +7012,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn find_by_external_ref(&self, external_ref: &str) -> Result<Option<Issue>> {
-        // Issue #229: use `query_with_params` to avoid the single-row
-        // prepared-statement fast path (same rationale as get_issue_from_conn).
-        let rows = self.conn.query_with_params(
+        match self.conn.query_row_with_params(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
@@ -7114,10 +7022,10 @@ impl SqliteStorage {
                      pinned, is_template
                FROM issues WHERE external_ref = ?",
             &[SqliteValue::from(external_ref)],
-        )?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(Some(Self::issue_from_row(&row)?)),
-            None => Ok(None),
+        ) {
+            Ok(row) => Ok(Some(Self::issue_from_row(&row)?)),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -7127,9 +7035,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn find_by_content_hash(&self, content_hash: &str) -> Result<Option<Issue>> {
-        // Issue #229: use `query_with_params` to avoid the single-row
-        // prepared-statement fast path (same rationale as get_issue_from_conn).
-        let rows = self.conn.query_with_params(
+        match self.conn.query_row_with_params(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
@@ -7139,10 +7045,10 @@ impl SqliteStorage {
                      pinned, is_template
                FROM issues WHERE content_hash = ?",
             &[SqliteValue::from(content_hash)],
-        )?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(Some(Self::issue_from_row(&row)?)),
-            None => Ok(None),
+        ) {
+            Ok(row) => Ok(Some(Self::issue_from_row(&row)?)),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -7478,15 +7384,18 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
 }
 
 fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
-    // Issue #229: use `query_with_params` to avoid the single-row
-    // prepared-statement fast path.
-    let rows = conn.query_with_params(
+    let row = match conn.query_row_with_params(
         "SELECT id, issue_id, author, text, created_at FROM comments WHERE id = ?",
         &[SqliteValue::from(comment_id)],
-    )?;
-    let row = rows.into_iter().next().ok_or_else(|| {
-        BeadsError::Config(format!("comment {comment_id} not found after insert"))
-    })?;
+    ) {
+        Ok(row) => row,
+        Err(FrankenError::QueryReturnedNoRows) => {
+            return Err(BeadsError::Config(format!(
+                "comment {comment_id} not found after insert"
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
     comment_from_row(&row)
 }
 

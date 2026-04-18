@@ -498,7 +498,7 @@ fn open_sqlite_storage_with_recovery(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-) -> Result<(SqliteStorage, bool)> {
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     open_sqlite_storage_with_recovery_strategy(
         beads_dir,
         paths,
@@ -513,7 +513,7 @@ fn open_sqlite_storage_with_deferred_jsonl_recovery(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-) -> Result<(SqliteStorage, bool)> {
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     open_sqlite_storage_with_recovery_strategy(
         beads_dir,
         paths,
@@ -529,13 +529,13 @@ fn open_sqlite_storage_with_recovery_strategy(
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
     recovery_strategy: JsonlRecoveryStrategy,
-) -> Result<(SqliteStorage, bool)> {
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     if !paths.db_path.is_file() && paths.jsonl_path.is_file() {
         return match recovery_strategy {
             JsonlRecoveryStrategy::RebuildFromJsonl => {
                 let storage =
                     rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
-                Ok((storage, true))
+                Ok((storage, true, None))
             }
             JsonlRecoveryStrategy::DeferToExplicitImport => {
                 warn!(
@@ -546,6 +546,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                 Ok((
                     SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)?,
                     false,
+                    None,
                 ))
             }
         };
@@ -573,22 +574,34 @@ fn open_sqlite_storage_with_recovery_strategy(
         )));
     }
 
-    let prepare_fresh_storage = || -> Result<SqliteStorage> {
-        let (storage, recovery_dir) =
-            rebuild_database_family_with_backup(&paths.db_path, beads_dir, || {
-                SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)
-            })?;
+    let prepare_fresh_storage = || -> Result<(SqliteStorage, RecoveryBackupSet)> {
+        let backup_set = backup_database_family_for_recovery(&paths.db_path, beads_dir)?;
+        let recovery_dir = backup_set.recovery_dir.clone();
+        let storage = match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
+            Ok(storage) => storage,
+            Err(open_err) => {
+                if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set)
+                {
+                    return Err(recovery_restore_failure(
+                        &backup_set,
+                        &open_err.into(),
+                        restore_err,
+                    ));
+                }
+                return Err(open_err.into());
+            }
+        };
         warn!(
             db_path = %paths.db_path.display(),
             recovery_dir = %recovery_dir.display(),
             "Prepared a fresh SQLite database; explicit import will populate it"
         );
-        Ok(storage)
+        Ok((storage, backup_set))
     };
 
     match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
-            Ok(None) => Ok((storage, false)),
+            Ok(None) => Ok((storage, false, None)),
             Ok(Some(anomaly)) => {
                 drop(storage);
                 match recovery_strategy {
@@ -605,7 +618,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                             lock_timeout,
                             bootstrap_layer,
                         )?;
-                        Ok((storage, true))
+                        Ok((storage, true, None))
                     }
                     JsonlRecoveryStrategy::DeferToExplicitImport => {
                         warn!(
@@ -614,7 +627,8 @@ fn open_sqlite_storage_with_recovery_strategy(
                             anomaly = %anomaly,
                             "Detected recoverable database anomaly after open; deferring JSONL recovery to explicit import semantics"
                         );
-                        Ok((prepare_fresh_storage()?, false))
+                        let (storage, backup_set) = prepare_fresh_storage()?;
+                        Ok((storage, false, Some(backup_set)))
                     }
                 }
             }
@@ -642,7 +656,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                             lock_timeout,
                             bootstrap_layer,
                         )?;
-                        Ok((storage, true))
+                        Ok((storage, true, None))
                     }
                     JsonlRecoveryStrategy::DeferToExplicitImport => {
                         warn!(
@@ -651,7 +665,8 @@ fn open_sqlite_storage_with_recovery_strategy(
                             probe_error = %probe_err,
                             "Post-open database probe failed; deferring JSONL recovery to explicit import semantics"
                         );
-                        Ok((prepare_fresh_storage()?, false))
+                        let (storage, backup_set) = prepare_fresh_storage()?;
+                        Ok((storage, false, Some(backup_set)))
                     }
                 }
             }
@@ -669,7 +684,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                         lock_timeout,
                         bootstrap_layer,
                     ) {
-                        Ok(storage) => Ok((storage, true)),
+                        Ok(storage) => Ok((storage, true, None)),
                         Err(recovery_err) => {
                             warn!(
                                 db_path = %paths.db_path.display(),
@@ -693,7 +708,8 @@ fn open_sqlite_storage_with_recovery_strategy(
                         open_error = %open_err,
                         "Open failed with a recoverable database error; deferring JSONL recovery to explicit import semantics"
                     );
-                    Ok((prepare_fresh_storage()?, false))
+                    let (storage, backup_set) = prepare_fresh_storage()?;
+                    Ok((storage, false, Some(backup_set)))
                 }
             }
         }
@@ -1228,7 +1244,7 @@ pub fn open_storage(
         .or_else(|| lock_timeout_from_layer(&merged_layer))
         .or(Some(30000));
 
-    let (storage, _auto_rebuilt) = open_sqlite_storage_with_recovery(
+    let (storage, _auto_rebuilt, _pending_recovery_backup) = open_sqlite_storage_with_recovery(
         beads_dir,
         &startup.paths,
         resolved_lock_timeout,
@@ -1254,6 +1270,7 @@ pub struct OpenStorageResult {
     bootstrap_layer: ConfigLayer,
     resolved_lock_timeout: Option<u64>,
     loaded_jsonl_hash: Option<String>,
+    pending_recovery_backup: Option<RecoveryBackupSet>,
 }
 
 impl OpenStorageResult {
@@ -1314,7 +1331,34 @@ impl OpenStorageResult {
         self.storage = storage;
         self.loaded_jsonl_hash = None;
         self.auto_rebuilt = true;
+        self.pending_recovery_backup = None;
         Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn pending_recovery_dir(&self) -> Option<&Path> {
+        self.pending_recovery_backup
+            .as_ref()
+            .map(|backup| backup.recovery_dir.as_path())
+    }
+
+    pub(crate) fn discard_pending_recovery_backup(&mut self) {
+        self.pending_recovery_backup = None;
+    }
+
+    /// Restore the original database family after a deferred recovery prepared
+    /// a fresh DB but the explicit import later failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the original database family cannot be restored.
+    pub(crate) fn restore_pending_recovery_backup(&mut self) -> Result<()> {
+        let Some(backup_set) = self.pending_recovery_backup.take() else {
+            return Ok(());
+        };
+
+        self.storage = SqliteStorage::open_memory()?;
+        restore_database_family_after_failed_rebuild(&backup_set)
     }
 
     /// Flush JSONL if no-db mode is enabled and there are pending changes.
@@ -1488,9 +1532,10 @@ fn open_storage_with_cli_impl(
             bootstrap_layer: merged_layer,
             resolved_lock_timeout,
             loaded_jsonl_hash,
+            pending_recovery_backup: None,
         })
     } else {
-        let (storage, auto_rebuilt) = if defer_jsonl_recovery {
+        let (storage, auto_rebuilt, pending_recovery_backup) = if defer_jsonl_recovery {
             open_sqlite_storage_with_deferred_jsonl_recovery(
                 beads_dir,
                 &paths,
@@ -1515,6 +1560,7 @@ fn open_storage_with_cli_impl(
             bootstrap_layer: merged_layer,
             resolved_lock_timeout,
             loaded_jsonl_hash: None,
+            pending_recovery_backup,
         })
     }
 }

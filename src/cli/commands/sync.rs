@@ -1955,15 +1955,19 @@ mod tests {
         let traversal_path = PathBuf::from("../outside/issues.jsonl");
         let err = validate_sync_paths(&beads_dir, &traversal_path, true).unwrap_err();
 
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("traversal"),
-                    "unexpected message: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains("traversal"),
+            "unexpected message: {message}"
+        );
     }
 
     #[cfg(unix)]
@@ -1983,12 +1987,16 @@ mod tests {
 
         let err = validate_sync_paths(&beads_dir, &symlink_path, true).unwrap_err();
 
-        match err {
-            BeadsError::Config(message) => {
-                assert!(message.contains("symlink"), "unexpected message: {message}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(message.contains("symlink"), "unexpected message: {message}");
     }
 
     #[cfg(unix)]
@@ -2010,15 +2018,19 @@ mod tests {
 
         let err = validate_sync_paths(&beads_dir, &git_link, true).unwrap_err();
 
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains(".git") || message.contains("git"),
-                    "unexpected message: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains(".git") || message.contains("git"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]

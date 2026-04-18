@@ -492,9 +492,10 @@ fn open_sqlite_storage_with_recovery(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-) -> Result<SqliteStorage> {
+) -> Result<(SqliteStorage, bool)> {
     if !paths.db_path.is_file() && paths.jsonl_path.is_file() {
-        return rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer);
+        let storage = rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+        return Ok((storage, true));
     }
 
     // Issue #228: proactively remove truncated WAL sidecar files before
@@ -521,7 +522,7 @@ fn open_sqlite_storage_with_recovery(
 
     match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
-            Ok(None) => Ok(storage),
+            Ok(None) => Ok((storage, false)),
             Ok(Some(anomaly)) => {
                 drop(storage);
                 warn!(
@@ -530,7 +531,9 @@ fn open_sqlite_storage_with_recovery(
                     anomaly = %anomaly,
                     "Detected recoverable database anomaly after open; rebuilding from JSONL"
                 );
-                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)
+                let storage =
+                    rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+                Ok((storage, true))
             }
             Err(probe_err) => {
                 drop(storage);
@@ -548,7 +551,9 @@ fn open_sqlite_storage_with_recovery(
                     probe_error = %probe_err,
                     "Post-open database probe failed; rebuilding from JSONL"
                 );
-                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)
+                let storage =
+                    rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+                Ok((storage, true))
             }
         },
         Err(open_err) => {
@@ -557,7 +562,7 @@ fn open_sqlite_storage_with_recovery(
             }
 
             match rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer) {
-                Ok(storage) => Ok(storage),
+                Ok(storage) => Ok((storage, true)),
                 Err(recovery_err) => {
                     warn!(
                         db_path = %paths.db_path.display(),
@@ -1104,7 +1109,7 @@ pub fn open_storage(
         .or_else(|| lock_timeout_from_layer(&merged_layer))
         .or(Some(30000));
 
-    let storage = open_sqlite_storage_with_recovery(
+    let (storage, _auto_rebuilt) = open_sqlite_storage_with_recovery(
         beads_dir,
         &startup.paths,
         resolved_lock_timeout,
@@ -1119,6 +1124,12 @@ pub struct OpenStorageResult {
     pub storage: SqliteStorage,
     pub paths: ConfigPaths,
     pub no_db: bool,
+    /// True when the SQLite DB file was just rebuilt from JSONL during this
+    /// `open_storage_with_cli` call (either because the file didn't exist, or
+    /// because a recoverable anomaly was detected after opening). Callers that
+    /// would otherwise re-run a full rebuild (e.g. `br sync --rebuild`) can
+    /// skip the redundant work — the DB is already a fresh import.
+    pub auto_rebuilt: bool,
     allow_external_jsonl: bool,
     startup_layers: Vec<ConfigLayer>,
     bootstrap_layer: ConfigLayer,
@@ -1342,6 +1353,7 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             storage,
             paths,
             no_db,
+            auto_rebuilt: false,
             allow_external_jsonl,
             startup_layers,
             bootstrap_layer: merged_layer,
@@ -1349,7 +1361,7 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             loaded_jsonl_hash,
         })
     } else {
-        let storage = open_sqlite_storage_with_recovery(
+        let (storage, auto_rebuilt) = open_sqlite_storage_with_recovery(
             beads_dir,
             &paths,
             resolved_lock_timeout,
@@ -1359,6 +1371,7 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             storage,
             paths,
             no_db,
+            auto_rebuilt,
             allow_external_jsonl,
             startup_layers,
             bootstrap_layer: merged_layer,

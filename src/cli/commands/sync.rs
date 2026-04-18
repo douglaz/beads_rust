@@ -93,7 +93,10 @@ pub fn execute(
     // Open storage
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let config::OpenStorageResult {
-        mut storage, paths, ..
+        mut storage,
+        paths,
+        auto_rebuilt,
+        ..
     } = config::open_storage_with_cli(&beads_dir, cli)?;
 
     let jsonl_path = paths.jsonl_path;
@@ -166,6 +169,7 @@ pub fn execute(
             args,
             use_json,
             show_progress,
+            auto_rebuilt,
             ctx,
         )
     }
@@ -834,6 +838,7 @@ fn should_show_progress(json: bool, quiet: bool) -> bool {
 
 /// Execute the --import-only operation.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn execute_import(
     storage: &mut crate::storage::SqliteStorage,
     beads_dir: &std::path::Path,
@@ -842,6 +847,7 @@ fn execute_import(
     args: &SyncArgs,
     use_json: bool,
     show_progress: bool,
+    auto_rebuilt: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting JSONL import");
@@ -850,8 +856,45 @@ fn execute_import(
         jsonl_path = %jsonl_path.display(),
         external_jsonl = path_policy.is_external,
         force = args.force,
+        auto_rebuilt,
         "Import configuration resolved"
     );
+
+    // If the storage was just rebuilt from JSONL during the open sequence
+    // (either the DB file did not exist or a recoverable anomaly triggered
+    // `rebuild_database_from_jsonl`), the DB is already a clean import of the
+    // JSONL. Re-running `--rebuild`/`--force` here would redo the import and
+    // trigger fsqlite's stale-pager OpenRead bug ("could not open storage
+    // cursor on root page N") because `reset_data_tables` + bulk INSERT within
+    // the fresh connection exercises exactly the code path that just ran. In
+    // this case we short-circuit to the happy path output; the rebuild is
+    // already done.
+    if auto_rebuilt && (args.rebuild || args.force) {
+        info!(
+            "Skipping redundant --rebuild/--force import: database was just rebuilt from JSONL during open"
+        );
+        let record_count = count_issues_in_jsonl(jsonl_path).unwrap_or(0);
+        let result = ImportResultOutput {
+            created: record_count,
+            updated: 0,
+            skipped: 0,
+            tombstone_skipped: 0,
+            orphans_removed: 0,
+            blocked_cache_rebuilt: true,
+        };
+        if use_json {
+            ctx.json_pretty(&result);
+        } else if !suppress_human_sync_output(ctx, use_json) {
+            if ctx.is_rich() {
+                render_import_result_rich(&result, ctx);
+            } else {
+                println!("Imported from JSONL (via automatic recovery):");
+                println!("  Created: {} issues", result.created);
+                println!("  Rebuilt blocked cache");
+            }
+        }
+        return Ok(());
+    }
 
     // Check if JSONL exists
     if !jsonl_path.exists() {

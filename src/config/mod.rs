@@ -4524,6 +4524,41 @@ routing:
     }
 
     #[test]
+    fn deferred_recovery_restore_for_missing_db_cleans_up_fresh_database_family() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-import", "Deferred import payload");
+
+        let mut storage_ctx =
+            open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, &CliOverrides::default())
+                .expect("storage");
+
+        assert!(
+            storage_ctx.pending_recovery_dir().is_some(),
+            "missing-db deferred recovery should track cleanup state"
+        );
+        assert!(
+            db_path.is_file(),
+            "opening deferred recovery should create a fresh database file"
+        );
+
+        storage_ctx
+            .restore_pending_recovery_backup()
+            .expect("cleanup fresh db");
+
+        assert!(
+            storage_ctx.pending_recovery_dir().is_none(),
+            "cleanup should clear the pending recovery handle"
+        );
+        assert!(!db_path.exists(), "cleanup should remove the fresh db path");
+        assert!(!storage_ctx.auto_rebuilt);
+    }
+
+    #[test]
     fn open_storage_with_cli_recovers_using_resolved_external_jsonl() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");

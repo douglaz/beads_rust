@@ -1358,7 +1358,19 @@ impl OpenStorageResult {
         };
 
         self.storage = SqliteStorage::open_memory()?;
-        restore_database_family_after_failed_rebuild(&backup_set)
+        restore_database_family_after_failed_rebuild(&backup_set)?;
+        self.storage =
+            SqliteStorage::open_with_timeout(&self.paths.db_path, self.resolved_lock_timeout)
+                .map_err(|reopen_err| BeadsError::WithContext {
+                    context: format!(
+                        "Restored the original database family at '{}' but failed to reopen it",
+                        self.paths.db_path.display()
+                    ),
+                    source: Box::new(BeadsError::from(reopen_err)),
+                })?;
+        self.loaded_jsonl_hash = None;
+        self.auto_rebuilt = false;
+        Ok(())
     }
 
     /// Flush JSONL if no-db mode is enabled and there are pending changes.
@@ -4425,6 +4437,70 @@ routing:
             }),
             "duplicate-config database should be preserved in the recovery directory"
         );
+    }
+
+    #[test]
+    fn deferred_recovery_restore_reopens_original_database_family() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let now = Utc::now();
+        let original_issue = Issue {
+            id: "bd-original".to_string(),
+            title: "Original on-disk issue".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+
+        let mut storage = SqliteStorage::open(&db_path).expect("create seed db");
+        storage
+            .set_config("issue_prefix", "bd")
+            .expect("seed issue prefix");
+        storage
+            .create_issue(&original_issue, "tester")
+            .expect("seed original issue");
+        drop(storage);
+
+        insert_duplicate_issue_prefix_config_row(&db_path, "bd");
+        write_single_issue_jsonl(&jsonl_path, "bd-import", "Deferred import payload");
+
+        let mut storage_ctx =
+            open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, &CliOverrides::default())
+                .expect("storage");
+
+        assert!(
+            storage_ctx.pending_recovery_dir().is_some(),
+            "deferred recovery should keep a restoreable backup"
+        );
+        assert!(
+            storage_ctx
+                .storage
+                .get_issue("bd-original")
+                .expect("query fresh placeholder db")
+                .is_none(),
+            "placeholder db should not still expose the pre-recovery issue"
+        );
+
+        storage_ctx
+            .restore_pending_recovery_backup()
+            .expect("restore original db");
+
+        assert!(
+            storage_ctx.pending_recovery_dir().is_none(),
+            "restore should clear the pending backup handle"
+        );
+        assert!(!storage_ctx.auto_rebuilt);
+
+        let restored_issue = storage_ctx
+            .storage
+            .get_issue("bd-original")
+            .expect("query restored issue")
+            .expect("original issue should be readable after restore");
+        assert_eq!(restored_issue.title, "Original on-disk issue");
     }
 
     #[test]

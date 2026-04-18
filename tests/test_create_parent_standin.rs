@@ -16,7 +16,7 @@ fn test_create_parent_standin() {
     let file_path = temp.path().join("issues.md");
     std::fs::write(
         &file_path,
-        r#"
+        r"
 ## My Epic
 ### ID
 epic1
@@ -26,7 +26,7 @@ epic
 ## My Task
 ### Parent
 epic1
-"#,
+",
     )
     .unwrap();
 

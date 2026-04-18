@@ -1158,7 +1158,8 @@ fn e2e_sync_import_force_preserves_integrity_and_close_works() {
 ///   3. mutates it via `update`,
 ///   4. adds a dependency to a seed bead that came from the rebuild,
 ///   5. defers every other bead,
-/// while asserting the alternate DB stays readable by upstream sqlite3.
+///
+/// It also asserts the alternate DB stays readable by upstream sqlite3.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths() {

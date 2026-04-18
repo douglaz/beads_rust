@@ -23,10 +23,10 @@ fn test_create_deps_colon_title() {
     let file_path = temp.path().join("issues.md");
     std::fs::write(
         &file_path,
-        r#"
+        r"
 ## My Task
 [depends_on: Task: With colon]
-"#,
+",
     )
     .unwrap();
 

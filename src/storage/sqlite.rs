@@ -472,28 +472,6 @@ impl SqliteStorage {
         })
     }
 
-    /// Replace the underlying connection with a fresh one opened at `path`.
-    ///
-    /// After a large bulk import, fsqlite's in-memory pager and MVCC state can
-    /// lag behind what was actually written to disk — subsequent VACUUM,
-    /// REINDEX, and even OpenRead cursors fail with stale-snapshot errors
-    /// ("database is busy (snapshot conflict on pages: page N > snapshot db_size M)"
-    /// or "OpenRead failed: could not open storage cursor on root page N").
-    /// Dropping the connection and reopening forces fsqlite to reload its
-    /// view from disk, which makes those operations succeed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the new connection cannot be established.
-    pub fn reopen_at(&mut self, path: &Path, lock_timeout_ms: Option<u64>) -> Result<()> {
-        // Dropping the old connection is required before the new one is opened
-        // because fsqlite tracks pages by file path; two live connections to
-        // the same DB file can surface BusySnapshot conflicts.
-        let fresh = Self::open_with_timeout(path, lock_timeout_ms)?;
-        *self = fresh;
-        Ok(())
-    }
-
     /// Open an in-memory database for testing.
     ///
     /// # Errors

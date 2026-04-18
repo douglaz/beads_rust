@@ -90,6 +90,29 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    // Validate arg combinations BEFORE opening storage or triggering any
+    // rebuild side effects. A `--flush-only --rebuild` or `--merge --rebuild`
+    // combination must return an error without having touched the DB family
+    // — otherwise the validation message arrives after `recover_database_from_jsonl`
+    // has already moved the existing DB aside.
+    let mode_count = u8::from(args.flush_only) + u8::from(args.import_only) + u8::from(args.merge);
+    if mode_count > 1 {
+        return Err(BeadsError::Validation {
+            field: "mode".to_string(),
+            reason: "Must specify exactly one of --flush-only, --import-only, or --merge"
+                .to_string(),
+        });
+    }
+
+    // --rebuild only makes sense with import (the default or --import-only)
+    if args.rebuild && (args.flush_only || args.merge) {
+        return Err(BeadsError::Validation {
+            field: "rebuild".to_string(),
+            reason: "--rebuild can only be used with import mode (not --flush-only or --merge)"
+                .to_string(),
+        });
+    }
+
     // Open storage
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut open_result = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -97,14 +120,24 @@ pub fn execute(
     // When `--rebuild` is requested against an existing (non-auto-rebuilt) DB,
     // delegate the actual rebuild to the same proven path that auto-recovery
     // uses: backup the DB family, open a fresh connection, import JSONL,
-    // checkpoint+reopen, VACUUM/REINDEX. The in-place
+    // checkpoint, VACUUM/REINDEX. The in-place
     // `reset_data_tables`+`import_from_jsonl` code path inside `execute_import`
     // is fragile on fsqlite — it trips stale-pager/MVCC bugs that leave
     // "never used" pages and partial-index mismatches that VACUUM can't
     // always reclaim. Using `recover_database_from_jsonl` sidesteps all of
     // that, and `execute_import` then sees `auto_rebuilt == true` and
     // short-circuits.
-    if args.rebuild && !open_result.no_db && !open_result.auto_rebuilt {
+    //
+    // Only fire this for the request that will actually go through
+    // `execute_import`: `--rebuild` without `--status`, and not alongside
+    // `--flush-only`/`--merge` (already rejected above). `--status` must
+    // stay read-only even when the caller also passed `--rebuild`, so skip
+    // the rebuild if status was requested.
+    if args.rebuild
+        && !args.status
+        && !open_result.no_db
+        && !open_result.auto_rebuilt
+    {
         info!(
             db_path = %open_result.paths.db_path.display(),
             jsonl_path = %open_result.paths.jsonl_path.display(),
@@ -122,7 +155,6 @@ pub fn execute(
     } = open_result;
 
     let db_path = paths.db_path.clone();
-    let db_lock_timeout = cli.lock_timeout;
     let jsonl_path = paths.jsonl_path;
     let retention_days = paths.metadata.deletions_retention_days;
     let use_json = ctx.is_json() || args.robot;
@@ -139,25 +171,6 @@ pub fn execute(
     // Handle --status flag
     if args.status {
         return execute_status(&storage, &path_policy, use_json, ctx);
-    }
-
-    // Validate mutually exclusive modes
-    let mode_count = u8::from(args.flush_only) + u8::from(args.import_only) + u8::from(args.merge);
-    if mode_count > 1 {
-        return Err(BeadsError::Validation {
-            field: "mode".to_string(),
-            reason: "Must specify exactly one of --flush-only, --import-only, or --merge"
-                .to_string(),
-        });
-    }
-
-    // --rebuild only makes sense with import (the default or --import-only)
-    if args.rebuild && (args.flush_only || args.merge) {
-        return Err(BeadsError::Validation {
-            field: "rebuild".to_string(),
-            reason: "--rebuild can only be used with import mode (not --flush-only or --merge)"
-                .to_string(),
-        });
     }
 
     if args.flush_only {
@@ -195,7 +208,6 @@ pub fn execute(
             show_progress,
             auto_rebuilt,
             &db_path,
-            db_lock_timeout,
             ctx,
         )
     }
@@ -874,7 +886,6 @@ fn execute_import(
     show_progress: bool,
     auto_rebuilt: bool,
     db_path: &std::path::Path,
-    _db_lock_timeout: Option<u64>,
     ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting JSONL import");
@@ -900,9 +911,13 @@ fn execute_import(
         info!(
             "Skipping redundant --rebuild/--force import: database was just rebuilt from JSONL during open"
         );
-        let record_count = count_issues_in_jsonl(jsonl_path).unwrap_or(0);
+        // Report the actual number of rows the rebuild put into the DB,
+        // not the JSONL line count — the two diverge when the JSONL contains
+        // tombstones or otherwise skipped records. Reading from the storage
+        // also avoids a redundant parse pass over a multi-megabyte JSONL.
+        let created = storage.count_all_issues()?;
         let result = ImportResultOutput {
-            created: record_count,
+            created,
             updated: 0,
             skipped: 0,
             tombstone_skipped: 0,

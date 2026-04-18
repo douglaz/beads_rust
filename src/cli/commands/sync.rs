@@ -180,9 +180,28 @@ pub fn execute(
             jsonl_path = %open_result.paths.jsonl_path.display(),
             "--rebuild requested on existing DB: delegating to auto-recovery rebuild path"
         );
+        // Snapshot tombstones before the delegation wipes the DB. The
+        // in-place rebuild path inside `execute_import` preserves deletion-
+        // retention state across `reset_data_tables` via
+        // `snapshot_tombstones` + `restore_tombstones`; the auto-recovery
+        // path opens a fresh DB and only imports what's in the JSONL, so
+        // any tombstones that were in the old DB but not yet flushed would
+        // be silently lost. Grab them here, restore them after the
+        // delegated rebuild completes.
+        let preserved_pre_delegation_tombstones = snapshot_tombstones(&open_result.storage)?;
         // `recover_database_from_jsonl` sets `auto_rebuilt = true` on success,
         // which is what gates the short-circuit inside `execute_import` below.
         open_result.recover_database_from_jsonl()?;
+        if !preserved_pre_delegation_tombstones.is_empty() {
+            restore_tombstones(
+                &open_result.storage,
+                &preserved_pre_delegation_tombstones,
+            )?;
+            debug!(
+                count = preserved_pre_delegation_tombstones.len(),
+                "Restored tombstones across delegated auto-recovery rebuild"
+            );
+        }
     }
 
     let command_result = (|| {

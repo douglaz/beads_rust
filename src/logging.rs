@@ -71,17 +71,23 @@ fn default_filter(verbosity: u8, quiet: bool) -> String {
         return "error".to_string();
     }
 
+    // fsqlite's internal submodules (btree cells, VDBE steps, cx checkpoints,
+    // pager I/O) fire at `debug` for every row and page touched — enabling
+    // them unfiltered drowns out beads_rust's own logs by many orders of
+    // magnitude on bulk imports. Keep fsqlite clamped to `warn` until the
+    // operator explicitly asks for trace-level output, so `-v`/`-vv` stays
+    // useful for diagnosing beads behaviour.
     match verbosity {
         0 => {
             if cfg!(debug_assertions) {
-                "beads_rust=debug".to_string()
+                "beads_rust=debug,fsqlite=warn".to_string()
             } else {
                 "error".to_string()
             }
         }
-        1 => "beads_rust=debug".to_string(),
-        2 => "beads_rust=debug,fsqlite=debug".to_string(),
-        _ => "beads_rust=trace".to_string(),
+        1 => "beads_rust=debug,fsqlite=warn".to_string(),
+        2 => "beads_rust=debug,fsqlite=info,fsqlite_btree=warn,fsqlite_vdbe=warn,fsqlite_pager=warn".to_string(),
+        _ => "beads_rust=trace,fsqlite=debug,fsqlite_btree=info,fsqlite_vdbe=info".to_string(),
     }
 }
 
@@ -112,9 +118,15 @@ mod tests {
 
     #[test]
     fn default_filter_varies_with_verbosity() {
-        assert_eq!(default_filter(1, false), "beads_rust=debug");
-        assert_eq!(default_filter(2, false), "beads_rust=debug,fsqlite=debug");
-        assert_eq!(default_filter(3, false), "beads_rust=trace");
+        assert_eq!(default_filter(1, false), "beads_rust=debug,fsqlite=warn");
+        assert_eq!(
+            default_filter(2, false),
+            "beads_rust=debug,fsqlite=info,fsqlite_btree=warn,fsqlite_vdbe=warn,fsqlite_pager=warn"
+        );
+        assert_eq!(
+            default_filter(3, false),
+            "beads_rust=trace,fsqlite=debug,fsqlite_btree=info,fsqlite_vdbe=info"
+        );
     }
 
     #[test]

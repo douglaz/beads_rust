@@ -1170,7 +1170,7 @@ impl ToolHandler for CreateIssueTool {
             }
 
             let id = if let Some(ref pid) = parent_id {
-                let next_num = storage.next_child_number(pid)?;
+                let next_num = storage.next_child_number(pid).map_err(beads_to_mcp)?;
                 let mut candidate = crate::util::id::child_id(pid, next_num);
                 // Handle rare hash/id collision safely under the transaction lock
                 let mut num = next_num + 1;
@@ -1196,7 +1196,7 @@ impl ToolHandler for CreateIssueTool {
                     .map(String::from),
                 status: Status::Open,
                 priority,
-                issue_type,
+                issue_type: issue_type.clone(),
                 assignee: args
                     .get("assignee")
                     .and_then(|v| v.as_str())
@@ -1207,7 +1207,7 @@ impl ToolHandler for CreateIssueTool {
                 ..Issue::default()
             };
 
-            storage.create_issue(&issue, &self.0.actor)?;
+            storage.create_issue(&issue, &self.0.actor).map_err(beads_to_mcp)?;
 
             for label in &labels_to_add {
                 let _ = storage.add_label(&id, label, &self.0.actor);
@@ -1222,13 +1222,13 @@ impl ToolHandler for CreateIssueTool {
 
         let mut warnings: Vec<String> = Vec::new();
         // Warn if coercions happened
-        warnings.extend(coercions);
+        warnings.extend(coercions.clone());
 
         let mut result = json!({
             "id": id,
             "title": title,
             "status": "open",
-            "priority": priority.as_str(),
+            "priority": priority.0,
             "type": issue_type.as_str(),
             "next_actions": [
                 "Use update_issue to add details or change fields",
@@ -1387,10 +1387,10 @@ impl ToolHandler for UpdateIssueTool {
                     .is_some_and(|s| !s.is_empty());
 
             let issue = if has_field_updates {
-                storage.update_issue(id, &updates, &self.0.actor)?
+                storage.update_issue(id, &updates, &self.0.actor).map_err(beads_to_mcp)?
             } else if has_side_effects {
                 storage
-                    .get_issue_details(id, false, false, 0)?
+                    .get_issue_details(id, false, false, 0).map_err(beads_to_mcp)?
                     .ok_or_else(|| issue_not_found_err(storage, id))?
                     .issue
             } else {
@@ -1435,7 +1435,7 @@ impl ToolHandler for UpdateIssueTool {
         })?;
 
         let mut warnings: Vec<String> = Vec::new();
-        warnings.extend(coercions);
+        warnings.extend(coercions.clone());
 
         let mut result = json!({
             "id": issue.id,
@@ -1527,10 +1527,11 @@ impl ToolHandler for CloseIssueTool {
 
             // Idempotency: if already closed, return existing state without error
             if let Some(details) = storage
-                .get_issue_details(id, false, false, 0)?
-                && details.issue.status == Status::Closed
+                .get_issue_details(id, false, false, 0).map_err(beads_to_mcp)?
             {
-                return Ok((details.issue, None, None));
+                if details.issue.status == Status::Closed {
+                    return Ok((details.issue, None, None));
+                }
             }
 
             let now = chrono::Utc::now();
@@ -1541,7 +1542,7 @@ impl ToolHandler for CloseIssueTool {
                 ..IssueUpdate::default()
             };
 
-            let issue = storage.update_issue(id, &close_update, &self.0.actor)?;
+            let issue = storage.update_issue(id, &close_update, &self.0.actor).map_err(beads_to_mcp)?;
 
             // Check for blockers this issue had (warn about closing a blocked issue)
             let our_blockers = storage.get_blockers(id).unwrap_or_default();
@@ -1783,7 +1784,7 @@ impl ToolHandler for ManageDependenciesTool {
 
         match action {
             "list" => {
-                let mut storage = open(&self.0)?;
+                let storage = open(&self.0)?;
                 require_valid_issue(&storage, id)?;
                 let deps = storage.get_dependencies_full(id).map_err(beads_to_mcp)?;
                 let dependents = storage.get_dependents(id).map_err(beads_to_mcp)?;

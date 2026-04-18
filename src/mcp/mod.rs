@@ -52,9 +52,9 @@ impl BeadsState {
 
     /// Execute a mutating closure against the storage, acquiring the cross-process
     /// write lock and triggering an auto-flush upon success.
-    pub fn with_mutation<F, R>(&self, mut f: F) -> McpResult<R>
+    pub fn with_mutation<F, R>(&self, mut f: F) -> fastmcp_rust::McpResult<R>
     where
-        F: FnMut(&mut SqliteStorage) -> crate::Result<R>,
+        F: FnMut(&mut SqliteStorage) -> fastmcp_rust::McpResult<R>,
     {
         // 1. Acquire the cross-process write lock.
         let _write_lock = crate::sync::blocking_write_lock(&self.beads_dir);
@@ -63,7 +63,7 @@ impl BeadsState {
         let mut storage = self.open_storage().map_err(to_mcp)?;
 
         // 3. Execute the mutation.
-        let result = f(&mut storage).map_err(to_mcp)?;
+        let result = f(&mut storage)?;
 
         // 4. Auto-flush.
         let _sync_lock = crate::sync::try_sync_lock(&self.beads_dir);

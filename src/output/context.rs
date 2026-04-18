@@ -378,8 +378,9 @@ impl OutputContext {
     pub fn error(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                let panel = Panel::from_text(message).title(Text::new("Error"));
-                // .border_style(self.theme.error.clone()); // border_style missing?
+                let panel = Panel::from_text(message)
+                    .title(Text::new("Error"))
+                    .border_style(self.theme().error.clone());
                 self.console().print_renderable(&panel);
             }
             OutputMode::Plain | OutputMode::Quiet => eprintln!("Error: {}", message),

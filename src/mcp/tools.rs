@@ -1608,97 +1608,6 @@ impl ToolHandler for CloseIssueTool {
 // 6. manage_dependencies
 // ---------------------------------------------------------------------------
 
-/// Handle the "add" action for `manage_dependencies`.
-fn dep_add(
-    storage: &mut SqliteStorage,
-    actor: &str,
-    id: &str,
-    args: &serde_json::Value,
-) -> McpResult<Vec<Content>> {
-    let depends_on = args
-        .get("depends_on")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| McpError::invalid_params("'depends_on' is required for action 'add'"))?;
-
-    // Validate target ID exists too
-    require_valid_issue(storage, depends_on)?;
-
-    let dep_type_raw = args
-        .get("dep_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("blocks");
-    let (dep_type_str, dep_coercion) = parse_dep_type(dep_type_raw)?;
-
-    // Check for cycles with structured error
-    if storage
-        .would_create_cycle(id, depends_on, true)
-        .map_err(beads_to_mcp)?
-    {
-        return Err(McpError::with_data(
-            McpErrorCode::ToolExecutionError,
-            format!("Adding dependency {id} -> {depends_on} would create a cycle"),
-            json!({
-                "error_type": "CYCLE_DETECTED",
-                "recoverable": false,
-                "from": id,
-                "to": depends_on,
-                "hint": "Circular dependencies are not allowed. Check the existing dependency graph.",
-                "suggested_tool_calls": [
-                    {"tool": "manage_dependencies", "arguments": {"action": "list", "id": id}},
-                    {"tool": "manage_dependencies", "arguments": {"action": "list", "id": depends_on}}
-                ]
-            }),
-        ));
-    }
-
-    let added = storage
-        .add_dependency(id, depends_on, &dep_type_str, actor)
-        .map_err(beads_to_mcp)?;
-
-    let mut result = json!({
-        "added": added,
-        "from": id,
-        "to": depends_on,
-        "dep_type": dep_type_str,
-    });
-    if let Some(w) = dep_coercion {
-        result["coercion"] = json!(w);
-    }
-
-    Ok(vec![Content::text(result.to_string())])
-}
-
-/// Handle the "remove" action for `manage_dependencies`.
-fn dep_remove(
-    storage: &mut SqliteStorage,
-    actor: &str,
-    id: &str,
-    args: &serde_json::Value,
-) -> McpResult<Vec<Content>> {
-    let depends_on = args
-        .get("depends_on")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| McpError::invalid_params("'depends_on' is required for action 'remove'"))?;
-
-    // Validate target ID (placeholder check only — it might have been deleted)
-    if let Some(err) = detect_placeholder(depends_on) {
-        return Err(err);
-    }
-
-    let removed = storage
-        .remove_dependency(id, depends_on, actor)
-        .map_err(beads_to_mcp)?;
-
-    Ok(vec![Content::text(
-        json!({
-            "removed": removed,
-            "from": id,
-            "to": depends_on,
-        })
-        .to_string(),
-    )])
-}
-
 pub struct ManageDependenciesTool(Arc<BeadsState>);
 impl ManageDependenciesTool {
     pub fn new(state: Arc<BeadsState>) -> Self {
@@ -1803,14 +1712,93 @@ impl ToolHandler for ManageDependenciesTool {
                     .to_string(),
                 )])
             }
-            "add" => self.0.with_mutation(|storage| {
-                require_valid_issue(storage, id)?;
-                dep_add(storage, &self.0.actor, id, &args)
-            }),
-            "remove" => self.0.with_mutation(|storage| {
-                require_valid_issue(storage, id)?;
-                dep_remove(storage, &self.0.actor, id, &args)
-            }),
+            "add" => {
+                let depends_on = args
+                    .get("depends_on")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| McpError::invalid_params("'depends_on' is required for action 'add'"))?;
+
+                let dep_type_raw = args
+                    .get("dep_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("blocks");
+                let (dep_type_str, dep_coercion) = parse_dep_type(dep_type_raw)?;
+
+                // Read-only pre-validation
+                {
+                    let storage = open(&self.0)?;
+                    require_valid_issue(&storage, id)?;
+                    require_valid_issue(&storage, depends_on)?;
+
+                    // Check for cycles with structured error
+                    if storage
+                        .would_create_cycle(id, depends_on, true)
+                        .map_err(beads_to_mcp)?
+                    {
+                        return Err(McpError::with_data(
+                            McpErrorCode::ToolExecutionError,
+                            format!("Adding dependency {id} -> {depends_on} would create a cycle"),
+                            json!({
+                                "error_type": "CYCLE_DETECTED",
+                                "recoverable": false,
+                                "from": id,
+                                "to": depends_on,
+                                "hint": "Circular dependencies are not allowed. Check the existing dependency graph.",
+                                "suggested_tool_calls": [
+                                    {"tool": "manage_dependencies", "arguments": {"action": "list", "id": id}},
+                                    {"tool": "manage_dependencies", "arguments": {"action": "list", "id": depends_on}}
+                                ]
+                            }),
+                        ).into());
+                    }
+                }
+
+                let added = self.0.with_mutation(|storage| {
+                    storage.add_dependency(id, depends_on, &dep_type_str, &self.0.actor).map_err(beads_to_mcp)
+                })?;
+
+                let mut result = json!({
+                    "added": added,
+                    "from": id,
+                    "to": depends_on,
+                    "dep_type": dep_type_str,
+                });
+                if let Some(w) = dep_coercion {
+                    result["coercion"] = json!(w);
+                }
+
+                Ok(vec![Content::text(result.to_string())])
+            }
+            "remove" => {
+                let depends_on = args
+                    .get("depends_on")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| McpError::invalid_params("'depends_on' is required for action 'remove'"))?;
+
+                // Validate target ID (placeholder check only — it might have been deleted)
+                if let Some(err) = detect_placeholder(depends_on) {
+                    return Err(err);
+                }
+
+                // Pre-validate source ID
+                {
+                    let storage = open(&self.0)?;
+                    require_valid_issue(&storage, id)?;
+                }
+
+                let removed = self.0.with_mutation(|storage| {
+                    storage.remove_dependency(id, depends_on, &self.0.actor).map_err(beads_to_mcp)
+                })?;
+
+                Ok(vec![Content::text(
+                    json!({
+                        "removed": removed,
+                        "from": id,
+                        "to": depends_on,
+                    })
+                    .to_string(),
+                )])
+            }
             other => Err(McpError::with_data(
                 McpErrorCode::InvalidParams,
                 format!("Unknown action '{other}'"),

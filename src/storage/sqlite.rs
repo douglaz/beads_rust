@@ -1496,7 +1496,11 @@ impl SqliteStorage {
                     if issue.closed_at.is_some() && updates.closed_at.is_none() {
                         // Reopening (or fixing state): Clear closed_at if it was set
                         issue.closed_at = None;
+                        issue.close_reason = None;
+                        issue.closed_by_session = None;
                         add_update("closed_at", SqliteValue::Null);
+                        add_update("close_reason", SqliteValue::from(""));
+                        add_update("closed_by_session", SqliteValue::from(""));
                     }
                     if issue.deleted_at.is_some() {
                         issue.deleted_at = None;

@@ -305,14 +305,16 @@ impl SqliteStorage {
     }
 
     fn upsert_metadata_key_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
-        conn.execute_with_params(
-            "DELETE FROM metadata WHERE key = ?",
-            &[SqliteValue::from(key)],
+        let updated = conn.execute_with_params(
+            "UPDATE metadata SET value = ? WHERE key = ?",
+            &[SqliteValue::from(value), SqliteValue::from(key)],
         )?;
-        conn.execute_with_params(
-            "INSERT INTO metadata (key, value) VALUES (?, ?)",
-            &[SqliteValue::from(key), SqliteValue::from(value)],
-        )?;
+        if updated == 0 {
+            conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )?;
+        }
         Ok(())
     }
 
@@ -329,8 +331,8 @@ impl SqliteStorage {
                 continue;
             }
             match conn.execute_with_params(
-                "INSERT INTO metadata (key, value) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM metadata WHERE key = ?)",
-                &[SqliteValue::from(key), SqliteValue::from(default_value), SqliteValue::from(key)],
+                "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(default_value)],
             ) {
                 Ok(_) => {}
                 Err(e) if e.is_transient() => {
@@ -1097,9 +1099,14 @@ impl SqliteStorage {
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
         self.mutate("create_issue", actor, |conn, ctx| {
             // Explicit duplicate check since fsqlite does not enforce
-            // UNIQUE constraints on non-rowid columns.
+            // UNIQUE constraints on non-rowid columns. CTE-wrapped per #254
+            // to keep the lookup off the fsqlite prepared-statement
+            // fast-path cache.
             let existing = conn.query_with_params(
-                "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
+                "WITH target(id_value) AS (SELECT ?) \
+                 SELECT 1 FROM issues AS i, target AS t \
+                 WHERE i.id = t.id_value \
+                 LIMIT 1",
                 &[SqliteValue::from(issue.id.as_str())],
             )?;
             if !existing.is_empty() {
@@ -1404,8 +1411,13 @@ impl SqliteStorage {
             // Atomic claim guard: check assignee INSIDE the CONCURRENT transaction
             // to prevent TOCTOU races where two agents both see "unassigned".
             if updates.expect_unassigned {
+                // #254: CTE-wrap so the planner cannot hand us a stale
+                // assignee from a cached fast-path plan for this TOCTOU
+                // claim guard.
                 let rows = conn.query_with_params(
-                    "SELECT assignee FROM issues WHERE id = ?",
+                    "WITH target(id_value) AS (SELECT ?) \
+                     SELECT i.assignee FROM issues AS i, target AS t \
+                     WHERE i.id = t.id_value",
                     &[SqliteValue::from(id)],
                 )?;
                 let current_assignee: Option<String> = rows
@@ -1745,8 +1757,12 @@ impl SqliteStorage {
             let updated_rows = conn.execute_with_params(&sql, &params)?;
             if updated_rows == 0 {
                 if updates.expect_unassigned {
+                    // #254: CTE-wrap for consistency with the pre-update
+                    // claim guard above.
                     let rows = conn.query_with_params(
-                        "SELECT assignee FROM issues WHERE id = ?",
+                        "WITH target(id_value) AS (SELECT ?) \
+                         SELECT i.assignee FROM issues AS i, target AS t \
+                         WHERE i.id = t.id_value",
                         &[SqliteValue::from(id)],
                     )?;
                     let current_assignee = rows
@@ -1976,7 +1992,20 @@ impl SqliteStorage {
         ";
         let rows = conn.query_with_params(sql, &[SqliteValue::from(id)])?;
         match rows.into_iter().next() {
-            Some(row) => Ok(Some(Self::issue_from_row(&row)?)),
+            Some(row) => {
+                let issue = Self::issue_from_row(&row)?;
+                // Issue #255: defensive invariant — if the planner ever returns a
+                // row whose id does not match the requested id, convert the
+                // silent wrong-row bug into a loud error rather than surfacing
+                // a foreign issue through `br show` / `br update`.
+                if issue.id != id {
+                    return Err(BeadsError::Other(anyhow::anyhow!(
+                        "storage consistency: get_issue_from_conn requested {id:?} but row returned id {:?}",
+                        issue.id
+                    )));
+                }
+                Ok(Some(issue))
+            }
             None => Ok(None),
         }
     }
@@ -2831,23 +2860,35 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocks_dep_edges(&self) -> Result<Vec<(String, String)>> {
-        let rows = self.conn.query(
-            r"
-            SELECT issue_id, depends_on_id FROM dependencies 
-            WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')
-            UNION
-            SELECT depends_on_id, issue_id FROM dependencies 
-            WHERE type = 'parent-child'
-            ",
+        let mut edges = Vec::new();
+        
+        // Query 1: Standard blocking types
+        let rows1 = self.conn.query(
+            "SELECT issue_id, depends_on_id FROM dependencies \
+             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')"
         )?;
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                let issue_id = row.get(0).and_then(SqliteValue::as_text)?.to_string();
-                let depends_on = row.get(1).and_then(SqliteValue::as_text)?.to_string();
-                Some((issue_id, depends_on))
-            })
-            .collect())
+        for row in &rows1 {
+            if let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) {
+                if let Some(depends_on) = row.get(1).and_then(SqliteValue::as_text) {
+                    edges.push((issue_id.to_string(), depends_on.to_string()));
+                }
+            }
+        }
+
+        // Query 2: Parent-child (reversed direction)
+        let rows2 = self.conn.query(
+            "SELECT depends_on_id, issue_id FROM dependencies \
+             WHERE type = 'parent-child'"
+        )?;
+        for row in &rows2 {
+            if let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) {
+                if let Some(depends_on) = row.get(1).and_then(SqliteValue::as_text) {
+                    edges.push((issue_id.to_string(), depends_on.to_string()));
+                }
+            }
+        }
+
+        Ok(edges)
     }
 
     /// Check if an issue is blocked (in the blocked cache).
@@ -3928,16 +3969,31 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn id_exists(&self, id: &str) -> Result<bool> {
-        let rows = self.conn.query_with_params(
-            "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
-            &[SqliteValue::from(id)],
-        )?;
+        // Issue #254: same CTE-wrap rationale as `get_issue_from_conn` (#252).
+        // `query_with_params` still satisfies fsqlite's
+        // `prepared_select_requires_dispatch` fast-path predicate for a plain
+        // `SELECT … FROM issues WHERE id = ?` and has returned stale zero-row
+        // answers for freshly-inserted rows under concurrent write load.
+        // Wrapping the SELECT in a CTE makes `select.with.is_some()` true in
+        // the predicate and forces the uncached B-tree walk.
+        let sql = "\
+            WITH target(id_value) AS (SELECT ?) \
+            SELECT 1 FROM issues AS i, target AS t \
+            WHERE i.id = t.id_value \
+            LIMIT 1";
+        let rows = self.conn.query_with_params(sql, &[SqliteValue::from(id)])?;
         Ok(!rows.is_empty())
     }
 
     fn issue_status_in_tx(conn: &Connection, id: &str) -> Result<Option<Status>> {
+        // #254: CTE-wrap to keep this off fsqlite's prepared-statement
+        // fast-path cache. Called from pre-update validation (e.g.
+        // dependency target checks) where a stale hit would silently
+        // accept a tombstoned target.
         let rows = conn.query_with_params(
-            "SELECT status FROM issues WHERE id = ?",
+            "WITH target(id_value) AS (SELECT ?) \
+             SELECT i.status FROM issues AS i, target AS t \
+             WHERE i.id = t.id_value",
             &[SqliteValue::from(id)],
         )?;
         if let Some(row) = rows.first() {
@@ -6961,27 +7017,22 @@ impl SqliteStorage {
 
         // Get all dependencies, respecting parent-child direction (parent depends on child)
         let mut graph: HashMap<String, Vec<String>> = HashMap::new();
-        let stmt = self.conn.prepare(
-            r"
-                SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'
-                UNION
-                SELECT depends_on_id, issue_id FROM dependencies WHERE type = 'parent-child'
-            ",
+        
+        let rows1 = self.conn.query(
+            "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'"
         )?;
+        for row in &rows1 {
+            let from = row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string();
+            let to = row.get(1).and_then(SqliteValue::as_text).unwrap_or("").to_string();
+            graph.entry(from).or_default().push(to);
+        }
 
-        let rows = stmt.query()?;
-
-        for row in &rows {
-            let from = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
-            let to = row
-                .get(1)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
+        let rows2 = self.conn.query(
+            "SELECT depends_on_id, issue_id FROM dependencies WHERE type = 'parent-child'"
+        )?;
+        for row in &rows2 {
+            let from = row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string();
+            let to = row.get(1).and_then(SqliteValue::as_text).unwrap_or("").to_string();
             graph.entry(from).or_default().push(to);
         }
 
@@ -7079,12 +7130,19 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn is_tombstone(&self, id: &str) -> Result<bool> {
-        // Issue #229: use `query_with_params` to avoid the single-row
-        // prepared-statement fast path (same rationale as get_issue_from_conn).
-        let rows = self.conn.query_with_params(
-            "SELECT status FROM issues WHERE id = ?",
-            &[SqliteValue::from(id)],
-        )?;
+        // Issue #254: the #229 `query_with_params` change did NOT escape
+        // fsqlite's prepared-statement fast-path cache (both
+        // `query_row_with_params` and `query_with_params` route through
+        // `ad_hoc_query_supports_prepared_reuse`). Only CTE-wrapping forces
+        // the dispatch through `prepared_select_requires_dispatch`. This
+        // function is on the resolver's hot path (via
+        // `IdResolver::resolve_fallible`) and a stale cache hit here has
+        // been observed to alias a live bead onto a tombstoned one.
+        let sql = "\
+            WITH target(id_value) AS (SELECT ?) \
+            SELECT i.status FROM issues AS i, target AS t \
+            WHERE i.id = t.id_value";
+        let rows = self.conn.query_with_params(sql, &[SqliteValue::from(id)])?;
         match rows.into_iter().next() {
             Some(row) => {
                 let status = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");

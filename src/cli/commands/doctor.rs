@@ -281,9 +281,13 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
         )?;
 
         // Read it back inside the same transaction to verify the read path
-        // agrees with what we just wrote.
+        // agrees with what we just wrote. CTE-wrap per #254 so the probe
+        // itself does not hit fsqlite's prepared-statement fast-path cache
+        // and report false-healthy against a stale plan.
         let rows = conn.query_with_params(
-            "SELECT id FROM issues WHERE id = ?",
+            "WITH target(id_value) AS (SELECT ?) \
+             SELECT i.id FROM issues AS i, target AS t \
+             WHERE i.id = t.id_value",
             &[SqliteValue::from(probe_id)],
         )?;
         if rows.is_empty() {

@@ -176,90 +176,93 @@ pub fn execute(
         open_result.recover_database_from_jsonl()?;
     }
 
-    let db_path = open_result.paths.db_path.clone();
-    let jsonl_path = open_result.paths.jsonl_path.clone();
-    let retention_days = open_result.paths.metadata.deletions_retention_days;
-    let use_json = ctx.is_json() || args.robot;
-    let quiet = cli.quiet.unwrap_or(false);
-    let show_progress = should_show_progress(use_json, quiet);
-    let path_policy = validate_sync_paths(&beads_dir, &jsonl_path, args.allow_external_jsonl)?;
-    debug!(
-        jsonl_path = %path_policy.jsonl_path.display(),
-        manifest_path = %path_policy.manifest_path.display(),
-        external_jsonl = path_policy.is_external,
-        "Resolved sync path policy"
-    );
-
-    // Handle --status flag
-    if args.status {
-        return execute_status(&open_result.storage, &path_policy, use_json, ctx);
-    }
-
-    if args.flush_only {
-        execute_flush(
-            &mut open_result.storage,
-            &beads_dir,
-            &path_policy,
-            args,
-            use_json,
-            show_progress,
-            retention_days,
-            ctx,
-        )
-    } else if args.merge {
-        execute_merge(
-            &mut open_result.storage,
-            &path_policy,
-            args,
-            use_json,
-            show_progress,
-            retention_days,
-            cli,
-            ctx,
-        )
-    } else {
-        // Default to import-only if no flag is specified (consistent with existing behavior)
-        // or explicitly import-only
-        let result = execute_import(
-            &mut open_result.storage,
-            &beads_dir,
-            cli,
-            &path_policy,
-            args,
-            use_json,
-            show_progress,
-            open_result.auto_rebuilt,
-            &db_path,
-            ctx,
+    let command_result = (|| {
+        let db_path = open_result.paths.db_path.clone();
+        let jsonl_path = open_result.paths.jsonl_path.clone();
+        let retention_days = open_result.paths.metadata.deletions_retention_days;
+        let use_json = ctx.is_json() || args.robot;
+        let quiet = cli.quiet.unwrap_or(false);
+        let show_progress = should_show_progress(use_json, quiet);
+        let path_policy = validate_sync_paths(&beads_dir, &jsonl_path, args.allow_external_jsonl)?;
+        debug!(
+            jsonl_path = %path_policy.jsonl_path.display(),
+            manifest_path = %path_policy.manifest_path.display(),
+            external_jsonl = path_policy.is_external,
+            "Resolved sync path policy"
         );
-        match result {
-            Ok(()) => {
-                open_result.discard_pending_recovery_backup();
-                Ok(())
+
+        // Handle --status flag
+        if args.status {
+            return execute_status(&open_result.storage, &path_policy, use_json, ctx);
+        }
+
+        if args.flush_only {
+            execute_flush(
+                &mut open_result.storage,
+                &beads_dir,
+                &path_policy,
+                args,
+                use_json,
+                show_progress,
+                retention_days,
+                ctx,
+            )
+        } else if args.merge {
+            execute_merge(
+                &mut open_result.storage,
+                &path_policy,
+                args,
+                use_json,
+                show_progress,
+                retention_days,
+                cli,
+                ctx,
+            )
+        } else {
+            // Default to import-only if no flag is specified (consistent with existing behavior)
+            // or explicitly import-only
+            execute_import(
+                &mut open_result.storage,
+                &beads_dir,
+                cli,
+                &path_policy,
+                args,
+                use_json,
+                show_progress,
+                open_result.auto_rebuilt,
+                &db_path,
+                ctx,
+            )
+        }
+    })();
+
+    match command_result {
+        Ok(()) => {
+            open_result.discard_pending_recovery_backup();
+            Ok(())
+        }
+        Err(command_err) => {
+            let recovery_dir = open_result.pending_recovery_dir().map(PathBuf::from);
+            if let Err(restore_err) = open_result.restore_pending_recovery_backup() {
+                let context = recovery_dir.map_or_else(
+                    || {
+                        format!(
+                            "sync command failed after deferred database recovery ({command_err}); original database restore also failed"
+                        )
+                    },
+                    |dir| {
+                        format!(
+                            "sync command failed after deferred database recovery ({command_err}); original database restore from '{}' also failed",
+                            dir.display()
+                        )
+                    },
+                );
+                return Err(BeadsError::WithContext {
+                    context,
+                    source: Box::new(restore_err),
+                });
             }
-            Err(import_err) => {
-                let recovery_dir = open_result.pending_recovery_dir().map(PathBuf::from);
-                if let Err(restore_err) = open_result.restore_pending_recovery_backup() {
-                    let context = recovery_dir.map_or_else(
-                        || {
-                            format!(
-                                "explicit import failed after deferred database recovery ({import_err}); original database restore also failed"
-                            )
-                        },
-                        |dir| {
-                            format!(
-                                "explicit import failed after deferred database recovery ({import_err}); original database restore from '{}' also failed",
-                                dir.display()
-                            )
-                        },
-                    );
-                    return Err(BeadsError::WithContext {
-                        context,
-                        source: Box::new(restore_err),
-                    });
-                }
-                Err(import_err)
-            }
+            Err(command_err)
         }
     }
 }

@@ -471,6 +471,106 @@ fn e2e_sync_rename_prefix_applies_after_missing_db_recovery_without_force() {
 }
 
 #[test]
+fn e2e_sync_rebuild_with_rename_prefix_keeps_renamed_issues() {
+    // Regression: `--rebuild --rename-prefix` used to wipe the DB. The
+    // rebuild's orphan-cleanup pass compares the *raw* JSONL IDs (pre-rename)
+    // against `storage.get_all_ids()` (post-rename). Every renamed issue
+    // therefore looked like a "DB entry not present in JSONL" and got
+    // deleted. The fix is to skip the orphan pass when `--rename-prefix`
+    // rewrote the IDs the import just inserted, since the set-difference
+    // comparison is no longer semantically meaningful.
+    let _log = common::test_log("e2e_sync_rebuild_with_rename_prefix_keeps_renamed_issues");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let set_prefix = run_br(
+        &workspace,
+        ["config", "set", "issue_prefix=target"],
+        "config_set_issue_prefix",
+    );
+    assert!(
+        set_prefix.status.success(),
+        "config set failed: {}",
+        set_prefix.stderr
+    );
+
+    let create = run_br(&workspace, ["create", "Seed issue"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let original_id = parse_created_id(&create.stdout);
+    let mismatched_id = format!(
+        "other-{}",
+        original_id
+            .split_once('-')
+            .map(|(_, remainder)| remainder)
+            .expect("created issue id should include a prefix")
+    );
+
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(
+        flush.status.success(),
+        "sync flush failed: {}",
+        flush.stderr
+    );
+
+    let issues_path = workspace.root.join(".beads").join("issues.jsonl");
+    let jsonl = fs::read_to_string(&issues_path).expect("read issues jsonl");
+    fs::write(&issues_path, jsonl.replace(&original_id, &mismatched_id)).expect("rewrite jsonl");
+
+    let result = run_br(
+        &workspace,
+        [
+            "sync",
+            "--import-only",
+            "--rebuild",
+            "--rename-prefix",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "sync_rebuild_rename_prefix",
+    );
+    assert!(
+        result.status.success(),
+        "--rebuild --rename-prefix should succeed: {}",
+        result.stderr
+    );
+
+    let payload = extract_json_payload(&result.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse import json");
+    assert_eq!(
+        json["created"].as_u64(),
+        Some(1),
+        "expected the renamed issue to be inserted"
+    );
+    assert_eq!(
+        json["orphans_removed"].as_u64(),
+        Some(0),
+        "orphan cleanup must not run when --rename-prefix rewrote IDs; otherwise every renamed issue is wiped"
+    );
+
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let storage = SqliteStorage::open(&db_path).expect("open rebuilt db");
+    assert_eq!(
+        storage.count_all_issues().expect("count issues"),
+        1,
+        "DB must retain the renamed issue after --rebuild + --rename-prefix"
+    );
+    let ids = storage.get_all_ids().expect("all ids");
+    assert_eq!(ids.len(), 1);
+    assert!(
+        ids[0].starts_with("target-"),
+        "issue should carry the renamed prefix, got {:?}",
+        ids
+    );
+    assert_ne!(
+        ids[0], mismatched_id,
+        "the renamed ID must differ from the pre-rename JSONL ID"
+    );
+}
+
+#[test]
 fn e2e_sync_auto_rebuild_plain_import_reports_recovery_result() {
     let _log = common::test_log("e2e_sync_auto_rebuild_plain_import_reports_recovery_result");
     let workspace = BrWorkspace::new();
@@ -708,6 +808,83 @@ fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
     assert_eq!(
         restored_bytes, original_bytes,
         "failed deferred import should restore the original corrupt db bytes"
+    );
+}
+
+#[test]
+fn e2e_sync_rename_prefix_validation_failure_restores_original_corrupt_db_family() {
+    let _log = common::test_log(
+        "e2e_sync_rename_prefix_validation_failure_restores_original_corrupt_db_family",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let set_prefix = run_br(
+        &workspace,
+        ["config", "set", "issue_prefix=target"],
+        "config_set_issue_prefix",
+    );
+    assert!(
+        set_prefix.status.success(),
+        "config set failed: {}",
+        set_prefix.stderr
+    );
+
+    let external_dir = workspace.root.join("external-jsonl");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_jsonl = external_dir.join("metadata.jsonl");
+    fs::write(
+        &external_jsonl,
+        "{\"id\":\"legacy-1\",\"title\":\"External metadata JSONL\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .expect("write external jsonl");
+
+    let metadata_path = workspace.root.join(".beads").join("metadata.json");
+    let metadata_json = format!(
+        r#"{{"database":"beads.db","jsonl_export":"{}"}}"#,
+        external_jsonl.display()
+    );
+    fs::write(&metadata_path, metadata_json).expect("write metadata");
+
+    let alt_db = workspace
+        .root
+        .join(".beads")
+        .join("deferred-recovery-validation-restore-alt.db");
+    let original_bytes = b"not a sqlite database but should survive validation failure".to_vec();
+    fs::write(&alt_db, &original_bytes).expect("write corrupt alt db");
+
+    let result = run_br(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "sync",
+            "--import-only",
+            "--rename-prefix",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "sync_failed_deferred_recovery_validation_restore",
+    );
+    assert!(
+        !result.status.success(),
+        "external metadata JSONL without allow flag should fail validation"
+    );
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("external")
+            || combined.contains("allow-external-jsonl")
+            || combined.contains("outside"),
+        "unexpected validation failure output: {combined}"
+    );
+
+    let restored_bytes = fs::read(&alt_db).expect("read restored alt db");
+    assert_eq!(
+        restored_bytes, original_bytes,
+        "validation failure after deferred recovery should restore the original corrupt db bytes"
     );
 }
 

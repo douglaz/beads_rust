@@ -434,8 +434,9 @@ impl OutputContext {
                     text.append(&format!("• {}\n", suggestion));
                 }
 
-                let panel = Panel::from_rich_text(&text, self.width()).title(Text::new(title));
-                // .border_style(self.theme.error.clone());
+                let panel = Panel::from_rich_text(&text, self.width())
+                    .title(Text::new(title))
+                    .border_style(self.theme().error.clone());
                 self.console().print_renderable(&panel);
             }
             OutputMode::Plain => {

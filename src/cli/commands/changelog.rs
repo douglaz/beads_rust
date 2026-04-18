@@ -331,18 +331,24 @@ fn resolve_since(
 ) -> Result<(Option<DateTime<Utc>>, String)> {
     if let Some(tag) = args.since_tag.as_deref() {
         let dt = git_tag_date(tag, repo_root)?;
-        return Ok((Some(dt), dt.to_rfc3339()));
+        return Ok((Some(dt), tag.to_string()));
     }
     if let Some(commit) = args.since_commit.as_deref() {
         let dt = git_commit_date(commit, repo_root)?;
-        return Ok((Some(dt), dt.to_rfc3339()));
+        // Show short hash if possible
+        let label = if commit.len() > 7 {
+            &commit[..7]
+        } else {
+            commit
+        };
+        return Ok((Some(dt), label.to_string()));
     }
     if let Some(since) = args.since.as_deref() {
         if let Some(dt) = parse_relative_time(since) {
-            return Ok((Some(dt), dt.to_rfc3339()));
+            return Ok((Some(dt), since.to_string()));
         }
         let dt = parse_flexible_timestamp(since, "since")?;
-        return Ok((Some(dt), dt.to_rfc3339()));
+        return Ok((Some(dt), since.to_string()));
     }
     Ok((None, "all".to_string()))
 }
@@ -470,7 +476,7 @@ mod tests {
             dt.unwrap(),
             Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap()
         );
-        assert_eq!(label, "2023-01-01T00:00:00+00:00");
+        assert_eq!(label, "2023-01-01T00:00:00Z");
     }
 
     #[test]

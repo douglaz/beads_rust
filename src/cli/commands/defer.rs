@@ -726,10 +726,8 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::{Datelike, Duration, Local, Utc};
-    
-    use tempfile::TempDir;
 
-    
+    use tempfile::TempDir;
 
     fn make_issue(id: &str, title: &str) -> Issue {
         let now = Utc::now();

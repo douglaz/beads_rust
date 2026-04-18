@@ -86,7 +86,10 @@ fn default_filter(verbosity: u8, quiet: bool) -> String {
             }
         }
         1 => "beads_rust=debug,fsqlite=warn".to_string(),
-        2 => "beads_rust=debug,fsqlite=info,fsqlite_btree=warn,fsqlite_vdbe=warn,fsqlite_pager=warn".to_string(),
+        2 => {
+            "beads_rust=debug,fsqlite=info,fsqlite_btree=warn,fsqlite_vdbe=warn,fsqlite_pager=warn"
+                .to_string()
+        }
         _ => "beads_rust=trace,fsqlite=debug,fsqlite_btree=info,fsqlite_vdbe=info".to_string(),
     }
 }

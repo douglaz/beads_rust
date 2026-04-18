@@ -753,10 +753,8 @@ mod tests {
     use chrono::Utc;
     use std::env;
     use std::path::PathBuf;
-    
-    use tempfile::TempDir;
 
-    
+    use tempfile::TempDir;
 
     struct DirGuard {
         previous: PathBuf,

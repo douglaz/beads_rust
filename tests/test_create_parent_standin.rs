@@ -5,7 +5,7 @@ use tempfile::TempDir;
 fn test_create_parent_standin() {
     let temp = TempDir::new().unwrap();
     let beads_dir = temp.path().join(".beads");
-    
+
     // Initialize the beads directory
     let mut cmd = Command::cargo_bin("br").unwrap();
     cmd.arg("init")
@@ -14,7 +14,9 @@ fn test_create_parent_standin() {
         .success();
 
     let file_path = temp.path().join("issues.md");
-    std::fs::write(&file_path, r#"
+    std::fs::write(
+        &file_path,
+        r#"
 ## My Epic
 ### ID
 epic1
@@ -24,7 +26,9 @@ epic
 ## My Task
 ### Parent
 epic1
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let mut cmd = Command::cargo_bin("br").unwrap();
     cmd.arg("create")

@@ -101,11 +101,8 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
     let prefix = res.storage.get_config("issue_prefix")?;
     let db_path = res.paths.db_path.clone();
     let jsonl_path = res.paths.jsonl_path.clone();
-    let allow_external_jsonl = config::implicit_external_jsonl_allowed(
-        &beads_dir,
-        &db_path,
-        &jsonl_path,
-    );
+    let allow_external_jsonl =
+        config::implicit_external_jsonl_allowed(&beads_dir, &db_path, &jsonl_path);
 
     // Eagerly drop the bootstrap connection; handlers will open their own.
     drop(res.storage);

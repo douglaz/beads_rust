@@ -714,7 +714,7 @@ impl IdResolver {
 
             if !hash_pattern.is_empty() {
                 let mut matches = substring_match_fn(hash_pattern);
-                
+
                 if let Some(p) = prefix {
                     let expected_prefix = format!("{p}-");
                     matches.retain(|id| id.starts_with(&expected_prefix));
@@ -802,7 +802,7 @@ impl IdResolver {
 
             if !hash_pattern.is_empty() {
                 let mut matches = substring_match_fn(hash_pattern)?;
-                
+
                 if let Some(p) = prefix {
                     let expected_prefix = format!("{p}-");
                     matches.retain(|id| id.starts_with(&expected_prefix));

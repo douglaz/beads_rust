@@ -1466,10 +1466,8 @@ mod tests {
     use super::*;
     use crate::output::OutputContext;
     use std::env;
-    
-    use tempfile::TempDir;
 
-    
+    use tempfile::TempDir;
 
     struct DirGuard {
         previous: PathBuf,

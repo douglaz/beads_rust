@@ -46,7 +46,9 @@ fn main() {
     // operations through a blocking flock on `.beads/.write.lock`. Read-only
     // commands skip this lock entirely. The lock is held until main() exits.
     let _write_lock = if needs_write_lock(&cli.command) && ctx.is_initialized() {
-        ctx.beads_dir.as_deref().and_then(beads_rust::sync::blocking_write_lock)
+        ctx.beads_dir
+            .as_deref()
+            .and_then(beads_rust::sync::blocking_write_lock)
     } else {
         None
     };
@@ -85,7 +87,10 @@ fn main() {
                 .map_or(true, |staleness| staleness.jsonl_newer);
 
         if should_attempt_auto_import {
-            let _sync_lock = ctx.beads_dir.as_deref().and_then(beads_rust::sync::try_sync_lock);
+            let _sync_lock = ctx
+                .beads_dir
+                .as_deref()
+                .and_then(beads_rust::sync::try_sync_lock);
             let allow_external_jsonl = config::implicit_external_jsonl_allowed(
                 &paths.beads_dir,
                 &paths.db_path,
@@ -316,7 +321,10 @@ fn main() {
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
     if is_mutating && !ctx.no_auto_flush() {
-        let _sync_lock = ctx.beads_dir.as_deref().and_then(beads_rust::sync::try_sync_lock);
+        let _sync_lock = ctx
+            .beads_dir
+            .as_deref()
+            .and_then(beads_rust::sync::try_sync_lock);
         if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
             && let Err(e) = auto_flush(
                 &mut res.storage,
@@ -461,8 +469,10 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         ),
         Commands::History(args) => matches!(
             args.command,
-            Some(beads_rust::cli::HistoryCommands::Restore { .. }
-                | beads_rust::cli::HistoryCommands::Prune { .. })
+            Some(
+                beads_rust::cli::HistoryCommands::Restore { .. }
+                    | beads_rust::cli::HistoryCommands::Prune { .. }
+            )
         ),
         Commands::Doctor(args) => args.repair,
         Commands::Init { .. } => true,

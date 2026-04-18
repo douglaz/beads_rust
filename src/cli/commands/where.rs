@@ -309,10 +309,8 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
-    
-    use tempfile::TempDir;
 
-    
+    use tempfile::TempDir;
 
     struct DirGuard {
         previous: PathBuf,

@@ -1157,7 +1157,11 @@ impl ToolHandler for CreateIssueTool {
         let labels_to_add: Vec<String> = args
             .get("labels")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|val| val.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|val| val.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let id = self.0.with_mutation(|storage| {
@@ -1180,8 +1184,9 @@ impl ToolHandler for CreateIssueTool {
                 }
                 candidate
             } else {
-                let id_gen =
-                    crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
+                let id_gen = crate::util::id::IdGenerator::new(
+                    crate::util::id::IdConfig::with_prefix(prefix),
+                );
                 id_gen.generate(title, None, Some(&self.0.actor), now, 0, |candidate| {
                     storage.id_exists(candidate).unwrap_or(false)
                 })
@@ -1207,7 +1212,9 @@ impl ToolHandler for CreateIssueTool {
                 ..Issue::default()
             };
 
-            storage.create_issue(&issue, &self.0.actor).map_err(beads_to_mcp)?;
+            storage
+                .create_issue(&issue, &self.0.actor)
+                .map_err(beads_to_mcp)?;
 
             for label in &labels_to_add {
                 let _ = storage.add_label(&id, label, &self.0.actor);
@@ -1527,7 +1534,8 @@ impl ToolHandler for CloseIssueTool {
 
             // Idempotency: if already closed, return existing state without error
             if let Some(details) = storage
-                .get_issue_details(id, false, false, 0).map_err(beads_to_mcp)?
+                .get_issue_details(id, false, false, 0)
+                .map_err(beads_to_mcp)?
             {
                 if details.issue.status == Status::Closed {
                     return Ok((details.issue, None, None));
@@ -1542,11 +1550,13 @@ impl ToolHandler for CloseIssueTool {
                 ..IssueUpdate::default()
             };
 
-            let issue = storage.update_issue(id, &close_update, &self.0.actor).map_err(beads_to_mcp)?;
+            let issue = storage
+                .update_issue(id, &close_update, &self.0.actor)
+                .map_err(beads_to_mcp)?;
 
             // Check for blockers this issue had (warn about closing a blocked issue)
             let our_blockers = storage.get_blockers(id).unwrap_or_default();
-            
+
             // Check what this issue was blocking (now potentially unblocked)
             let dependents = storage.get_blocked_issue_ids(id).unwrap_or_default();
 
@@ -1576,7 +1586,9 @@ impl ToolHandler for CloseIssueTool {
             "close_reason": reason,
         });
 
-        if let Some(our_blockers) = our_blockers && !our_blockers.is_empty() {
+        if let Some(our_blockers) = our_blockers
+            && !our_blockers.is_empty()
+        {
             result["warning"] = json!(format!(
                 "This issue was blocked by {} issue(s): {}. Consider whether those blockers are still relevant.",
                 our_blockers.len(),

@@ -429,10 +429,8 @@ mod tests {
     use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
     use chrono::{Duration, Utc};
-    
-    use tempfile::TempDir;
 
-    
+    use tempfile::TempDir;
 
     fn make_closed_deferred_issue(id: &str, title: &str) -> Issue {
         let now = Utc::now();

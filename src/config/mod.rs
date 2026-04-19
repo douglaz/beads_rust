@@ -15,10 +15,10 @@ use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    ExportConfig, ImportConfig, ImportResult, PreservedTombstone, auto_flush, compute_jsonl_hash,
-    export_to_jsonl_with_policy, finalize_export, get_tombstone_ids_from_jsonl, import_from_jsonl,
-    preflight_import, restore_tombstones, snapshot_tombstones,
-    tombstones_missing_from_jsonl_tombstones,
+    ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedTombstone, auto_flush,
+    compute_jsonl_hash, export_to_jsonl_with_policy, finalize_export, import_from_jsonl,
+    preflight_import, restore_tombstones_after_rebuild, scan_jsonl_for_tombstone_filter,
+    snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
 };
 use crate::util::id::{IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder};
 use chrono::Utc;
@@ -634,9 +634,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                             lock_timeout,
                             bootstrap_layer,
                         )?;
-                        if !preserved_tombstones.is_empty() {
-                            restore_tombstones(&mut storage, &preserved_tombstones)?;
-                        }
+                        restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
                         Ok((storage, true, None))
                     }
                     JsonlRecoveryStrategy::DeferToExplicitImport => {
@@ -686,9 +684,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                             lock_timeout,
                             bootstrap_layer,
                         )?;
-                        if !preserved_tombstones.is_empty() {
-                            restore_tombstones(&mut storage, &preserved_tombstones)?;
-                        }
+                        restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
                         Ok((storage, true, None))
                     }
                     JsonlRecoveryStrategy::DeferToExplicitImport => {
@@ -849,9 +845,9 @@ fn preserved_unflushed_tombstones(
     if snapshot.is_empty() {
         return snapshot;
     }
-    let jsonl_tombstone_ids = if jsonl_path.is_file() {
-        match get_tombstone_ids_from_jsonl(jsonl_path) {
-            Ok(ids) => ids,
+    let jsonl_filter = if jsonl_path.is_file() {
+        match scan_jsonl_for_tombstone_filter(jsonl_path) {
+            Ok(filter) => filter,
             Err(err) => {
                 // The rebuild itself will also parse the JSONL and
                 // re-surface any parse error (e.g. conflict markers) with
@@ -861,15 +857,15 @@ fn preserved_unflushed_tombstones(
                 // ultimately fails, the backup set has our back.
                 tracing::debug!(
                     error = %err,
-                    "Could not read JSONL tombstone IDs during startup auto-rebuild; preserving all snapshotted tombstones and letting the rebuild surface the JSONL error"
+                    "Could not scan JSONL for tombstone filter during startup auto-rebuild; preserving all snapshotted tombstones and letting the rebuild surface the JSONL error"
                 );
-                std::collections::HashSet::new()
+                JsonlTombstoneFilter::default()
             }
         }
     } else {
-        std::collections::HashSet::new()
+        JsonlTombstoneFilter::default()
     };
-    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_tombstone_ids)
+    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_filter)
 }
 
 pub(crate) fn repair_database_from_jsonl(

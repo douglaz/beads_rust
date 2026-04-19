@@ -4135,6 +4135,53 @@ pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Result<Vec<Preserv
     Ok(tombstones)
 }
 
+/// Restore preserved tombstones after a successful rebuild, wrapping any
+/// failure with a message that makes clear the rebuild itself succeeded —
+/// only the retention-state restoration step failed.
+///
+/// The rebuild has already moved the original database family into the
+/// recovery directory and replaced it with a clean JSONL import at this
+/// point, so on failure the live DB is *valid* (it mirrors the JSONL),
+/// just missing whatever local unflushed tombstones we tried to preserve.
+/// Without this wrapper, a transient lock-contention retry exhaustion
+/// inside `restore_tombstones` would bubble up through callers that
+/// otherwise describe the failure as "JSONL may be corrupt" or "database
+/// recovery failed", both of which are actively misleading for this
+/// specific post-rebuild failure mode. The wrapped message tells the
+/// operator: re-running the command is idempotent and safe; the only
+/// thing they've lost is local deletions that hadn't yet been flushed.
+///
+/// Callers should prefer this helper over calling `restore_tombstones`
+/// directly when the restore follows an already-completed rebuild. Use
+/// the bare `restore_tombstones` when the surrounding transaction is
+/// still mid-rebuild and a rollback is still possible.
+///
+/// # Errors
+///
+/// Returns a `BeadsError::WithContext` whose source is the original
+/// `restore_tombstones` error. Returns `Ok(())` when `tombstones` is
+/// empty without calling into the write-transaction retry loop.
+pub(crate) fn restore_tombstones_after_rebuild(
+    storage: &mut SqliteStorage,
+    tombstones: &[PreservedTombstone],
+) -> Result<()> {
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+    let count = tombstones.len();
+    restore_tombstones(storage, tombstones).map_err(|err| BeadsError::WithContext {
+        context: format!(
+            "Rebuild from JSONL succeeded, but failed to restore {count} preserved \
+             tombstone(s). The database now mirrors the JSONL exactly — any local \
+             deletions that had not yet been flushed to the JSONL are gone. \
+             Re-running the command is idempotent and safe (the rebuild itself \
+             completed successfully). If the underlying cause is lock contention, \
+             wait for other `br` processes to finish and try again."
+        ),
+        source: Box::new(err),
+    })
+}
+
 /// Restore preserved tombstones (and their relations) atomically and mark
 /// them dirty so the next flush re-exports them.
 ///
@@ -4177,46 +4224,105 @@ pub(crate) fn restore_tombstones(
     Ok(())
 }
 
-/// Drop any preserved tombstone whose ID is already present in the JSONL as
-/// a tombstone (i.e. the deletion has already been flushed). Remaining
-/// tombstones represent local unflushed deletions that need to be
-/// re-applied after the rebuild.
+/// Per-ID view of the JSONL used to decide which preserved tombstones
+/// should actually be restored after a rebuild. The rebuild imports
+/// everything in the JSONL first, so tombstone preservation only needs to
+/// fix up rows where the local DB and the JSONL disagree.
+///
+/// Two buckets:
+///
+/// - `tombstone_ids`: IDs whose JSONL record carries `status = tombstone`.
+///   The deletion has already been flushed, so the rebuild will reimport it
+///   as a tombstone on its own — we drop any local preserved tombstone for
+///   these IDs.
+///
+/// - `non_tombstone_updated_at`: IDs whose JSONL record carries a *non*-
+///   tombstone status, mapped to the record's `updated_at`. When the local
+///   DB has one of these IDs as a tombstone, there is a disagreement: the
+///   JSONL says the issue is alive, the DB says it's deleted. We resolve
+///   it by timestamp — whichever side's last write is newer wins.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JsonlTombstoneFilter {
+    pub(crate) tombstone_ids: HashSet<String>,
+    pub(crate) non_tombstone_updated_at:
+        std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+}
+
+/// Filter the preserved tombstone set down to those that should actually
+/// be restored after the rebuild has reimported the JSONL. Three cases:
+///
+/// 1. JSONL has this ID as a tombstone: drop from preservation set — the
+///    rebuild's own `import_from_jsonl` will reinstate the tombstone.
+///
+/// 2. JSONL has this ID as a non-tombstone: the user's local delete
+///    competes with the JSONL's live record. Keep the local tombstone
+///    only if `deleted_at > updated_at` (i.e. the local deletion actually
+///    happened after the state the JSONL captured). Otherwise the JSONL
+///    is newer and we let the rebuild's import win, same way a 3-way
+///    merge with `--merge` would resolve it. Missing `deleted_at` (which
+///    shouldn't happen for a well-formed tombstone) is treated
+///    conservatively as "local is newer": preserve the tombstone rather
+///    than silently lose a local deletion.
+///
+/// 3. JSONL doesn't have this ID at all: the deletion has never been
+///    flushed anywhere. Always preserve — otherwise this path would
+///    silently lose the local delete.
 #[must_use]
 pub(crate) fn tombstones_missing_from_jsonl_tombstones(
     tombstones: Vec<PreservedTombstone>,
-    jsonl_tombstone_ids: &HashSet<String>,
+    jsonl_filter: &JsonlTombstoneFilter,
 ) -> Vec<PreservedTombstone> {
     let original_count = tombstones.len();
+    let mut skipped_already_flushed = 0usize;
+    let mut skipped_jsonl_newer = 0usize;
     let preserved: Vec<PreservedTombstone> = tombstones
         .into_iter()
-        .filter(|tombstone| !jsonl_tombstone_ids.contains(&tombstone.issue.id))
+        .filter(|tombstone| {
+            let id = &tombstone.issue.id;
+            if jsonl_filter.tombstone_ids.contains(id) {
+                skipped_already_flushed += 1;
+                return false;
+            }
+            if let Some(jsonl_updated_at) = jsonl_filter.non_tombstone_updated_at.get(id) {
+                let local_deleted_at = tombstone.issue.deleted_at;
+                let local_is_newer =
+                    local_deleted_at.map_or(true, |deleted_at| deleted_at > *jsonl_updated_at);
+                if !local_is_newer {
+                    skipped_jsonl_newer += 1;
+                    return false;
+                }
+            }
+            true
+        })
         .collect();
 
-    let skipped = original_count.saturating_sub(preserved.len());
-    if skipped > 0 {
+    if skipped_already_flushed > 0 || skipped_jsonl_newer > 0 {
         tracing::debug!(
             preserved = preserved.len(),
-            skipped,
-            "Skipping tombstone preservation for IDs already present in JSONL"
+            skipped_already_flushed,
+            skipped_jsonl_newer,
+            original = original_count,
+            "Filtered preserved tombstones against JSONL state"
         );
     }
 
     preserved
 }
 
-/// Collect the set of IDs whose JSONL record carries `status = tombstone`.
+/// Scan the JSONL once and build a `JsonlTombstoneFilter` we can use to
+/// decide which preserved tombstones to restore after a rebuild.
 ///
 /// # Errors
 ///
 /// Returns an error if the JSONL cannot be read, contains invalid JSON, or
 /// has duplicate IDs across lines.
-pub(crate) fn get_tombstone_ids_from_jsonl(path: &Path) -> Result<HashSet<String>> {
+pub(crate) fn scan_jsonl_for_tombstone_filter(path: &Path) -> Result<JsonlTombstoneFilter> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut seen_ids = HashSet::new();
-    let mut tombstone_ids = HashSet::new();
+    let mut filter = JsonlTombstoneFilter::default();
 
     loop {
         line_buf.clear();
@@ -4244,11 +4350,15 @@ pub(crate) fn get_tombstone_ids_from_jsonl(path: &Path) -> Result<HashSet<String
         }
 
         if issue.status == crate::model::Status::Tombstone {
-            tombstone_ids.insert(issue.id);
+            filter.tombstone_ids.insert(issue.id);
+        } else {
+            filter
+                .non_tombstone_updated_at
+                .insert(issue.id, issue.updated_at);
         }
     }
 
-    Ok(tombstone_ids)
+    Ok(filter)
 }
 
 #[cfg(test)]

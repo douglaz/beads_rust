@@ -8,10 +8,10 @@ use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    PathValidation, PreservedTombstone, compute_staleness, get_tombstone_ids_from_jsonl,
-    restore_tombstones, scan_conflict_markers, snapshot_tombstones,
-    tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records, validate_no_git_path,
-    validate_sync_path, validate_sync_path_with_external,
+    JsonlTombstoneFilter, PathValidation, PreservedTombstone, compute_staleness,
+    restore_tombstones_after_rebuild, scan_conflict_markers, scan_jsonl_for_tombstone_filter,
+    snapshot_tombstones, tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
+    validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
 };
 use fsqlite::Connection;
 use fsqlite_error::FrankenError;
@@ -709,9 +709,7 @@ fn repair_database_from_jsonl(
         show_progress,
     )?;
 
-    if !preserved_tombstones.is_empty() {
-        restore_tombstones(&mut storage, &preserved_tombstones)?;
-    }
+    restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
 
     let fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
 
@@ -797,22 +795,22 @@ fn preserved_tombstones_for_doctor_rebuild(
     if snapshot.is_empty() {
         return snapshot;
     }
-    let jsonl_tombstone_ids = if jsonl_path.is_file() {
-        match get_tombstone_ids_from_jsonl(jsonl_path) {
-            Ok(ids) => ids,
+    let jsonl_filter = if jsonl_path.is_file() {
+        match scan_jsonl_for_tombstone_filter(jsonl_path) {
+            Ok(filter) => filter,
             Err(err) => {
                 tracing::debug!(
                     jsonl_path = %jsonl_path.display(),
                     error = %err,
-                    "Could not read JSONL tombstone IDs during doctor --repair; preserving every snapshotted tombstone and letting the rebuild surface the JSONL error"
+                    "Could not scan JSONL for tombstone filter during doctor --repair; preserving every snapshotted tombstone and letting the rebuild surface the JSONL error"
                 );
-                std::collections::HashSet::new()
+                JsonlTombstoneFilter::default()
             }
         }
     } else {
-        std::collections::HashSet::new()
+        JsonlTombstoneFilter::default()
     };
-    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_tombstone_ids)
+    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_filter)
 }
 
 fn repair_recoverable_db_state(

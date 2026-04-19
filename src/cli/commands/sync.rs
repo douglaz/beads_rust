@@ -13,9 +13,9 @@ use crate::sync::{
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
     METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, compute_staleness,
     count_issues_in_jsonl, export_temp_path, export_to_jsonl_with_policy, finalize_export,
-    get_issue_ids_from_jsonl, get_tombstone_ids_from_jsonl, import_from_jsonl, load_base_snapshot,
-    read_issues_from_jsonl, require_safe_sync_overwrite_path, restore_tombstones,
-    save_base_snapshot, snapshot_tombstones, three_way_merge,
+    get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
+    require_safe_sync_overwrite_path, restore_tombstones_after_rebuild, save_base_snapshot,
+    scan_jsonl_for_tombstone_filter, snapshot_tombstones, three_way_merge,
     tombstones_missing_from_jsonl_tombstones, validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
@@ -189,28 +189,29 @@ pub fn execute(
         // be silently lost. Grab them here, restore them after the
         // delegated rebuild completes.
         //
-        // `get_tombstone_ids_from_jsonl` parses the JSONL, and that parse
-        // fails with a generic "Invalid JSON at line 1" when the file
-        // contains merge-conflict markers. Scan for markers first so the
-        // operator gets the conflict-markers error class that
+        // `scan_jsonl_for_tombstone_filter` parses the JSONL, and that
+        // parse fails with a generic "Invalid JSON at line 1" when the
+        // file contains merge-conflict markers. Scan for markers first so
+        // the operator gets the conflict-markers error class that
         // `recover_database_from_jsonl`'s preflight would have surfaced
         // otherwise.
         crate::sync::ensure_no_conflict_markers(&open_result.paths.jsonl_path)?;
-        let jsonl_tombstone_ids = get_tombstone_ids_from_jsonl(&open_result.paths.jsonl_path)?;
+        let jsonl_filter = scan_jsonl_for_tombstone_filter(&open_result.paths.jsonl_path)?;
         let preserved_pre_delegation_tombstones = tombstones_missing_from_jsonl_tombstones(
             snapshot_tombstones(&open_result.storage)?,
-            &jsonl_tombstone_ids,
+            &jsonl_filter,
         );
         // `recover_database_from_jsonl` sets `auto_rebuilt = true` on success,
         // which is what gates the short-circuit inside `execute_import` below.
         open_result.recover_database_from_jsonl()?;
-        if !preserved_pre_delegation_tombstones.is_empty() {
-            restore_tombstones(
-                &mut open_result.storage,
-                &preserved_pre_delegation_tombstones,
-            )?;
+        let restore_count = preserved_pre_delegation_tombstones.len();
+        restore_tombstones_after_rebuild(
+            &mut open_result.storage,
+            &preserved_pre_delegation_tombstones,
+        )?;
+        if restore_count > 0 {
             debug!(
-                count = preserved_pre_delegation_tombstones.len(),
+                count = restore_count,
                 "Restored tombstones across delegated auto-recovery rebuild"
             );
         }
@@ -1303,8 +1304,8 @@ fn execute_import(
     } else {
         None
     };
-    let jsonl_tombstone_ids = if args.force || args.rebuild {
-        Some(get_tombstone_ids_from_jsonl(jsonl_path)?)
+    let jsonl_filter = if args.force || args.rebuild {
+        Some(scan_jsonl_for_tombstone_filter(jsonl_path)?)
     } else {
         None
     };
@@ -1312,9 +1313,9 @@ fn execute_import(
     let preserved_tombstones = if args.force || args.rebuild {
         tombstones_missing_from_jsonl_tombstones(
             snapshot_tombstones(storage)?,
-            jsonl_tombstone_ids
+            jsonl_filter
                 .as_ref()
-                .expect("force/rebuild imports should precompute JSONL tombstone IDs"),
+                .expect("force/rebuild imports should precompute JSONL tombstone filter"),
         )
     } else {
         Vec::new()
@@ -1419,8 +1420,8 @@ fn execute_import(
         );
     }
 
-    if (args.force || args.rebuild) && !preserved_tombstones.is_empty() {
-        restore_tombstones(storage, &preserved_tombstones)?;
+    if args.force || args.rebuild {
+        restore_tombstones_after_rebuild(storage, &preserved_tombstones)?;
     }
 
     // Post-rebuild VACUUM + REINDEX to eliminate B-tree/index corruption
@@ -1923,8 +1924,8 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use crate::sync::{
-        PreservedTombstone, get_tombstone_ids_from_jsonl, restore_tombstones, snapshot_tombstones,
-        tombstones_missing_from_jsonl_tombstones,
+        PreservedTombstone, restore_tombstones, scan_jsonl_for_tombstone_filter,
+        snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
     };
     use chrono::Utc;
     use std::collections::HashSet;
@@ -2140,10 +2141,12 @@ mod tests {
             comments: Some(Vec::new()),
         };
 
-        let filtered = tombstones_missing_from_jsonl_tombstones(
-            vec![in_jsonl, missing.clone()],
-            &HashSet::from(["bd-in-jsonl".to_string()]),
-        );
+        let filter = crate::sync::JsonlTombstoneFilter {
+            tombstone_ids: HashSet::from(["bd-in-jsonl".to_string()]),
+            non_tombstone_updated_at: std::collections::HashMap::new(),
+        };
+        let filtered =
+            tombstones_missing_from_jsonl_tombstones(vec![in_jsonl, missing.clone()], &filter);
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].issue.id, "bd-missing");
@@ -2153,7 +2156,58 @@ mod tests {
     }
 
     #[test]
-    fn test_get_tombstone_ids_from_jsonl_rejects_duplicate_issue_ids() {
+    fn test_tombstones_missing_from_jsonl_tombstones_respects_timestamps() {
+        // Regression: when the JSONL has an ID as a *non*-tombstone, the
+        // preserved tombstone should only overwrite the imported open row
+        // if the local deletion is actually newer than the JSONL state.
+        // Otherwise a stale local delete would silently clobber a pulled
+        // update from another contributor.
+        use crate::model::Status;
+        use chrono::{Duration, Utc};
+
+        let jsonl_updated_at = Utc::now();
+        let mut old_local_tombstone = make_test_issue("bd-contested-older", "older local delete");
+        old_local_tombstone.status = Status::Tombstone;
+        old_local_tombstone.deleted_at = Some(jsonl_updated_at - Duration::hours(1));
+        let old_local_preserved = PreservedTombstone {
+            issue: old_local_tombstone,
+            labels: None,
+            dependencies: None,
+            comments: None,
+        };
+
+        let mut new_local_tombstone = make_test_issue("bd-contested-newer", "newer local delete");
+        new_local_tombstone.status = Status::Tombstone;
+        new_local_tombstone.deleted_at = Some(jsonl_updated_at + Duration::hours(1));
+        let new_local_preserved = PreservedTombstone {
+            issue: new_local_tombstone,
+            labels: None,
+            dependencies: None,
+            comments: None,
+        };
+
+        let mut non_tombstone_map = std::collections::HashMap::new();
+        non_tombstone_map.insert("bd-contested-older".to_string(), jsonl_updated_at);
+        non_tombstone_map.insert("bd-contested-newer".to_string(), jsonl_updated_at);
+
+        let filter = crate::sync::JsonlTombstoneFilter {
+            tombstone_ids: HashSet::new(),
+            non_tombstone_updated_at: non_tombstone_map,
+        };
+
+        let filtered = tombstones_missing_from_jsonl_tombstones(
+            vec![old_local_preserved, new_local_preserved],
+            &filter,
+        );
+
+        // Only the newer local tombstone survives: the older one lost to
+        // the JSONL's non-tombstone state (import wins).
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].issue.id, "bd-contested-newer");
+    }
+
+    #[test]
+    fn test_scan_jsonl_for_tombstone_filter_rejects_duplicate_issue_ids() {
         let temp_dir = tempfile::tempdir().unwrap();
         let jsonl_path = temp_dir.path().join("duplicate-tombstones.jsonl");
         let mut first = make_test_issue("bd-dup", "first");
@@ -2166,7 +2220,7 @@ mod tests {
         );
         std::fs::write(&jsonl_path, content).unwrap();
 
-        let err = get_tombstone_ids_from_jsonl(&jsonl_path).unwrap_err();
+        let err = scan_jsonl_for_tombstone_filter(&jsonl_path).unwrap_err();
         match err {
             BeadsError::Config(message) => {
                 assert!(

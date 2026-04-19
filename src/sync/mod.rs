@@ -600,6 +600,7 @@ pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueVali
     let file = File::open(path)?;
     let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut summary = JsonlIssueValidationSummary::default();
+    let mut seen_ids = HashSet::new();
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = line_result?;
@@ -612,6 +613,13 @@ pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueVali
         match serde_json::from_str::<Issue>(trimmed) {
             Ok(mut issue) => {
                 normalize_issue(&mut issue);
+                if !seen_ids.insert(issue.id.clone()) {
+                    summary.push_failure(
+                        line_num + 1,
+                        format!("Duplicate issue id '{}'", issue.id),
+                    );
+                    continue;
+                }
                 if let Err(errors) = IssueValidator::validate(&issue) {
                     summary.push_failure(
                         line_num + 1,
@@ -1297,7 +1305,14 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
         let partial: PartialId = serde_json::from_str(trimmed)
             .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
 
-        ids.insert(partial.id);
+        if !ids.insert(partial.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                partial.id,
+                path.display(),
+                line_num
+            )));
+        }
         count += 1;
     }
 
@@ -2753,6 +2768,7 @@ pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
     let estimated_count = (file_size / 500) as usize;
     let mut reader = BufReader::new(file);
     let mut issues = Vec::with_capacity(estimated_count);
+    let mut seen_ids = HashSet::with_capacity(estimated_count);
     let mut line = String::new();
     let mut line_num = 0;
 
@@ -2772,6 +2788,14 @@ pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
         let issue: Issue = serde_json::from_str(trimmed).map_err(|e| {
             BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
         })?;
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue.id,
+                path.display(),
+                line_num + 1
+            )));
+        }
         issues.push(issue);
         line_num += 1;
     }
@@ -3057,7 +3081,7 @@ pub fn import_from_jsonl(
     let estimated_count = (file_size / 500) as usize;
     let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut issues = Vec::with_capacity(estimated_count);
-    let mut id_to_index = std::collections::HashMap::with_capacity(estimated_count);
+    let mut seen_ids = HashSet::with_capacity(estimated_count);
     let mut mismatches = Vec::new();
 
     let mut line = String::new();
@@ -3103,18 +3127,16 @@ pub fn import_from_jsonl(
             mismatches.push(issue.id.clone());
         }
 
-        // 4. Deduplicate
-        if let Some(&index) = id_to_index.get(&issue.id) {
-            tracing::warn!(
-                line = line_num,
-                id = %issue.id,
-                "Duplicate issue ID in JSONL; using the last occurrence"
-            );
-            issues[index] = issue;
-        } else {
-            id_to_index.insert(issue.id.clone(), issues.len());
-            issues.push(issue);
+        // 4. Reject duplicate IDs instead of silently collapsing records.
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue.id,
+                input_path.display(),
+                line_num
+            )));
         }
+        issues.push(issue);
 
         line.clear();
     }
@@ -4455,6 +4477,32 @@ mod tests {
     }
 
     #[test]
+    fn test_analyze_jsonl_rejects_duplicate_issue_ids() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("duplicate-ids.jsonl");
+
+        let issue1 = make_test_issue("bd-dup", "Original");
+        let issue2 = make_test_issue("bd-dup", "Duplicate");
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&issue1).unwrap(),
+            serde_json::to_string(&issue2).unwrap()
+        );
+        fs::write(&path, content).unwrap();
+
+        let err = analyze_jsonl(&path).unwrap_err();
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains("Duplicate issue id 'bd-dup'"),
+                    "unexpected duplicate-id error: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_export_excludes_ephemerals() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -5552,6 +5600,27 @@ mod tests {
     }
 
     #[test]
+    fn test_import_duplicate_issue_ids_error() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let issue1 = make_issue_at("bd-001", "Issue 1", fixed_time(100));
+        let issue2 = make_issue_at("bd-001", "Issue 2", fixed_time(120));
+
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&issue1).unwrap(),
+            serde_json::to_string(&issue2).unwrap()
+        );
+        fs::write(&path, content).unwrap();
+
+        let err =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap_err();
+        assert!(err.to_string().contains("Duplicate issue id 'bd-001'"));
+    }
+
+    #[test]
     fn test_import_duplicate_external_ref_clears_and_inserts() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -6035,9 +6104,12 @@ mod tests {
         let jsonl_path = beads_dir.join("issues.jsonl");
 
         // Write JSONL with invalid lines
-        let issue = make_test_issue("bd-001", "Good issue");
-        let good_json = serde_json::to_string(&issue).unwrap();
-        let content = format!("{good_json}\nNOT VALID JSON\n{good_json}\n{{\"broken: true}}\n");
+        let issue1 = make_test_issue("bd-001", "Good issue");
+        let issue2 = make_test_issue("bd-002", "Another good issue");
+        let good_json_1 = serde_json::to_string(&issue1).unwrap();
+        let good_json_2 = serde_json::to_string(&issue2).unwrap();
+        let content =
+            format!("{good_json_1}\nNOT VALID JSON\n{good_json_2}\n{{\"broken: true}}\n");
         std::fs::write(&jsonl_path, content).unwrap();
 
         let config = ImportConfig {
@@ -6084,6 +6156,59 @@ mod tests {
         let json_check = result.checks.iter().find(|c| c.name == "json_valid");
         assert!(json_check.is_some());
         assert_eq!(json_check.unwrap().status, PreflightCheckStatus::Pass);
+    }
+
+    #[test]
+    fn test_validate_jsonl_issue_records_rejects_duplicate_issue_ids() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+
+        let issue = make_test_issue("bd-dup", "Duplicate");
+        let issue_json = serde_json::to_string(&issue).unwrap();
+        std::fs::write(&jsonl_path, format!("{issue_json}\n{issue_json}\n")).unwrap();
+
+        let summary = validate_jsonl_issue_records(&jsonl_path).unwrap();
+
+        assert_eq!(summary.record_count, 2);
+        assert_eq!(summary.invalid_count, 1);
+        let preview = summary.preview_messages();
+        assert!(
+            preview
+                .iter()
+                .any(|message| message.contains("line 2: Duplicate issue id 'bd-dup'")),
+            "expected duplicate-id validation failure in preview, got {preview:?}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_import_rejects_duplicate_issue_ids_during_validation() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let issue = make_test_issue("bd-dup", "Duplicate");
+        let issue_json = serde_json::to_string(&issue).unwrap();
+        std::fs::write(&jsonl_path, format!("{issue_json}\n{issue_json}\n")).unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            ..Default::default()
+        };
+
+        let result = preflight_import(&jsonl_path, &config, None).unwrap();
+
+        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
+        let failures = result.failures();
+        let json_check = failures
+            .iter()
+            .find(|c| c.name == "json_valid")
+            .expect("expected json_valid failure");
+        assert!(
+            json_check.message.contains("Duplicate issue id 'bd-dup'"),
+            "expected duplicate-id validation message, got {}",
+            json_check.message
+        );
     }
 
     #[test]

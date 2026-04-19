@@ -17,7 +17,7 @@ pub use path::{
 };
 
 use crate::error::{BeadsError, Result};
-use crate::model::Issue;
+use crate::model::{Comment, Dependency, Issue};
 use crate::storage::SqliteStorage;
 use crate::sync::history::HistoryConfig;
 use crate::util::id::parse_id;
@@ -4034,6 +4034,221 @@ pub fn load_base_snapshot(jsonl_dir: &Path) -> Result<std::collections::HashMap<
     }
 
     Ok(base)
+}
+
+/// A tombstone row plus its related labels, dependencies, and comments,
+/// snapshotted before a rebuild so it can be atomically restored afterwards.
+///
+/// The option wrappers on the relations let callers partially preserve a
+/// tombstone whose relation fetches failed (a pattern the CLI layer already
+/// uses): we keep the issue row and skip whatever relation set couldn't be
+/// read, rather than losing the tombstone entirely.
+#[derive(Clone, Debug)]
+pub(crate) struct PreservedTombstone {
+    pub(crate) issue: Issue,
+    pub(crate) labels: Option<Vec<String>>,
+    pub(crate) dependencies: Option<Vec<Dependency>>,
+    pub(crate) comments: Option<Vec<Comment>>,
+}
+
+/// Snapshot every tombstoned issue in the database, including its labels,
+/// dependencies, and comments, so a rebuild can restore deletion-retention
+/// state that is not present in the JSONL export.
+///
+/// This is best-effort: if the enumeration query fails outright we log and
+/// return an empty list (the rebuild still proceeds without tombstone
+/// preservation). Per-tombstone relation fetches also degrade gracefully to
+/// issue-row-only preservation.
+///
+/// # Errors
+///
+/// Does not currently return errors; the signature keeps `Result` for
+/// forward compatibility with future non-best-effort modes.
+pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Result<Vec<PreservedTombstone>> {
+    let mut tombstones = Vec::new();
+    let tombstone_ids = match storage.get_issue_ids_by_status(crate::model::Status::Tombstone) {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Failed to enumerate tombstones before rebuild; continuing without tombstone preservation"
+            );
+            return Ok(tombstones);
+        }
+    };
+
+    for tombstone_id in tombstone_ids {
+        let Some(issue) = (match storage.get_issue(&tombstone_id) {
+            Ok(issue) => issue,
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Skipping tombstone preservation for issue that could not be read before rebuild"
+                );
+                continue;
+            }
+        }) else {
+            continue;
+        };
+
+        let labels = match storage.get_labels(&tombstone_id) {
+            Ok(labels) => Some(labels),
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Failed to snapshot tombstone labels before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        let dependencies = match storage.get_dependencies_full(&tombstone_id) {
+            Ok(dependencies) => Some(dependencies),
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Failed to snapshot tombstone dependencies before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        let comments = match storage.get_comments(&tombstone_id) {
+            Ok(comments) => Some(comments),
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Failed to snapshot tombstone comments before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        tombstones.push(PreservedTombstone {
+            issue,
+            labels,
+            dependencies,
+            comments,
+        });
+    }
+    Ok(tombstones)
+}
+
+/// Restore preserved tombstones (and their relations) atomically and mark
+/// them dirty so the next flush re-exports them.
+///
+/// # Errors
+///
+/// Returns an error if the underlying write transaction fails; the entire
+/// restore is rolled back on failure.
+pub(crate) fn restore_tombstones(
+    storage: &mut SqliteStorage,
+    tombstones: &[PreservedTombstone],
+) -> Result<()> {
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+
+    let marked_at = Utc::now().to_rfc3339();
+    storage.with_write_transaction(|storage| {
+        for tombstone in tombstones {
+            storage.upsert_issue_for_import(&tombstone.issue)?;
+        }
+        for tombstone in tombstones {
+            if let Some(labels) = &tombstone.labels {
+                storage.sync_labels_for_import(&tombstone.issue.id, labels)?;
+            }
+            if let Some(dependencies) = &tombstone.dependencies {
+                storage.sync_dependencies_for_import(&tombstone.issue.id, dependencies)?;
+            }
+            if let Some(comments) = &tombstone.comments {
+                storage.sync_comments_for_import(&tombstone.issue.id, comments)?;
+            }
+            storage.replace_dirty_issue_marker(&tombstone.issue.id, &marked_at)?;
+        }
+        Ok(())
+    })?;
+
+    tracing::debug!(
+        count = tombstones.len(),
+        "Restored tombstones atomically after rebuild and marked them dirty for export"
+    );
+    Ok(())
+}
+
+/// Drop any preserved tombstone whose ID is already present in the JSONL as
+/// a tombstone (i.e. the deletion has already been flushed). Remaining
+/// tombstones represent local unflushed deletions that need to be
+/// re-applied after the rebuild.
+#[must_use]
+pub(crate) fn tombstones_missing_from_jsonl_tombstones(
+    tombstones: Vec<PreservedTombstone>,
+    jsonl_tombstone_ids: &HashSet<String>,
+) -> Vec<PreservedTombstone> {
+    let original_count = tombstones.len();
+    let preserved: Vec<PreservedTombstone> = tombstones
+        .into_iter()
+        .filter(|tombstone| !jsonl_tombstone_ids.contains(&tombstone.issue.id))
+        .collect();
+
+    let skipped = original_count.saturating_sub(preserved.len());
+    if skipped > 0 {
+        tracing::debug!(
+            preserved = preserved.len(),
+            skipped,
+            "Skipping tombstone preservation for IDs already present in JSONL"
+        );
+    }
+
+    preserved
+}
+
+/// Collect the set of IDs whose JSONL record carries `status = tombstone`.
+///
+/// # Errors
+///
+/// Returns an error if the JSONL cannot be read, contains invalid JSON, or
+/// has duplicate IDs across lines.
+pub(crate) fn get_tombstone_ids_from_jsonl(path: &Path) -> Result<HashSet<String>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+    let mut seen_ids = HashSet::new();
+    let mut tombstone_ids = HashSet::new();
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
+
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue.id,
+                path.display(),
+                line_num
+            )));
+        }
+
+        if issue.status == crate::model::Status::Tombstone {
+            tombstone_ids.insert(issue.id);
+        }
+    }
+
+    Ok(tombstone_ids)
 }
 
 #[cfg(test)]

@@ -15,8 +15,10 @@ use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    ExportConfig, ImportConfig, ImportResult, auto_flush, compute_jsonl_hash,
-    export_to_jsonl_with_policy, finalize_export, import_from_jsonl, preflight_import,
+    ExportConfig, ImportConfig, ImportResult, PreservedTombstone, auto_flush, compute_jsonl_hash,
+    export_to_jsonl_with_policy, finalize_export, get_tombstone_ids_from_jsonl, import_from_jsonl,
+    preflight_import, restore_tombstones, snapshot_tombstones,
+    tombstones_missing_from_jsonl_tombstones,
 };
 use crate::util::id::{IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder};
 use chrono::Utc;
@@ -605,7 +607,6 @@ fn open_sqlite_storage_with_recovery_strategy(
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
             Ok(None) => Ok((storage, false, None)),
             Ok(Some(anomaly)) => {
-                drop(storage);
                 match recovery_strategy {
                     JsonlRecoveryStrategy::RebuildFromJsonl => {
                         warn!(
@@ -614,12 +615,30 @@ fn open_sqlite_storage_with_recovery_strategy(
                             anomaly = %anomaly,
                             "Detected recoverable database anomaly after open; rebuilding from JSONL"
                         );
-                        let storage = rebuild_database_from_jsonl(
+                        // Snapshot tombstones from the anomalous (but still
+                        // queryable) storage BEFORE we drop it. The anomaly
+                        // detector only flags duplicates on
+                        // `blocked_issues_cache` / its index and on
+                        // `config`/`metadata` kv duplicates — none of which
+                        // break a plain `SELECT … FROM issues`. Without this
+                        // snapshot, any unflushed local tombstones that
+                        // haven't landed in JSONL would be silently dropped by
+                        // the rebuild (which only imports what's in JSONL),
+                        // taking their deletion-retention state with them.
+                        let preserved_tombstones = preserved_unflushed_tombstones(
+                            &storage,
+                            &paths.jsonl_path,
+                        );
+                        drop(storage);
+                        let mut storage = rebuild_database_from_jsonl(
                             beads_dir,
                             paths,
                             lock_timeout,
                             bootstrap_layer,
                         )?;
+                        if !preserved_tombstones.is_empty() {
+                            restore_tombstones(&mut storage, &preserved_tombstones)?;
+                        }
                         Ok((storage, true, None))
                     }
                     JsonlRecoveryStrategy::DeferToExplicitImport => {
@@ -629,13 +648,13 @@ fn open_sqlite_storage_with_recovery_strategy(
                             anomaly = %anomaly,
                             "Detected recoverable database anomaly after open; deferring JSONL recovery to explicit import semantics"
                         );
+                        drop(storage);
                         let (storage, backup_set) = prepare_fresh_storage()?;
                         Ok((storage, false, Some(backup_set)))
                     }
                 }
             }
             Err(probe_err) => {
-                drop(storage);
                 if !should_attempt_jsonl_recovery_after_open(
                     &probe_err,
                     &paths.db_path,
@@ -652,12 +671,28 @@ fn open_sqlite_storage_with_recovery_strategy(
                             probe_error = %probe_err,
                             "Post-open database probe failed; rebuilding from JSONL"
                         );
-                        let storage = rebuild_database_from_jsonl(
+                        // Best-effort tombstone snapshot. If the probe failed
+                        // the storage may be in a strange state, but
+                        // `snapshot_tombstones` itself is fault-tolerant
+                        // (warn+empty on enumeration failure, warn+partial on
+                        // per-tombstone failure), so we try anyway: the worst
+                        // case is the same as the old behavior (no
+                        // preservation), the best case is we rescue the
+                        // unflushed tombstones the old code lost silently.
+                        let preserved_tombstones = preserved_unflushed_tombstones(
+                            &storage,
+                            &paths.jsonl_path,
+                        );
+                        drop(storage);
+                        let mut storage = rebuild_database_from_jsonl(
                             beads_dir,
                             paths,
                             lock_timeout,
                             bootstrap_layer,
                         )?;
+                        if !preserved_tombstones.is_empty() {
+                            restore_tombstones(&mut storage, &preserved_tombstones)?;
+                        }
                         Ok((storage, true, None))
                     }
                     JsonlRecoveryStrategy::DeferToExplicitImport => {
@@ -667,6 +702,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                             probe_error = %probe_err,
                             "Post-open database probe failed; deferring JSONL recovery to explicit import semantics"
                         );
+                        drop(storage);
                         let (storage, backup_set) = prepare_fresh_storage()?;
                         Ok((storage, false, Some(backup_set)))
                     }
@@ -789,6 +825,55 @@ fn rebuild_database_from_jsonl(
         false,
     )
     .map(|(storage, _)| storage)
+}
+
+/// Snapshot local tombstones that have not yet been flushed to JSONL.
+///
+/// Returns an empty vector and logs a debug/warn entry on any failure —
+/// this is a preservation path, not a correctness invariant, so we always
+/// prefer to proceed with the rebuild rather than fail the whole command
+/// because we couldn't read a tombstone or couldn't read the JSONL. The
+/// returned vector is filtered so only tombstones that are *not* already
+/// flushed to JSONL as tombstones survive (the already-flushed ones will
+/// come back via the rebuild's own `import_from_jsonl`).
+fn preserved_unflushed_tombstones(
+    storage: &SqliteStorage,
+    jsonl_path: &Path,
+) -> Vec<PreservedTombstone> {
+    let snapshot = match snapshot_tombstones(storage) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Failed to snapshot tombstones before startup auto-rebuild; proceeding without preservation"
+            );
+            return Vec::new();
+        }
+    };
+    if snapshot.is_empty() {
+        return snapshot;
+    }
+    let jsonl_tombstone_ids = if jsonl_path.is_file() {
+        match get_tombstone_ids_from_jsonl(jsonl_path) {
+            Ok(ids) => ids,
+            Err(err) => {
+                // The rebuild itself will also parse the JSONL and
+                // re-surface any parse error (e.g. conflict markers) with
+                // a proper diagnostic. For the purposes of tombstone
+                // preservation, fall back to treating the JSONL as empty
+                // so every snapshotted tombstone is kept; if the rebuild
+                // ultimately fails, the backup set has our back.
+                tracing::debug!(
+                    error = %err,
+                    "Could not read JSONL tombstone IDs during startup auto-rebuild; preserving all snapshotted tombstones and letting the rebuild surface the JSONL error"
+                );
+                std::collections::HashSet::new()
+            }
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_tombstone_ids)
 }
 
 pub(crate) fn repair_database_from_jsonl(
@@ -1537,6 +1622,23 @@ pub(crate) fn open_storage_with_startup_config(
         let prefix = resolve_bootstrap_issue_prefix(&merged_layer, &beads_dir, &paths.jsonl_path)?;
         storage.set_config("issue_prefix", &prefix)?;
 
+        // Capture the JSONL content hash BEFORE the import so later
+        // `flush_no_db_if_dirty` can detect that the file we imported from
+        // has changed on disk — e.g. a non-`br` writer (like `git pull`)
+        // that does not respect `.write.lock` has rewritten the JSONL
+        // between our import and our flush. If we instead hashed AFTER
+        // import, a concurrent mid-import modification would leave
+        // `loaded_jsonl_hash` equal to the (already-modified) on-disk file
+        // while `storage` only contains the pre-modification content, and
+        // the staleness check at flush time would silently wave the flush
+        // through, overwriting the modified file with stale in-memory
+        // content. Hashing first means any concurrent write causes the
+        // staleness check to surface a `SyncConflict` instead of data loss.
+        let loaded_jsonl_hash = if paths.jsonl_path.is_file() {
+            Some(compute_jsonl_hash(&paths.jsonl_path)?)
+        } else {
+            None
+        };
         if paths.jsonl_path.is_file() {
             let mut import_config =
                 import_config_for_resolved_jsonl(&beads_dir, &paths.db_path, &paths.jsonl_path);
@@ -1548,11 +1650,6 @@ pub(crate) fn open_storage_with_startup_config(
                 Some(&prefix),
             )?;
         }
-        let loaded_jsonl_hash = if paths.jsonl_path.is_file() {
-            Some(compute_jsonl_hash(&paths.jsonl_path)?)
-        } else {
-            None
-        };
 
         Ok(OpenStorageResult {
             storage,

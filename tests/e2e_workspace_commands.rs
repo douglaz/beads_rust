@@ -511,6 +511,104 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
 }
 
 #[test]
+fn e2e_startup_auto_recovery_preserves_unflushed_tombstones() {
+    // Regression: when the DB opens successfully but
+    // `detect_recoverable_open_anomaly` flags duplicate config/metadata/
+    // schema rows, the startup recovery path inside
+    // `open_sqlite_storage_with_recovery_strategy` used to
+    // `drop(storage)` + `rebuild_database_from_jsonl(...)` unconditionally.
+    // Any local tombstone the user had deleted but not yet flushed to
+    // JSONL was silently wiped by the rebuild, because the JSONL still
+    // showed the issue as open and the rebuild only imports what's in the
+    // JSONL. The fix snapshots tombstones from the anomalous-but-queryable
+    // storage before dropping it and restores them after the rebuild, the
+    // same way the explicit `br sync --rebuild` delegation path does.
+    let _log = common::test_log("e2e_startup_auto_recovery_preserves_unflushed_tombstones");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let keep = run_br(&workspace, ["create", "Keep me"], "create_keep");
+    assert!(keep.status.success(), "create keep failed: {}", keep.stderr);
+
+    let delete = run_br(&workspace, ["create", "Delete me"], "create_delete");
+    assert!(
+        delete.status.success(),
+        "create delete failed: {}",
+        delete.stderr
+    );
+    let delete_id = delete
+        .stdout
+        .lines()
+        .next()
+        .and_then(|line| {
+            line.strip_prefix("✓ ")
+                .unwrap_or(line)
+                .strip_prefix("Created ")
+                .and_then(|rest| rest.split(':').next())
+        })
+        .expect("parse delete id")
+        .trim()
+        .to_string();
+
+    // Flush so the JSONL shows both issues as open.
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    // Delete one issue without flushing: tombstone lives only in the DB.
+    let delete_cmd = run_br(
+        &workspace,
+        ["delete", &delete_id, "--force", "--no-auto-flush"],
+        "delete_no_flush",
+    );
+    assert!(
+        delete_cmd.status.success(),
+        "delete failed: {}",
+        delete_cmd.stderr
+    );
+
+    // Inject duplicate config rows directly into the DB so the next open
+    // trips `detect_recoverable_open_anomaly`, firing the startup rebuild
+    // path. Scope the connection in its own block so it is closed before
+    // the next `br` invocation tries to reopen the DB.
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("open beads db for anomaly injection");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+            .expect("insert duplicate config row a");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+            .expect("insert duplicate config row b");
+    }
+
+    // Any read command that opens storage will now trip startup
+    // auto-recovery. Use `br show` on the tombstoned ID so the assertion
+    // below tests the exact question we care about.
+    let show = run_br(&workspace, ["show", &delete_id, "--json"], "show_after_rebuild");
+    assert!(
+        show.status.success(),
+        "show after startup auto-rebuild failed: stderr={}",
+        show.stderr
+    );
+    let payload = extract_json_payload(&show.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse show json");
+    let record = if json.is_array() {
+        json.as_array().and_then(|a| a.first()).cloned()
+    } else {
+        Some(json.clone())
+    }
+    .expect("show should return at least one record");
+    assert_eq!(
+        record["status"].as_str(),
+        Some("tombstone"),
+        "the local unflushed tombstone must survive startup auto-recovery from a recoverable anomaly, \
+         but was found as `{:?}`",
+        record["status"]
+    );
+}
+
+#[test]
 fn e2e_doctor_repair_json_rebuilds_when_db_is_missing() {
     let _log = common::test_log("e2e_doctor_repair_json_rebuilds_when_db_is_missing");
     let workspace = BrWorkspace::new();

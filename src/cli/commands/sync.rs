@@ -6,7 +6,6 @@
 use crate::cli::SyncArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::{Comment, Dependency, Issue};
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::{
@@ -14,12 +13,12 @@ use crate::sync::{
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
     METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, compute_staleness,
     count_issues_in_jsonl, export_temp_path, export_to_jsonl_with_policy, finalize_export,
-    get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
-    require_safe_sync_overwrite_path, save_base_snapshot, three_way_merge,
-    validate_sync_path_with_external,
+    get_issue_ids_from_jsonl, get_tombstone_ids_from_jsonl, import_from_jsonl, load_base_snapshot,
+    read_issues_from_jsonl, require_safe_sync_overwrite_path, restore_tombstones,
+    save_base_snapshot, snapshot_tombstones, three_way_merge,
+    tombstones_missing_from_jsonl_tombstones, validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
-use chrono::Utc;
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1511,184 +1510,6 @@ fn execute_import(
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct PreservedTombstone {
-    issue: Issue,
-    labels: Option<Vec<String>>,
-    dependencies: Option<Vec<Dependency>>,
-    comments: Option<Vec<Comment>>,
-}
-
-fn snapshot_tombstones(storage: &crate::storage::SqliteStorage) -> Result<Vec<PreservedTombstone>> {
-    let mut tombstones = Vec::new();
-    let tombstone_ids = match storage.get_issue_ids_by_status(crate::model::Status::Tombstone) {
-        Ok(ids) => ids,
-        Err(error) => {
-            warn!(
-                error = %error,
-                "Failed to enumerate tombstones before rebuild; continuing without tombstone preservation"
-            );
-            return Ok(tombstones);
-        }
-    };
-
-    for tombstone_id in tombstone_ids {
-        let Some(issue) = (match storage.get_issue(&tombstone_id) {
-            Ok(issue) => issue,
-            Err(error) => {
-                warn!(
-                    issue_id = %tombstone_id,
-                    error = %error,
-                    "Skipping tombstone preservation for issue that could not be read before rebuild"
-                );
-                continue;
-            }
-        }) else {
-            continue;
-        };
-
-        let labels = match storage.get_labels(&tombstone_id) {
-            Ok(labels) => Some(labels),
-            Err(error) => {
-                warn!(
-                    issue_id = %tombstone_id,
-                    error = %error,
-                    "Failed to snapshot tombstone labels before rebuild; preserving issue row only"
-                );
-                None
-            }
-        };
-        let dependencies = match storage.get_dependencies_full(&tombstone_id) {
-            Ok(dependencies) => Some(dependencies),
-            Err(error) => {
-                warn!(
-                    issue_id = %tombstone_id,
-                    error = %error,
-                    "Failed to snapshot tombstone dependencies before rebuild; preserving issue row only"
-                );
-                None
-            }
-        };
-        let comments = match storage.get_comments(&tombstone_id) {
-            Ok(comments) => Some(comments),
-            Err(error) => {
-                warn!(
-                    issue_id = %tombstone_id,
-                    error = %error,
-                    "Failed to snapshot tombstone comments before rebuild; preserving issue row only"
-                );
-                None
-            }
-        };
-        tombstones.push(PreservedTombstone {
-            issue,
-            labels,
-            dependencies,
-            comments,
-        });
-    }
-    Ok(tombstones)
-}
-
-fn restore_tombstones(
-    storage: &mut crate::storage::SqliteStorage,
-    tombstones: &[PreservedTombstone],
-) -> Result<()> {
-    if tombstones.is_empty() {
-        return Ok(());
-    }
-
-    let marked_at = Utc::now().to_rfc3339();
-    storage.with_write_transaction(|storage| {
-        for tombstone in tombstones {
-            storage.upsert_issue_for_import(&tombstone.issue)?;
-        }
-        for tombstone in tombstones {
-            if let Some(labels) = &tombstone.labels {
-                storage.sync_labels_for_import(&tombstone.issue.id, labels)?;
-            }
-            if let Some(dependencies) = &tombstone.dependencies {
-                storage.sync_dependencies_for_import(&tombstone.issue.id, dependencies)?;
-            }
-            if let Some(comments) = &tombstone.comments {
-                storage.sync_comments_for_import(&tombstone.issue.id, comments)?;
-            }
-            storage.replace_dirty_issue_marker(&tombstone.issue.id, &marked_at)?;
-        }
-        Ok(())
-    })?;
-
-    if !tombstones.is_empty() {
-        debug!(
-            count = tombstones.len(),
-            "Restored tombstones atomically after rebuild and marked them dirty for export"
-        );
-    }
-    Ok(())
-}
-
-fn tombstones_missing_from_jsonl_tombstones(
-    tombstones: Vec<PreservedTombstone>,
-    jsonl_tombstone_ids: &HashSet<String>,
-) -> Vec<PreservedTombstone> {
-    let original_count = tombstones.len();
-    let preserved: Vec<PreservedTombstone> = tombstones
-        .into_iter()
-        .filter(|tombstone| !jsonl_tombstone_ids.contains(&tombstone.issue.id))
-        .collect();
-
-    let skipped = original_count.saturating_sub(preserved.len());
-    if skipped > 0 {
-        debug!(
-            preserved = preserved.len(),
-            skipped, "Skipping tombstone preservation for IDs already present in JSONL"
-        );
-    }
-
-    preserved
-}
-
-fn get_tombstone_ids_from_jsonl(path: &Path) -> Result<HashSet<String>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut line_buf = String::new();
-    let mut line_num = 0;
-    let mut seen_ids = HashSet::new();
-    let mut tombstone_ids = HashSet::new();
-
-    loop {
-        line_buf.clear();
-        let bytes = reader.read_line(&mut line_buf)?;
-        if bytes == 0 {
-            break;
-        }
-
-        line_num += 1;
-        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
-        if trimmed.trim().is_empty() {
-            continue;
-        }
-
-        let issue: Issue = serde_json::from_str(trimmed)
-            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
-
-        if !seen_ids.insert(issue.id.clone()) {
-            return Err(BeadsError::Config(format!(
-                "Duplicate issue id '{}' in {} at line {}",
-                issue.id,
-                path.display(),
-                line_num
-            )));
-        }
-
-        if issue.status == crate::model::Status::Tombstone {
-            tombstone_ids.insert(issue.id);
-        }
-    }
-
-    Ok(tombstone_ids)
-}
-
 /// Render import result with rich formatting.
 fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
     let _console = Console::default();
@@ -2092,11 +1913,13 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 #[cfg(test)]
 mod tests {
     use super::{
-        PreservedTombstone, auto_rebuild_semantic_conflict_field,
-        auto_rebuild_semantic_flag_conflict_reason, detect_prefix_from_jsonl,
-        get_tombstone_ids_from_jsonl, jsonl_contains_duplicate_external_refs,
-        jsonl_contains_prefix_mismatch, restore_tombstones, snapshot_tombstones,
-        tombstones_missing_from_jsonl_tombstones, validate_sync_paths,
+        auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
+        detect_prefix_from_jsonl, jsonl_contains_duplicate_external_refs,
+        jsonl_contains_prefix_mismatch, validate_sync_paths,
+    };
+    use crate::sync::{
+        PreservedTombstone, get_tombstone_ids_from_jsonl, restore_tombstones, snapshot_tombstones,
+        tombstones_missing_from_jsonl_tombstones,
     };
     use crate::cli::SyncArgs;
     use crate::config::CliOverrides;

@@ -2850,11 +2850,14 @@ mod tests {
         let jsonl_path = beads_dir.join("issues.jsonl");
         let mut storage = SqliteStorage::open(&db_path).unwrap();
         storage
-            .create_issue(&sample_issue("bd-test01", "Doctor count source"), "doctor-test")
+            .create_issue(
+                &sample_issue("bd-test01", "Doctor count source"),
+                "doctor-test",
+            )
             .unwrap();
 
-        let valid_json = serde_json::to_string(&sample_issue("bd-test01", "Doctor count source"))
-            .unwrap();
+        let valid_json =
+            serde_json::to_string(&sample_issue("bd-test01", "Doctor count source")).unwrap();
         fs::write(&jsonl_path, format!("{valid_json}\n{{bad json}}\n")).unwrap();
 
         let paths = config::ConfigPaths {

@@ -7175,11 +7175,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the marker cannot be updated.
-    pub(crate) fn replace_dirty_issue_marker(
-        &self,
-        issue_id: &str,
-        marked_at: &str,
-    ) -> Result<()> {
+    pub(crate) fn replace_dirty_issue_marker(&self, issue_id: &str, marked_at: &str) -> Result<()> {
         self.conn.execute_with_params(
             "DELETE FROM dirty_issues WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],

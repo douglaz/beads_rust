@@ -206,7 +206,10 @@ pub fn execute(
         // which is what gates the short-circuit inside `execute_import` below.
         open_result.recover_database_from_jsonl()?;
         if !preserved_pre_delegation_tombstones.is_empty() {
-            restore_tombstones(&mut open_result.storage, &preserved_pre_delegation_tombstones)?;
+            restore_tombstones(
+                &mut open_result.storage,
+                &preserved_pre_delegation_tombstones,
+            )?;
             debug!(
                 count = preserved_pre_delegation_tombstones.len(),
                 "Restored tombstones across delegated auto-recovery rebuild"
@@ -2256,7 +2259,12 @@ mod tests {
         );
         assert!(storage.get_issue("bd-delete").unwrap().is_none());
         assert!(storage.get_labels("bd-delete").unwrap().is_empty());
-        assert!(storage.get_dependencies_full("bd-delete").unwrap().is_empty());
+        assert!(
+            storage
+                .get_dependencies_full("bd-delete")
+                .unwrap()
+                .is_empty()
+        );
         assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
     }
 
@@ -2288,7 +2296,10 @@ mod tests {
         assert_eq!(dependencies[0].depends_on_id, "bd-second");
         let mut dirty_ids = storage.get_dirty_issue_ids().unwrap();
         dirty_ids.sort();
-        assert_eq!(dirty_ids, vec!["bd-first".to_string(), "bd-second".to_string()]);
+        assert_eq!(
+            dirty_ids,
+            vec!["bd-first".to_string(), "bd-second".to_string()]
+        );
     }
 
     #[test]

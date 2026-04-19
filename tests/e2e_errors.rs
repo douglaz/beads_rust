@@ -3114,3 +3114,58 @@ fn e2e_error_text_json_parity_validation() {
         "JSON error should have required fields"
     );
 }
+
+#[test]
+fn e2e_sync_merge_detects_conflict_markers_in_base_snapshot() {
+    // Regression: `execute_merge` loads `beads.base.jsonl` via
+    // `load_base_snapshot` *before* scanning the main JSONL for conflict
+    // markers. If the base snapshot itself contained unresolved
+    // `<<<<<<<` / `=======` / `>>>>>>>` regions (a rare but possible state
+    // when a user commits the base snapshot against the default gitignore
+    // and then hits a botched `git merge`), the merge would fail with a
+    // cryptic "Invalid JSON in base snapshot at line 1" instead of the
+    // helpful "merge conflict markers detected" diagnostic. The fix
+    // scans the base snapshot for markers before attempting to parse.
+    let _log = common::test_log("e2e_sync_merge_detects_conflict_markers_in_base_snapshot");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Seed"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    // First flush so the JSONL is valid and the main sync path won't
+    // short-circuit before the merge code runs.
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    // Build a base snapshot that contains merge-conflict markers as if a
+    // user committed `beads.base.jsonl` and then hit a botched `git merge`.
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let clean = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    let base_path = workspace.root.join(".beads").join("beads.base.jsonl");
+    let conflicted = format!("<<<<<<< HEAD\n{clean}=======\n{clean}>>>>>>> branch\n");
+    fs::write(&base_path, &conflicted).expect("write conflicted base snapshot");
+
+    // Merge must refuse with a conflict-markers diagnostic instead of a
+    // generic "Invalid JSON in base snapshot" parse error.
+    let merge = run_br(&workspace, ["sync", "--merge"], "sync_merge");
+    assert!(
+        !merge.status.success(),
+        "merge should fail when base snapshot contains conflict markers: stdout={} stderr={}",
+        merge.stdout,
+        merge.stderr
+    );
+    let lower = merge.stderr.to_lowercase();
+    assert!(
+        lower.contains("conflict") || lower.contains("marker"),
+        "merge error should mention conflict markers, got stderr: {}",
+        merge.stderr
+    );
+    assert!(
+        !lower.contains("invalid json in base snapshot"),
+        "merge error should surface the conflict-markers diagnostic rather than the generic JSON parse failure, got stderr: {}",
+        merge.stderr
+    );
+}

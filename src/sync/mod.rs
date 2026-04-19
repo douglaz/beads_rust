@@ -4004,6 +4004,17 @@ pub fn load_base_snapshot(jsonl_dir: &Path) -> Result<std::collections::HashMap<
     }
 
     require_valid_sync_path(&snapshot_path, jsonl_dir)?;
+
+    // `beads.base.jsonl` is normally .gitignore'd, but if a user's workspace
+    // has it committed (or committed by accident once), a botched `git merge`
+    // / `git pull` can leave `<<<<<<<` / `=======` / `>>>>>>>` markers in
+    // this file just like in `issues.jsonl`. The serde parse below would
+    // then fail with a generic "Invalid JSON in base snapshot at line N"
+    // that buries the actual problem. Run the conflict-marker scan first so
+    // the operator gets the same actionable "merge conflict markers
+    // detected" diagnostic that the JSONL path surfaces.
+    ensure_no_conflict_markers(&snapshot_path)?;
+
     let file = File::open(&snapshot_path)?;
     let reader = BufReader::new(file);
 

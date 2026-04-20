@@ -15,12 +15,12 @@ use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    ExportConfig, ImportConfig, ImportResult, auto_flush, compute_jsonl_hash,
-    export_to_jsonl_with_policy, finalize_export, import_from_jsonl, preflight_import,
+    ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedTombstone, auto_flush,
+    compute_jsonl_hash, export_to_jsonl_with_policy, finalize_export, import_from_jsonl,
+    preflight_import, restore_tombstones_after_rebuild, scan_jsonl_for_tombstone_filter,
+    snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
 };
-use crate::util::id::{
-    DEFAULT_ID_PREFIX, IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder,
-};
+use crate::util::id::{IdConfig, abbreviate_prefix, normalize_prefix, split_prefix_remainder};
 use chrono::Utc;
 use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
@@ -32,9 +32,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tempfile::tempdir;
 use tracing::warn;
-
-/// Maximum number of redirect hops to follow when resolving `.beads` routing.
-pub(crate) const MAX_REDIRECT_DEPTH: usize = 10;
 
 /// Check whether a directory name is a valid beads directory name.
 ///
@@ -165,40 +162,9 @@ impl ConfigPaths {
     ///
     /// Returns an error if metadata cannot be read.
     pub fn resolve(beads_dir: &Path, db_override: Option<&PathBuf>) -> Result<Self> {
-        Self::resolve_internal(beads_dir, db_override, true)
-    }
-
-    /// Resolve database + JSONL paths while ignoring any transient
-    /// `BEADS_JSONL` environment override.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if metadata cannot be read.
-    pub fn resolve_without_env_jsonl(
-        beads_dir: &Path,
-        db_override: Option<&PathBuf>,
-    ) -> Result<Self> {
-        Self::resolve_internal(beads_dir, db_override, false)
-    }
-
-    fn resolve_internal(
-        beads_dir: &Path,
-        db_override: Option<&PathBuf>,
-        include_env_jsonl: bool,
-    ) -> Result<Self> {
         let metadata = Metadata::load(beads_dir)?;
         let db_path = resolve_db_path(beads_dir, &metadata, db_override);
-        let env_jsonl_override = if include_env_jsonl {
-            current_env_jsonl_override()
-        } else {
-            None
-        };
-        let jsonl_path = resolve_jsonl_path(
-            beads_dir,
-            &metadata,
-            db_override,
-            env_jsonl_override.as_deref(),
-        );
+        let jsonl_path = resolve_jsonl_path(beads_dir, &metadata, db_override);
 
         Ok(Self {
             beads_dir: beads_dir.to_path_buf(),
@@ -264,7 +230,7 @@ fn discover_beads_dir_with_env(
     }
 
     let candidate = discover_beads_dir_candidate_with_env(start, None)?;
-    routing::follow_redirects(&candidate, MAX_REDIRECT_DEPTH)
+    routing::follow_redirects(&candidate, 10)
 }
 
 fn discover_beads_dir_candidate_with_env(
@@ -320,13 +286,6 @@ fn discover_beads_dir_candidate_with_env(
 /// - No beads directory found (when `--db` not provided)
 pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
     discover_beads_dir_with_cli_from(None, cli, None, None)
-}
-
-pub(crate) fn discover_beads_dir_with_cli_and_start(
-    start: Option<&Path>,
-    cli: &CliOverrides,
-) -> Result<PathBuf> {
-    discover_beads_dir_with_cli_from(start, cli, None, None)
 }
 
 /// Discover the active `.beads` directory, but allow "no workspace" when no
@@ -496,11 +455,9 @@ fn validate_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
 
 fn resolve_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
     let candidate = validate_explicit_beads_dir(path, source)?;
-    routing::follow_redirects(&candidate, MAX_REDIRECT_DEPTH).map_err(|err| {
-        BeadsError::WithContext {
-            context: format!("{source} is invalid"),
-            source: Box::new(err),
-        }
+    routing::follow_redirects(&candidate, 10).map_err(|err| BeadsError::WithContext {
+        context: format!("{source} is invalid"),
+        source: Box::new(err),
     })
 }
 
@@ -532,31 +489,79 @@ struct RecoveryBackupSet {
     files: Vec<(PathBuf, PathBuf)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonlRecoveryStrategy {
+    RebuildFromJsonl,
+    DeferToExplicitImport,
+}
+
 fn open_sqlite_storage_with_recovery(
     beads_dir: &Path,
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-) -> Result<SqliteStorage> {
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    open_sqlite_storage_with_recovery_strategy(
+        beads_dir,
+        paths,
+        lock_timeout,
+        bootstrap_layer,
+        JsonlRecoveryStrategy::RebuildFromJsonl,
+    )
+}
+
+fn open_sqlite_storage_with_deferred_jsonl_recovery(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    open_sqlite_storage_with_recovery_strategy(
+        beads_dir,
+        paths,
+        lock_timeout,
+        bootstrap_layer,
+        JsonlRecoveryStrategy::DeferToExplicitImport,
+    )
+}
+
+fn open_sqlite_storage_with_recovery_strategy(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     if !paths.db_path.is_file() && paths.jsonl_path.is_file() {
-        return rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer);
+        return open_when_db_file_is_missing(
+            beads_dir,
+            paths,
+            lock_timeout,
+            bootstrap_layer,
+            recovery_strategy,
+        );
     }
+
+    remove_truncated_wal_sidecar(&paths.db_path);
+
+    let prepare_fresh_storage = || -> Result<(SqliteStorage, RecoveryBackupSet)> {
+        prepare_fresh_storage_for_deferred_import(&paths.db_path, beads_dir, lock_timeout)
+    };
 
     match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
-            Ok(None) => Ok(storage),
-            Ok(Some(anomaly)) => {
-                drop(storage);
-                warn!(
-                    db_path = %paths.db_path.display(),
-                    jsonl_path = %paths.jsonl_path.display(),
-                    anomaly = %anomaly,
-                    "Detected recoverable database anomaly after open; rebuilding from JSONL"
-                );
-                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)
-            }
+            Ok(None) => Ok((storage, false, None)),
+            Ok(Some(anomaly)) => rebuild_or_defer_after_recoverable_anomaly(
+                storage,
+                &anomaly,
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                recovery_strategy,
+                &prepare_fresh_storage,
+            ),
             Err(probe_err) => {
-                drop(storage);
                 if !should_attempt_jsonl_recovery_after_open(
                     &probe_err,
                     &paths.db_path,
@@ -564,23 +569,141 @@ fn open_sqlite_storage_with_recovery(
                 ) {
                     return Err(probe_err);
                 }
-
-                warn!(
-                    db_path = %paths.db_path.display(),
-                    jsonl_path = %paths.jsonl_path.display(),
-                    probe_error = %probe_err,
-                    "Post-open database probe failed; rebuilding from JSONL"
-                );
-                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)
+                rebuild_or_defer_after_probe_error(
+                    storage,
+                    &probe_err,
+                    beads_dir,
+                    paths,
+                    lock_timeout,
+                    bootstrap_layer,
+                    recovery_strategy,
+                    &prepare_fresh_storage,
+                )
             }
         },
         Err(open_err) => {
             if !should_attempt_jsonl_recovery(&open_err, &paths.db_path, &paths.jsonl_path) {
                 return Err(open_err);
             }
+            rebuild_or_defer_after_open_error(
+                open_err,
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                recovery_strategy,
+                &prepare_fresh_storage,
+            )
+        }
+    }
+}
 
+/// Handle the "DB file missing, JSONL present" case: either rebuild the
+/// DB from JSONL outright, or (for the deferred-recovery path) prepare a
+/// cleanup set and let the caller's explicit import populate a fresh DB.
+fn open_when_db_file_is_missing(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    match recovery_strategy {
+        JsonlRecoveryStrategy::RebuildFromJsonl => {
+            let storage =
+                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+            Ok((storage, true, None))
+        }
+        JsonlRecoveryStrategy::DeferToExplicitImport => {
+            let cleanup_set =
+                prepare_missing_database_cleanup_for_recovery(&paths.db_path, beads_dir)?;
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                "Database file is missing; deferring JSONL recovery to explicit import semantics"
+            );
+            Ok((
+                SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)?,
+                false,
+                Some(cleanup_set),
+            ))
+        }
+    }
+}
+
+/// Issue #228: proactively remove truncated WAL sidecar files before
+/// opening. A WAL file that exists but is shorter than 32 bytes (the WAL
+/// header size) cannot be valid and will cause frankensqlite to return
+/// `WalCorrupt` during rebuild. Removing it is safe — SQLite recreates
+/// the WAL on the next write, and the main DB file already contains all
+/// committed data (the adaptive checkpoint drains frames continuously).
+fn remove_truncated_wal_sidecar(db_path: &Path) {
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+    let Ok(meta) = fs::metadata(&wal_path) else {
+        return;
+    };
+    if meta.len() >= 32 {
+        return;
+    }
+    tracing::warn!(
+        wal_path = %wal_path.display(),
+        wal_size = meta.len(),
+        "removing truncated WAL sidecar (< 32 bytes) before open"
+    );
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(PathBuf::from(format!("{}-shm", db_path.to_string_lossy())));
+}
+
+/// Back up the current database family and reopen a fresh handle. Used
+/// by the deferred-import recovery path when we want to install a blank
+/// DB and let an explicit `br sync --import-only` populate it.
+fn prepare_fresh_storage_for_deferred_import(
+    db_path: &Path,
+    beads_dir: &Path,
+    lock_timeout: Option<u64>,
+) -> Result<(SqliteStorage, RecoveryBackupSet)> {
+    let backup_set = backup_database_family_for_recovery(db_path, beads_dir)?;
+    let recovery_dir = backup_set.recovery_dir.clone();
+    let storage = match SqliteStorage::open_with_timeout(db_path, lock_timeout) {
+        Ok(storage) => storage,
+        Err(open_err) => {
+            if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
+                return Err(recovery_restore_failure(
+                    &backup_set,
+                    &open_err,
+                    restore_err,
+                ));
+            }
+            return Err(open_err);
+        }
+    };
+    warn!(
+        db_path = %db_path.display(),
+        recovery_dir = %recovery_dir.display(),
+        "Prepared a fresh SQLite database; explicit import will populate it"
+    );
+    Ok((storage, backup_set))
+}
+
+/// Handle the `Err(open_err)` branch of the top-level open: either
+/// rebuild the DB from JSONL or, on the deferred-import strategy, move
+/// the broken DB family aside and open a fresh placeholder. The rebuild
+/// arm prefers the original open error over a recovery error unless the
+/// recovery error carries extra context worth surfacing.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_or_defer_after_open_error(
+    open_err: BeadsError,
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+    prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    match recovery_strategy {
+        JsonlRecoveryStrategy::RebuildFromJsonl => {
             match rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer) {
-                Ok(storage) => Ok(storage),
+                Ok(storage) => Ok((storage, true, None)),
                 Err(recovery_err) => {
                     warn!(
                         db_path = %paths.db_path.display(),
@@ -596,6 +719,16 @@ fn open_sqlite_storage_with_recovery(
                     }
                 }
             }
+        }
+        JsonlRecoveryStrategy::DeferToExplicitImport => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                open_error = %open_err,
+                "Open failed with a recoverable database error; deferring JSONL recovery to explicit import semantics"
+            );
+            let (storage, backup_set) = prepare_fresh_storage()?;
+            Ok((storage, false, Some(backup_set)))
         }
     }
 }
@@ -656,6 +789,136 @@ fn is_recoverable_database_internal_error(detail: &str) -> bool {
         || detail_lower.contains("missing from index")
 }
 
+/// Handle the `Ok(Some(anomaly))` branch from
+/// `detect_recoverable_open_anomaly`: either rebuild from JSONL while
+/// preserving local unflushed tombstones, or move the DB family aside
+/// and open a fresh placeholder for the explicit-import path.
+///
+/// Split out of `open_sqlite_storage_with_recovery_strategy` so the
+/// caller stays under the pedantic `too_many_lines` budget; the
+/// preservation comment lives here so the behavior is documented next to
+/// the code that performs it.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_or_defer_after_recoverable_anomaly(
+    storage: SqliteStorage,
+    anomaly: &str,
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+    prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    match recovery_strategy {
+        JsonlRecoveryStrategy::RebuildFromJsonl => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                anomaly = %anomaly,
+                "Detected recoverable database anomaly after open; rebuilding from JSONL"
+            );
+            // Snapshot tombstones from the anomalous (but still queryable)
+            // storage BEFORE we drop it. The anomaly detector only flags
+            // duplicates on `blocked_issues_cache` / its index and on
+            // `config`/`metadata` kv duplicates — none of which break a
+            // plain `SELECT … FROM issues`. Without this snapshot, any
+            // unflushed local tombstones that haven't landed in JSONL
+            // would be silently dropped by the rebuild (which only
+            // imports what's in JSONL), taking their deletion-retention
+            // state with them.
+            let storage = rebuild_with_tombstone_preservation(
+                storage,
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+            )?;
+            Ok((storage, true, None))
+        }
+        JsonlRecoveryStrategy::DeferToExplicitImport => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                anomaly = %anomaly,
+                "Detected recoverable database anomaly after open; deferring JSONL recovery to explicit import semantics"
+            );
+            drop(storage);
+            let (storage, backup_set) = prepare_fresh_storage()?;
+            Ok((storage, false, Some(backup_set)))
+        }
+    }
+}
+
+/// Handle the `Err(probe_err)` branch from
+/// `detect_recoverable_open_anomaly`. Counterpart of
+/// `rebuild_or_defer_after_recoverable_anomaly`; split out for the same
+/// reason and sharing the same preservation helper so both anomaly
+/// surfaces rescue unflushed tombstones consistently.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_or_defer_after_probe_error(
+    storage: SqliteStorage,
+    probe_err: &BeadsError,
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+    prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    match recovery_strategy {
+        JsonlRecoveryStrategy::RebuildFromJsonl => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                probe_error = %probe_err,
+                "Post-open database probe failed; rebuilding from JSONL"
+            );
+            // Best-effort tombstone snapshot. If the probe failed the
+            // storage may be in a strange state, but `snapshot_tombstones`
+            // itself is fault-tolerant (warn+empty on enumeration
+            // failure, warn+partial on per-tombstone failure), so we try
+            // anyway: the worst case is the same as the old behavior (no
+            // preservation), the best case is we rescue the unflushed
+            // tombstones the old code lost silently.
+            let storage = rebuild_with_tombstone_preservation(
+                storage,
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+            )?;
+            Ok((storage, true, None))
+        }
+        JsonlRecoveryStrategy::DeferToExplicitImport => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                probe_error = %probe_err,
+                "Post-open database probe failed; deferring JSONL recovery to explicit import semantics"
+            );
+            drop(storage);
+            let (storage, backup_set) = prepare_fresh_storage()?;
+            Ok((storage, false, Some(backup_set)))
+        }
+    }
+}
+
+/// Snapshot unflushed tombstones from `storage`, drop the old connection,
+/// rebuild from JSONL, and restore the preserved tombstones atomically.
+fn rebuild_with_tombstone_preservation(
+    storage: SqliteStorage,
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+) -> Result<SqliteStorage> {
+    let preserved_tombstones = preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
+    drop(storage);
+    let mut storage = rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+    restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
+    Ok(storage)
+}
+
 fn rebuild_database_from_jsonl(
     beads_dir: &Path,
     paths: &ConfigPaths,
@@ -671,6 +934,46 @@ fn rebuild_database_from_jsonl(
         false,
     )
     .map(|(storage, _)| storage)
+}
+
+/// Snapshot local tombstones that have not yet been flushed to JSONL.
+///
+/// Returns an empty vector and logs a debug/warn entry on any failure —
+/// this is a preservation path, not a correctness invariant, so we always
+/// prefer to proceed with the rebuild rather than fail the whole command
+/// because we couldn't read a tombstone or couldn't read the JSONL. The
+/// returned vector is filtered so only tombstones that are *not* already
+/// flushed to JSONL as tombstones survive (the already-flushed ones will
+/// come back via the rebuild's own `import_from_jsonl`).
+fn preserved_unflushed_tombstones(
+    storage: &SqliteStorage,
+    jsonl_path: &Path,
+) -> Vec<PreservedTombstone> {
+    let snapshot = snapshot_tombstones(storage);
+    if snapshot.is_empty() {
+        return snapshot;
+    }
+    let jsonl_filter = if jsonl_path.is_file() {
+        match scan_jsonl_for_tombstone_filter(jsonl_path) {
+            Ok(filter) => filter,
+            Err(err) => {
+                // The rebuild itself will also parse the JSONL and
+                // re-surface any parse error (e.g. conflict markers) with
+                // a proper diagnostic. For the purposes of tombstone
+                // preservation, fall back to treating the JSONL as empty
+                // so every snapshotted tombstone is kept; if the rebuild
+                // ultimately fails, the backup set has our back.
+                tracing::debug!(
+                    error = %err,
+                    "Could not scan JSONL for tombstone filter during startup auto-rebuild; preserving all snapshotted tombstones and letting the rebuild surface the JSONL error"
+                );
+                JsonlTombstoneFilter::default()
+            }
+        }
+    } else {
+        JsonlTombstoneFilter::default()
+    };
+    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_filter)
 }
 
 pub(crate) fn repair_database_from_jsonl(
@@ -834,7 +1137,214 @@ fn rebuild_database_family(
     let mut storage = SqliteStorage::open_with_timeout(db_path, lock_timeout)?;
     storage.set_config("issue_prefix", prefix)?;
     let import_result = import_from_jsonl(&mut storage, jsonl_path, import_config, Some(prefix))?;
+
+    // Drain the WAL to the main DB file so the follow-up maintenance (VACUUM,
+    // REINDEX, VACUUM INTO) operates against what is actually on disk.
+    // Without this, fsqlite's post-import MVCC state can lag behind and
+    // maintenance silently fails with "database is busy (snapshot conflict
+    // on pages: page N > snapshot db_size M)", leaving the corruption it
+    // was supposed to clean up in place.
+    if let Err(e) = storage.checkpoint_full() {
+        tracing::warn!(
+            error = %e,
+            db_path = %db_path.display(),
+            "Full WAL checkpoint after rebuild failed (non-fatal)"
+        );
+    }
+
+    // Post-rebuild VACUUM to eliminate freeblock accounting anomalies that
+    // frankensqlite's B-tree layer may leave behind during bulk import.
+    // Without this, C sqlite3's `PRAGMA integrity_check` can report
+    // "free space corruption" even though the data is intact (issue #237).
+    if let Err(e) = storage.execute_raw("VACUUM") {
+        tracing::warn!(
+            error = %e,
+            db_path = %db_path.display(),
+            "VACUUM after rebuild failed (non-fatal); on-disk DB may still contain free-space corruption"
+        );
+    }
+
+    // Post-rebuild REINDEX to fix partial-index row mismatches that
+    // frankensqlite's B-tree layer can introduce during bulk insert.
+    // VACUUM rewrites pages but does not rebuild index entries; without
+    // REINDEX, `PRAGMA integrity_check` reports "row N missing from index"
+    // for partial indexes like idx_issues_list_active_order (issue #246).
+    if let Err(e) = storage.execute_raw("REINDEX") {
+        tracing::warn!(
+            error = %e,
+            db_path = %db_path.display(),
+            "REINDEX after rebuild failed (non-fatal); partial-index entries may be inconsistent"
+        );
+    }
+
+    // Compact the rebuilt DB via `VACUUM INTO` and atomic rename. This is
+    // the only reliable way to make upstream sqlite3's
+    // `PRAGMA integrity_check` report `ok` on a file produced by fsqlite's
+    // bulk-insert + REINDEX path (issue #248). In-place VACUUM alone —
+    // even called twice after a fresh checkpoint — does not truncate the
+    // trailing pages that fsqlite's REINDEX leaves orphaned: those pages
+    // exist in the file but are neither on the freelist nor referenced
+    // from any B-tree root. `VACUUM INTO` sidesteps fsqlite's in-place
+    // truncation bug because it writes a brand-new compacted file from
+    // the reachable page set — page count matches exactly what sqlite3's
+    // own `VACUUM INTO` produces. The subsequent atomic rename is
+    // crash-safe on POSIX (within a filesystem) and keeps the database
+    // family consistent with its sidecars, which we drop first.
+    compact_database_via_vacuum_into_in_place(&mut storage, db_path, lock_timeout);
     Ok((storage, import_result))
+}
+
+/// Compact a database at `db_path` by writing a fresh copy via `VACUUM
+/// INTO` to a temp file, atomically replacing the original, and reopening
+/// the storage connection in place.
+///
+/// Preconditions: the caller must pass a `storage` handle whose connection
+/// was opened against `db_path` (the helper names its temp file
+/// `.<stem>.vacuum.<pid>.tmp` next to `db_path` and installs it there).
+/// Passing mismatched storage and db_path would copy the storage's actual
+/// DB contents over db_path.
+///
+/// Failure handling: on any failure (VACUUM INTO error, rename error, or
+/// reopen error after a successful rename) the helper leaves `*storage`
+/// in the best-available working state:
+///
+/// * VACUUM INTO failed — `*storage` is unchanged (still the
+///   pre-compaction connection).
+/// * Rename failed — `*storage` is reopened against the still-intact
+///   original `db_path`; the compacted temp file is removed.
+/// * Reopen failed after a successful rename — `*storage` is left as
+///   the in-memory placeholder handle we swapped in; the persistent
+///   DB on disk IS correctly compacted, so the caller's next attempt
+///   (or the next invocation of `br`) will find a clean file.
+///
+/// This helper never returns a `Result` because its only value is
+/// cosmetic (the file size / integrity-check output). Correctness of
+/// the DB contents is established by the VACUUM/REINDEX that runs
+/// before compaction; a missed compaction surfaces as upstream
+/// sqlite3's `Page N: never used` diagnostic, not as data loss.
+///
+/// This is called only in rebuild/force-import paths where the DB is
+/// known to have just been fully populated from JSONL.
+pub(crate) fn compact_database_via_vacuum_into_in_place(
+    storage: &mut SqliteStorage,
+    db_path: &Path,
+    lock_timeout: Option<u64>,
+) {
+    // Drain any WAL frames the prior VACUUM/REINDEX (run by the caller)
+    // left behind, so `VACUUM INTO` sees the fully-committed on-disk
+    // state instead of having to reach into a WAL that fsqlite's own
+    // `VACUUM INTO` may or may not consult. Keeping this inside the
+    // helper means every caller gets the same guarantee regardless of
+    // whether they remembered to checkpoint themselves.
+    if let Err(err) = storage.checkpoint_full() {
+        tracing::debug!(
+            error = %err,
+            db_path = %db_path.display(),
+            "Pre-VACUUM-INTO WAL checkpoint failed (non-fatal); compaction may miss uncheckpointed frames"
+        );
+    }
+
+    // Unique temp path next to the real DB so the subsequent rename is on
+    // the same filesystem (atomic) and so parallel rebuilds of different
+    // DBs don't collide.
+    let stem = db_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map_or_else(|| "beads".to_string(), str::to_string);
+    let temp_path = db_path.with_file_name(format!(".{stem}.vacuum.{}.tmp", std::process::id()));
+    // Defensive: if a previous aborted rebuild from this same PID left a
+    // stale temp file behind, remove it before `VACUUM INTO` tries to
+    // open it. Stale temp files from other (crashed) PIDs are left alone
+    // because we cannot safely distinguish "crashed process" from
+    // "concurrent rebuild holding the temp open" without coordinating
+    // via the `.write.lock` we already depend on upstream.
+    let _ = fs::remove_file(&temp_path);
+
+    let temp_path_display = temp_path.display().to_string();
+    // Escape single quotes the SQL way (doubling) for the literal path
+    // embedded in the `VACUUM INTO` statement. The temp path is
+    // constructed from the DB path + our own PID suffix, so in practice
+    // it never contains a quote, but the doubling keeps us safe against
+    // unusual filesystem names.
+    let escaped_path = temp_path_display.replace('\'', "''");
+    let vacuum_into_sql = format!("VACUUM INTO '{escaped_path}'");
+    if let Err(err) = storage.execute_raw(&vacuum_into_sql) {
+        tracing::warn!(
+            error = %err,
+            db_path = %db_path.display(),
+            "`VACUUM INTO` compaction failed; keeping the in-place rebuild which may still show unused tail pages under upstream sqlite3"
+        );
+        let _ = fs::remove_file(&temp_path);
+        return;
+    }
+
+    // Replace `*storage` with a throwaway in-memory handle so we can close
+    // the on-disk connection (via `drop`) and swap its file under our own
+    // feet. On any failure in the remaining steps we reopen the original
+    // db_path to give the caller a working storage rather than leaving
+    // `*storage` pointing at an empty in-memory DB.
+    let Ok(placeholder) = SqliteStorage::open_memory() else {
+        // Extremely unlikely — open_memory only fails if we can't create a
+        // temp-dir file. Bail on the compaction path and keep the original.
+        let _ = fs::remove_file(&temp_path);
+        return;
+    };
+    let old = std::mem::replace(storage, placeholder);
+    drop(old);
+
+    // Atomic swap: rename `temp_path` onto `db_path`. On POSIX this
+    // atomically replaces the target, so there is never a moment when
+    // db_path does not exist (unlike a "remove then rename" sequence,
+    // which would leave a gap where another process could see db_path
+    // missing and create a fresh empty DB). The old sidecars are cleaned
+    // up AFTER the rename so any error there doesn't roll back the
+    // successful swap — stale `-wal`/`-shm` left alongside a clean DB
+    // are recovered automatically on next open.
+    if let Err(err) = fs::rename(&temp_path, db_path) {
+        tracing::warn!(
+            error = %err,
+            temp_path = %temp_path.display(),
+            db_path = %db_path.display(),
+            "Failed to atomically install compacted database; skipping VACUUM INTO compaction"
+        );
+        let _ = fs::remove_file(&temp_path);
+        // db_path is still the original file here (rename failed, so the
+        // old file is intact). Reopen it so *storage is a valid handle.
+        if let Ok(reopened) = SqliteStorage::open_with_timeout(db_path, lock_timeout) {
+            *storage = reopened;
+        }
+        return;
+    }
+
+    // Clean up the stale sidecars from the pre-compaction file. These
+    // describe a DIFFERENT file layout than the one we just installed, so
+    // leaving them in place can mislead the next open into a recovery
+    // attempt. Best-effort: if a sidecar can't be removed, log and
+    // continue — next open will still work because the compacted db_path
+    // header declares the canonical layout.
+    for sidecar_suffix in &["-wal", "-shm", "-journal"] {
+        let sidecar = PathBuf::from(format!("{}{}", db_path.to_string_lossy(), sidecar_suffix));
+        if fs::symlink_metadata(&sidecar).is_ok()
+            && let Err(err) = fs::remove_file(&sidecar)
+        {
+            tracing::debug!(
+                error = %err,
+                sidecar = %sidecar.display(),
+                "Failed to remove pre-compaction sidecar after VACUUM INTO; next open will re-derive it"
+            );
+        }
+    }
+
+    match SqliteStorage::open_with_timeout(db_path, lock_timeout) {
+        Ok(reopened) => *storage = reopened,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                db_path = %db_path.display(),
+                "Failed to reopen compacted database after VACUUM INTO; storage is now the placeholder in-memory handle"
+            );
+        }
+    }
 }
 
 pub(crate) fn rebuild_database_family_with_backup<T, F>(
@@ -875,6 +1385,21 @@ fn backup_database_family_for_recovery(
 ) -> Result<RecoveryBackupSet> {
     let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
     move_database_family_to_recovery(db_path, beads_dir, &stamp)
+}
+
+fn prepare_missing_database_cleanup_for_recovery(
+    db_path: &Path,
+    beads_dir: &Path,
+) -> Result<RecoveryBackupSet> {
+    let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+    let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
+    fs::create_dir_all(&recovery_dir)?;
+    Ok(RecoveryBackupSet {
+        db_path: db_path.to_path_buf(),
+        recovery_dir,
+        stamp,
+        files: Vec::new(),
+    })
 }
 
 fn move_database_family_to_recovery(
@@ -1082,7 +1607,7 @@ pub fn open_storage(
         .or_else(|| lock_timeout_from_layer(&merged_layer))
         .or(Some(30000));
 
-    let storage = open_sqlite_storage_with_recovery(
+    let (storage, _auto_rebuilt, _pending_recovery_backup) = open_sqlite_storage_with_recovery(
         beads_dir,
         &startup.paths,
         resolved_lock_timeout,
@@ -1097,11 +1622,18 @@ pub struct OpenStorageResult {
     pub storage: SqliteStorage,
     pub paths: ConfigPaths,
     pub no_db: bool,
+    /// True when the SQLite DB file was just rebuilt from JSONL during this
+    /// `open_storage_with_cli` call (either because the file didn't exist, or
+    /// because a recoverable anomaly was detected after opening). Callers that
+    /// would otherwise re-run a full rebuild (e.g. `br sync --rebuild`) can
+    /// skip the redundant work — the DB is already a fresh import.
+    pub auto_rebuilt: bool,
     allow_external_jsonl: bool,
     startup_layers: Vec<ConfigLayer>,
     bootstrap_layer: ConfigLayer,
     resolved_lock_timeout: Option<u64>,
     loaded_jsonl_hash: Option<String>,
+    pending_recovery_backup: Option<RecoveryBackupSet>,
 }
 
 impl OpenStorageResult {
@@ -1127,6 +1659,11 @@ impl OpenStorageResult {
     }
 
     /// Rebuild the current SQLite database from the resolved JSONL export.
+    ///
+    /// On success, `auto_rebuilt` is set to `true` so downstream code can
+    /// detect that the storage is now a fresh import of the JSONL and skip
+    /// redundant rebuilds (for example, `br sync --rebuild` short-circuits
+    /// when it sees this flag).
     ///
     /// # Errors
     ///
@@ -1156,6 +1693,49 @@ impl OpenStorageResult {
         )?;
         self.storage = storage;
         self.loaded_jsonl_hash = None;
+        self.auto_rebuilt = true;
+        self.pending_recovery_backup = None;
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn pending_recovery_dir(&self) -> Option<&Path> {
+        self.pending_recovery_backup
+            .as_ref()
+            .map(|backup| backup.recovery_dir.as_path())
+    }
+
+    pub(crate) fn discard_pending_recovery_backup(&mut self) {
+        self.pending_recovery_backup = None;
+    }
+
+    /// Restore the original database family after a deferred recovery prepared
+    /// a fresh DB but the explicit import later failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the original database family cannot be restored.
+    pub(crate) fn restore_pending_recovery_backup(&mut self) -> Result<()> {
+        let Some(backup_set) = self.pending_recovery_backup.take() else {
+            return Ok(());
+        };
+        let had_original_database_family = !backup_set.files.is_empty();
+
+        self.storage = SqliteStorage::open_memory()?;
+        restore_database_family_after_failed_rebuild(&backup_set)?;
+        if had_original_database_family {
+            self.storage =
+                SqliteStorage::open_with_timeout(&self.paths.db_path, self.resolved_lock_timeout)
+                    .map_err(|reopen_err| BeadsError::WithContext {
+                    context: format!(
+                        "Restored the original database family at '{}' but failed to reopen it",
+                        self.paths.db_path.display()
+                    ),
+                    source: Box::new(reopen_err),
+                })?;
+        }
+        self.loaded_jsonl_hash = None;
+        self.auto_rebuilt = false;
         Ok(())
     }
 
@@ -1267,18 +1847,22 @@ impl OpenStorageResult {
     }
 }
 
-/// Open storage with CLI overrides and support for `--no-db` mode.
+/// Open storage with a preloaded startup snapshot and support for `--no-db` mode.
 ///
 /// # Errors
 ///
-/// Returns an error if configuration loading, JSONL import, or storage setup fails.
-pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<OpenStorageResult> {
-    let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+/// Returns an error if JSONL import or storage setup fails.
+pub(crate) fn open_storage_with_startup_config(
+    startup: StartupConfig,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+) -> Result<OpenStorageResult> {
     let StartupConfig {
         paths,
         layers: startup_layers,
         ..
     } = startup;
+    let beads_dir = paths.beads_dir.clone();
     let cli_layer = cli.as_layer();
 
     let mut all_layers = startup_layers.clone();
@@ -1287,7 +1871,7 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
 
     let no_db = no_db_from_layer(&merged_layer).unwrap_or(false);
     let allow_external_jsonl =
-        implicit_external_jsonl_allowed(beads_dir, &paths.db_path, &paths.jsonl_path);
+        implicit_external_jsonl_allowed(&beads_dir, &paths.db_path, &paths.jsonl_path);
 
     let resolved_lock_timeout = cli
         .lock_timeout
@@ -1296,12 +1880,29 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
 
     if no_db {
         let mut storage = SqliteStorage::open_memory()?;
-        let prefix = resolve_bootstrap_issue_prefix(&merged_layer, beads_dir, &paths.jsonl_path)?;
+        let prefix = resolve_bootstrap_issue_prefix(&merged_layer, &beads_dir, &paths.jsonl_path)?;
         storage.set_config("issue_prefix", &prefix)?;
 
+        // Capture the JSONL content hash BEFORE the import so later
+        // `flush_no_db_if_dirty` can detect that the file we imported from
+        // has changed on disk — e.g. a non-`br` writer (like `git pull`)
+        // that does not respect `.write.lock` has rewritten the JSONL
+        // between our import and our flush. If we instead hashed AFTER
+        // import, a concurrent mid-import modification would leave
+        // `loaded_jsonl_hash` equal to the (already-modified) on-disk file
+        // while `storage` only contains the pre-modification content, and
+        // the staleness check at flush time would silently wave the flush
+        // through, overwriting the modified file with stale in-memory
+        // content. Hashing first means any concurrent write causes the
+        // staleness check to surface a `SyncConflict` instead of data loss.
+        let loaded_jsonl_hash = if paths.jsonl_path.is_file() {
+            Some(compute_jsonl_hash(&paths.jsonl_path)?)
+        } else {
+            None
+        };
         if paths.jsonl_path.is_file() {
             let mut import_config =
-                import_config_for_resolved_jsonl(beads_dir, &paths.db_path, &paths.jsonl_path);
+                import_config_for_resolved_jsonl(&beads_dir, &paths.db_path, &paths.jsonl_path);
             import_config.skip_prefix_validation = true;
             import_from_jsonl(
                 &mut storage,
@@ -1310,40 +1911,73 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
                 Some(&prefix),
             )?;
         }
-        let loaded_jsonl_hash = if paths.jsonl_path.is_file() {
-            Some(compute_jsonl_hash(&paths.jsonl_path)?)
-        } else {
-            None
-        };
 
         Ok(OpenStorageResult {
             storage,
             paths,
             no_db,
+            auto_rebuilt: false,
             allow_external_jsonl,
             startup_layers,
             bootstrap_layer: merged_layer,
             resolved_lock_timeout,
             loaded_jsonl_hash,
+            pending_recovery_backup: None,
         })
     } else {
-        let storage = open_sqlite_storage_with_recovery(
-            beads_dir,
-            &paths,
-            resolved_lock_timeout,
-            &merged_layer,
-        )?;
+        let (storage, auto_rebuilt, pending_recovery_backup) = if defer_jsonl_recovery {
+            open_sqlite_storage_with_deferred_jsonl_recovery(
+                &beads_dir,
+                &paths,
+                resolved_lock_timeout,
+                &merged_layer,
+            )?
+        } else {
+            open_sqlite_storage_with_recovery(
+                &beads_dir,
+                &paths,
+                resolved_lock_timeout,
+                &merged_layer,
+            )?
+        };
         Ok(OpenStorageResult {
             storage,
             paths,
             no_db,
+            auto_rebuilt,
             allow_external_jsonl,
             startup_layers,
             bootstrap_layer: merged_layer,
             resolved_lock_timeout,
             loaded_jsonl_hash: None,
+            pending_recovery_backup,
         })
     }
+}
+
+/// Open storage with CLI overrides and support for `--no-db` mode.
+///
+/// # Errors
+///
+/// Returns an error if configuration loading, JSONL import, or storage setup fails.
+fn open_storage_with_cli_impl(
+    beads_dir: &Path,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+) -> Result<OpenStorageResult> {
+    let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    open_storage_with_startup_config(startup, cli, defer_jsonl_recovery)
+}
+
+pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<OpenStorageResult> {
+    open_storage_with_cli_impl(beads_dir, cli, false)
+}
+
+pub fn open_storage_with_cli_deferred_jsonl_recovery(
+    beads_dir: &Path,
+    cli: &CliOverrides,
+) -> Result<OpenStorageResult> {
+    open_storage_with_cli_impl(beads_dir, cli, true)
 }
 
 #[must_use]
@@ -1401,7 +2035,7 @@ pub fn no_auto_import_from_layer(layer: &ConfigLayer) -> Option<bool> {
     .and_then(|value| parse_bool(value))
 }
 
-pub(crate) fn resolve_bootstrap_issue_prefix(
+fn resolve_bootstrap_issue_prefix(
     bootstrap_layer: &ConfigLayer,
     beads_dir: &Path,
     jsonl_path: &Path,
@@ -1427,7 +2061,7 @@ pub(crate) fn resolve_bootstrap_issue_prefix(
         return Ok(abbreviate_prefix(name));
     }
 
-    Ok(DEFAULT_ID_PREFIX.to_string())
+    Ok("br".to_string())
 }
 
 fn import_config_for_resolved_jsonl(
@@ -1462,41 +2096,8 @@ pub fn implicit_external_jsonl_allowed(
 ) -> bool {
     resolved_jsonl_path_is_external(beads_dir, jsonl_path)
         && !path_is_within_beads_dir(db_path, beads_dir)
-        && parent_dirs_match(db_path, jsonl_path)
-}
-
-fn parent_dirs_match(left: &Path, right: &Path) -> bool {
-    let Some(left_parent) = left.parent() else {
-        return false;
-    };
-    let Some(right_parent) = right.parent() else {
-        return false;
-    };
-
-    normalize_path_for_comparison(left_parent) == normalize_path_for_comparison(right_parent)
-}
-
-fn normalize_path_for_comparison(path: &Path) -> PathBuf {
-    if let Ok(canonical) = dunce::canonicalize(path) {
-        return canonical;
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-        }
-    }
-
-    normalized
+        && db_path.parent().is_some()
+        && db_path.parent() == jsonl_path.parent()
 }
 
 fn path_is_within_beads_dir(path: &Path, beads_dir: &Path) -> bool {
@@ -1504,21 +2105,15 @@ fn path_is_within_beads_dir(path: &Path, beads_dir: &Path) -> bool {
         dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
 
     let effective_path = if path.exists() {
-        dunce::canonicalize(path).unwrap_or_else(|_| normalize_path_for_comparison(path))
+        dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     } else if let Some(parent) = path.parent().filter(|parent| parent.exists()) {
-        let canonical_parent =
-            dunce::canonicalize(parent).unwrap_or_else(|_| normalize_path_for_comparison(parent));
+        let canonical_parent = dunce::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
         path.file_name().map_or_else(
             || canonical_parent.clone(),
             |name| canonical_parent.join(name),
         )
-    } else if path.is_relative() {
-        std::env::current_dir().map_or_else(
-            |_| normalize_path_for_comparison(path),
-            |cwd| normalize_path_for_comparison(&cwd.join(path)),
-        )
     } else {
-        normalize_path_for_comparison(path)
+        path.to_path_buf()
     };
 
     effective_path.starts_with(beads_dir) || effective_path.starts_with(&canonical_beads)
@@ -1580,29 +2175,6 @@ pub fn resolve_paths(beads_dir: &Path, db_override: Option<&PathBuf>) -> Result<
     Ok(startup.paths)
 }
 
-/// Resolve config paths while ignoring the transient `BEADS_JSONL`
-/// environment override.
-///
-/// # Errors
-///
-/// Returns an error if metadata cannot be read.
-pub fn resolve_paths_without_env_jsonl(
-    beads_dir: &Path,
-    db_override: Option<&PathBuf>,
-) -> Result<ConfigPaths> {
-    let (legacy_user, user, project, env_layer) = load_startup_layers_for_paths(beads_dir)?;
-    let resolved_db_override = resolve_startup_db_override(
-        beads_dir,
-        db_override,
-        &legacy_user,
-        &user,
-        &project,
-        &env_layer,
-    );
-
-    ConfigPaths::resolve_without_env_jsonl(beads_dir, resolved_db_override.as_ref())
-}
-
 fn resolve_db_path(
     beads_dir: &Path,
     metadata: &Metadata,
@@ -1627,11 +2199,12 @@ fn resolve_jsonl_path(
     beads_dir: &Path,
     metadata: &Metadata,
     db_override: Option<&PathBuf>,
-    env_jsonl_override: Option<&Path>,
 ) -> PathBuf {
     // Priority 1: BEADS_JSONL environment variable (highest priority)
-    if let Some(env_jsonl_override) = env_jsonl_override {
-        return env_jsonl_override.to_path_buf();
+    if let Ok(env_path) = env::var("BEADS_JSONL")
+        && !env_path.trim().is_empty()
+    {
+        return PathBuf::from(env_path);
     }
 
     // Priority 2: metadata.json override (if explicitly set to non-default)
@@ -1667,14 +2240,6 @@ fn resolve_jsonl_path(
     beads_dir.join(DEFAULT_JSONL_FILENAME)
 }
 
-fn current_env_jsonl_override() -> Option<PathBuf> {
-    env::var("BEADS_JSONL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
 /// A configuration layer split into startup-only and runtime (DB) keys.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigLayer {
@@ -1694,17 +2259,12 @@ impl ConfigLayer {
             // Remove any variant of this key that already exists under a
             // different spelling (e.g. hyphenated vs underscored).
             if canonical == *key {
-                // Key is already canonical (no hyphens) — remove any
-                // hyphenated form left by a lower-precedence layer.
                 let hyphenated = key.replace('_', "-");
                 if hyphenated != *key {
                     self.startup.remove(&hyphenated);
                 }
             } else {
-                // Key has hyphens — remove the canonical form AND the
-                // original hyphenated form that may exist from a prior merge.
                 self.startup.remove(&canonical);
-                self.startup.remove(key);
             }
             self.startup.insert(canonical, value.clone());
         }
@@ -1717,7 +2277,6 @@ impl ConfigLayer {
                 }
             } else {
                 self.runtime.remove(&canonical);
-                self.runtime.remove(key);
             }
             self.runtime.insert(canonical, value.clone());
         }
@@ -1907,10 +2466,17 @@ pub fn load_legacy_user_config() -> Result<ConfigLayer> {
 ///
 /// Returns an error if any config file cannot be read or parsed.
 pub fn load_startup_config(beads_dir: &Path) -> Result<ConfigLayer> {
-    let (legacy_user, user, project, env_layer) = load_startup_layers_for_paths(beads_dir)?;
-    let layers = vec![legacy_user, user, project, env_layer];
+    let legacy_user = load_legacy_user_config()?;
+    let user = load_user_config()?;
+    let project = load_project_config(beads_dir)?;
+    let env_layer = ConfigLayer::from_env();
 
-    Ok(ConfigLayer::merge_layers(&layers))
+    Ok(ConfigLayer::merge_layers(&[
+        legacy_user,
+        user,
+        project,
+        env_layer,
+    ]))
 }
 
 /// Default config layer (lowest precedence).
@@ -1919,7 +2485,7 @@ pub fn default_config_layer() -> ConfigLayer {
     let mut layer = ConfigLayer::default();
     layer
         .runtime
-        .insert("issue_prefix".to_string(), DEFAULT_ID_PREFIX.to_string());
+        .insert("issue_prefix".to_string(), "br".to_string());
     layer
 }
 
@@ -1987,15 +2553,22 @@ pub fn load_startup_config_with_paths(
     beads_dir: &Path,
     db_override: Option<&PathBuf>,
 ) -> Result<StartupConfig> {
-    let (legacy_user, user, project, env_layer) = load_startup_layers_for_paths(beads_dir)?;
-    let resolved_db_override = resolve_startup_db_override(
-        beads_dir,
-        db_override,
-        &legacy_user,
-        &user,
-        &project,
-        &env_layer,
-    );
+    let legacy_user = load_legacy_user_config()?;
+    let user = load_user_config()?;
+    let project = load_project_config(beads_dir)?;
+    let env_layer = ConfigLayer::from_env();
+
+    let resolved_db_override = db_override.cloned().or_else(|| {
+        [
+            resolve_db_override_from_layer(beads_dir, &env_layer),
+            resolve_db_override_from_layer(beads_dir, &project),
+            resolve_db_override_from_layer(beads_dir, &user),
+            resolve_db_override_from_layer(beads_dir, &legacy_user),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+    });
 
     let layers = vec![legacy_user, user, project, env_layer];
     let merged_startup = ConfigLayer::merge_layers(&layers);
@@ -2006,38 +2579,6 @@ pub fn load_startup_config_with_paths(
         paths,
         layers,
         merged_config: merged_startup,
-    })
-}
-
-fn load_startup_layers_for_paths(
-    beads_dir: &Path,
-) -> Result<(ConfigLayer, ConfigLayer, ConfigLayer, ConfigLayer)> {
-    let legacy_user = load_legacy_user_config()?;
-    let user = load_user_config()?;
-    let project = load_project_config(beads_dir)?;
-    let env_layer = ConfigLayer::from_env();
-
-    Ok((legacy_user, user, project, env_layer))
-}
-
-fn resolve_startup_db_override(
-    beads_dir: &Path,
-    cli_db_override: Option<&PathBuf>,
-    legacy_user: &ConfigLayer,
-    user: &ConfigLayer,
-    project: &ConfigLayer,
-    env_layer: &ConfigLayer,
-) -> Option<PathBuf> {
-    cli_db_override.cloned().or_else(|| {
-        [
-            resolve_db_override_from_layer(beads_dir, env_layer),
-            resolve_db_override_from_layer(beads_dir, project),
-            resolve_db_override_from_layer(beads_dir, user),
-            resolve_db_override_from_layer(beads_dir, legacy_user),
-        ]
-        .into_iter()
-        .flatten()
-        .next()
     })
 }
 
@@ -2060,10 +2601,7 @@ pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
     let prefix = get_value(layer, &["issue_prefix", "issue-prefix", "prefix"])
         .cloned()
         .filter(|p| !p.trim().is_empty())
-        .map_or_else(
-            || DEFAULT_ID_PREFIX.to_string(),
-            |prefix| normalize_prefix(&prefix),
-        );
+        .map_or_else(|| "br".to_string(), |prefix| normalize_prefix(&prefix));
 
     let min_hash_length = parse_usize(layer, &["min_hash_length", "min-hash-length"]).unwrap_or(3);
     let max_hash_length = parse_usize(layer, &["max_hash_length", "max-hash-length"]).unwrap_or(8);
@@ -2440,27 +2978,8 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
-    use std::env;
     use std::process::Command;
     use tempfile::TempDir;
-
-    struct DirGuard {
-        previous_dir: PathBuf,
-    }
-
-    impl DirGuard {
-        fn new(path: &Path) -> Self {
-            let previous_dir = env::current_dir().expect("current dir");
-            env::set_current_dir(path).expect("set current dir");
-            Self { previous_dir }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous_dir);
-        }
-    }
 
     fn write_issue_jsonl(path: &Path, issue: &Issue) {
         let json = serde_json::to_string(&issue).expect("serialize issue");
@@ -3256,7 +3775,7 @@ labels:
             deletions_retention_days: None,
         };
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
         assert_eq!(resolved, PathBuf::from(absolute_path));
     }
 
@@ -3273,7 +3792,7 @@ labels:
             deletions_retention_days: None,
         };
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
         assert_eq!(resolved, beads_dir.join("relative.jsonl"));
     }
 
@@ -3286,7 +3805,7 @@ labels:
         let metadata = Metadata::default();
         let db_override = PathBuf::from("/some/path/custom.db");
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override), None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override));
         assert_eq!(resolved, PathBuf::from("/some/path/issues.jsonl"));
     }
 
@@ -3299,29 +3818,8 @@ labels:
         let db_override = beads_dir.join("custom.db");
         fs::write(beads_dir.join("beads.jsonl"), "{}\n").expect("write legacy jsonl");
 
-        let resolved =
-            resolve_jsonl_path(&beads_dir, &Metadata::default(), Some(&db_override), None);
+        let resolved = resolve_jsonl_path(&beads_dir, &Metadata::default(), Some(&db_override));
         assert_eq!(resolved, beads_dir.join("beads.jsonl"));
-    }
-
-    #[test]
-    fn resolve_paths_without_env_jsonl_uses_project_db_override_for_jsonl_target() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        let cache_dir = temp.path().join("cache");
-        let db_path = cache_dir.join("custom.db");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-        fs::create_dir_all(&cache_dir).expect("create cache dir");
-        fs::write(
-            beads_dir.join("config.yaml"),
-            format!("db: {}\n", db_path.display()),
-        )
-        .expect("write project config");
-
-        let paths = resolve_paths_without_env_jsonl(&beads_dir, None).expect("paths");
-
-        assert_eq!(paths.db_path, db_path);
-        assert_eq!(paths.jsonl_path, cache_dir.join("issues.jsonl"));
     }
 
     #[test]
@@ -3845,7 +4343,7 @@ routing:
         fs::write(beads_dir.join("beads.jsonl"), "{}").expect("write beads");
 
         let metadata = Metadata::default();
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
 
         // Should discover beads.jsonl since issues.jsonl doesn't exist
         assert_eq!(resolved, beads_dir.join("beads.jsonl"));
@@ -3868,7 +4366,7 @@ routing:
             deletions_retention_days: None,
         };
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
         // Metadata override should win over discovered legacy/default filenames.
         assert_eq!(resolved, beads_dir.join("custom.jsonl"));
     }
@@ -3890,7 +4388,7 @@ routing:
             deletions_retention_days: None,
         };
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
         // Should fall through to discovery, find issues.jsonl
         assert_eq!(resolved, beads_dir.join("issues.jsonl"));
     }
@@ -3903,7 +4401,7 @@ routing:
 
         // No JSONL files exist
         let metadata = Metadata::default();
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None, None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
 
         // Should return default for writing
         assert_eq!(resolved, beads_dir.join("issues.jsonl"));
@@ -3923,7 +4421,7 @@ routing:
         let metadata = Metadata::default();
         let db_override = custom_dir.join("custom.db");
 
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override), None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override));
         // Should derive sibling from db_override path
         assert_eq!(resolved, custom_dir.join("issues.jsonl"));
     }
@@ -3964,29 +4462,6 @@ routing:
     }
 
     #[test]
-    fn resolve_jsonl_path_allows_explicit_env_override_to_be_ignored() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-
-        fs::write(
-            beads_dir.join("metadata.json"),
-            r#"{"database": "beads.db", "jsonl_export": "my-export.jsonl"}"#,
-        )
-        .expect("write metadata");
-
-        let env_jsonl = beads_dir.join("env-override.jsonl");
-        let metadata = Metadata::load(&beads_dir).expect("metadata");
-
-        let resolved_with_env =
-            resolve_jsonl_path(&beads_dir, &metadata, None, Some(env_jsonl.as_path()));
-        let resolved_without_env = resolve_jsonl_path(&beads_dir, &metadata, None, None);
-
-        assert_eq!(resolved_with_env, env_jsonl);
-        assert_eq!(resolved_without_env, beads_dir.join("my-export.jsonl"));
-    }
-
-    #[test]
     fn metadata_jsonl_override_respected_even_with_db_override() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -4001,7 +4476,7 @@ routing:
 
         let db_override = beads_dir.join("beads.db");
         let metadata = Metadata::load(&beads_dir).expect("metadata");
-        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override), None);
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override));
 
         // Metadata override should still win when the database path is explicit.
         assert_eq!(
@@ -4357,6 +4832,157 @@ routing:
     }
 
     #[test]
+    fn deferred_recovery_restore_reopens_original_database_family() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let now = Utc::now();
+        let original_issue = Issue {
+            id: "bd-original".to_string(),
+            title: "Original on-disk issue".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+
+        let mut storage = SqliteStorage::open(&db_path).expect("create seed db");
+        storage
+            .set_config("issue_prefix", "bd")
+            .expect("seed issue prefix");
+        storage
+            .create_issue(&original_issue, "tester")
+            .expect("seed original issue");
+        drop(storage);
+
+        insert_duplicate_issue_prefix_config_row(&db_path, "bd");
+        write_single_issue_jsonl(&jsonl_path, "bd-import", "Deferred import payload");
+
+        let mut storage_ctx =
+            open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, &CliOverrides::default())
+                .expect("storage");
+
+        assert!(
+            storage_ctx.pending_recovery_dir().is_some(),
+            "deferred recovery should keep a restoreable backup"
+        );
+        assert!(
+            storage_ctx
+                .storage
+                .get_issue("bd-original")
+                .expect("query fresh placeholder db")
+                .is_none(),
+            "placeholder db should not still expose the pre-recovery issue"
+        );
+
+        storage_ctx
+            .restore_pending_recovery_backup()
+            .expect("restore original db");
+
+        assert!(
+            storage_ctx.pending_recovery_dir().is_none(),
+            "restore should clear the pending backup handle"
+        );
+        assert!(!storage_ctx.auto_rebuilt);
+
+        let restored_issue = storage_ctx
+            .storage
+            .get_issue("bd-original")
+            .expect("query restored issue")
+            .expect("original issue should be readable after restore");
+        assert_eq!(restored_issue.title, "Original on-disk issue");
+    }
+
+    #[test]
+    fn deferred_recovery_restore_for_missing_db_cleans_up_fresh_database_family() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-import", "Deferred import payload");
+
+        let mut storage_ctx =
+            open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, &CliOverrides::default())
+                .expect("storage");
+
+        assert!(
+            storage_ctx.pending_recovery_dir().is_some(),
+            "missing-db deferred recovery should track cleanup state"
+        );
+        assert!(
+            db_path.is_file(),
+            "opening deferred recovery should create a fresh database file"
+        );
+
+        storage_ctx
+            .restore_pending_recovery_backup()
+            .expect("cleanup fresh db");
+
+        assert!(
+            storage_ctx.pending_recovery_dir().is_none(),
+            "cleanup should clear the pending recovery handle"
+        );
+        assert!(!db_path.exists(), "cleanup should remove the fresh db path");
+        assert!(!storage_ctx.auto_rebuilt);
+    }
+
+    #[test]
+    fn open_storage_with_startup_config_uses_preloaded_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let first_jsonl = beads_dir.join("first.jsonl");
+        let second_jsonl = beads_dir.join("second.jsonl");
+        write_single_issue_jsonl(&first_jsonl, "bd-first", "First startup snapshot");
+        write_single_issue_jsonl(&second_jsonl, "bd-second", "Mutated metadata path");
+
+        let metadata_path = beads_dir.join("metadata.json");
+        fs::write(
+            &metadata_path,
+            r#"{"database":"beads.db","jsonl_export":"first.jsonl"}"#,
+        )
+        .expect("write initial metadata");
+
+        let startup = load_startup_config_with_paths(&beads_dir, None).expect("load startup");
+
+        fs::write(
+            &metadata_path,
+            r#"{"database":"beads.db","jsonl_export":"second.jsonl"}"#,
+        )
+        .expect("rewrite metadata");
+
+        let cli = CliOverrides {
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+        let storage_ctx =
+            open_storage_with_startup_config(startup, &cli, false).expect("open storage");
+
+        assert_eq!(storage_ctx.paths.jsonl_path, first_jsonl);
+        assert!(
+            storage_ctx
+                .storage
+                .get_issue("bd-first")
+                .expect("query preloaded jsonl issue")
+                .is_some(),
+            "preloaded startup snapshot should still import from the original JSONL path"
+        );
+        assert!(
+            storage_ctx
+                .storage
+                .get_issue("bd-second")
+                .expect("query mutated jsonl issue")
+                .is_none(),
+            "mutating metadata after startup load must not change the opened storage paths"
+        );
+    }
+
+    #[test]
     fn open_storage_with_cli_recovers_using_resolved_external_jsonl() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -4527,44 +5153,6 @@ routing:
             &external_db,
             &external_jsonl
         ));
-    }
-
-    #[test]
-    fn implicit_external_jsonl_allowed_accepts_noncanonical_external_db_parent() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join("project").join(".beads");
-        let external_dir = temp.path().join("external-store");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-        fs::create_dir_all(&external_dir).expect("create external dir");
-
-        let db_path = temp
-            .path()
-            .join("external-store")
-            .join("..")
-            .join("external-store")
-            .join("beads.db");
-        let jsonl_path = external_dir.join("issues.jsonl");
-
-        assert!(
-            implicit_external_jsonl_allowed(&beads_dir, &db_path, &jsonl_path),
-            "same external DB family should stay implicitly allowed even when the DB path is non-canonical"
-        );
-    }
-
-    #[test]
-    fn resolved_jsonl_path_is_external_treats_missing_relative_internal_path_as_internal() {
-        let temp = TempDir::new().expect("tempdir");
-        let project_root = temp.path().join("project");
-        let beads_dir = project_root.join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-
-        let _guard = DirGuard::new(&project_root);
-        let jsonl_path = PathBuf::from(".beads").join("nested").join("issues.jsonl");
-
-        assert!(
-            !resolved_jsonl_path_is_external(&beads_dir, &jsonl_path),
-            "relative paths targeting a missing child under .beads should still classify as internal"
-        );
     }
 
     #[test]

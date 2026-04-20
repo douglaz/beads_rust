@@ -1,6 +1,4 @@
-use super::{
-    open_storage_ctx_with_auto_import, resolve_issue_id, retry_mutation_with_jsonl_recovery,
-};
+use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery};
 use crate::cli::CreateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -12,6 +10,7 @@ use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -39,6 +38,20 @@ struct NewIdInput<'a> {
 /// Returns an error if validation fails, the database cannot be opened, or the issue cannot be created.
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    execute_with_storage(args, cli, ctx, None)
+}
+
+/// Execute the create command, optionally reusing a pre-opened storage
+/// connection. When `pre_opened` is `Some`, the caller's connection is used
+/// directly, avoiding a redundant second open that would compete for the
+/// WAL write lock under concurrent access.
+#[allow(clippy::too_many_lines)]
+pub fn execute_with_storage(
+    args: &CreateArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    pre_opened: Option<config::OpenStorageResult>,
+) -> Result<()> {
     if let Some(ref file_path) = args.file {
         if args.title.is_some() || args.title_flag.is_some() {
             return Err(BeadsError::validation(
@@ -52,14 +65,22 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 "--external-ref is not supported with --file",
             ));
         }
+        if args.dry_run {
+            return Err(BeadsError::validation(
+                "dry_run",
+                "--dry-run is not supported with --file",
+            ));
+        }
         return execute_import(file_path, args, cli, ctx);
     }
 
-    // 1. Open storage (unless dry run without DB)
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-
-    // We open storage even for dry-run to check ID collisions.
-    let mut storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
+    // 1. Open storage (reuse pre-opened if available)
+    let mut storage_ctx = if let Some(ctx) = pre_opened {
+        ctx
+    } else {
+        let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+        config::open_storage_with_cli(&beads_dir, cli)?
+    };
     let layer = storage_ctx.load_config(cli)?;
 
     let config = CreateConfig {
@@ -184,14 +205,7 @@ pub fn create_issue_impl(
 
     // Parse status (default to Open if not provided)
     let status = if let Some(s) = &args.status {
-        let parsed = Status::from_str(s)?;
-        if parsed == Status::Tombstone {
-            return Err(BeadsError::validation(
-                "status",
-                "cannot manually create issues in tombstone state; use 'br delete' instead",
-            ));
-        }
-        parsed
+        Status::from_str(s)?
     } else {
         Status::Open
     };
@@ -539,20 +553,12 @@ fn execute_import(
     }
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let layer = storage_ctx.load_config(cli)?;
 
     let id_config = config::id_config_from_layer(&layer);
-    let fallback_priority = if let Some(p) = &args.priority {
-        Priority::from_str(p)?
-    } else {
-        config::default_priority_from_layer(&layer)?
-    };
-    let fallback_issue_type = if let Some(t) = &args.type_ {
-        IssueType::from_str(t)?
-    } else {
-        config::default_issue_type_from_layer(&layer)?
-    };
+    let default_priority = config::default_priority_from_layer(&layer)?;
+    let default_issue_type = config::default_issue_type_from_layer(&layer)?;
     let actor = config::resolve_actor(&layer);
     let now = Utc::now();
     let _json_mode = cli.json.unwrap_or(false);
@@ -588,7 +594,14 @@ fn execute_import(
 
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
-    'outer: for parsed in parsed_issues {
+    // Phase 1: Create all issues, deferring intra-file dependency resolution.
+    // Maps for resolving symbolic references between issues in the same import.
+    let mut title_to_id: HashMap<String, String> = HashMap::new();
+    let mut standin_to_id: HashMap<String, String> = HashMap::new();
+    // Deferred deps: (issue_id, raw_dep_strings, dep_types_from_cli)
+    let mut deferred_deps: Vec<(String, Vec<String>)> = Vec::new();
+
+    for parsed in parsed_issues {
         let title = parsed.title.trim().to_string();
         if title.is_empty() {
             eprintln!("✗ Failed to create issue: title cannot be empty");
@@ -604,7 +617,16 @@ fn execute_import(
         // Resolve parent (item-specific header or CLI global fallback)
         let parent_candidate = parsed.parent.as_deref().or(args.parent.as_deref());
         let resolved_parent = parent_candidate
-            .map(|p| resolve_issue_id(storage, &id_resolver, p))
+            .map(|p| {
+                let p_lower = p.to_lowercase();
+                if let Some(id) = standin_to_id.get(&p_lower) {
+                    Ok(id.clone())
+                } else if let Some(id) = title_to_id.get(&p_lower) {
+                    Ok(id.clone())
+                } else {
+                    resolve_issue_id(storage, &id_resolver, p)
+                }
+            })
             .transpose()?;
 
         let mut retries = 0;
@@ -637,7 +659,7 @@ fn execute_import(
                     }
                 }
             } else {
-                fallback_priority
+                default_priority
             };
 
             let issue_type = if let Some(ref t) = issue_type_override {
@@ -649,7 +671,7 @@ fn execute_import(
                     }
                 }
             } else {
-                fallback_issue_type.clone()
+                default_issue_type.clone()
             };
 
             let mut issue = Issue {
@@ -728,12 +750,7 @@ fn execute_import(
                 }
             }
 
-            // Populate Dependencies (with validation)
-            let mut deps = parsed.dependencies.clone();
-            deps.extend(args.deps.clone());
-            let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
-            let mut dependency_error = None;
-
+            // Parent dependency is wired inline (parent must pre-exist or be CLI-provided).
             if let Some(parent_id) = resolved_parent.as_deref() {
                 issue.dependencies.push(Dependency {
                     issue_id: id.clone(),
@@ -744,57 +761,6 @@ fn execute_import(
                     metadata: None,
                     thread_id: None,
                 });
-            }
-
-            for dep_str in deps {
-                let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
-                if !valid {
-                    eprintln!(
-                        "warning: skipping invalid dependency type '{type_str}' for issue {id}"
-                    );
-                    continue;
-                }
-                if type_str.eq_ignore_ascii_case("blocked-by") {
-                    type_str = "blocks".to_string();
-                }
-
-                let resolved_dep_id = match resolve_dependency_id(&resolver, storage, &dep_id) {
-                    Ok(resolved_dep) => resolved_dep,
-                    Err(err) => {
-                        dependency_error = Some(format!(
-                            "unresolved dependency '{dep_id}' for issue {id}: {err}"
-                        ));
-                        break;
-                    }
-                };
-
-                if resolved_dep_id == id {
-                    eprintln!("warning: skipping self-dependency for issue {id}");
-                    continue;
-                }
-                if is_marker_only_dependency(&resolved_dep_id) {
-                    eprintln!(
-                        "warning: skipping invalid dependency '{resolved_dep_id}' for issue {id}"
-                    );
-                    continue;
-                }
-
-                let dep_type: DependencyType = type_str.parse().expect("from_str is infallible");
-
-                issue.dependencies.push(Dependency {
-                    issue_id: id.clone(),
-                    depends_on_id: resolved_dep_id,
-                    dep_type,
-                    created_at: now,
-                    created_by: Some(actor.clone()),
-                    metadata: None,
-                    thread_id: None,
-                });
-            }
-
-            if let Some(message) = dependency_error {
-                eprintln!("✗ Failed to create {title}: {message}");
-                continue 'outer;
             }
 
             match storage.create_issue(&issue, &actor) {
@@ -823,10 +789,100 @@ fn execute_import(
         }
         let id = final_id;
 
+        // Collect dependencies for deferred resolution (Phase 2).
+        // Must be OUTSIDE the retry loop so we only record the final (non-colliding) ID.
+        let mut deps = parsed.dependencies.clone();
+        deps.extend(args.deps.clone());
+        if !deps.is_empty() {
+            deferred_deps.push((id.clone(), deps));
+        }
+
+        // Register this issue for intra-file dependency resolution.
+        title_to_id.insert(title.to_lowercase(), id.clone());
+        if let Some(ref sid) = parsed.stand_in_id {
+            let sid_trimmed = sid.trim().to_string();
+            if !sid_trimmed.is_empty() {
+                // Case-insensitive, consistent with title-based resolution.
+                standin_to_id.insert(sid_trimmed.to_lowercase(), id.clone());
+            }
+        }
+
         // Increment count for next ID generation in the loop
         count += 1;
         last_created_id = Some(id.clone());
         created_ids.push((id, title));
+    }
+
+    // Phase 2: Resolve and wire up deferred dependencies.
+    // Now that all issues exist in storage, we can resolve intra-file references
+    // by title or stand-in ID, as well as references to pre-existing issues.
+    if !deferred_deps.is_empty() && !args.dry_run {
+        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
+
+        for (issue_id, deps) in &deferred_deps {
+            for dep_str in deps {
+                // First, check the raw string against intra-file maps before parsing.
+                // This handles titles containing colons (e.g., "Step 1: Setup Database")
+                // that would otherwise be misinterpreted as typed dependencies.
+                let raw_lower = dep_str.to_lowercase();
+                let (type_str, resolved_dep_id) = if let Some(id) = standin_to_id
+                    .get(&raw_lower)
+                    .or_else(|| title_to_id.get(&raw_lower))
+                {
+                    ("blocks".to_string(), id.clone())
+                } else {
+                    // No raw match — parse as type:id or bare id.
+                    let (mut t, dep_id, valid) = parse_dependency(dep_str);
+                    if !valid {
+                        eprintln!(
+                            "warning: skipping invalid dependency type '{t}' for issue {issue_id}"
+                        );
+                        continue;
+                    }
+                    if t.eq_ignore_ascii_case("blocked-by") {
+                        t = "blocks".to_string();
+                    }
+
+                    // Resolution order: stand-in ID → title → storage ID
+                    // All intra-file lookups are case-insensitive.
+                    let resolved = if let Some(id) = standin_to_id.get(&dep_id.to_lowercase()) {
+                        id.clone()
+                    } else if let Some(id) = title_to_id.get(&dep_id.to_lowercase()) {
+                        id.clone()
+                    } else {
+                        match resolve_dependency_id(&resolver, storage, &dep_id) {
+                            Ok(r) => r,
+                            Err(err) => {
+                                eprintln!(
+                                    "warning: unresolved dependency '{dep_id}' for issue {issue_id}: {err}"
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                    (t, resolved)
+                };
+
+                if resolved_dep_id == *issue_id {
+                    eprintln!("warning: skipping self-dependency for issue {issue_id}");
+                    continue;
+                }
+                if is_marker_only_dependency(&resolved_dep_id) {
+                    eprintln!(
+                        "warning: skipping invalid dependency '{resolved_dep_id}' for issue {issue_id}"
+                    );
+                    continue;
+                }
+
+                if let Err(err) =
+                    storage.add_dependency(issue_id, &resolved_dep_id, &type_str, &actor)
+                {
+                    eprintln!(
+                        "warning: failed to add dependency {issue_id} → {resolved_dep_id}: {err}"
+                    );
+                }
+            }
+        }
     }
 
     if ctx.is_json() || ctx.is_toon() {

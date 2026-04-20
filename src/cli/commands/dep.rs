@@ -1,8 +1,7 @@
 //! Dependency command implementation.
 
 use super::{
-    auto_import_storage_ctx_if_stale, open_storage_ctx_with_auto_import, resolve_issue_id,
-    retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{
     DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
@@ -38,7 +37,7 @@ pub fn execute(
         DepCommands::List(args) => execute_dep_list(args, cli, ctx, &beads_dir),
         DepCommands::Tree(args) => execute_dep_tree(args, json, cli, ctx, &beads_dir),
         DepCommands::Cycles(args) => {
-            let storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
+            let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
             dep_cycles(args, &storage_ctx.storage, json, ctx)
         }
     }
@@ -259,12 +258,9 @@ fn dep_add(
     // Cycle check for blocking types only
     if dep_type.is_blocking()
         && !depends_on_id.starts_with("external:")
-        && storage_ctx.storage.would_create_cycle(
-            &issue_id,
-            &depends_on_id,
-            Some(dep_type.as_str()),
-            true,
-        )?
+        && storage_ctx
+            .storage
+            .would_create_cycle(&issue_id, &depends_on_id, true)?
     {
         return Err(BeadsError::DependencyCycle {
             path: format!("{issue_id} -> {depends_on_id}"),
@@ -1392,7 +1388,7 @@ mod tests {
 
         // bd-002 depends on bd-001 would create a cycle
         let would_cycle = storage
-            .would_create_cycle("bd-002", "bd-001", Some("blocks"), true)
+            .would_create_cycle("bd-002", "bd-001", true)
             .unwrap();
         assert!(would_cycle);
         info!("test_cycle_detection_simple: assertions passed");
@@ -1421,13 +1417,13 @@ mod tests {
 
         // bd-003 -> bd-001 would create a cycle
         let would_cycle = storage
-            .would_create_cycle("bd-003", "bd-001", Some("blocks"), true)
+            .would_create_cycle("bd-003", "bd-001", true)
             .unwrap();
         assert!(would_cycle);
 
         // bd-003 -> bd-002 would also create a cycle
         let would_cycle = storage
-            .would_create_cycle("bd-003", "bd-002", Some("blocks"), true)
+            .would_create_cycle("bd-003", "bd-002", true)
             .unwrap();
         assert!(would_cycle);
         info!("test_cycle_detection_transitive: assertions passed");
@@ -1453,7 +1449,7 @@ mod tests {
 
         // bd-003 -> bd-002 should NOT be a cycle
         let would_cycle = storage
-            .would_create_cycle("bd-003", "bd-002", Some("blocks"), true)
+            .would_create_cycle("bd-003", "bd-002", true)
             .unwrap();
         assert!(!would_cycle);
         info!("test_no_false_positive_cycle: assertions passed");

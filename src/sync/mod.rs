@@ -17,7 +17,7 @@ pub use path::{
 };
 
 use crate::error::{BeadsError, Result};
-use crate::model::Issue;
+use crate::model::{Comment, Dependency, Issue};
 use crate::storage::SqliteStorage;
 use crate::sync::history::HistoryConfig;
 use crate::util::id::parse_id;
@@ -33,9 +33,62 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-const JSONL_BUFREADER_CAPACITY: usize = 2 * 1024 * 1024; // 2 MB
-const ESTIMATED_BYTES_PER_ISSUE: u64 = 500;
-pub(crate) const MISSING_IDS_PREVIEW_LIMIT: usize = 10;
+/// Acquire a blocking exclusive lock on `.beads/.write.lock`.
+///
+/// This serializes all mutating operations across processes, preventing
+/// concurrent-write deadlocks in the underlying SQLite engine. Uses a fast-path
+/// `try_lock()` for the uncontended case, then falls back to a true blocking
+/// `lock()` that waits indefinitely until the holder releases. The lock is
+/// held until the returned `File` drops.
+#[allow(clippy::incompatible_msrv)]
+#[must_use]
+pub fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
+    let lock_path = beads_dir.join(".write.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+
+    // Fast path: non-blocking try for the common uncontended case.
+    if file.try_lock().is_ok() {
+        return Some(file);
+    }
+
+    // Contended: block until the current holder releases.
+    tracing::debug!(".write.lock is held by another process; waiting for release");
+    match file.lock() {
+        Ok(()) => Some(file),
+        Err(e) => {
+            tracing::debug!("failed to acquire .write.lock: {e}; proceeding without lock");
+            None
+        }
+    }
+}
+
+/// Try to acquire an exclusive advisory lock on `.beads/.sync.lock`.
+///
+/// Returns the lock file on success. The lock is held until the returned
+/// `File` is dropped. If another process already holds the lock, returns
+/// `None` (non-blocking).
+#[allow(clippy::incompatible_msrv)]
+#[must_use]
+pub fn try_sync_lock(beads_dir: &Path) -> Option<File> {
+    let lock_path = beads_dir.join(".sync.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(_) => None,
+    }
+}
 
 struct TempFileGuard {
     path: PathBuf,
@@ -545,8 +598,9 @@ impl JsonlIssueValidationSummary {
 
 pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueValidationSummary> {
     let file = File::open(path)?;
-    let reader = BufReader::with_capacity(JSONL_BUFREADER_CAPACITY, file);
+    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut summary = JsonlIssueValidationSummary::default();
+    let mut seen_ids = HashSet::new();
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = line_result?;
@@ -559,6 +613,11 @@ pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueVali
         match serde_json::from_str::<Issue>(trimmed) {
             Ok(mut issue) => {
                 normalize_issue(&mut issue);
+                if !seen_ids.insert(issue.id.clone()) {
+                    summary
+                        .push_failure(line_num + 1, format!("Duplicate issue id '{}'", issue.id));
+                    continue;
+                }
                 if let Err(errors) = IssueValidator::validate(&issue) {
                     summary.push_failure(
                         line_num + 1,
@@ -636,7 +695,9 @@ pub fn preflight_export(
     // Check 2: Output path validation (PC-1, PC-2, PC-3, NGI-3)
     if let Some(ref beads_dir) = config.beads_dir {
         // Determine if the path is external (outside .beads/)
-        let is_external = crate::config::resolved_jsonl_path_is_external(beads_dir, output_path);
+        let canonical_beads = dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.clone());
+        let is_external =
+            !output_path.starts_with(beads_dir) && !output_path.starts_with(&canonical_beads);
 
         match validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)
         {
@@ -861,7 +922,9 @@ pub fn preflight_import(
     // Check 2: Input path validation (PC-1, PC-2, PC-3, NGI-3)
     if let Some(ref beads_dir) = config.beads_dir {
         // Determine if the path is external (outside .beads/)
-        let is_external = crate::config::resolved_jsonl_path_is_external(beads_dir, input_path);
+        let canonical_beads = dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.clone());
+        let is_external =
+            !input_path.starts_with(beads_dir) && !input_path.starts_with(&canonical_beads);
 
         match validate_sync_path_with_external(input_path, beads_dir, config.allow_external_jsonl) {
             Ok(()) => {
@@ -1137,7 +1200,7 @@ const CONFLICT_END: &str = ">>>>>>>";
 /// Returns an error if the file cannot be read.
 pub fn scan_conflict_markers(path: &Path) -> Result<Vec<ConflictMarker>> {
     let file = File::open(path)?;
-    let reader = BufReader::with_capacity(JSONL_BUFREADER_CAPACITY, file);
+    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut markers = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
@@ -1240,7 +1303,14 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
         let partial: PartialId = serde_json::from_str(trimmed)
             .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
 
-        ids.insert(partial.id);
+        if !ids.insert(partial.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                partial.id,
+                path.display(),
+                line_num
+            )));
+        }
         count += 1;
     }
 
@@ -1397,13 +1467,10 @@ pub fn export_to_jsonl_with_policy(
             if !missing.is_empty() {
                 let mut missing_list = missing.into_iter().cloned().collect::<Vec<_>>();
                 missing_list.sort();
-                let display_count = missing_list.len().min(MISSING_IDS_PREVIEW_LIMIT);
+                let display_count = missing_list.len().min(10);
                 let preview: Vec<_> = missing_list.iter().take(display_count).collect();
-                let more = if missing_list.len() > MISSING_IDS_PREVIEW_LIMIT {
-                    format!(
-                        " ... and {} more",
-                        missing_list.len() - MISSING_IDS_PREVIEW_LIMIT
-                    )
+                let more = if missing_list.len() > 10 {
+                    format!(" ... and {} more", missing_list.len() - 10)
                 } else {
                     String::new()
                 };
@@ -1495,8 +1562,10 @@ pub fn export_to_jsonl_with_policy(
             issue.labels = labels;
         }
 
-        // Comments — attach before normalization so normalize_issue_for_export
-        // can sort them for deterministic output.
+        // Normalize for consistent round-trip hashing (matches import behavior)
+        normalize_issue_for_export(issue);
+
+        // Comments
         if let Some(ref map) = all_comments {
             if let Some(comments) = map.get(&issue.id) {
                 issue.comments = comments.clone();
@@ -1506,10 +1575,6 @@ pub fn export_to_jsonl_with_policy(
         {
             issue.comments = comments;
         }
-
-        // Normalize for consistent round-trip hashing (matches import behavior).
-        // Must run AFTER labels, deps, and comments are attached.
-        normalize_issue_for_export(issue);
     }
 
     // Write to temp file for atomic rename
@@ -1771,8 +1836,10 @@ pub fn export_to_writer_with_policy<W: Write>(
             issue.labels = labels;
         }
 
-        // Comments — attach before normalization so normalize_issue_for_export
-        // can sort them for deterministic output.
+        // Normalize for consistent round-trip hashing (matches import behavior)
+        normalize_issue_for_export(issue);
+
+        // Comments
         if let Some(ref map) = all_comments {
             if let Some(comments) = map.get(&issue.id) {
                 issue.comments = comments.clone();
@@ -1782,10 +1849,6 @@ pub fn export_to_writer_with_policy<W: Write>(
         {
             issue.comments = comments;
         }
-
-        // Normalize for consistent round-trip hashing (matches import behavior).
-        // Must run AFTER labels, deps, and comments are attached.
-        normalize_issue_for_export(issue);
     }
 
     let mut hasher = Sha256::new();
@@ -2210,8 +2273,9 @@ pub fn finalize_export(
         storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
         record_jsonl_witness_in_tx(storage, jsonl_path)?;
 
-        // Clear force-flush flag if it was set
-        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        // Keep the row stable and clear the flag in place so ordinary export
+        // cycles avoid delete+insert churn on the metadata B-tree.
+        storage.set_metadata_in_tx("needs_flush", "false")?;
 
         Ok(())
     })?;
@@ -2236,34 +2300,6 @@ fn normalize_issue_for_export(issue: &mut Issue) {
                 .then_with(|| left.metadata.cmp(&right.metadata))
                 .then_with(|| left.thread_id.cmp(&right.thread_id))
         });
-
-        // Deduplicate dependencies on export to match import normalization.
-        // Keep the entry with the latest created_at for each (issue_id, depends_on_id) pair.
-        if issue.dependencies.len() > 1 {
-            use std::collections::HashMap;
-            let mut best: HashMap<(&str, &str), usize> = HashMap::new();
-            for (i, dep) in issue.dependencies.iter().enumerate() {
-                let key = (dep.issue_id.as_str(), dep.depends_on_id.as_str());
-                match best.get(&key) {
-                    Some(&prev_idx)
-                        if issue.dependencies[prev_idx].created_at >= dep.created_at =>
-                    {
-                        // existing entry is newer or equal, skip
-                    }
-                    _ => {
-                        best.insert(key, i);
-                    }
-                }
-            }
-            if best.len() < issue.dependencies.len() {
-                let mut keep_indices: Vec<usize> = best.into_values().collect();
-                keep_indices.sort_unstable();
-                issue.dependencies = keep_indices
-                    .into_iter()
-                    .map(|i| issue.dependencies[i].clone())
-                    .collect();
-            }
-        }
     }
 
     if !issue.comments.is_empty() {
@@ -2403,7 +2439,7 @@ fn finalize_incremental_auto_flush(
             })?;
             record_jsonl_witness_in_tx(storage, jsonl_path)?;
         }
-        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        storage.set_metadata_in_tx("needs_flush", "false")?;
         Ok(())
     })?;
 
@@ -2657,6 +2693,23 @@ pub fn auto_flush(
         return Ok(AutoFlushResult::default());
     }
 
+    // Refuse to auto-flush over a JSONL that still holds unresolved
+    // merge-conflict markers. The downstream export path would otherwise
+    // silently overwrite the `<<<<<<<` / `=======` / `>>>>>>>` regions
+    // (along with the remote side of the merge the operator hadn't yet
+    // looked at) every time a mutating CLI command returns. Explicit
+    // `br sync --flush-only` already has a `--force` escape hatch for this
+    // case; auto-flush has no such surface, so the only safe default is to
+    // stop, log clearly, and let the next explicit sync surface the error.
+    if jsonl_exists && let Err(err) = ensure_no_conflict_markers(jsonl_path) {
+        tracing::warn!(
+            jsonl_path = %jsonl_path.display(),
+            error = %err,
+            "Skipping auto-flush: JSONL contains merge-conflict markers. Resolve them (or run `br sync --flush-only --force` to override) before the next write.",
+        );
+        return Ok(AutoFlushResult::default());
+    }
+
     tracing::debug!(
         dirty_count,
         needs_flush,
@@ -2727,22 +2780,39 @@ pub fn auto_flush(
 pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
     let file = File::open(path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
-    let estimated_count = (file_size / ESTIMATED_BYTES_PER_ISSUE) as usize;
-    let reader = BufReader::new(file);
+    let estimated_count = (file_size / 500) as usize;
+    let mut reader = BufReader::new(file);
     let mut issues = Vec::with_capacity(estimated_count);
+    let mut seen_ids = HashSet::with_capacity(estimated_count);
+    let mut line = String::new();
+    let mut line_num = 0;
 
-    let iter = serde_json::Deserializer::from_reader(reader).into_iter::<Issue>();
-    for result in iter {
-        match result {
-            Ok(issue) => issues.push(issue),
-            Err(e) => {
-                return Err(BeadsError::Config(format!(
-                    "Invalid JSON at line {}: {}",
-                    e.line(),
-                    e
-                )));
-            }
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
         }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            line_num += 1;
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(trimmed).map_err(|e| {
+            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
+        })?;
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue.id,
+                path.display(),
+                line_num + 1
+            )));
+        }
+        issues.push(issue);
+        line_num += 1;
     }
 
     Ok(issues)
@@ -2902,17 +2972,20 @@ fn normalize_issue(issue: &mut Issue) {
         }
     }
 
-    // Deduplicate dependencies: the schema stores at most one dependency row
-    // per (issue_id, depends_on_id) pair regardless of type, so keep only the
-    // most recent entry by created_at for each pair. This also resolves
-    // duplicate parent-child artifacts from reparenting or migration history.
+    // Deduplicate dependencies: for each (issue_id, depends_on_id, dep_type) triple,
+    // keep only the most recent entry by created_at. This handles duplicate parent-child
+    // entries from reparenting or migration artifacts (see issue #159).
     if issue.dependencies.len() > 1 {
         use std::collections::HashMap;
-        // Build a map keyed by (issue_id, depends_on_id), keeping the entry
-        // with the latest created_at for each pair.
-        let mut best: HashMap<(String, String), usize> = HashMap::new();
+        // Build a map keyed by (issue_id, depends_on_id, dep_type), keeping the entry
+        // with the latest created_at for each triple.
+        let mut best: HashMap<(String, String, String), usize> = HashMap::new();
         for (i, dep) in issue.dependencies.iter().enumerate() {
-            let key = (dep.issue_id.clone(), dep.depends_on_id.clone());
+            let key = (
+                dep.issue_id.clone(),
+                dep.depends_on_id.clone(),
+                dep.dep_type.as_str().to_string(),
+            );
             match best.get(&key) {
                 Some(&prev_idx) if issue.dependencies[prev_idx].created_at >= dep.created_at => {
                     // existing entry is newer or equal, skip
@@ -2931,6 +3004,9 @@ fn normalize_issue(issue: &mut Issue) {
                 .collect();
         }
     }
+
+    // Recompute content hash
+    issue.content_hash = Some(content_hash(issue));
 
     // Wisp detection: if ID contains "-wisp-", mark as ephemeral
     if issue.id.contains("-wisp-") {
@@ -2963,11 +3039,6 @@ fn normalize_issue(issue: &mut Issue) {
     if issue.updated_at < issue.created_at {
         issue.updated_at = issue.created_at;
     }
-
-    // Recompute content hash AFTER all normalization and repairs above,
-    // since the hash includes external_ref, ephemeral, closed_at, and
-    // updated_at — all of which may have changed.
-    issue.content_hash = Some(content_hash(issue));
 }
 
 /// Import issues from a JSONL file.
@@ -3022,10 +3093,10 @@ pub fn import_from_jsonl(
     let file = File::open(input_path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
     // Estimate ~500 bytes per issue to pre-allocate vector capacity
-    let estimated_count = (file_size / ESTIMATED_BYTES_PER_ISSUE) as usize;
-    let mut reader = BufReader::with_capacity(JSONL_BUFREADER_CAPACITY, file);
+    let estimated_count = (file_size / 500) as usize;
+    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut issues = Vec::with_capacity(estimated_count);
-    let mut id_to_index = std::collections::HashMap::with_capacity(estimated_count);
+    let mut seen_ids = HashSet::with_capacity(estimated_count);
     let mut mismatches = Vec::new();
 
     let mut line = String::new();
@@ -3071,18 +3142,16 @@ pub fn import_from_jsonl(
             mismatches.push(issue.id.clone());
         }
 
-        // 4. Deduplicate
-        if let Some(&index) = id_to_index.get(&issue.id) {
-            tracing::warn!(
-                line = line_num,
-                id = %issue.id,
-                "Duplicate issue ID in JSONL; using the last occurrence"
-            );
-            issues[index] = issue;
-        } else {
-            id_to_index.insert(issue.id.clone(), issues.len());
-            issues.push(issue);
+        // 4. Reject duplicate IDs instead of silently collapsing records.
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue.id,
+                input_path.display(),
+                line_num
+            )));
         }
+        issues.push(issue);
 
         line.clear();
     }
@@ -3416,8 +3485,8 @@ fn process_import_action(
 ) -> Result<()> {
     match action {
         CollisionAction::Insert => {
-            storage.upsert_issue_for_import_on_active_tx(issue)?;
-            sync_issue_relations_in_active_tx(storage, issue)?;
+            storage.upsert_issue_for_import(issue)?;
+            sync_issue_relations(storage, issue)?;
             result.imported_count += 1;
             result.created_count += 1;
         }
@@ -3425,13 +3494,13 @@ fn process_import_action(
             // When updating by external_ref or content_hash, the incoming issue may have
             // a different ID than the existing one. We need to update using the existing ID.
             if existing_id == &issue.id {
-                storage.upsert_issue_for_import_on_active_tx(issue)?;
-                sync_issue_relations_in_active_tx(storage, issue)?;
+                storage.upsert_issue_for_import(issue)?;
+                sync_issue_relations(storage, issue)?;
             } else {
                 let mut updated_issue = issue.clone();
-                rewrite_issue_id_and_embedded_sources(&mut updated_issue, existing_id);
-                storage.upsert_issue_for_import_on_active_tx(&updated_issue)?;
-                sync_issue_relations_in_active_tx(storage, &updated_issue)?;
+                updated_issue.id.clone_from(existing_id);
+                storage.upsert_issue_for_import(&updated_issue)?;
+                sync_issue_relations(storage, &updated_issue)?;
             }
             result.imported_count += 1;
             result.updated_count += 1;
@@ -3448,29 +3517,16 @@ fn process_import_action(
     Ok(())
 }
 
-fn rewrite_issue_id_and_embedded_sources(issue: &mut Issue, new_id: &str) {
-    let source_id = new_id.to_string();
-    issue.id.clone_from(&source_id);
-
-    for dependency in &mut issue.dependencies {
-        dependency.issue_id.clone_from(&source_id);
-    }
-
-    for comment in &mut issue.comments {
-        comment.issue_id.clone_from(&source_id);
-    }
-}
-
 /// Sync labels, dependencies, and comments for an imported issue.
-fn sync_issue_relations_in_active_tx(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
+fn sync_issue_relations(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
     // Sync labels
-    storage.sync_labels_for_import_on_active_tx(&issue.id, &issue.labels)?;
+    storage.sync_labels_for_import(&issue.id, &issue.labels)?;
 
     // Sync dependencies
-    storage.sync_dependencies_for_import_on_active_tx(&issue.id, &issue.dependencies)?;
+    storage.sync_dependencies_for_import(&issue.id, &issue.dependencies)?;
 
     // Sync comments
-    storage.sync_comments_for_import_on_active_tx(&issue.id, &issue.comments)?;
+    storage.sync_comments_for_import(&issue.id, &issue.comments)?;
 
     Ok(())
 }
@@ -3946,6 +4002,17 @@ pub fn load_base_snapshot(jsonl_dir: &Path) -> Result<std::collections::HashMap<
     }
 
     require_valid_sync_path(&snapshot_path, jsonl_dir)?;
+
+    // `beads.base.jsonl` is normally .gitignore'd, but if a user's workspace
+    // has it committed (or committed by accident once), a botched `git merge`
+    // / `git pull` can leave `<<<<<<<` / `=======` / `>>>>>>>` markers in
+    // this file just like in `issues.jsonl`. The serde parse below would
+    // then fail with a generic "Invalid JSON in base snapshot at line N"
+    // that buries the actual problem. Run the conflict-marker scan first so
+    // the operator gets the same actionable "merge conflict markers
+    // detected" diagnostic that the JSONL path surfaces.
+    ensure_no_conflict_markers(&snapshot_path)?;
+
     let file = File::open(&snapshot_path)?;
     let reader = BufReader::new(file);
 
@@ -3965,6 +4032,328 @@ pub fn load_base_snapshot(jsonl_dir: &Path) -> Result<std::collections::HashMap<
     }
 
     Ok(base)
+}
+
+/// A tombstone row plus its related labels, dependencies, and comments,
+/// snapshotted before a rebuild so it can be atomically restored afterwards.
+///
+/// The option wrappers on the relations let callers partially preserve a
+/// tombstone whose relation fetches failed (a pattern the CLI layer already
+/// uses): we keep the issue row and skip whatever relation set couldn't be
+/// read, rather than losing the tombstone entirely.
+#[derive(Clone, Debug)]
+pub(crate) struct PreservedTombstone {
+    pub(crate) issue: Issue,
+    pub(crate) labels: Option<Vec<String>>,
+    pub(crate) dependencies: Option<Vec<Dependency>>,
+    pub(crate) comments: Option<Vec<Comment>>,
+}
+
+/// Snapshot every tombstoned issue in the database, including its labels,
+/// dependencies, and comments, so a rebuild can restore deletion-retention
+/// state that is not present in the JSONL export.
+///
+/// This is fully best-effort — the function never returns an error: if
+/// the enumeration query fails outright we log and return an empty list
+/// (the rebuild still proceeds without tombstone preservation), and
+/// per-tombstone relation fetches also degrade gracefully to issue-row-
+/// only preservation.
+#[must_use]
+pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedTombstone> {
+    let mut tombstones = Vec::new();
+    let tombstone_ids = match storage.get_issue_ids_by_status(&crate::model::Status::Tombstone) {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Failed to enumerate tombstones before rebuild; continuing without tombstone preservation"
+            );
+            return tombstones;
+        }
+    };
+
+    for tombstone_id in tombstone_ids {
+        let Some(issue) = (match storage.get_issue(&tombstone_id) {
+            Ok(issue) => issue,
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Skipping tombstone preservation for issue that could not be read before rebuild"
+                );
+                continue;
+            }
+        }) else {
+            continue;
+        };
+
+        let labels = match storage.get_labels(&tombstone_id) {
+            Ok(labels) => Some(labels),
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Failed to snapshot tombstone labels before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        let dependencies = match storage.get_dependencies_full(&tombstone_id) {
+            Ok(dependencies) => Some(dependencies),
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Failed to snapshot tombstone dependencies before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        let comments = match storage.get_comments(&tombstone_id) {
+            Ok(comments) => Some(comments),
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %tombstone_id,
+                    error = %error,
+                    "Failed to snapshot tombstone comments before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        tombstones.push(PreservedTombstone {
+            issue,
+            labels,
+            dependencies,
+            comments,
+        });
+    }
+    tombstones
+}
+
+/// Restore preserved tombstones after a successful rebuild, wrapping any
+/// failure with a message that makes clear the rebuild itself succeeded —
+/// only the retention-state restoration step failed.
+///
+/// The rebuild has already moved the original database family into the
+/// recovery directory and replaced it with a clean JSONL import at this
+/// point, so on failure the live DB is *valid* (it mirrors the JSONL),
+/// just missing whatever local unflushed tombstones we tried to preserve.
+/// Without this wrapper, a transient lock-contention retry exhaustion
+/// inside `restore_tombstones` would bubble up through callers that
+/// otherwise describe the failure as "JSONL may be corrupt" or "database
+/// recovery failed", both of which are actively misleading for this
+/// specific post-rebuild failure mode. The wrapped message tells the
+/// operator: re-running the command is idempotent and safe; the only
+/// thing they've lost is local deletions that hadn't yet been flushed.
+///
+/// Callers should prefer this helper over calling `restore_tombstones`
+/// directly when the restore follows an already-completed rebuild. Use
+/// the bare `restore_tombstones` when the surrounding transaction is
+/// still mid-rebuild and a rollback is still possible.
+///
+/// # Errors
+///
+/// Returns a `BeadsError::WithContext` whose source is the original
+/// `restore_tombstones` error. Returns `Ok(())` when `tombstones` is
+/// empty without calling into the write-transaction retry loop.
+pub(crate) fn restore_tombstones_after_rebuild(
+    storage: &mut SqliteStorage,
+    tombstones: &[PreservedTombstone],
+) -> Result<()> {
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+    let count = tombstones.len();
+    restore_tombstones(storage, tombstones).map_err(|err| BeadsError::WithContext {
+        context: format!(
+            "Rebuild from JSONL succeeded, but failed to restore {count} preserved \
+             tombstone(s). The database now mirrors the JSONL exactly — any local \
+             deletions that had not yet been flushed to the JSONL are gone. \
+             Re-running the command is idempotent and safe (the rebuild itself \
+             completed successfully). If the underlying cause is lock contention, \
+             wait for other `br` processes to finish and try again."
+        ),
+        source: Box::new(err),
+    })
+}
+
+/// Restore preserved tombstones (and their relations) atomically and mark
+/// them dirty so the next flush re-exports them.
+///
+/// # Errors
+///
+/// Returns an error if the underlying write transaction fails; the entire
+/// restore is rolled back on failure.
+pub(crate) fn restore_tombstones(
+    storage: &mut SqliteStorage,
+    tombstones: &[PreservedTombstone],
+) -> Result<()> {
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+
+    let marked_at = Utc::now().to_rfc3339();
+    storage.with_write_transaction(|storage| {
+        for tombstone in tombstones {
+            storage.upsert_issue_for_import(&tombstone.issue)?;
+        }
+        for tombstone in tombstones {
+            if let Some(labels) = &tombstone.labels {
+                storage.sync_labels_for_import(&tombstone.issue.id, labels)?;
+            }
+            if let Some(dependencies) = &tombstone.dependencies {
+                storage.sync_dependencies_for_import(&tombstone.issue.id, dependencies)?;
+            }
+            if let Some(comments) = &tombstone.comments {
+                storage.sync_comments_for_import(&tombstone.issue.id, comments)?;
+            }
+            storage.replace_dirty_issue_marker(&tombstone.issue.id, &marked_at)?;
+        }
+        Ok(())
+    })?;
+
+    tracing::debug!(
+        count = tombstones.len(),
+        "Restored tombstones atomically after rebuild and marked them dirty for export"
+    );
+    Ok(())
+}
+
+/// Per-ID view of the JSONL used to decide which preserved tombstones
+/// should actually be restored after a rebuild. The rebuild imports
+/// everything in the JSONL first, so tombstone preservation only needs to
+/// fix up rows where the local DB and the JSONL disagree.
+///
+/// Two buckets:
+///
+/// - `tombstone_ids`: IDs whose JSONL record carries `status = tombstone`.
+///   The deletion has already been flushed, so the rebuild will reimport it
+///   as a tombstone on its own — we drop any local preserved tombstone for
+///   these IDs.
+///
+/// - `non_tombstone_updated_at`: IDs whose JSONL record carries a *non*-
+///   tombstone status, mapped to the record's `updated_at`. When the local
+///   DB has one of these IDs as a tombstone, there is a disagreement: the
+///   JSONL says the issue is alive, the DB says it's deleted. We resolve
+///   it by timestamp — whichever side's last write is newer wins.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JsonlTombstoneFilter {
+    pub(crate) tombstone_ids: HashSet<String>,
+    pub(crate) non_tombstone_updated_at:
+        std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+}
+
+/// Filter the preserved tombstone set down to those that should actually
+/// be restored after the rebuild has reimported the JSONL. Three cases:
+///
+/// 1. JSONL has this ID as a tombstone: drop from preservation set — the
+///    rebuild's own `import_from_jsonl` will reinstate the tombstone.
+///
+/// 2. JSONL has this ID as a non-tombstone: the user's local delete
+///    competes with the JSONL's live record. Keep the local tombstone
+///    only if `deleted_at > updated_at` (i.e. the local deletion actually
+///    happened after the state the JSONL captured). Otherwise the JSONL
+///    is newer and we let the rebuild's import win, same way a 3-way
+///    merge with `--merge` would resolve it. Missing `deleted_at` (which
+///    shouldn't happen for a well-formed tombstone) is treated
+///    conservatively as "local is newer": preserve the tombstone rather
+///    than silently lose a local deletion.
+///
+/// 3. JSONL doesn't have this ID at all: the deletion has never been
+///    flushed anywhere. Always preserve — otherwise this path would
+///    silently lose the local delete.
+#[must_use]
+pub(crate) fn tombstones_missing_from_jsonl_tombstones(
+    tombstones: Vec<PreservedTombstone>,
+    jsonl_filter: &JsonlTombstoneFilter,
+) -> Vec<PreservedTombstone> {
+    let original_count = tombstones.len();
+    let mut skipped_already_flushed = 0usize;
+    let mut skipped_jsonl_newer = 0usize;
+    let preserved: Vec<PreservedTombstone> = tombstones
+        .into_iter()
+        .filter(|tombstone| {
+            let id = &tombstone.issue.id;
+            if jsonl_filter.tombstone_ids.contains(id) {
+                skipped_already_flushed += 1;
+                return false;
+            }
+            if let Some(jsonl_updated_at) = jsonl_filter.non_tombstone_updated_at.get(id) {
+                let local_deleted_at = tombstone.issue.deleted_at;
+                let local_is_newer =
+                    local_deleted_at.is_none_or(|deleted_at| deleted_at > *jsonl_updated_at);
+                if !local_is_newer {
+                    skipped_jsonl_newer += 1;
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    if skipped_already_flushed > 0 || skipped_jsonl_newer > 0 {
+        tracing::debug!(
+            preserved = preserved.len(),
+            skipped_already_flushed,
+            skipped_jsonl_newer,
+            original = original_count,
+            "Filtered preserved tombstones against JSONL state"
+        );
+    }
+
+    preserved
+}
+
+/// Scan the JSONL once and build a `JsonlTombstoneFilter` we can use to
+/// decide which preserved tombstones to restore after a rebuild.
+///
+/// # Errors
+///
+/// Returns an error if the JSONL cannot be read, contains invalid JSON, or
+/// has duplicate IDs across lines.
+pub(crate) fn scan_jsonl_for_tombstone_filter(path: &Path) -> Result<JsonlTombstoneFilter> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+    let mut seen_ids = HashSet::new();
+    let mut filter = JsonlTombstoneFilter::default();
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
+
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue.id,
+                path.display(),
+                line_num
+            )));
+        }
+
+        if issue.status == crate::model::Status::Tombstone {
+            filter.tombstone_ids.insert(issue.id);
+        } else {
+            filter
+                .non_tombstone_updated_at
+                .insert(issue.id, issue.updated_at);
+        }
+    }
+
+    Ok(filter)
 }
 
 #[cfg(test)]
@@ -4436,6 +4825,32 @@ mod tests {
     }
 
     #[test]
+    fn test_analyze_jsonl_rejects_duplicate_issue_ids() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("duplicate-ids.jsonl");
+
+        let issue1 = make_test_issue("bd-dup", "Original");
+        let issue2 = make_test_issue("bd-dup", "Duplicate");
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&issue1).unwrap(),
+            serde_json::to_string(&issue2).unwrap()
+        );
+        fs::write(&path, content).unwrap();
+
+        let err = analyze_jsonl(&path).unwrap_err();
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains("Duplicate issue id 'bd-dup'"),
+                    "unexpected duplicate-id error: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_export_excludes_ephemerals() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -4886,45 +5301,6 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_issue_keeps_latest_dependency_for_same_target_pair() {
-        let mut issue = make_test_issue("bd-001", "Duplicate dependency target");
-        issue.dependencies = vec![
-            crate::model::Dependency {
-                issue_id: issue.id.clone(),
-                depends_on_id: "bd-002".to_string(),
-                dep_type: crate::model::DependencyType::Blocks,
-                created_at: fixed_time(100),
-                created_by: Some("alice".to_string()),
-                metadata: Some("{\"order\":1}".to_string()),
-                thread_id: None,
-            },
-            crate::model::Dependency {
-                issue_id: issue.id.clone(),
-                depends_on_id: "bd-002".to_string(),
-                dep_type: crate::model::DependencyType::WaitsFor,
-                created_at: fixed_time(200),
-                created_by: Some("bob".to_string()),
-                metadata: Some("{\"order\":2}".to_string()),
-                thread_id: Some("br-2".to_string()),
-            },
-        ];
-
-        normalize_issue(&mut issue);
-
-        assert_eq!(issue.dependencies.len(), 1);
-        assert_eq!(
-            issue.dependencies[0].dep_type,
-            crate::model::DependencyType::WaitsFor
-        );
-        assert_eq!(issue.dependencies[0].created_by.as_deref(), Some("bob"));
-        assert_eq!(
-            issue.dependencies[0].metadata.as_deref(),
-            Some("{\"order\":2}")
-        );
-        assert_eq!(issue.dependencies[0].thread_id.as_deref(), Some("br-2"));
-    }
-
-    #[test]
     fn test_import_collision_by_id_updates_newer() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -5022,65 +5398,6 @@ mod tests {
             assert_eq!(match_type, MatchType::ExternalRef);
             assert_eq!(phase, 1);
         }
-    }
-
-    #[test]
-    fn test_import_remaps_embedded_relation_sources_when_external_ref_matches_other_id() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("issues.jsonl");
-
-        let mut existing = make_issue_at("bd-ext", "Existing", fixed_time(100));
-        existing.external_ref = Some("JIRA-1".to_string());
-        set_content_hash(&mut existing);
-        storage.upsert_issue_for_import(&existing).unwrap();
-
-        let target = make_issue_at("bd-target", "Dependency Target", fixed_time(90));
-        storage.upsert_issue_for_import(&target).unwrap();
-
-        let mut incoming = make_issue_at("bd-new", "Existing", fixed_time(200));
-        incoming.external_ref = Some("JIRA-1".to_string());
-        incoming.dependencies = vec![crate::model::Dependency {
-            issue_id: incoming.id.clone(),
-            depends_on_id: "bd-target".to_string(),
-            dep_type: crate::model::DependencyType::Blocks,
-            created_at: fixed_time(201),
-            created_by: Some("tester".to_string()),
-            metadata: None,
-            thread_id: None,
-        }];
-        incoming.comments = vec![crate::model::Comment {
-            id: 0,
-            issue_id: incoming.id.clone(),
-            author: "tester".to_string(),
-            body: "imported comment".to_string(),
-            created_at: fixed_time(202),
-        }];
-
-        std::fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string(&incoming).unwrap()),
-        )
-        .unwrap();
-
-        let result =
-            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
-
-        assert_eq!(result.imported_count, 1);
-        assert!(storage.get_issue("bd-new").unwrap().is_none());
-
-        let updated = storage.get_issue("bd-ext").unwrap().unwrap();
-        assert_eq!(updated.title, "Existing");
-
-        let dependencies = storage.get_dependencies_full("bd-ext").unwrap();
-        assert_eq!(dependencies.len(), 1);
-        assert_eq!(dependencies[0].issue_id, "bd-ext");
-        assert_eq!(dependencies[0].depends_on_id, "bd-target");
-
-        let comments = storage.get_comments("bd-ext").unwrap();
-        assert_eq!(comments.len(), 1);
-        assert_eq!(comments[0].issue_id, "bd-ext");
-        assert_eq!(comments[0].body, "imported comment");
     }
 
     #[test]
@@ -5631,6 +5948,27 @@ mod tests {
     }
 
     #[test]
+    fn test_import_duplicate_issue_ids_error() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let issue1 = make_issue_at("bd-001", "Issue 1", fixed_time(100));
+        let issue2 = make_issue_at("bd-001", "Issue 2", fixed_time(120));
+
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&issue1).unwrap(),
+            serde_json::to_string(&issue2).unwrap()
+        );
+        fs::write(&path, content).unwrap();
+
+        let err = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+            .unwrap_err();
+        assert!(err.to_string().contains("Duplicate issue id 'bd-001'"));
+    }
+
+    #[test]
     fn test_import_duplicate_external_ref_clears_and_inserts() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -6077,34 +6415,6 @@ mod tests {
         assert!(result.failures().is_empty());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn test_preflight_import_treats_symlinked_internal_target_as_internal() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        std::fs::create_dir_all(&beads_dir).unwrap();
-
-        let real_target = beads_dir.join("issues.jsonl");
-        let issue = make_test_issue("bd-001", "Test Issue");
-        let json = serde_json::to_string(&issue).unwrap();
-        std::fs::write(&real_target, format!("{json}\n")).unwrap();
-
-        let symlink_target = temp.path().join("linked-issues.jsonl");
-        symlink(&real_target, &symlink_target).unwrap();
-
-        let config = ImportConfig {
-            beads_dir: Some(beads_dir),
-            allow_external_jsonl: true,
-            ..Default::default()
-        };
-
-        let result = preflight_import(&symlink_target, &config, None).unwrap();
-
-        assert_eq!(result.overall_status, PreflightCheckStatus::Pass);
-        assert!(result.warnings().is_empty());
-        assert!(result.failures().is_empty());
-    }
-
     #[test]
     fn test_preflight_export_passes_with_valid_setup() {
         let temp = TempDir::new().unwrap();
@@ -6130,32 +6440,6 @@ mod tests {
         assert!(result.failures().is_empty());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn test_preflight_export_treats_symlinked_internal_target_as_internal() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        std::fs::create_dir_all(&beads_dir).unwrap();
-
-        let real_target = beads_dir.join("issues.jsonl");
-        std::fs::write(&real_target, "").unwrap();
-        let symlink_target = temp.path().join("linked-issues.jsonl");
-        symlink(&real_target, &symlink_target).unwrap();
-
-        let storage = SqliteStorage::open_memory().unwrap();
-        let config = ExportConfig {
-            beads_dir: Some(beads_dir),
-            allow_external_jsonl: true,
-            ..Default::default()
-        };
-
-        let result = preflight_export(&storage, &symlink_target, &config).unwrap();
-
-        assert_eq!(result.overall_status, PreflightCheckStatus::Pass);
-        assert!(result.warnings().is_empty());
-        assert!(result.failures().is_empty());
-    }
-
     // ========================================================================
     // Preflight Guardrail Tests (beads_rust-1quj)
     // ========================================================================
@@ -6168,9 +6452,11 @@ mod tests {
         let jsonl_path = beads_dir.join("issues.jsonl");
 
         // Write JSONL with invalid lines
-        let issue = make_test_issue("bd-001", "Good issue");
-        let good_json = serde_json::to_string(&issue).unwrap();
-        let content = format!("{good_json}\nNOT VALID JSON\n{good_json}\n{{\"broken: true}}\n");
+        let issue1 = make_test_issue("bd-001", "Good issue");
+        let issue2 = make_test_issue("bd-002", "Another good issue");
+        let good_json_1 = serde_json::to_string(&issue1).unwrap();
+        let good_json_2 = serde_json::to_string(&issue2).unwrap();
+        let content = format!("{good_json_1}\nNOT VALID JSON\n{good_json_2}\n{{\"broken: true}}\n");
         std::fs::write(&jsonl_path, content).unwrap();
 
         let config = ImportConfig {
@@ -6220,6 +6506,59 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_jsonl_issue_records_rejects_duplicate_issue_ids() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+
+        let issue = make_test_issue("bd-dup", "Duplicate");
+        let issue_json = serde_json::to_string(&issue).unwrap();
+        std::fs::write(&jsonl_path, format!("{issue_json}\n{issue_json}\n")).unwrap();
+
+        let summary = validate_jsonl_issue_records(&jsonl_path).unwrap();
+
+        assert_eq!(summary.record_count, 2);
+        assert_eq!(summary.invalid_count, 1);
+        let preview = summary.preview_messages();
+        assert!(
+            preview
+                .iter()
+                .any(|message| message.contains("line 2: Duplicate issue id 'bd-dup'")),
+            "expected duplicate-id validation failure in preview, got {preview:?}"
+        );
+    }
+
+    #[test]
+    fn test_preflight_import_rejects_duplicate_issue_ids_during_validation() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let issue = make_test_issue("bd-dup", "Duplicate");
+        let issue_json = serde_json::to_string(&issue).unwrap();
+        std::fs::write(&jsonl_path, format!("{issue_json}\n{issue_json}\n")).unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            ..Default::default()
+        };
+
+        let result = preflight_import(&jsonl_path, &config, None).unwrap();
+
+        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
+        let failures = result.failures();
+        let json_check = failures
+            .iter()
+            .find(|c| c.name == "json_valid")
+            .expect("expected json_valid failure");
+        assert!(
+            json_check.message.contains("Duplicate issue id 'bd-dup'"),
+            "expected duplicate-id validation message, got {}",
+            json_check.message
+        );
+    }
+
+    #[test]
     fn test_preflight_import_rejects_semantically_invalid_issue_records() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -6251,99 +6590,6 @@ mod tests {
                 .message
                 .contains("title"),
             "Expected validation failure to mention the empty title"
-        );
-    }
-
-    #[test]
-    fn test_preflight_import_rejects_invalid_embedded_comment_records() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        std::fs::create_dir_all(&beads_dir).unwrap();
-        let jsonl_path = beads_dir.join("issues.jsonl");
-
-        let mut invalid_issue = make_test_issue("bd-001", "Has bad comments");
-        invalid_issue.comments = vec![
-            crate::model::Comment {
-                id: 5,
-                issue_id: invalid_issue.id.clone(),
-                author: "alice".to_string(),
-                body: "first".to_string(),
-                created_at: invalid_issue.created_at,
-            },
-            crate::model::Comment {
-                id: 5,
-                issue_id: invalid_issue.id.clone(),
-                author: "bob".to_string(),
-                body: "second".to_string(),
-                created_at: invalid_issue.created_at + chrono::Duration::minutes(1),
-            },
-        ];
-        std::fs::write(
-            &jsonl_path,
-            format!("{}\n", serde_json::to_string(&invalid_issue).unwrap()),
-        )
-        .unwrap();
-
-        let config = ImportConfig {
-            beads_dir: Some(beads_dir),
-            ..Default::default()
-        };
-
-        let result = preflight_import(&jsonl_path, &config, None).unwrap();
-
-        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
-        let failures = result.failures();
-        let json_check = failures.iter().find(|c| c.name == "json_valid");
-        assert!(json_check.is_some(), "Expected json_valid failure");
-        assert!(
-            json_check
-                .expect("json_valid failure")
-                .message
-                .contains("comments[1].id"),
-            "Expected validation failure to mention the duplicate embedded comment id"
-        );
-    }
-
-    #[test]
-    fn test_preflight_import_rejects_invalid_embedded_dependency_records() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        std::fs::create_dir_all(&beads_dir).unwrap();
-        let jsonl_path = beads_dir.join("issues.jsonl");
-
-        let mut invalid_issue = make_test_issue("bd-001", "Has bad dependencies");
-        invalid_issue.dependencies = vec![crate::model::Dependency {
-            issue_id: invalid_issue.id.clone(),
-            depends_on_id: invalid_issue.id.clone(),
-            dep_type: crate::model::DependencyType::Blocks,
-            created_at: invalid_issue.created_at,
-            created_by: Some("alice".to_string()),
-            metadata: None,
-            thread_id: None,
-        }];
-        std::fs::write(
-            &jsonl_path,
-            format!("{}\n", serde_json::to_string(&invalid_issue).unwrap()),
-        )
-        .unwrap();
-
-        let config = ImportConfig {
-            beads_dir: Some(beads_dir),
-            ..Default::default()
-        };
-
-        let result = preflight_import(&jsonl_path, &config, None).unwrap();
-
-        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
-        let failures = result.failures();
-        let json_check = failures.iter().find(|c| c.name == "json_valid");
-        assert!(json_check.is_some(), "Expected json_valid failure");
-        assert!(
-            json_check
-                .expect("json_valid failure")
-                .message
-                .contains("dependencies[0].depends_on_id"),
-            "Expected validation failure to mention the invalid embedded dependency"
         );
     }
 

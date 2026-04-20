@@ -17,8 +17,6 @@ use crate::config;
 use crate::format::truncate_title;
 use crate::model::{IssueType, Status};
 
-const COMPLETION_TITLE_MAX_WIDTH: usize = 60;
-
 pub mod commands;
 
 #[derive(Clone, Copy)]
@@ -463,7 +461,7 @@ fn issue_id_candidates(prefix: &str, filter: IssueCompletionFilter) -> Vec<Compl
             continue;
         }
         if filter.matches(&issue.status) {
-            let title = truncate_title(&issue.title, COMPLETION_TITLE_MAX_WIDTH);
+            let title = truncate_title(&issue.title, 60);
             let help = format!("{} | {}", issue.status.as_str(), title);
             candidates.push(CompletionCandidate::new(&issue.id).help(Some(StyledStr::from(help))));
         }

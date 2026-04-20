@@ -1,5 +1,4 @@
 use crate::cli::QuickArgs;
-use crate::cli::commands::open_storage_ctx_with_auto_import;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
@@ -43,7 +42,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     }
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let layer = storage_ctx.load_config(cli)?;
     let id_config = config::id_config_from_layer(&layer);
     let default_priority = config::default_priority_from_layer(&layer)?;
@@ -174,7 +173,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     if let Some(parent_id) = resolved_parent_id.as_ref() {
         // Double-check cycle even though we are a new issue, to catch logic errors
         // and ensure the storage would_create_cycle works correctly for prospective links
-        if storage.would_create_cycle(&issue.id, parent_id, Some("parent-child"), true)? {
+        if storage.would_create_cycle(&issue.id, parent_id, true)? {
             return Err(BeadsError::DependencyCycle {
                 path: format!("{} -> {}", issue.id, parent_id),
             });

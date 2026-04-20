@@ -6,23 +6,9 @@
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
-pub const DEFAULT_ID_PREFIX: &str = "br";
 pub const MAX_ID_PREFIX_LEN: usize = 64;
 pub const MAX_ID_HASH_LEN: usize = 40;
 pub const MAX_ID_LENGTH: usize = MAX_ID_PREFIX_LEN + 1 + MAX_ID_HASH_LEN;
-
-/// Number of nonce values to try at each hash length before increasing length.
-const NONCE_RETRIES_PER_LENGTH: u32 = 10;
-/// Hash length used in the fallback path when normal lengths are exhausted.
-const FALLBACK_HASH_LENGTH: usize = 12;
-/// After this many fallback collisions, append the nonce to force uniqueness.
-const SAFETY_BREAK_THRESHOLD: u32 = 1000;
-/// Absolute upper bound on fallback nonce to prevent infinite loops.
-const HARD_STOP_LIMIT: u32 = 2000;
-/// Prefixes at or below this length are kept as-is by `abbreviate_prefix`.
-const ABBREVIATION_THRESHOLD: usize = 6;
-/// Number of leading alphanumeric chars used as a last-resort abbreviation.
-const FALLBACK_ABBREVIATION_LENGTH: usize = 3;
 
 /// Default ID generation configuration.
 #[derive(Debug, Clone)]
@@ -40,7 +26,7 @@ pub struct IdConfig {
 impl Default for IdConfig {
     fn default() -> Self {
         Self {
-            prefix: DEFAULT_ID_PREFIX.to_string(),
+            prefix: "br".to_string(),
             min_hash_length: 3,
             max_hash_length: 8,
             max_collision_prob: 0.25,
@@ -143,8 +129,8 @@ impl IdGenerator {
         let mut length = self.optimal_length(issue_count);
 
         loop {
-            // Try nonces at this length
-            for nonce in 0..NONCE_RETRIES_PER_LENGTH {
+            // Try nonces 0..10 at this length
+            for nonce in 0..10 {
                 let id =
                     self.generate_candidate(title, description, creator, created_at, nonce, length);
                 if !exists(&id) {
@@ -161,7 +147,7 @@ impl IdGenerator {
                 let mut nonce = 0;
                 loop {
                     let seed = generate_id_seed(title, description, creator, created_at, nonce);
-                    let hash_str = compute_id_hash(&seed, FALLBACK_HASH_LENGTH);
+                    let hash_str = compute_id_hash(&seed, 12);
                     let id = format!("{}-{hash_str}", self.config.prefix);
 
                     if !exists(&id) {
@@ -170,17 +156,17 @@ impl IdGenerator {
 
                     nonce += 1;
 
-                    // Safety break: if we hit many collisions even with long hashes,
+                    // Safety break: if we hit 1000 collisions even with 12-char hashes,
                     // append the nonce to force uniqueness.
-                    if nonce > SAFETY_BREAK_THRESHOLD {
+                    if nonce > 1000 {
                         let desperate_id = format!("{}-{hash_str}{nonce}", self.config.prefix);
                         if !exists(&desperate_id) {
                             return desperate_id;
                         }
                     }
 
-                    // Hard stop to prevent infinite loop if exists() is broken
-                    if nonce > HARD_STOP_LIMIT {
+                    // Hard stop at 2000 to prevent infinite loop if exists() is broken
+                    if nonce > 2000 {
                         return format!("{}-{hash_str}{nonce}", self.config.prefix);
                     }
                 }
@@ -517,7 +503,7 @@ pub fn normalize_prefix(prefix: &str) -> String {
         .to_string();
 
     if normalized.is_empty() {
-        DEFAULT_ID_PREFIX.to_string()
+        "br".to_string()
     } else {
         normalized
     }
@@ -531,7 +517,7 @@ pub fn normalize_prefix(prefix: &str) -> String {
 #[must_use]
 pub fn abbreviate_prefix(prefix: &str) -> String {
     let normalized = normalize_prefix(prefix);
-    if normalized.len() <= ABBREVIATION_THRESHOLD {
+    if normalized.len() <= 6 {
         return normalized;
     }
 
@@ -553,7 +539,7 @@ pub fn abbreviate_prefix(prefix: &str) -> String {
     let fallback: String = normalized
         .chars()
         .filter(char::is_ascii_alphanumeric)
-        .take(FALLBACK_ABBREVIATION_LENGTH)
+        .take(3)
         .collect();
     if fallback.is_empty() {
         normalized
@@ -586,7 +572,7 @@ pub struct ResolverConfig {
 impl Default for ResolverConfig {
     fn default() -> Self {
         Self {
-            default_prefix: DEFAULT_ID_PREFIX.to_string(),
+            default_prefix: "br".to_string(),
             allowed_prefixes: Vec::new(),
             allow_substring_match: true,
         }
@@ -723,11 +709,16 @@ impl IdResolver {
         // Step 3: Substring match on hash portion
         if self.config.allow_substring_match {
             // Extract the potential hash portion (after dash, or entire input if no dash)
-            let hash_pattern = split_prefix_remainder(&normalized)
-                .map_or(normalized.as_str(), |(_, remainder)| remainder);
+            let (prefix, hash_pattern) = split_prefix_remainder(&normalized)
+                .map_or((None, normalized.as_str()), |(p, r)| (Some(p), r));
 
             if !hash_pattern.is_empty() {
-                let matches = substring_match_fn(hash_pattern);
+                let mut matches = substring_match_fn(hash_pattern);
+
+                if let Some(p) = prefix {
+                    let expected_prefix = format!("{p}-");
+                    matches.retain(|id| id.starts_with(&expected_prefix));
+                }
 
                 match matches.len() {
                     0 => {
@@ -806,11 +797,16 @@ impl IdResolver {
         }
 
         if self.config.allow_substring_match {
-            let hash_pattern = split_prefix_remainder(&normalized)
-                .map_or(normalized.as_str(), |(_, remainder)| remainder);
+            let (prefix, hash_pattern) = split_prefix_remainder(&normalized)
+                .map_or((None, normalized.as_str()), |(p, r)| (Some(p), r));
 
             if !hash_pattern.is_empty() {
-                let matches = substring_match_fn(hash_pattern)?;
+                let mut matches = substring_match_fn(hash_pattern)?;
+
+                if let Some(p) = prefix {
+                    let expected_prefix = format!("{p}-");
+                    matches.retain(|id| id.starts_with(&expected_prefix));
+                }
 
                 match matches.len() {
                     0 => {}
@@ -888,13 +884,28 @@ impl IdResolver {
 /// of `IdResolver::resolve`. The caller provides the list of all known IDs.
 #[must_use]
 pub fn find_matching_ids(all_ids: &[String], hash_substring: &str) -> Vec<String> {
+    // Split search pattern into base hash and optional child path so that
+    // searching for "64up6.4" correctly matches "bd-64up6.4" instead of
+    // stripping the child suffix from the candidate and failing.
+    let (search_base, search_child) = match hash_substring.split_once('.') {
+        Some((base, child)) => (base, Some(child)),
+        None => (hash_substring, None),
+    };
+
     all_ids
         .iter()
         .filter(|id| {
-            // Extract hash portion (after the last dash)
             split_prefix_remainder(id).is_some_and(|(_, remainder)| {
                 let base_hash = remainder.split('.').next().unwrap_or(remainder);
-                base_hash.contains(hash_substring)
+                if !base_hash.contains(search_base) {
+                    return false;
+                }
+                match search_child {
+                    Some(child) => remainder
+                        .split_once('.')
+                        .is_some_and(|(_, candidate_child)| candidate_child == child),
+                    None => true,
+                }
             })
         })
         .cloned()

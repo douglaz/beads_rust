@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_issues_array, extract_json_payload, run_br};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -34,8 +34,8 @@ fn q_creates_issue_returns_id_only() {
     // Should be just the ID, no other output
     assert_eq!(output.lines().count(), 1, "q should output only one line");
     assert!(
-        output.starts_with("bd-") || output.contains('-'),
-        "output should be an ID format, got: {output}"
+        output.contains('-'),
+        "output should be an issue ID (prefix-hash format), got: {output}"
     );
     // Should not contain "Created" or other verbose text
     assert!(
@@ -313,8 +313,7 @@ fn q_issue_appears_in_list() {
     let list = run_br(&workspace, ["list", "--json"], "list");
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&list.stdout);
 
     let found = json.iter().any(|issue| issue["id"] == id);
     assert!(found, "issue {id} should appear in list output");
@@ -560,8 +559,7 @@ fn q_multiple_creates_unique_ids() {
     let list = run_br(&workspace, ["list", "--json"], "list_all");
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
-    let payload = extract_json_payload(&list.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let json = extract_issues_array(&list.stdout);
     assert_eq!(json.len(), 10, "should have 10 issues");
 }
 

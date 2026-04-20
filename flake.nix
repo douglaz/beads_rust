@@ -52,6 +52,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         isLinux = pkgs.stdenv.isLinux;
+        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
 
         # For static musl builds on Linux
         muslTarget = {
@@ -114,8 +115,8 @@
           inherit cargoVendorDir;
           cargoLock = ./Cargo.lock;
 
-          pname = "beads_rust";
-          version = "0.1.34";
+          pname = cargoToml.package.name;
+          version = cargoToml.package.version;
 
           strictDeps = true;
 

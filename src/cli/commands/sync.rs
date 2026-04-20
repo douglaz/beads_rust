@@ -6,19 +6,19 @@
 use crate::cli::SyncArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::Issue;
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
-    METADATA_LAST_IMPORT_TIME, MISSING_IDS_PREVIEW_LIMIT, MergeContext, OrphanMode,
-    compute_jsonl_hash, compute_staleness, count_issues_in_jsonl, export_temp_path,
-    export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl, import_from_jsonl,
-    load_base_snapshot, read_issues_from_jsonl, require_safe_sync_overwrite_path,
-    save_base_snapshot, three_way_merge, validate_sync_path_with_external,
+    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, compute_staleness,
+    count_issues_in_jsonl, export_temp_path, export_to_jsonl_with_policy, finalize_export,
+    get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
+    require_safe_sync_overwrite_path, restore_tombstones_after_rebuild, save_base_snapshot,
+    scan_jsonl_for_tombstone_filter, snapshot_tombstones, three_way_merge,
+    tombstones_missing_from_jsonl_tombstones, validate_sync_path_with_external,
 };
-use crate::util::id::{DEFAULT_ID_PREFIX, split_prefix_remainder};
+use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -26,9 +26,6 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
-
-/// Number of hex characters to show when truncating SHA-256 content hashes.
-const HASH_DISPLAY_TRUNCATION_LEN: usize = 12;
 
 /// Result of a flush (export) operation.
 #[derive(Debug, Serialize)]
@@ -93,31 +90,44 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    // Open storage
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let config::OpenStorageResult {
-        mut storage, paths, ..
-    } = config::open_storage_with_cli(&beads_dir, cli)?;
+    validate_sync_mode_args(args)?;
 
-    let jsonl_path = paths.jsonl_path;
-    let retention_days = paths.metadata.deletions_retention_days;
-    let use_json = ctx.is_json() || args.robot;
-    let quiet = cli.quiet.unwrap_or(false);
-    let show_progress = should_show_progress(use_json, quiet);
-    let path_policy = validate_sync_paths(&beads_dir, &jsonl_path, args.allow_external_jsonl)?;
+    // Open storage. For `--rename-prefix` imports, defer any implicit JSONL
+    // recovery until the explicit import path below so the command's import
+    // semantics (ID rewrites and duplicate external_ref cleanup) are applied
+    // in the same invocation instead of being skipped by open-time recovery.
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
+    let path_policy = validate_sync_paths(
+        &beads_dir,
+        &startup.paths.jsonl_path,
+        args.allow_external_jsonl,
+    )?;
     debug!(
         jsonl_path = %path_policy.jsonl_path.display(),
         manifest_path = %path_policy.manifest_path.display(),
         external_jsonl = path_policy.is_external,
         "Resolved sync path policy"
     );
+    let defer_jsonl_recovery =
+        !args.status && !args.flush_only && !args.merge && args.rename_prefix;
+    let mut open_result =
+        config::open_storage_with_startup_config(startup, cli, defer_jsonl_recovery)?;
 
-    // Handle --status flag
-    if args.status {
-        return execute_status(&storage, &path_policy, use_json, ctx);
-    }
+    maybe_delegate_rebuild(args, &mut open_result)?;
 
-    // Validate mutually exclusive modes
+    let command_result =
+        dispatch_sync_subcommand(args, cli, ctx, &beads_dir, &path_policy, &mut open_result);
+
+    finalize_sync_result(command_result, &mut open_result)
+}
+
+/// Reject argument combinations that must fail BEFORE opening storage or
+/// triggering any rebuild side effect. A `--flush-only --rebuild` or
+/// `--merge --rebuild` combination must return an error without having
+/// touched the DB family — otherwise the validation message arrives after
+/// `recover_database_from_jsonl` has already moved the existing DB aside.
+fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
     let mode_count = u8::from(args.flush_only) + u8::from(args.import_only) + u8::from(args.merge);
     if mode_count > 1 {
         return Err(BeadsError::Validation {
@@ -135,42 +145,199 @@ pub fn execute(
                 .to_string(),
         });
     }
+    Ok(())
+}
 
+/// When `--rebuild` is requested against an existing (non-auto-rebuilt)
+/// DB, delegate the actual rebuild to the same proven path that auto-
+/// recovery uses: backup the DB family, open a fresh connection, import
+/// JSONL, checkpoint, VACUUM/REINDEX. The in-place
+/// `reset_data_tables`+`import_from_jsonl` code path inside
+/// `execute_import` is fragile on fsqlite — it trips stale-pager/MVCC
+/// bugs that leave "never used" pages and partial-index mismatches that
+/// VACUUM can't always reclaim. Using `recover_database_from_jsonl`
+/// sidesteps all of that, and `execute_import` then sees
+/// `auto_rebuilt == true` and short-circuits.
+///
+/// Only fire this for the request that will actually go through
+/// `execute_import`: `--rebuild` without `--status`, and not alongside
+/// `--flush-only`/`--merge` (already rejected above). `--status` must
+/// stay read-only even when the caller also passed `--rebuild`, so skip
+/// the rebuild if status was requested. Also require the JSONL to exist —
+/// `recover_database_from_jsonl` runs a preflight that fails hard if the
+/// file is missing, whereas `execute_import` already handles a missing
+/// JSONL gracefully, so leave that case to the normal path.
+///
+/// Skip the delegation when the caller asked for behavior that the
+/// auto-recovery path does not replicate: `--rename-prefix` rewrites
+/// imported IDs into the configured prefix, while
+/// `repair_database_from_jsonl` always runs with
+/// `rename_on_import = false`. That means the delegation would silently
+/// skip the requested rename behavior.
+///
+/// `--orphans` is intentionally *not* part of this guard today. The
+/// current import engine parses `orphan_mode` into `ImportConfig`, but it
+/// does not consult that field during import, so delegating does not
+/// change effective behavior. If orphan-mode semantics become active in
+/// the future, revisit this guard and the auto-rebuild conflict
+/// detection below.
+fn maybe_delegate_rebuild(
+    args: &SyncArgs,
+    open_result: &mut config::OpenStorageResult,
+) -> Result<()> {
+    let delegation_would_drop_user_flags = args.rename_prefix;
+    let should_delegate = args.rebuild
+        && !args.status
+        && !open_result.no_db
+        && !open_result.auto_rebuilt
+        && open_result.paths.jsonl_path.is_file()
+        && !delegation_would_drop_user_flags;
+    if !should_delegate {
+        return Ok(());
+    }
+
+    info!(
+        db_path = %open_result.paths.db_path.display(),
+        jsonl_path = %open_result.paths.jsonl_path.display(),
+        "--rebuild requested on existing DB: delegating to auto-recovery rebuild path"
+    );
+    // Snapshot tombstones before the delegation wipes the DB. The
+    // in-place rebuild path inside `execute_import` preserves deletion-
+    // retention state across `reset_data_tables` via
+    // `snapshot_tombstones` + `restore_tombstones`; the auto-recovery
+    // path opens a fresh DB and only imports what's in the JSONL, so
+    // any tombstones that were in the old DB but not yet flushed would
+    // be silently lost. Grab them here, restore them after the
+    // delegated rebuild completes.
+    //
+    // `scan_jsonl_for_tombstone_filter` parses the JSONL, and that
+    // parse fails with a generic "Invalid JSON at line 1" when the
+    // file contains merge-conflict markers. Scan for markers first so
+    // the operator gets the conflict-markers error class that
+    // `recover_database_from_jsonl`'s preflight would have surfaced
+    // otherwise.
+    crate::sync::ensure_no_conflict_markers(&open_result.paths.jsonl_path)?;
+    let jsonl_filter = scan_jsonl_for_tombstone_filter(&open_result.paths.jsonl_path)?;
+    let preserved_pre_delegation_tombstones = tombstones_missing_from_jsonl_tombstones(
+        snapshot_tombstones(&open_result.storage),
+        &jsonl_filter,
+    );
+    // `recover_database_from_jsonl` sets `auto_rebuilt = true` on success,
+    // which is what gates the short-circuit inside `execute_import` below.
+    open_result.recover_database_from_jsonl()?;
+    let restore_count = preserved_pre_delegation_tombstones.len();
+    restore_tombstones_after_rebuild(
+        &mut open_result.storage,
+        &preserved_pre_delegation_tombstones,
+    )?;
+    if restore_count > 0 {
+        debug!(
+            count = restore_count,
+            "Restored tombstones across delegated auto-recovery rebuild"
+        );
+    }
+    Ok(())
+}
+
+/// Dispatch to the appropriate sync-subcommand implementation based on
+/// the flag pattern (`--status` / `--flush-only` / `--merge` /
+/// default-or-`--import-only`). The status branch is read-only; the
+/// other three hold a `&mut` borrow on `open_result.storage` for the
+/// duration of their execution. Any `Err` propagates back to
+/// `finalize_sync_result`, which is the single place that decides how to
+/// handle recovery-backup rollback.
+fn dispatch_sync_subcommand(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+    path_policy: &SyncPathPolicy,
+    open_result: &mut config::OpenStorageResult,
+) -> Result<()> {
+    let db_path = open_result.paths.db_path.clone();
+    let retention_days = open_result.paths.metadata.deletions_retention_days;
+    let use_json = ctx.is_json() || args.robot;
+    let quiet = cli.quiet.unwrap_or(false);
+    let show_progress = should_show_progress(use_json, quiet);
+
+    if args.status {
+        return execute_status(&open_result.storage, path_policy, use_json, ctx);
+    }
     if args.flush_only {
-        execute_flush(
-            &mut storage,
-            &beads_dir,
-            &path_policy,
+        return execute_flush(
+            &mut open_result.storage,
+            beads_dir,
+            path_policy,
             args,
             use_json,
             show_progress,
             retention_days,
             ctx,
-        )
-    } else if args.merge {
-        execute_merge(
-            &mut storage,
-            &path_policy,
+        );
+    }
+    if args.merge {
+        return execute_merge(
+            &mut open_result.storage,
+            path_policy,
             args,
             use_json,
             show_progress,
             retention_days,
             cli,
             ctx,
-        )
-    } else {
-        // Default to import-only if no flag is specified (consistent with existing behavior)
-        // or explicitly import-only
-        execute_import(
-            &mut storage,
-            &beads_dir,
-            cli,
-            &path_policy,
-            args,
-            use_json,
-            show_progress,
-            ctx,
-        )
+        );
+    }
+    // Default to import-only if no flag is specified (consistent with
+    // existing behavior) or explicitly `--import-only`.
+    execute_import(
+        &mut open_result.storage,
+        beads_dir,
+        cli,
+        path_policy,
+        args,
+        use_json,
+        show_progress,
+        open_result.auto_rebuilt,
+        &db_path,
+        ctx,
+    )
+}
+
+/// Fold the subcommand result into the final command outcome, restoring
+/// the pre-recovery backup on error (deferred-recovery paths only) and
+/// discarding it on success.
+fn finalize_sync_result(
+    command_result: Result<()>,
+    open_result: &mut config::OpenStorageResult,
+) -> Result<()> {
+    match command_result {
+        Ok(()) => {
+            open_result.discard_pending_recovery_backup();
+            Ok(())
+        }
+        Err(command_err) => {
+            let recovery_dir = open_result.pending_recovery_dir().map(PathBuf::from);
+            if let Err(restore_err) = open_result.restore_pending_recovery_backup() {
+                let context = recovery_dir.map_or_else(
+                    || {
+                        format!(
+                            "sync command failed after deferred database recovery ({command_err}); original database restore also failed"
+                        )
+                    },
+                    |dir| {
+                        format!(
+                            "sync command failed after deferred database recovery ({command_err}); original database restore from '{}' also failed",
+                            dir.display()
+                        )
+                    },
+                );
+                return Err(BeadsError::WithContext {
+                    context,
+                    source: Box::new(restore_err),
+                });
+            }
+            Err(command_err)
+        }
     }
 }
 
@@ -213,7 +380,7 @@ fn validate_sync_paths(
         )));
     }
 
-    let is_external = config::resolved_jsonl_path_is_external(&canonical_beads, &jsonl_path);
+    let is_external = !jsonl_path.starts_with(&canonical_beads);
     if is_external && !allow_external_jsonl {
         warn!(
             path = %jsonl_path.display(),
@@ -443,8 +610,8 @@ fn render_status_rich(status: &SyncStatus, ctx: &OutputContext) {
     // Content hash (truncated)
     if let Some(ref hash) = status.jsonl_content_hash {
         text.append_styled("Content hash: ", theme.dimmed.clone());
-        let display_hash = if hash.len() > HASH_DISPLAY_TRUNCATION_LEN {
-            format!("{}…", &hash[..HASH_DISPLAY_TRUNCATION_LEN])
+        let display_hash = if hash.len() > 12 {
+            format!("{}…", &hash[..12])
         } else {
             hash.clone()
         };
@@ -488,8 +655,22 @@ fn execute_flush(
     let db_issue_count = storage.count_issues()?;
     debug!(dirty_count = dirty_ids.len(), "Found dirty issues");
 
+    // Refuse to overwrite a JSONL that still holds unresolved merge-conflict
+    // markers. The main flush path below would blow away the `<<<<<<<` /
+    // `=======` / `>>>>>>>` regions along with whatever remote side of the
+    // merge they contain, silently resolving the conflict in favor of the
+    // local DB. Detect the markers up-front so the operator can resolve the
+    // merge (or pass `--force` if they actually intend the DB to win).
+    if jsonl_exists && !args.force {
+        crate::sync::ensure_no_conflict_markers(jsonl_path)?;
+    }
+
     // If no dirty issues and no force, report nothing to do
     if dirty_ids.is_empty() && !needs_flush && jsonl_exists && !args.force {
+        // `ensure_no_conflict_markers` ran above before we got here, so
+        // `count_issues_in_jsonl` / `get_issue_ids_from_jsonl` below won't
+        // trip over unresolved `<<<<<<<` / `=======` / `>>>>>>>` lines.
+
         // Guard against empty DB overwriting a non-empty JSONL.
         let existing_count = count_issues_in_jsonl(jsonl_path)?;
         if existing_count > 0 && db_issue_count == 0 {
@@ -512,18 +693,15 @@ fn execute_flush(
 
             if !missing_list.is_empty() {
                 missing_list.sort();
-                let display_count = missing_list.len().min(MISSING_IDS_PREVIEW_LIMIT);
+                let display_count = missing_list.len().min(10);
                 let preview = missing_list
                     .iter()
                     .take(display_count)
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .join(", ");
-                let more = if missing_list.len() > MISSING_IDS_PREVIEW_LIMIT {
-                    format!(
-                        " ... and {} more",
-                        missing_list.len() - MISSING_IDS_PREVIEW_LIMIT
-                    )
+                let more = if missing_list.len() > 10 {
+                    format!(" ... and {} more", missing_list.len() - 10)
                 } else {
                     String::new()
                 };
@@ -624,8 +802,7 @@ fn execute_flush(
     };
 
     // Output result
-    let cleared_dirty =
-        export_result.exported_ids.len() + export_result.skipped_tombstone_ids.len();
+    let cleared_dirty = export_result.exported_marked_at.len();
     let result = FlushResult {
         exported_issues: report.issues_exported,
         exported_dependencies: report.dependencies_exported,
@@ -754,8 +931,8 @@ fn render_flush_result_rich(result: &FlushResult, errors: &[ExportError], ctx: &
     if !result.content_hash.is_empty() {
         text.append("\n");
         text.append_styled("Content hash  ", theme.dimmed.clone());
-        let display_hash = if result.content_hash.len() > HASH_DISPLAY_TRUNCATION_LEN {
-            format!("{}…", &result.content_hash[..HASH_DISPLAY_TRUNCATION_LEN])
+        let display_hash = if result.content_hash.len() > 12 {
+            format!("{}…", &result.content_hash[..12])
         } else {
             result.content_hash.clone()
         };
@@ -838,6 +1015,144 @@ fn should_show_progress(json: bool, quiet: bool) -> bool {
     !json && !quiet && std::io::stdout().is_terminal()
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn push_cli_rerun_overrides(rerun: &mut Vec<String>, cli: &config::CliOverrides) {
+    if cli.json == Some(true) {
+        rerun.push("--json".to_string());
+    }
+    if cli.quiet == Some(true) {
+        rerun.push("--quiet".to_string());
+    }
+    // Preserve `--no-color` so the re-run inherits the caller's output
+    // preference; dropping it silently flips colorized output back on.
+    if cli.display_color == Some(false) {
+        rerun.push("--no-color".to_string());
+    }
+    // Preserve `--actor` so audit-log entries from the re-run carry the
+    // same identity the operator originally specified.
+    if let Some(actor) = &cli.actor {
+        rerun.push("--actor".to_string());
+        rerun.push(shell_quote(actor));
+    }
+    if cli.allow_stale == Some(true) {
+        rerun.push("--allow-stale".to_string());
+    }
+    if cli.no_daemon == Some(true) {
+        rerun.push("--no-daemon".to_string());
+    }
+    if cli.no_auto_import == Some(true) {
+        rerun.push("--no-auto-import".to_string());
+    }
+    if cli.no_auto_flush == Some(true) {
+        rerun.push("--no-auto-flush".to_string());
+    }
+    if let Some(timeout) = cli.lock_timeout {
+        rerun.push("--lock-timeout".to_string());
+        rerun.push(timeout.to_string());
+    }
+}
+
+fn auto_rebuild_semantic_flag_conflict_reason(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    db_path: Option<&Path>,
+) -> Option<String> {
+    if !args.rename_prefix {
+        return None;
+    }
+
+    let mut rerun = vec!["br".to_string()];
+    if let Some(path) = db_path {
+        rerun.push("--db".to_string());
+        rerun.push(shell_quote(&path.display().to_string()));
+    }
+    push_cli_rerun_overrides(&mut rerun, cli);
+    rerun.push("sync".to_string());
+    rerun.push("--import-only".to_string());
+    if args.allow_external_jsonl {
+        rerun.push("--allow-external-jsonl".to_string());
+    }
+    if args.force {
+        rerun.push("--force".to_string());
+    }
+    if args.rebuild {
+        rerun.push("--rebuild".to_string());
+    }
+    rerun.push("--rename-prefix".to_string());
+
+    Some(format!(
+        "Open-time recovery rebuilt the database before import, so the requested import semantics (`--rename-prefix`) were not applied. Re-run `{}` now that the DB is healthy.",
+        rerun.join(" ")
+    ))
+}
+
+fn auto_rebuild_semantic_conflict_field(args: &SyncArgs) -> &'static str {
+    if args.rebuild {
+        "rebuild"
+    } else if args.force {
+        "force"
+    } else {
+        "rename_prefix"
+    }
+}
+
+fn jsonl_contains_prefix_mismatch(jsonl_path: &Path, expected_prefix: &str) -> Result<bool> {
+    let expected_prefix = expected_prefix.trim_end_matches('-');
+    for issue in read_issues_from_jsonl(jsonl_path)? {
+        if issue.status == crate::model::Status::Tombstone {
+            continue;
+        }
+        match split_prefix_remainder(&issue.id) {
+            Some((prefix, _)) if prefix == expected_prefix => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+fn jsonl_contains_duplicate_external_refs(jsonl_path: &Path) -> Result<bool> {
+    let mut seen_external_refs = HashSet::new();
+    for issue in read_issues_from_jsonl(jsonl_path)? {
+        if let Some(external_ref) = issue.external_ref
+            && !seen_external_refs.insert(external_ref)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn emit_auto_rebuild_import_result(
+    storage: &crate::storage::SqliteStorage,
+    use_json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let created = storage.count_all_issues()?;
+    let result = ImportResultOutput {
+        created,
+        updated: 0,
+        skipped: 0,
+        tombstone_skipped: 0,
+        orphans_removed: 0,
+        blocked_cache_rebuilt: true,
+    };
+    if use_json {
+        ctx.json_pretty(&result);
+    } else if !suppress_human_sync_output(ctx, use_json) {
+        if ctx.is_rich() {
+            render_import_result_rich(&result, ctx);
+        } else {
+            println!("Imported from JSONL (via automatic recovery):");
+            println!("  Created: {} issues", result.created);
+            println!("  Rebuilt blocked cache");
+        }
+    }
+    Ok(())
+}
+
 /// Execute the --import-only operation.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_import(
@@ -848,6 +1163,8 @@ fn execute_import(
     args: &SyncArgs,
     use_json: bool,
     show_progress: bool,
+    auto_rebuilt: bool,
+    db_path: &std::path::Path,
     ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting JSONL import");
@@ -856,8 +1173,78 @@ fn execute_import(
         jsonl_path = %jsonl_path.display(),
         external_jsonl = path_policy.is_external,
         force = args.force,
+        auto_rebuilt,
         "Import configuration resolved"
     );
+
+    // If the storage was just rebuilt from JSONL during the open sequence
+    // (either the DB file did not exist or a recoverable anomaly triggered
+    // `rebuild_database_from_jsonl`), the DB is already a clean import of the
+    // JSONL. Re-running `--rebuild`/`--force` here would redo the import and
+    // trigger fsqlite's stale-pager OpenRead bug ("could not open storage
+    // cursor on root page N") because `reset_data_tables` + bulk INSERT within
+    // the fresh connection exercises exactly the code path that just ran.
+    // Prefix is a default for newly generated IDs, not a project-wide import
+    // invariant. Only compute an expected prefix when the caller explicitly
+    // asked to rename imported IDs into the configured prefix.
+    let target_prefix = if args.rename_prefix {
+        let layer = config::load_config(beads_dir, Some(storage), cli)?;
+        let id_cfg = config::id_config_from_layer(&layer);
+        Some(if id_cfg.prefix == "br" {
+            // Prefix is still the default — check if we should auto-detect from JSONL
+            let db_prefix = storage.get_config("issue_prefix")?;
+            if let Some(p) = db_prefix {
+                p
+            } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
+                info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
+                // Persist the detected prefix to config for future operations
+                storage.set_config("issue_prefix", &detected)?;
+                detected
+            } else {
+                "br".to_string()
+            }
+        } else {
+            // Config layer resolved a non-default prefix — use it
+            id_cfg.prefix
+        })
+    } else {
+        None
+    };
+
+    // When the caller requested semantics that auto-recovery could not honor
+    // (`--rename-prefix`) *and* the JSONL actually contains mismatched IDs
+    // that would have been renamed, fail explicitly so the operator can re-run
+    // on the now-healthy DB. If the flag would have been a no-op, preserve the
+    // happy-path short-circuit because the rebuild is already done. Skip the
+    // whole check when there is no rename request (`target_prefix.is_none()`)
+    // so we avoid the disk-touching `resolve_paths` call on the common path.
+    let rename_semantics_were_skipped = auto_rebuilt
+        && target_prefix.as_deref().is_some_and(|prefix| {
+            jsonl_contains_prefix_mismatch(jsonl_path, prefix).unwrap_or(true)
+                || jsonl_contains_duplicate_external_refs(jsonl_path).unwrap_or(true)
+        });
+    if rename_semantics_were_skipped {
+        let rerun_db_path = config::resolve_paths(beads_dir, None)
+            .ok()
+            .filter(|paths| paths.db_path != *db_path)
+            .map(|_| db_path);
+        if let Some(reason) = auto_rebuild_semantic_flag_conflict_reason(args, cli, rerun_db_path) {
+            return Err(BeadsError::Validation {
+                field: auto_rebuild_semantic_conflict_field(args).to_string(),
+                reason,
+            });
+        }
+    }
+
+    if auto_rebuilt {
+        info!(
+            force = args.force,
+            rebuild = args.rebuild,
+            "Skipping import body: database was rebuilt from JSONL during open"
+        );
+        emit_auto_rebuild_import_result(storage, use_json, ctx)?;
+        return Ok(());
+    }
 
     // Check if JSONL exists
     if !jsonl_path.exists() {
@@ -941,45 +1328,65 @@ fn execute_import(
         show_progress,
     };
 
-    // Prefix is a default for newly generated IDs, not a project-wide import
-    // invariant. Only compute an expected prefix when the caller explicitly
-    // asked to rename imported IDs into the configured prefix.
-    let target_prefix = if args.rename_prefix {
-        let layer = config::load_config(beads_dir, Some(storage), cli)?;
-        let id_cfg = config::id_config_from_layer(&layer);
-        Some(if id_cfg.prefix == DEFAULT_ID_PREFIX {
-            // Prefix is still the default — check if we should auto-detect from JSONL
-            let db_prefix = storage.get_config("issue_prefix")?;
-            if let Some(p) = db_prefix {
-                p
-            } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
-                info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
-                // Persist the detected prefix to config for future operations
-                storage.set_config("issue_prefix", &detected)?;
-                detected
-            } else {
-                DEFAULT_ID_PREFIX.to_string()
-            }
-        } else {
-            // Config layer resolved a non-default prefix — use it
-            id_cfg.prefix
-        })
+    // For force/rebuild imports we read the JSONL twice before
+    // `import_from_jsonl` is even called (once to collect issue IDs for the
+    // orphan pass, once to precompute tombstone IDs for the preservation
+    // filter). Those reads fail with a generic "Invalid JSON at line 1"
+    // error when the JSONL contains merge-conflict markers, which buries
+    // the much more actionable "merge conflict markers detected" message
+    // that `import_from_jsonl` would surface later. Run the conflict-marker
+    // scan up-front so the operator sees the right error class regardless
+    // of which parse attempt fires first.
+    if args.force || args.rebuild {
+        crate::sync::ensure_no_conflict_markers(jsonl_path)?;
+    }
+    let jsonl_issue_ids = if args.force || args.rebuild {
+        Some(get_issue_ids_from_jsonl(jsonl_path)?)
+    } else {
+        None
+    };
+    let jsonl_filter = if args.force || args.rebuild {
+        Some(scan_jsonl_for_tombstone_filter(jsonl_path)?)
     } else {
         None
     };
 
-    let preserved_tombstones = if args.force {
-        snapshot_tombstones(storage)?
+    let preserved_tombstones = if args.force || args.rebuild {
+        tombstones_missing_from_jsonl_tombstones(
+            snapshot_tombstones(storage),
+            jsonl_filter
+                .as_ref()
+                .expect("force/rebuild imports should precompute JSONL tombstone filter"),
+        )
     } else {
         Vec::new()
     };
 
-    // For force imports, drop and recreate data tables to avoid fsqlite btree
-    // cursor bugs on DELETE operations in large tables. Config/metadata are preserved.
-    if args.force {
-        debug!("Force import: resetting data tables to avoid btree DELETE bugs");
-        storage.reset_data_tables()?;
-        restore_tombstones(storage, &preserved_tombstones)?;
+    // For force imports and rebuilds, drop and recreate data tables to avoid
+    // fsqlite btree cursor bugs on DELETE operations in large tables.
+    // Config/metadata are preserved.  Without this, --rebuild on a corrupt DB
+    // can hang indefinitely during orphan deletion (#245).
+    //
+    // Skip the reset when the `issues` table is already empty (e.g. right
+    // after `br init` or `br init --force`): the DROP + CREATE sequence
+    // generates "never used" freelist pages that fsqlite's VACUUM cannot
+    // reclaim, which C sqlite3's integrity_check then flags as corruption
+    // (issue #248). When the target is already empty, we can INSERT directly
+    // and skip the leak entirely.
+    if args.force || args.rebuild {
+        let existing_issue_count = storage.count_all_issues()?;
+        if existing_issue_count == 0 && preserved_tombstones.is_empty() {
+            debug!(
+                "Force/rebuild import: target DB already empty, skipping reset_data_tables to avoid fsqlite freelist leak"
+            );
+        } else {
+            debug!(
+                existing_issue_count,
+                preserved_tombstones = preserved_tombstones.len(),
+                "Force/rebuild import: resetting data tables to avoid btree DELETE bugs; preserved tombstones will be restored atomically after import"
+            );
+            storage.reset_data_tables()?;
+        }
     }
 
     // Execute import
@@ -998,11 +1405,38 @@ fn execute_import(
         "Import complete"
     );
 
-    // --rebuild: remove DB entries not present in JSONL
-    if args.rebuild {
-        let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
+    // --rebuild: remove DB entries not present in JSONL.
+    //
+    // Skip this entirely when `--rename-prefix` is also set: the import just
+    // rewrote every JSONL ID into the configured prefix, so `db_ids` are
+    // post-rename (e.g. "newpref-xre") while `jsonl_ids` are pre-rename
+    // (e.g. "oldpref-001"). The set-difference would classify every
+    // newly-imported issue as an orphan and wipe the DB — exactly the
+    // opposite of what the user asked for. With `reset_data_tables` having
+    // cleared everything beforehand, the post-import DB contents already
+    // mirror the JSONL (modulo the prefix rewrite), so the orphan pass has
+    // nothing legitimate to remove anyway.
+    //
+    // Tombstones preserved across `reset_data_tables` via `snapshot_tombstones`
+    // are NOT orphans — the whole point of preserving them was to keep
+    // deletion-retention state alive across the rebuild. If the user has not
+    // flushed to JSONL since deleting an issue, the tombstone is in the DB
+    // but not in the JSONL, and a naïve set-difference would wipe it. Union
+    // their IDs into the "acceptable" set so they survive the cleanup.
+    if args.rebuild && !args.rename_prefix {
+        let jsonl_ids = jsonl_issue_ids
+            .as_ref()
+            .expect("--rebuild should precompute JSONL issue IDs");
+        let preserved_ids: HashSet<String> = preserved_tombstones
+            .iter()
+            .map(|t| t.issue.id.clone())
+            .collect();
         let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
-        let orphan_ids: Vec<String> = db_ids.difference(&jsonl_ids).cloned().collect();
+        let orphan_ids: Vec<String> = db_ids
+            .iter()
+            .filter(|id| !jsonl_ids.contains(*id) && !preserved_ids.contains(*id))
+            .cloned()
+            .collect();
 
         if !orphan_ids.is_empty() {
             info!(
@@ -1021,6 +1455,64 @@ fn execute_import(
                 "Rebuild orphan cleanup complete"
             );
         }
+    } else if args.rebuild {
+        debug!(
+            "Skipping --rebuild orphan cleanup: --rename-prefix rewrote IDs, so JSONL IDs no longer match DB IDs and the set-difference would be incorrect"
+        );
+    }
+
+    if args.force || args.rebuild {
+        restore_tombstones_after_rebuild(storage, &preserved_tombstones)?;
+    }
+
+    // Post-rebuild VACUUM + REINDEX to eliminate B-tree/index corruption
+    // artifacts that frankensqlite's bulk-insert path can leave behind after
+    // `reset_data_tables()` + bulk import.  This mirrors what
+    // `rebuild_database_family` (used by `br doctor --repair` and auto
+    // recovery) does at the equivalent chokepoint.
+    //
+    // Without this, `br sync --import-only --force` / `--rebuild` can produce
+    // a DB where C sqlite3's `PRAGMA integrity_check` reports
+    // "database disk image is malformed" and where later write-transaction
+    // reads (inside `update_issue`) silently return zero rows for an ID that
+    // `br show` can still find — leading to the "Issue not found" error and
+    // secondary on-disk corruption seen in issue #248.
+    //
+    // The non-force import path does not drop/recreate tables, so it does
+    // not need this hardening.  Keeping the VACUUM/REINDEX scoped to the
+    // force/rebuild branch avoids paying the cost on every `br sync` run.
+    if args.force || args.rebuild {
+        // Drain the WAL before VACUUM/REINDEX so the snapshot they operate
+        // on matches what's actually on disk. Without this, fsqlite's
+        // post-import MVCC state lags behind and VACUUM fails silently with
+        // "database is busy (snapshot conflict on pages)", leaving the
+        // free-space / partial-index corruption that triggered issue #248.
+        if let Err(e) = storage.checkpoint_full() {
+            warn!(
+                error = %e,
+                db_path = %db_path.display(),
+                "Full WAL checkpoint after force/rebuild import failed (non-fatal)"
+            );
+        }
+        if let Err(e) = storage.execute_raw("VACUUM") {
+            warn!(error = %e, "VACUUM after force/rebuild import failed (non-fatal); DB may still contain free-space corruption");
+        }
+        if let Err(e) = storage.execute_raw("REINDEX") {
+            warn!(error = %e, "REINDEX after force/rebuild import failed (non-fatal); partial-index entries may be inconsistent");
+        }
+        // Final compaction via `VACUUM INTO` + atomic rename. fsqlite's
+        // in-place VACUUM does not truncate the trailing pages that its
+        // REINDEX leaves orphaned, so upstream sqlite3's `PRAGMA
+        // integrity_check` reports `Page N: never used` on the rebuilt
+        // file (issue #248). `VACUUM INTO` sidesteps the bug because it
+        // writes a brand-new compacted file from the reachable page set,
+        // page count and layout matching what `sqlite3 "VACUUM INTO"`
+        // would produce. The helper runs its own pre-VACUUM-INTO WAL
+        // checkpoint to drain the frames the VACUUM/REINDEX above just
+        // wrote. Best-effort: on any failure the helper leaves
+        // `*storage` in the best working state it can recover, and we
+        // only miss the cosmetic compaction — never correctness.
+        config::compact_database_via_vacuum_into_in_place(storage, db_path, cli.lock_timeout);
     }
 
     // Update content hash
@@ -1066,32 +1558,6 @@ fn execute_import(
         println!("  Rebuilt blocked cache");
     }
 
-    Ok(())
-}
-
-fn snapshot_tombstones(storage: &crate::storage::SqliteStorage) -> Result<Vec<Issue>> {
-    let mut tombstones = Vec::new();
-    for meta in storage.get_all_issues_metadata()? {
-        if meta.status != crate::model::Status::Tombstone {
-            continue;
-        }
-        if let Some(issue) = storage.get_issue(&meta.id)? {
-            tombstones.push(issue);
-        }
-    }
-    Ok(tombstones)
-}
-
-fn restore_tombstones(storage: &crate::storage::SqliteStorage, tombstones: &[Issue]) -> Result<()> {
-    for tombstone in tombstones {
-        storage.upsert_issue_for_import(tombstone)?;
-    }
-    if !tombstones.is_empty() {
-        debug!(
-            count = tombstones.len(),
-            "Restored tombstones after force reset"
-        );
-    }
     Ok(())
 }
 
@@ -1211,7 +1677,7 @@ fn execute_merge(
     use_json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
-    _cli: &config::CliOverrides,
+    cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting 3-way merge");
@@ -1249,6 +1715,13 @@ fn execute_merge(
     // 3. Load Right State (external JSONL)
     let mut right = HashMap::new();
     if jsonl_path.exists() {
+        // `read_issues_from_jsonl` parses JSON line-by-line, which yields a
+        // generic "Invalid JSON at line 1" error when the JSONL still
+        // contains unresolved merge-conflict markers from a botched
+        // `git merge` / `git pull`. A three-way merge on top of that state
+        // would be nonsense, so scan for markers first and surface the
+        // helpful error before we try to parse.
+        crate::sync::ensure_no_conflict_markers(jsonl_path)?;
         for issue in read_issues_from_jsonl(jsonl_path)? {
             right.insert(issue.id.clone(), issue);
         }
@@ -1285,7 +1758,34 @@ fn execute_merge(
         return Err(BeadsError::Config(msg));
     }
 
-    apply_merge_report(storage, &report)?;
+    let _actor = cli.actor.as_deref().unwrap_or("br");
+
+    // Apply deletions. Base snapshots can lag behind historical ID migrations, so a
+    // merge may legitimately request deletion of an issue that is already absent from
+    // the live database. Treat that as a no-op instead of aborting the whole merge.
+    let existing_deleted_issues = storage.get_issues_by_ids(&report.deleted)?;
+    let existing_deleted_ids: std::collections::HashSet<String> =
+        existing_deleted_issues.into_iter().map(|i| i.id).collect();
+
+    for id in &report.deleted {
+        if existing_deleted_ids.contains(id) {
+            storage.delete_issue(id, "system", "merge deletion", Some(chrono::Utc::now()))?;
+        } else {
+            tracing::debug!(
+                issue_id = %id,
+                "Skipping merge deletion for issue already absent from local database"
+            );
+        }
+    }
+
+    // Apply updates/creates (upsert)
+    // We need to retrieve the actual Issue objects to upsert.
+    for issue in &report.kept {
+        storage.upsert_issue_for_import(issue)?;
+        storage.sync_labels_for_import(&issue.id, &issue.labels)?;
+        storage.sync_dependencies_for_import(&issue.id, &issue.dependencies)?;
+        storage.sync_comments_for_import(&issue.id, &issue.comments)?;
+    }
 
     // Add merge notes as comments
     for (id, note) in &report.notes {
@@ -1295,6 +1795,20 @@ fn execute_merge(
             tracing::info!(issue_id = %id, note = %note, "Added merge resolution note");
         }
     }
+
+    // Rebuild cache
+    storage.rebuild_blocked_cache(true)?;
+    // Merge can introduce hierarchical IDs via upsert; refresh counters before
+    // the next child-ID allocation trusts them.
+    storage.rebuild_child_counters_in_tx()?;
+
+    // Save Base Snapshot
+    let new_base: HashMap<_, _> = report
+        .kept
+        .iter()
+        .map(|i| (i.id.clone(), i.clone()))
+        .collect();
+    save_base_snapshot(&new_base, beads_dir)?;
 
     // Force Export to update JSONL (ensure sync)
     info!(path = %jsonl_path.display(), "Writing merged issues.jsonl");
@@ -1316,10 +1830,6 @@ fn execute_merge(
         Some(&export_result.issue_hashes),
         jsonl_path,
     )?;
-
-    // Snapshot the finalized exported state so the next merge uses the
-    // exact post-merge baseline, including merge-note comments.
-    save_base_snapshot_from_exported_jsonl(jsonl_path, beads_dir)?;
 
     // Output success message
     if use_json {
@@ -1348,100 +1858,6 @@ fn execute_merge(
         println!("  Base snapshot updated.");
         println!("  JSONL exported.");
     }
-
-    Ok(())
-}
-
-fn save_base_snapshot_from_exported_jsonl(jsonl_path: &Path, beads_dir: &Path) -> Result<()> {
-    let exported_issues: HashMap<_, _> = read_issues_from_jsonl(jsonl_path)
-        .map_err(|source| BeadsError::WithContext {
-            context: format!(
-                "merge export succeeded, but reloading exported JSONL '{}' for base snapshot failed",
-                jsonl_path.display()
-            ),
-            source: Box::new(source),
-        })?
-        .into_iter()
-        .map(|issue| (issue.id.clone(), issue))
-        .collect();
-    save_base_snapshot(&exported_issues, beads_dir).map_err(|source| BeadsError::WithContext {
-        context: format!(
-            "merge export succeeded, but saving the refreshed base snapshot under '{}' failed",
-            beads_dir.display()
-        ),
-        source: Box::new(source),
-    })
-}
-
-fn apply_merge_report(
-    storage: &mut crate::storage::SqliteStorage,
-    report: &crate::sync::MergeReport,
-) -> Result<()> {
-    if report.total_actions() == 0 {
-        return Ok(());
-    }
-
-    let deleted_issues: HashMap<String, Issue> = storage
-        .get_issues_by_ids(&report.deleted)?
-        .into_iter()
-        .map(|issue| (issue.id.clone(), issue))
-        .collect();
-
-    storage.mutate("merge_apply", "system", |conn, ctx| {
-        let merge_deleted_at = chrono::Utc::now();
-
-        // Keep the merge mutation phase atomic so a later relation-sync error
-        // cannot leave tombstones or partially imported issues behind.
-        for id in &report.deleted {
-            if let Some(issue) = deleted_issues.get(id) {
-                let applied = crate::storage::SqliteStorage::tombstone_issue_in_tx(
-                    conn,
-                    ctx,
-                    issue,
-                    "system",
-                    "merge deletion",
-                    Some(merge_deleted_at),
-                )?;
-                if !applied {
-                    tracing::debug!(
-                        issue_id = %id,
-                        "Skipping merge deletion for issue already absent from local database"
-                    );
-                }
-            } else {
-                tracing::debug!(
-                    issue_id = %id,
-                    "Skipping merge deletion for issue already absent from local database"
-                );
-            }
-        }
-
-        for issue in &report.kept {
-            crate::storage::SqliteStorage::upsert_issue_for_import_in_tx(conn, issue)?;
-            crate::storage::SqliteStorage::sync_labels_for_import_in_tx(
-                conn,
-                &issue.id,
-                &issue.labels,
-            )?;
-            crate::storage::SqliteStorage::sync_dependencies_for_import_in_tx(
-                conn,
-                &issue.id,
-                &issue.dependencies,
-            )?;
-            crate::storage::SqliteStorage::sync_comments_for_import_in_tx(
-                conn,
-                &issue.id,
-                &issue.comments,
-            )?;
-            ctx.mark_dirty(&issue.id);
-        }
-
-        // Merge can introduce hierarchical IDs via imported issues; keep the
-        // derived child counter state atomic with the rest of the merge.
-        crate::storage::SqliteStorage::rebuild_child_counters_with_conn(conn)?;
-        ctx.invalidate_cache();
-        Ok(())
-    })?;
 
     Ok(())
 }
@@ -1547,18 +1963,24 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_merge_report, detect_prefix_from_jsonl, validate_sync_paths};
+    use super::{
+        auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
+        detect_prefix_from_jsonl, jsonl_contains_duplicate_external_refs,
+        jsonl_contains_prefix_mismatch, validate_sync_paths,
+    };
+    use crate::cli::SyncArgs;
     use crate::config::CliOverrides;
     use crate::error::BeadsError;
-    use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
-    use crate::output::OutputContext;
+    use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use crate::sync::{
-        MergeReport, load_base_snapshot, read_issues_from_jsonl, save_base_snapshot,
+        PreservedTombstone, restore_tombstones, scan_jsonl_for_tombstone_filter,
+        snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
     };
     use chrono::Utc;
-    use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn make_test_issue(id: &str, title: &str) -> Issue {
@@ -1628,6 +2050,300 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_tombstones_preserves_relations_and_marks_dirty() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let keep = make_test_issue("bd-keep", "Keep");
+        let delete = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&keep, "test").unwrap();
+        storage.create_issue(&delete, "test").unwrap();
+        storage.add_label("bd-delete", "urgent", "test").unwrap();
+        storage
+            .add_comment("bd-delete", "test", "preserve this comment")
+            .unwrap();
+        storage
+            .add_dependency("bd-delete", "bd-keep", "blocks", "test")
+            .unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        let tombstones = snapshot_tombstones(&storage);
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].issue.id, "bd-delete");
+        assert_eq!(
+            tombstones[0].labels.as_ref().unwrap(),
+            &vec!["urgent".to_string()]
+        );
+        assert_eq!(tombstones[0].comments.as_ref().unwrap().len(), 1);
+        assert_eq!(tombstones[0].dependencies.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            tombstones[0].dependencies.as_ref().unwrap()[0].depends_on_id,
+            "bd-keep"
+        );
+
+        storage.reset_data_tables().unwrap();
+        storage.upsert_issue_for_import(&keep).unwrap();
+        restore_tombstones(&mut storage, &tombstones).unwrap();
+
+        let restored = storage.get_issue("bd-delete").unwrap().unwrap();
+        assert_eq!(restored.status, Status::Tombstone);
+        assert_eq!(
+            storage.get_labels("bd-delete").unwrap(),
+            vec!["urgent".to_string()]
+        );
+        assert_eq!(storage.get_comments("bd-delete").unwrap().len(), 1);
+        let dependencies = storage.get_dependencies_full("bd-delete").unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, "bd-keep");
+
+        let dirty_ids = storage.get_dirty_issue_ids().unwrap();
+        assert_eq!(dirty_ids, vec!["bd-delete".to_string()]);
+    }
+
+    #[test]
+    fn test_restore_tombstones_rolls_back_when_relation_restore_fails() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let keep = make_test_issue("bd-keep", "Keep");
+        let issue = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&keep, "test").unwrap();
+        storage.create_issue(&issue, "test").unwrap();
+        storage.add_label("bd-delete", "urgent", "test").unwrap();
+        storage
+            .add_comment("bd-delete", "test", "preserve this comment")
+            .unwrap();
+        storage
+            .add_dependency("bd-delete", "bd-keep", "blocks", "test")
+            .unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        let tombstones = snapshot_tombstones(&storage);
+
+        storage.reset_data_tables().unwrap();
+        storage.upsert_issue_for_import(&keep).unwrap();
+        storage.execute_raw("DROP TABLE comments").unwrap();
+
+        let err = restore_tombstones(&mut storage, &tombstones).unwrap_err();
+        assert!(
+            err.to_string().contains("comments"),
+            "unexpected restore failure: {err}"
+        );
+        assert!(storage.get_issue("bd-delete").unwrap().is_none());
+        assert!(storage.get_labels("bd-delete").unwrap().is_empty());
+        assert!(
+            storage
+                .get_dependencies_full("bd-delete")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_restore_tombstones_restores_dependencies_between_preserved_tombstones() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let first = make_test_issue("bd-first", "First");
+        let second = make_test_issue("bd-second", "Second");
+        storage.create_issue(&first, "test").unwrap();
+        storage.create_issue(&second, "test").unwrap();
+        storage
+            .add_dependency("bd-first", "bd-second", "blocks", "test")
+            .unwrap();
+        storage
+            .delete_issue("bd-first", "test", "deleted for rebuild", None)
+            .unwrap();
+        storage
+            .delete_issue("bd-second", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        let tombstones = snapshot_tombstones(&storage);
+
+        storage.reset_data_tables().unwrap();
+        restore_tombstones(&mut storage, &tombstones).unwrap();
+
+        let dependencies = storage.get_dependencies_full("bd-first").unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, "bd-second");
+        let mut dirty_ids = storage.get_dirty_issue_ids().unwrap();
+        dirty_ids.sort();
+        assert_eq!(
+            dirty_ids,
+            vec!["bd-first".to_string(), "bd-second".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_tombstones_missing_from_jsonl_tombstones_only_skips_already_flushed_deletions() {
+        let in_jsonl = PreservedTombstone {
+            issue: make_test_issue("bd-in-jsonl", "in jsonl"),
+            labels: Some(vec!["jsonl".to_string()]),
+            dependencies: Some(Vec::new()),
+            comments: Some(Vec::new()),
+        };
+        let missing = PreservedTombstone {
+            issue: make_test_issue("bd-missing", "missing"),
+            labels: Some(vec!["local".to_string()]),
+            dependencies: Some(Vec::new()),
+            comments: Some(Vec::new()),
+        };
+
+        let filter = crate::sync::JsonlTombstoneFilter {
+            tombstone_ids: HashSet::from(["bd-in-jsonl".to_string()]),
+            non_tombstone_updated_at: std::collections::HashMap::new(),
+        };
+        let filtered =
+            tombstones_missing_from_jsonl_tombstones(vec![in_jsonl, missing.clone()], &filter);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].issue.id, "bd-missing");
+        assert_eq!(filtered[0].labels, missing.labels);
+        assert_eq!(filtered[0].dependencies, missing.dependencies);
+        assert_eq!(filtered[0].comments, missing.comments);
+    }
+
+    #[test]
+    fn test_tombstones_missing_from_jsonl_tombstones_respects_timestamps() {
+        // Regression: when the JSONL has an ID as a *non*-tombstone, the
+        // preserved tombstone should only overwrite the imported open row
+        // if the local deletion is actually newer than the JSONL state.
+        // Otherwise a stale local delete would silently clobber a pulled
+        // update from another contributor.
+        use crate::model::Status;
+        use chrono::{Duration, Utc};
+
+        let jsonl_updated_at = Utc::now();
+        let mut old_local_tombstone = make_test_issue("bd-contested-older", "older local delete");
+        old_local_tombstone.status = Status::Tombstone;
+        old_local_tombstone.deleted_at = Some(jsonl_updated_at - Duration::hours(1));
+        let old_local_preserved = PreservedTombstone {
+            issue: old_local_tombstone,
+            labels: None,
+            dependencies: None,
+            comments: None,
+        };
+
+        let mut new_local_tombstone = make_test_issue("bd-contested-newer", "newer local delete");
+        new_local_tombstone.status = Status::Tombstone;
+        new_local_tombstone.deleted_at = Some(jsonl_updated_at + Duration::hours(1));
+        let new_local_preserved = PreservedTombstone {
+            issue: new_local_tombstone,
+            labels: None,
+            dependencies: None,
+            comments: None,
+        };
+
+        let mut non_tombstone_map = std::collections::HashMap::new();
+        non_tombstone_map.insert("bd-contested-older".to_string(), jsonl_updated_at);
+        non_tombstone_map.insert("bd-contested-newer".to_string(), jsonl_updated_at);
+
+        let filter = crate::sync::JsonlTombstoneFilter {
+            tombstone_ids: HashSet::new(),
+            non_tombstone_updated_at: non_tombstone_map,
+        };
+
+        let filtered = tombstones_missing_from_jsonl_tombstones(
+            vec![old_local_preserved, new_local_preserved],
+            &filter,
+        );
+
+        // Only the newer local tombstone survives: the older one lost to
+        // the JSONL's non-tombstone state (import wins).
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].issue.id, "bd-contested-newer");
+    }
+
+    #[test]
+    fn test_scan_jsonl_for_tombstone_filter_rejects_duplicate_issue_ids() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let jsonl_path = temp_dir.path().join("duplicate-tombstones.jsonl");
+        let mut first = make_test_issue("bd-dup", "first");
+        first.status = Status::Tombstone;
+        let second = make_test_issue("bd-dup", "second");
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        std::fs::write(&jsonl_path, content).unwrap();
+
+        let err = scan_jsonl_for_tombstone_filter(&jsonl_path).unwrap_err();
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains("Duplicate issue id 'bd-dup'"),
+                    "unexpected duplicate-id error: {message}"
+                );
+            }
+            other => panic!("expected duplicate-id config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_tombstones_tolerates_broken_relation_tables() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let issue = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&issue, "test").unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        storage.execute_raw("DROP TABLE comments").unwrap();
+        storage.execute_raw("DROP TABLE labels").unwrap();
+        storage.execute_raw("DROP TABLE dependencies").unwrap();
+
+        let tombstones = snapshot_tombstones(&storage);
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].issue.id, "bd-delete");
+        assert_eq!(tombstones[0].issue.status, Status::Tombstone);
+        assert!(tombstones[0].labels.is_none());
+        assert!(tombstones[0].dependencies.is_none());
+        assert!(tombstones[0].comments.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_tombstones_ignores_malformed_non_tombstone_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let open_issue = make_test_issue("bd-open", "Open");
+        let delete_issue = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&open_issue, "test").unwrap();
+        storage.create_issue(&delete_issue, "test").unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        storage
+            .execute_raw("UPDATE issues SET updated_at = 'not-a-datetime' WHERE id = 'bd-open'")
+            .unwrap();
+
+        let tombstones = snapshot_tombstones(&storage);
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].issue.id, "bd-delete");
+        assert_eq!(tombstones[0].issue.status, Status::Tombstone);
+    }
+
+    #[test]
+    fn test_snapshot_tombstones_tolerates_missing_issues_table() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let issue = make_test_issue("bd-delete", "Delete");
+        storage.create_issue(&issue, "test").unwrap();
+        storage
+            .delete_issue("bd-delete", "test", "deleted for rebuild", None)
+            .unwrap();
+
+        storage.execute_raw("DROP TABLE issues").unwrap();
+
+        let tombstones = snapshot_tombstones(&storage);
+        assert!(tombstones.is_empty());
+    }
+
+    #[test]
     fn test_validate_sync_paths_allows_missing_internal_parent_directory() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -1663,18 +2379,22 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
 
-        let traversal_path = temp.path().join("../outside/issues.jsonl");
+        let traversal_path = PathBuf::from("../outside/issues.jsonl");
         let err = validate_sync_paths(&beads_dir, &traversal_path, true).unwrap_err();
 
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("traversal"),
-                    "unexpected message: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains("traversal"),
+            "unexpected message: {message}"
+        );
     }
 
     #[cfg(unix)]
@@ -1694,33 +2414,16 @@ mod tests {
 
         let err = validate_sync_paths(&beads_dir, &symlink_path, true).unwrap_err();
 
-        match err {
-            BeadsError::Config(message) => {
-                assert!(message.contains("symlink"), "unexpected message: {message}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_validate_sync_paths_allows_symlinked_internal_jsonl_without_opt_in() {
-        use std::os::unix::fs::symlink;
-
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        let internal_target = beads_dir.join("issues.jsonl");
-        fs::write(&internal_target, "{}\n").unwrap();
-
-        let symlink_path = temp.path().join("linked.jsonl");
-        symlink(&internal_target, &symlink_path).unwrap();
-
-        let policy = validate_sync_paths(&beads_dir, &symlink_path, false).expect("path policy");
-
-        assert_eq!(policy.jsonl_path, symlink_path);
-        assert!(!policy.is_external);
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(message.contains("symlink"), "unexpected message: {message}");
     }
 
     #[cfg(unix)]
@@ -1742,15 +2445,19 @@ mod tests {
 
         let err = validate_sync_paths(&beads_dir, &git_link, true).unwrap_err();
 
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains(".git") || message.contains("git"),
-                    "unexpected message: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains(".git") || message.contains("git"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
@@ -1771,131 +2478,225 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_merge_report_is_atomic_when_relation_sync_fails() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let delete_me = make_test_issue("bd-delete", "Delete me");
-        storage.create_issue(&delete_me, "test").unwrap();
-
-        let mut incoming = make_test_issue("bd-new", "Incoming");
-        incoming.dependencies.push(Dependency {
-            issue_id: incoming.id.clone(),
-            depends_on_id: "external:parent".to_string(),
-            dep_type: DependencyType::ParentChild,
-            created_at: Utc::now(),
-            created_by: Some("test".to_string()),
-            metadata: None,
-            thread_id: None,
-        });
-
-        let report = MergeReport {
-            kept: vec![incoming],
-            deleted: vec!["bd-delete".to_string()],
-            ..MergeReport::default()
-        };
-
-        let err = apply_merge_report(&mut storage, &report).unwrap_err();
-        match err {
-            BeadsError::Validation { field, reason } => {
-                assert_eq!(field, "depends_on_id");
-                assert!(reason.contains("parent-child dependencies must link local issues"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-
-        let delete_me = storage
-            .get_issue("bd-delete")
-            .unwrap()
-            .expect("deleted issue should still exist");
-        assert_eq!(delete_me.status, Status::Open);
+    fn test_auto_rebuild_semantic_flag_conflict_reason_absent_for_default_import_semantics() {
+        let args = SyncArgs::default();
         assert!(
-            storage.get_issue("bd-new").unwrap().is_none(),
-            "failed merge must not leave a partially imported issue behind"
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .is_none()
         );
     }
 
     #[test]
-    fn test_execute_merge_saves_base_snapshot_from_final_exported_state() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-        let jsonl_path = beads_dir.join("issues.jsonl");
-        let path_policy = validate_sync_paths(&beads_dir, &jsonl_path, false).unwrap();
-
-        let mut storage = SqliteStorage::open_memory().unwrap();
-
-        let mut base_issue = make_test_issue("bd-001", "Base Title");
-        base_issue.created_at = Utc::now() - chrono::Duration::minutes(5);
-        base_issue.updated_at = base_issue.created_at;
-
-        let mut local_issue = base_issue.clone();
-        local_issue.title = "Local Modified".to_string();
-        local_issue.updated_at = base_issue.updated_at + chrono::Duration::minutes(1);
-        storage.create_issue(&local_issue, "test").unwrap();
-
-        let mut base_snapshot = HashMap::new();
-        base_snapshot.insert(base_issue.id.clone(), base_issue.clone());
-        save_base_snapshot(&base_snapshot, &beads_dir).unwrap();
-
-        let mut external_issue = base_issue.clone();
-        external_issue.title = "External Modified".to_string();
-        external_issue.updated_at = base_issue.updated_at + chrono::Duration::minutes(2);
-        fs::write(
-            &jsonl_path,
-            format!("{}\n", serde_json::to_string(&external_issue).unwrap()),
-        )
-        .unwrap();
-
-        let args = crate::cli::SyncArgs {
-            flush_only: false,
-            import_only: false,
-            merge: true,
-            status: false,
-            force: false,
-            allow_external_jsonl: false,
-            manifest: false,
-            error_policy: None,
-            orphans: None,
-            rename_prefix: false,
-            rebuild: false,
-            robot: false,
+    fn test_auto_rebuild_semantic_flag_conflict_reason_mentions_rename_prefix_rerun() {
+        let args = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
         };
-        let ctx = OutputContext::from_flags(false, true, false);
+
+        let reason =
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .expect("rename-prefix conflict");
+        assert!(reason.contains("`--rename-prefix`"), "reason: {reason}");
+        assert!(
+            reason.contains("`br sync --import-only --force --rename-prefix`"),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_ignores_orphans_only_request() {
+        let args = SyncArgs {
+            rebuild: true,
+            orphans: Some("resurrect".to_string()),
+            ..SyncArgs::default()
+        };
+
+        assert!(
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_mentions_both_flags() {
+        let args = SyncArgs {
+            force: true,
+            rebuild: true,
+            rename_prefix: true,
+            orphans: Some("skip".to_string()),
+            ..SyncArgs::default()
+        };
+
+        let reason =
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .expect("combined conflict");
+        assert!(reason.contains("`--rename-prefix`"), "reason: {reason}");
+        assert!(
+            reason.contains("`br sync --import-only --force --rebuild --rename-prefix`"),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_preserves_custom_db_override() {
+        let args = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+
+        let custom_db = Path::new("/tmp/custom db.sqlite");
+        let reason = auto_rebuild_semantic_flag_conflict_reason(
+            &args,
+            &CliOverrides::default(),
+            Some(custom_db),
+        )
+        .expect("rename-prefix conflict");
+        assert!(
+            reason.contains(
+                "`br --db '/tmp/custom db.sqlite' sync --import-only --force --rename-prefix`"
+            ),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_preserves_external_jsonl_flag() {
+        let args = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            allow_external_jsonl: true,
+            ..SyncArgs::default()
+        };
+
+        let reason =
+            auto_rebuild_semantic_flag_conflict_reason(&args, &CliOverrides::default(), None)
+                .expect("rename-prefix conflict");
+        assert!(
+            reason
+                .contains("`br sync --import-only --allow-external-jsonl --force --rename-prefix`"),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_flag_conflict_reason_preserves_cli_startup_flags() {
+        let args = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
         let cli = CliOverrides {
-            quiet: Some(true),
+            json: Some(true),
+            allow_stale: Some(true),
+            no_auto_import: Some(true),
+            no_auto_flush: Some(true),
+            lock_timeout: Some(17),
             ..CliOverrides::default()
         };
 
-        super::execute_merge(
-            &mut storage,
-            &path_policy,
-            &args,
-            false,
-            false,
-            None,
-            &cli,
-            &ctx,
+        let reason = auto_rebuild_semantic_flag_conflict_reason(&args, &cli, None)
+            .expect("rename-prefix conflict");
+        assert!(
+            reason.contains(
+                "`br --json --allow-stale --no-auto-import --no-auto-flush --lock-timeout 17 sync --import-only --force --rename-prefix`"
+            ),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_auto_rebuild_semantic_conflict_field_prefers_explicit_rebuild_then_force() {
+        let plain = SyncArgs {
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(
+            auto_rebuild_semantic_conflict_field(&plain),
+            "rename_prefix"
+        );
+
+        let force = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(auto_rebuild_semantic_conflict_field(&force), "force");
+
+        let rebuild = SyncArgs {
+            force: true,
+            rebuild: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(auto_rebuild_semantic_conflict_field(&rebuild), "rebuild");
+    }
+
+    #[test]
+    fn test_jsonl_contains_prefix_mismatch_only_for_non_tombstone_ids() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+
+        let matching = make_test_issue("bd-alpha", "Matching");
+        let mut tombstone = make_test_issue("other-beta", "Tombstone mismatch");
+        tombstone.status = Status::Tombstone;
+
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&matching).unwrap(),
+                serde_json::to_string(&tombstone).unwrap()
+            ),
         )
         .unwrap();
 
-        let exported_issue = read_issues_from_jsonl(&jsonl_path)
-            .unwrap()
-            .into_iter()
-            .find(|issue| issue.id == "bd-001")
-            .expect("merged issue should be exported");
-        assert_eq!(exported_issue.comments.len(), 1);
-        assert_eq!(exported_issue.comments[0].author, "br-sync");
-        assert!(
-            exported_issue.comments[0].body.contains("Both modified"),
-            "merge note should be exported"
-        );
+        assert!(!jsonl_contains_prefix_mismatch(&jsonl_path, "bd").unwrap());
 
-        let base_snapshot = load_base_snapshot(&beads_dir).unwrap();
-        let snapshot_issue = base_snapshot
-            .get("bd-001")
-            .expect("merged issue should exist in saved base snapshot");
-        assert_eq!(
-            snapshot_issue.comments, exported_issue.comments,
-            "base snapshot must reflect the finalized exported state"
-        );
+        let mismatch = make_test_issue("other-gamma", "Mismatch");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&mismatch).unwrap()),
+        )
+        .unwrap();
+
+        assert!(jsonl_contains_prefix_mismatch(&jsonl_path, "bd").unwrap());
+    }
+
+    #[test]
+    fn test_jsonl_contains_duplicate_external_refs_detects_duplicates() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+
+        let mut first = make_test_issue("bd-alpha", "First");
+        first.external_ref = Some("EXT-123".to_string());
+        let mut second = make_test_issue("bd-beta", "Second");
+        second.external_ref = Some("EXT-123".to_string());
+
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(jsonl_contains_duplicate_external_refs(&jsonl_path).unwrap());
+
+        second.external_ref = Some("EXT-456".to_string());
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(!jsonl_contains_duplicate_external_refs(&jsonl_path).unwrap());
     }
 }

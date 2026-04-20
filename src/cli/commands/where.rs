@@ -1,7 +1,6 @@
 //! Where command implementation.
 
 use crate::config;
-use crate::config::MAX_REDIRECT_DEPTH;
 use crate::config::routing::follow_redirects;
 use crate::error::BeadsError;
 use crate::error::Result;
@@ -60,12 +59,11 @@ fn resolve_where_output(cli: &config::CliOverrides) -> Result<Option<WhereOutput
         return Ok(None);
     };
 
-    let canonical_source_dir = canonicalize_lossy(&source_dir);
-    let final_dir = follow_redirects(&source_dir, MAX_REDIRECT_DEPTH)?;
-    let redirected_from = if final_dir == canonical_source_dir {
+    let final_dir = follow_redirects(&source_dir, 10)?;
+    let redirected_from = if final_dir == source_dir {
         None
     } else {
-        Some(canonical_source_dir.display().to_string())
+        Some(canonicalize_lossy(&source_dir).display().to_string())
     };
 
     let paths = config::resolve_paths(&final_dir, cli.db.as_ref())?;
@@ -88,22 +86,11 @@ fn detect_prefix(
     jsonl_path: &Path,
     cli: &config::CliOverrides,
 ) -> Option<String> {
-    let effective_startup =
-        if let Ok(startup) = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref()) {
-            let mut effective_startup = startup.merged_config;
-            effective_startup.merge_from(&cli.as_layer());
-            effective_startup
-        } else {
-            cli.as_layer()
-        };
-
-    if let Some(prefix) = config::configured_issue_prefix_from_map(&effective_startup.runtime) {
+    if let Ok(startup) = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())
+        && let Some(prefix) =
+            config::configured_issue_prefix_from_map(&startup.merged_config.runtime)
+    {
         return Some(prefix);
-    }
-
-    if config::no_db_from_layer(&effective_startup).unwrap_or(false) {
-        return config::resolve_bootstrap_issue_prefix(&effective_startup, beads_dir, jsonl_path)
-            .ok();
     }
 
     match inspect_jsonl_prefix(jsonl_path) {
@@ -322,26 +309,24 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+
     use tempfile::TempDir;
 
-    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
-
     struct DirGuard {
-        previous_dir: PathBuf,
+        previous: PathBuf,
     }
 
     impl DirGuard {
-        fn new(path: &Path) -> Self {
-            let previous_dir = env::current_dir().expect("current dir");
-            env::set_current_dir(path).expect("set current dir");
-            Self { previous_dir }
+        fn new(target: &Path) -> Self {
+            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+            env::set_current_dir(target).expect("set current dir");
+            Self { previous }
         }
     }
 
     impl Drop for DirGuard {
         fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous_dir);
+            let _ = env::set_current_dir(&self.previous);
         }
     }
 
@@ -360,7 +345,6 @@ mod tests {
             ..CliOverrides::default()
         };
 
-        let _guard = DirGuard::new(temp.path());
         let output = resolve_where_output(&cli)
             .expect("where output")
             .expect("workspace output");
@@ -382,7 +366,7 @@ mod tests {
 
     #[test]
     fn resolve_where_output_preserves_redirect_origin() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -434,7 +418,7 @@ mod tests {
 
     #[test]
     fn resolve_where_output_does_not_create_missing_db() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -463,7 +447,7 @@ mod tests {
 
     #[test]
     fn resolve_where_output_falls_back_for_external_db_override() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -497,44 +481,6 @@ mod tests {
                     .display()
                     .to_string()
             )
-        );
-    }
-
-    #[test]
-    fn resolve_where_output_does_not_report_redirect_for_noncanonical_db_override_path() {
-        let _lock = TEST_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let temp = TempDir::new().expect("tempdir");
-        let project_root = temp.path().join("workspace");
-        let beads_dir = project_root.join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-
-        let cli = CliOverrides {
-            db: Some(PathBuf::from("workspace/../workspace/.beads/beads.db")),
-            ..CliOverrides::default()
-        };
-
-        let _guard = DirGuard::new(temp.path());
-        let output = resolve_where_output(&cli)
-            .expect("where output")
-            .expect("workspace output");
-
-        assert_eq!(
-            output.path,
-            canonicalize_lossy(&beads_dir).display().to_string()
-        );
-        assert_eq!(
-            output.database_path,
-            Some(
-                canonicalize_lossy(&project_root.join(".beads").join("beads.db"))
-                    .display()
-                    .to_string()
-            )
-        );
-        assert_eq!(
-            output.redirected_from, None,
-            "path normalization alone must not be reported as a redirect"
         );
     }
 
@@ -605,7 +551,7 @@ mod tests {
 
     #[test]
     fn resolve_where_output_accepts_startup_prefix_alias() {
-        let _lock = TEST_DIR_LOCK
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
@@ -638,53 +584,6 @@ mod tests {
         assert_eq!(
             detect_prefix(&beads_dir, &db_path, &jsonl_path, &CliOverrides::default()),
             Some("dbpref".to_string())
-        );
-    }
-
-    #[test]
-    fn detect_prefix_prefers_jsonl_prefix_when_cli_no_db_is_true() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-
-        let db_path = beads_dir.join("beads.db");
-        let mut storage = SqliteStorage::open(&db_path).expect("open db");
-        storage.set_config("prefix", "dbpref").expect("set prefix");
-
-        let jsonl_path = beads_dir.join("issues.jsonl");
-        fs::write(&jsonl_path, r#"{"id":"jsonl-abc12","title":"Example"}"#).expect("write jsonl");
-
-        let cli = CliOverrides {
-            no_db: Some(true),
-            ..CliOverrides::default()
-        };
-
-        assert_eq!(
-            detect_prefix(&beads_dir, &db_path, &jsonl_path, &cli),
-            Some("jsonl".to_string())
-        );
-    }
-
-    #[test]
-    fn detect_prefix_uses_bootstrap_prefix_when_cli_no_db_and_jsonl_missing() {
-        let temp = TempDir::new().expect("tempdir");
-        let workspace_root = temp.path().join("workspace-name");
-        let beads_dir = workspace_root.join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-
-        let cli = CliOverrides {
-            no_db: Some(true),
-            ..CliOverrides::default()
-        };
-
-        assert_eq!(
-            detect_prefix(
-                &beads_dir,
-                &beads_dir.join("beads.db"),
-                &beads_dir.join("issues.jsonl"),
-                &cli
-            ),
-            Some(crate::util::id::abbreviate_prefix("workspace-name"))
         );
     }
 }

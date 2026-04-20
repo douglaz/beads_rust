@@ -225,6 +225,20 @@ where
     }
 }
 
+/// Extract the issue ID from `br create` stdout.
+///
+/// Handles both formats: `"Created pfx-xxx: title"` and `"✓ Created pfx-xxx: title"`.
+pub fn parse_created_id(stdout: &str) -> String {
+    let line = stdout.lines().next().unwrap_or("");
+    let normalized = line.strip_prefix("✓ ").unwrap_or(line);
+    normalized
+        .strip_prefix("Created ")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 pub fn extract_json_payload(stdout: &str) -> String {
     let lines: Vec<&str> = stdout.lines().collect();
     for (idx, line) in lines.iter().enumerate() {
@@ -239,6 +253,23 @@ pub fn extract_json_payload(stdout: &str) -> String {
 pub fn parse_json_value(stdout: &str) -> Value {
     let payload = extract_json_payload(stdout);
     serde_json::from_str(&payload).expect("valid JSON payload")
+}
+
+/// Extract an issue array from JSON stdout, handling both formats:
+/// - Paginated: `{"issues": [...], "total": N, ...}` → returns the inner array
+/// - Bare array: `[...]` → returns it directly
+pub fn extract_issues_array(stdout: &str) -> Vec<Value> {
+    let json = parse_json_value(stdout);
+    if let Some(arr) = json.as_array() {
+        return arr.clone();
+    }
+    if let Some(issues) = json.get("issues").and_then(Value::as_array) {
+        return issues.clone();
+    }
+    panic!(
+        "JSON output is neither a bare array nor an object with 'issues': {}",
+        &stdout[..stdout.len().min(200)]
+    );
 }
 
 pub fn parse_list_page(stdout: &str) -> Value {

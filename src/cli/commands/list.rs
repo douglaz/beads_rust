@@ -3,7 +3,6 @@
 //! Primary discovery interface with classic filter semantics and
 //! paginated `ListPage` JSON output. Supports text, JSON, and CSV formats.
 
-use crate::cli::commands::open_storage_ctx_with_auto_import;
 use crate::cli::{ListArgs, OutputFormat, resolve_output_format_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -33,7 +32,7 @@ pub fn execute(
 ) -> Result<()> {
     // Open storage (--db flag allows working from any directory)
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = open_storage_ctx_with_auto_import(&beads_dir, cli)?;
+    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     execute_inner(args, cli, outer_ctx, &storage_ctx)
 }
 
@@ -73,7 +72,6 @@ fn execute_inner(
     let is_json_output = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);
 
     // The effective limit and offset from the user's request.
-    // Default must match mcp/tools.rs DEFAULT_LIST_LIMIT (50).
     let user_limit = args.limit.unwrap_or(50);
     let user_offset = args.offset.unwrap_or(0);
 

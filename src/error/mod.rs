@@ -289,7 +289,9 @@ impl BeadsError {
     /// Create from multiple validation errors.
     #[must_use]
     pub fn from_validation_errors(errors: Vec<ValidationError>) -> Self {
-        if errors.len() == 1 {
+        if errors.is_empty() {
+            Self::ValidationErrors { errors }
+        } else if errors.len() == 1 {
             let err = &errors[0];
             Self::Validation {
                 field: err.field.clone(),

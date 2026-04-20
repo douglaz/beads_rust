@@ -8,7 +8,9 @@ use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    PathValidation, compute_staleness, scan_conflict_markers, validate_jsonl_issue_records,
+    JsonlTombstoneFilter, PathValidation, PreservedTombstone, compute_staleness,
+    restore_tombstones_after_rebuild, scan_conflict_markers, scan_jsonl_for_tombstone_filter,
+    snapshot_tombstones, tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
     validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
 };
 use fsqlite::Connection;
@@ -64,11 +66,26 @@ struct LocalRepairResult {
     blocked_cache_rebuilt: bool,
     wal_checkpoint_completed: bool,
     indexes_reindexed: bool,
+    vacuumed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     quarantined_artifacts: Vec<String>,
 }
 
 const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
+const ROOT_GITIGNORE_OFFENDING_PATTERNS: &[&str] = &[
+    ".beads",
+    ".beads/",
+    ".beads/*",
+    ".beads/**",
+    ".beads/.gitignore",
+    "/.beads",
+    "/.beads/",
+    "/.beads/*",
+    "/.beads/**",
+    "/.beads/.gitignore",
+];
+const ROOT_GITIGNORE_REPAIR_MESSAGE: &str =
+    "Removed offending .beads ignore pattern(s) from root .gitignore";
 const NO_OP_REPAIR_MESSAGE: &str = "No errors detected; nothing to repair.";
 const REINDEX_INCOMPLETE_MESSAGE: &str = "REINDEX was attempted but did not complete.";
 
@@ -96,6 +113,7 @@ impl LocalRepairResult {
         self.blocked_cache_rebuilt
             || self.wal_checkpoint_completed
             || self.indexes_reindexed
+            || self.vacuumed
             || !self.quarantined_artifacts.is_empty()
     }
 }
@@ -177,6 +195,160 @@ fn report_has_sidecar_anomaly(report: &DoctorReport) -> bool {
         .any(|check| check.name == "db.sidecars" && matches!(check.status, CheckStatus::Error))
 }
 
+/// Return true if any integrity check reported non-benign page corruption
+/// (e.g., "free space corruption") that VACUUM can fix by rewriting all pages.
+fn report_has_page_corruption(report: &DoctorReport) -> bool {
+    report.checks.iter().any(|check| {
+        if !matches!(check.status, CheckStatus::Error) {
+            return false;
+        }
+        if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
+            return false;
+        }
+        check.message.as_deref().is_some_and(|msg| {
+            let lower = msg.to_lowercase();
+            // Match structural page corruption that VACUUM can fix.
+            // Note: "out of order" for DESC indexes is a known frankensqlite
+            // B-tree artifact (not fixable by VACUUM) and is handled as benign
+            // in integrity_messages_only_benign instead.
+            lower.contains("free space corruption")
+                || lower.contains("malformed")
+                || lower.contains("disk image")
+        })
+    })
+}
+
+/// Compact the database via VACUUM to fix page-level anomalies (free space
+/// corruption, B-tree malformation) that arise from frankensqlite's B-tree
+/// layer.  VACUUM rewrites every page from scratch, eliminating any internal
+/// accounting discrepancies.
+fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
+    if !db_path.is_file() {
+        tracing::debug!(
+            path = %db_path.display(),
+            "Skipping VACUUM because the database file is missing"
+        );
+        return;
+    }
+    match Connection::open(db_path.to_string_lossy().into_owned()) {
+        Ok(conn) => match conn.execute("VACUUM") {
+            Ok(_) => {
+                repair.vacuumed = true;
+                tracing::info!(path = %db_path.display(), "VACUUM completed successfully");
+            }
+            Err(err) => {
+                tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Skipping VACUUM because the database could not be opened"
+            );
+        }
+    }
+}
+
+/// Write probe: verify the database can actually perform writes after repair.
+///
+/// Issue #245: REINDEX can fix index ordering so `PRAGMA integrity_check`
+/// passes, but the underlying B-tree corruption may silently cause writes to
+/// fail (reads work, writes get ISSUE_NOT_FOUND).  This probe inserts a row,
+/// reads it back, then ROLLS BACK the entire transaction so no data is
+/// persisted.  The insert-then-read pattern catches read-after-write
+/// divergence that a simple no-op UPDATE would miss.
+fn write_probe_after_repair(db_path: &Path) -> bool {
+    let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
+        return false;
+    };
+    let _ = conn.execute("PRAGMA busy_timeout=5000");
+
+    // Use a probe ID that cannot collide with real issues.
+    let probe_id = "__doctor_write_probe__";
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let probe = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
+        conn.execute("BEGIN IMMEDIATE")?;
+
+        conn.execute_with_params(
+            "INSERT OR REPLACE INTO issues (id, title, status, priority, created_at, updated_at) \
+             VALUES (?, ?, 'open', 2, ?, ?)",
+            &[
+                SqliteValue::from(probe_id),
+                SqliteValue::from("doctor write probe"),
+                SqliteValue::from(now.as_str()),
+                SqliteValue::from(now.as_str()),
+            ],
+        )?;
+
+        // Read it back inside the same transaction to verify the read path
+        // agrees with what we just wrote. CTE-wrap per #254 so the probe
+        // itself does not hit fsqlite's prepared-statement fast-path cache
+        // and report false-healthy against a stale plan.
+        let rows = conn.query_with_params(
+            "WITH target(id_value) AS (SELECT ?) \
+             SELECT i.id FROM issues AS i, target AS t \
+             WHERE i.id = t.id_value",
+            &[SqliteValue::from(probe_id)],
+        )?;
+        if rows.is_empty() {
+            conn.execute("ROLLBACK")?;
+            tracing::warn!("Write probe: INSERT succeeded but SELECT returned no rows");
+            return Err("read-after-write divergence".into());
+        }
+
+        // Always ROLLBACK — the probe is non-destructive.  No data is
+        // persisted, so JSONL export state stays clean.
+        conn.execute("ROLLBACK")?;
+        Ok(())
+    })();
+
+    match probe {
+        Ok(()) => {
+            tracing::info!("Post-repair write probe passed");
+            true
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "Post-repair write probe failed — DB may still be corrupt");
+            // Best-effort rollback in case we're stuck mid-transaction.
+            let _ = conn.execute("ROLLBACK");
+            false
+        }
+    }
+}
+
+/// Return true if any integrity check reported WARN-level page anomalies
+/// (e.g. "page N: never used", "free space corruption", "malformed"): the
+/// kind of residue VACUUM can clean up.
+///
+/// Intentionally distinct from [`report_has_page_corruption`] (ERROR-only),
+/// because orphaned pages introduced/exposed by a light-repair pass (notably
+/// the blocked-cache rebuild from `repair_recoverable_db_state`) land as
+/// WARN-level findings — they don't flip the DB into `ok: false` on their
+/// own, but they persist across subsequent `--repair` runs unless we
+/// compact the file.
+///
+/// See #253 for the original report and the exact sequence that leaves the
+/// DB in this state.
+fn report_has_warn_level_page_anomaly(report: &DoctorReport) -> bool {
+    report.checks.iter().any(|check| {
+        if !matches!(check.status, CheckStatus::Warn) {
+            return false;
+        }
+        if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
+            return false;
+        }
+        check.message.as_deref().is_some_and(|msg| {
+            let lower = msg.to_lowercase();
+            lower.contains("never used")
+                || lower.contains("free space corruption")
+                || lower.contains("malformed")
+                || lower.contains("disk image")
+        })
+    })
+}
+
 /// Return true if any integrity check reported partial-index row mismatches
 /// ("row N missing from index") as a warning.  These can be repaired via `REINDEX`.
 fn report_has_partial_index_warnings(report: &DoctorReport) -> bool {
@@ -205,6 +377,9 @@ fn local_repair_message(local_repair: &LocalRepairResult) -> String {
     if local_repair.indexes_reindexed {
         actions.push("rebuilt all indexes via REINDEX".to_string());
     }
+    if local_repair.vacuumed {
+        actions.push("compacted database via VACUUM to fix page-level anomalies".to_string());
+    }
     if !local_repair.quarantined_artifacts.is_empty() {
         actions.push(format!(
             "quarantined {} anomalous database artifact(s)",
@@ -219,110 +394,15 @@ fn local_repair_message(local_repair: &LocalRepairResult) -> String {
     }
 }
 
-fn beads_dir_marker(beads_dir: &Path) -> String {
-    beads_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| *name == ".beads" || *name == "_beads")
-        .map_or_else(|| ".beads".to_string(), str::to_string)
-}
-
-fn root_gitignore_offending_patterns(beads_dir: &Path) -> Vec<String> {
-    let marker = beads_dir_marker(beads_dir);
-    vec![
-        marker.clone(),
-        format!("{marker}/"),
-        format!("{marker}/*"),
-        format!("{marker}/**"),
-        format!("{marker}/.gitignore"),
-        format!("/{marker}"),
-        format!("/{marker}/"),
-        format!("/{marker}/*"),
-        format!("/{marker}/**"),
-        format!("/{marker}/.gitignore"),
-    ]
-}
-
-fn root_gitignore_repair_message(beads_dir: &Path) -> String {
-    format!(
-        "Removed offending {} ignore pattern(s) from root .gitignore",
-        beads_dir_marker(beads_dir)
-    )
-}
-
-fn beads_workspace_label(beads_dir: &Path) -> String {
-    format!("{}/", beads_dir_marker(beads_dir))
-}
-
-fn merge_artifacts_message(beads_dir: &Path) -> String {
-    format!(
-        "Merge artifacts detected in {}",
-        beads_workspace_label(beads_dir)
-    )
-}
-
-fn jsonl_inside_workspace_remediation(beads_dir: &Path) -> String {
-    format!(
-        "Move JSONL file inside {} directory",
-        beads_workspace_label(beads_dir)
-    )
-}
-
-fn jsonl_external_path_remediation(beads_dir: &Path) -> String {
-    format!(
-        "Use --allow-external-jsonl flag or move JSONL inside {}",
-        beads_workspace_label(beads_dir)
-    )
-}
-
-fn jsonl_external_manual_sync_remediation(beads_dir: &Path) -> String {
-    format!(
-        "Move JSONL inside {}, place the database beside it, or pass --allow-external-jsonl for manual sync commands",
-        beads_workspace_label(beads_dir)
-    )
-}
-
-fn jsonl_symlink_remediation(beads_dir: &Path) -> String {
-    format!(
-        "Remove symlink and use a regular file inside {}",
-        beads_workspace_label(beads_dir)
-    )
-}
-
-fn jsonl_outside_workspace_message(beads_dir: &Path) -> String {
-    format!(
-        "JSONL path is outside {} directory",
-        beads_workspace_label(beads_dir)
-    )
-}
-
-fn jsonl_symlink_escape_message(beads_dir: &Path) -> String {
-    format!(
-        "JSONL path is a symlink pointing outside {}",
-        beads_workspace_label(beads_dir)
-    )
-}
-
-fn missing_jsonl_message(beads_dir: &Path) -> String {
-    let workspace = beads_workspace_label(beads_dir);
-    format!(
-        "No JSONL file found ({}issues.jsonl or {}beads.jsonl)",
-        workspace, workspace
-    )
-}
-
-fn is_offending_root_gitignore_pattern(line: &str, beads_dir: &Path) -> bool {
+fn is_offending_root_gitignore_pattern(line: &str) -> bool {
     let trimmed = line.trim();
     !trimmed.is_empty()
         && !trimmed.starts_with('#')
         && !trimmed.starts_with('!')
-        && root_gitignore_offending_patterns(beads_dir)
-            .iter()
-            .any(|pattern| pattern == trimmed)
+        && ROOT_GITIGNORE_OFFENDING_PATTERNS.contains(&trimmed)
 }
 
 fn repair_outcome_message(
-    beads_dir: &Path,
     gitignore_repaired: bool,
     local_repair: Option<&LocalRepairResult>,
     incomplete_attempt_message: Option<&str>,
@@ -330,7 +410,7 @@ fn repair_outcome_message(
     let mut messages = Vec::new();
 
     if gitignore_repaired {
-        messages.push(root_gitignore_repair_message(beads_dir));
+        messages.push(ROOT_GITIGNORE_REPAIR_MESSAGE.to_string());
     }
 
     if let Some(repair) = local_repair {
@@ -608,7 +688,19 @@ fn repair_database_from_jsonl(
         cli.as_layer(),
     ]);
 
-    let (storage, import_result) = config::repair_database_from_jsonl(
+    // Snapshot any local tombstones before the JSONL rebuild. `doctor
+    // --repair` reaches this branch only after light repairs failed (or
+    // never applied) and the on-disk DB reports errors, so the storage
+    // handle here might be limping — but `snapshot_tombstones` is already
+    // fault-tolerant (warn+empty on enumeration failure, warn+partial on
+    // per-tombstone failure) and the cost of trying is a few selects.
+    // Without this, repair would silently wipe any tombstone the user
+    // deleted but had not yet flushed to JSONL (same hazard that
+    // `br sync --rebuild` preserves via snapshot/restore), since the
+    // rebuild only replays what's in the JSONL.
+    let preserved_tombstones = preserved_tombstones_for_doctor_rebuild(db_path, jsonl_path);
+
+    let (mut storage, import_result) = config::repair_database_from_jsonl(
         beads_dir,
         db_path,
         jsonl_path,
@@ -616,6 +708,8 @@ fn repair_database_from_jsonl(
         &bootstrap_layer,
         show_progress,
     )?;
+
+    restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
 
     let fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
 
@@ -656,6 +750,57 @@ fn repair_database_from_jsonl(
         skipped: import_result.skipped_count,
         fk_violations_cleaned: fk_violations,
     })
+}
+
+/// Best-effort snapshot of unflushed local tombstones, guarded on every
+/// failure mode the doctor-repair path may encounter (DB missing, DB can't
+/// be opened, JSONL unreadable).
+///
+/// This mirrors the helper at the config layer (`preserved_unflushed_tombstones`)
+/// but has to live here because the doctor-repair entry point is where we have
+/// the storage-open attempt — the config helper receives an already-open
+/// storage handle. Returns an empty vector if no tombstones survive filtering
+/// or if any step fails; the rebuild itself always proceeds either way, and
+/// `snapshot_tombstones` logs its own best-effort warnings.
+fn preserved_tombstones_for_doctor_rebuild(
+    db_path: &Path,
+    jsonl_path: &Path,
+) -> Vec<PreservedTombstone> {
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let storage = match SqliteStorage::open(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            tracing::debug!(
+                db_path = %db_path.display(),
+                error = %err,
+                "Could not open DB for pre-repair tombstone snapshot; proceeding without preservation"
+            );
+            return Vec::new();
+        }
+    };
+    let snapshot = snapshot_tombstones(&storage);
+    drop(storage);
+    if snapshot.is_empty() {
+        return snapshot;
+    }
+    let jsonl_filter = if jsonl_path.is_file() {
+        match scan_jsonl_for_tombstone_filter(jsonl_path) {
+            Ok(filter) => filter,
+            Err(err) => {
+                tracing::debug!(
+                    jsonl_path = %jsonl_path.display(),
+                    error = %err,
+                    "Could not scan JSONL for tombstone filter during doctor --repair; preserving every snapshotted tombstone and letting the rebuild surface the JSONL error"
+                );
+                JsonlTombstoneFilter::default()
+            }
+        }
+    } else {
+        JsonlTombstoneFilter::default()
+    };
+    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_filter)
 }
 
 fn repair_recoverable_db_state(
@@ -1067,14 +1212,17 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
 }
 
 /// Return true if all integrity check messages are benign frankensqlite artifacts
-/// (either "never used" pages, partial-index row mismatches, or a mix of both).
+/// (either "never used" pages, partial-index row mismatches, DESC index ordering
+/// differences, or a mix of these).
 fn integrity_messages_only_benign(messages: &[String]) -> bool {
     if messages.is_empty() {
         return false;
     }
     let has_benign = messages.iter().any(|msg| {
         let lower = msg.to_lowercase();
-        lower.contains("never used") || lower.contains("missing from index")
+        lower.contains("never used")
+            || lower.contains("missing from index")
+            || lower.contains("out of order")
     });
     if !has_benign {
         return false;
@@ -1083,6 +1231,7 @@ fn integrity_messages_only_benign(messages: &[String]) -> bool {
         let lower = msg.to_lowercase();
         lower.contains("never used")
             || lower.contains("missing from index")
+            || lower.contains("out of order")
             || lower.contains("*** in database")
     })
 }
@@ -1511,7 +1660,7 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
             checks,
             "jsonl.merge_artifacts",
             CheckStatus::Warn,
-            Some(merge_artifacts_message(beads_dir)),
+            Some("Merge artifacts detected in .beads/".to_string()),
             Some(serde_json::json!({ "files": artifacts })),
         );
     }
@@ -1519,14 +1668,13 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
 }
 
 /// Check whether the project root `.gitignore` contains a pattern that would
-/// hide the workspace-local `.gitignore`, preventing git from reading br's
-/// ignore rules. This commonly happens during bd-to-br migration where the old
-/// root `.gitignore` still excludes the workspace directory directly.
+/// hide `.beads/.gitignore`, preventing git from reading br's ignore rules.
+/// This commonly happens during bd-to-br migration where the old `.gitignore`
+/// included patterns like `.beads/`, `.beads/*`, or `.beads/.gitignore`.
 fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let Some(project_root) = beads_dir.parent() else {
         return;
     };
-    let beads_dir_name = beads_dir_marker(beads_dir);
     let gitignore_path = project_root.join(".gitignore");
     let Ok(content) = fs::read_to_string(&gitignore_path) else {
         // No .gitignore is fine — nothing to warn about.
@@ -1535,7 +1683,7 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
 
     let offending: Vec<String> = content
         .lines()
-        .filter(|line| is_offending_root_gitignore_pattern(line, beads_dir))
+        .filter(|line| is_offending_root_gitignore_pattern(line))
         .map(String::from)
         .collect();
 
@@ -1547,7 +1695,7 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
             "gitignore.beads_inner",
             CheckStatus::Warn,
             Some(format!(
-                "Root .gitignore excludes {beads_dir_name}/.gitignore — br's ignore rules are ineffective. \
+                "Root .gitignore excludes .beads/.gitignore — br's ignore rules are ineffective. \
                  Remove the offending line(s) from .gitignore to fix: {}",
                 offending.join(", ")
             )),
@@ -1583,7 +1731,7 @@ fn fix_root_gitignore_if_warned(
 
     let filtered: Vec<&str> = content
         .lines()
-        .filter(|line| !is_offending_root_gitignore_pattern(line, beads_dir))
+        .filter(|line| !is_offending_root_gitignore_pattern(line))
         .collect();
     let mut new_content = filtered.join("\n");
     if content.ends_with('\n') {
@@ -1597,7 +1745,7 @@ fn fix_root_gitignore_if_warned(
         false
     } else {
         if !ctx.is_json() {
-            ctx.info(&root_gitignore_repair_message(beads_dir));
+            ctx.info(ROOT_GITIGNORE_REPAIR_MESSAGE);
         }
         true
     }
@@ -1622,34 +1770,7 @@ fn should_fallback_to_workspace_jsonl(beads_dir: &Path, paths: &config::ConfigPa
 
     !has_env_override
         && paths.metadata.jsonl_export == "issues.jsonl"
-        && doctor_paths_equivalent(&paths.jsonl_path, &beads_dir.join("issues.jsonl"))
-}
-
-fn doctor_paths_equivalent(left: &Path, right: &Path) -> bool {
-    normalize_doctor_path(left) == normalize_doctor_path(right)
-}
-
-fn normalize_doctor_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = dunce::canonicalize(path) {
-        return canonical;
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-        }
-    }
-
-    normalized
+        && paths.jsonl_path == beads_dir.join("issues.jsonl")
 }
 
 fn select_doctor_jsonl_path(beads_dir: &Path, paths: &config::ConfigPaths) -> Option<PathBuf> {
@@ -1662,7 +1783,15 @@ fn select_doctor_jsonl_path(beads_dir: &Path, paths: &config::ConfigPaths) -> Op
     }
 }
 
-fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<usize> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonlCountState {
+    Available(usize),
+    Invalid,
+    Missing,
+    Unreadable,
+}
+
+fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<JsonlCountState> {
     let summary = validate_jsonl_issue_records(path)?;
 
     if summary.invalid_count == 0 {
@@ -1676,6 +1805,7 @@ fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<usize> {
                 "records": summary.record_count
             })),
         );
+        Ok(JsonlCountState::Available(summary.record_count))
     } else {
         let preview = summary.preview_messages();
         push_check(
@@ -1706,14 +1836,13 @@ fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<usize> {
                     .collect::<Vec<_>>()
             })),
         );
+        Ok(JsonlCountState::Invalid)
     }
-
-    Ok(summary.record_count)
 }
 
 fn check_db_count(
     conn: &Connection,
-    jsonl_count: Option<usize>,
+    jsonl_count: JsonlCountState,
     checks: &mut Vec<CheckResult>,
 ) -> Result<()> {
     let db_count: i64 = conn.query_row(
@@ -1723,37 +1852,58 @@ fn check_db_count(
         .and_then(SqliteValue::as_integer)
         .unwrap_or(0);
 
-    if let Some(jsonl_count) = jsonl_count {
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let db_count_usize = db_count as usize;
-        if db_count_usize == jsonl_count {
-            push_check(
-                checks,
-                "counts.db_vs_jsonl",
-                CheckStatus::Ok,
-                Some(format!("Both have {db_count} records")),
-                None,
-            );
-        } else {
+    match jsonl_count {
+        JsonlCountState::Available(jsonl_count) => {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let db_count_usize = db_count as usize;
+            if db_count_usize == jsonl_count {
+                push_check(
+                    checks,
+                    "counts.db_vs_jsonl",
+                    CheckStatus::Ok,
+                    Some(format!("Both have {db_count} records")),
+                    None,
+                );
+            } else {
+                push_check(
+                    checks,
+                    "counts.db_vs_jsonl",
+                    CheckStatus::Warn,
+                    Some("DB and JSONL counts differ".to_string()),
+                    Some(serde_json::json!({
+                        "db": db_count,
+                        "jsonl": jsonl_count
+                    })),
+                );
+            }
+        }
+        JsonlCountState::Invalid => {
             push_check(
                 checks,
                 "counts.db_vs_jsonl",
                 CheckStatus::Warn,
-                Some("DB and JSONL counts differ".to_string()),
-                Some(serde_json::json!({
-                    "db": db_count,
-                    "jsonl": jsonl_count
-                })),
+                Some("JSONL is invalid; cannot compare counts".to_string()),
+                Some(serde_json::json!({ "db": db_count })),
             );
         }
-    } else {
-        push_check(
-            checks,
-            "counts.db_vs_jsonl",
-            CheckStatus::Warn,
-            Some("JSONL not found; cannot compare counts".to_string()),
-            Some(serde_json::json!({ "db": db_count })),
-        );
+        JsonlCountState::Missing => {
+            push_check(
+                checks,
+                "counts.db_vs_jsonl",
+                CheckStatus::Warn,
+                Some("JSONL not found; cannot compare counts".to_string()),
+                Some(serde_json::json!({ "db": db_count })),
+            );
+        }
+        JsonlCountState::Unreadable => {
+            push_check(
+                checks,
+                "counts.db_vs_jsonl",
+                CheckStatus::Warn,
+                Some("JSONL unreadable; cannot compare counts".to_string()),
+                Some(serde_json::json!({ "db": db_count })),
+            );
+        }
     }
 
     Ok(())
@@ -1770,12 +1920,7 @@ fn check_db_count(
 /// 2. Is within the .beads directory, or passes the configured external-path policy
 /// 3. Has an allowed extension
 #[allow(clippy::too_many_lines)]
-fn check_sync_jsonl_path(
-    jsonl_path: &Path,
-    beads_dir: &Path,
-    db_path: &Path,
-    checks: &mut Vec<CheckResult>,
-) {
+fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let check_name = "sync_jsonl_path";
 
     // 1. Check if path is valid UTF-8
@@ -1792,7 +1937,7 @@ fn check_sync_jsonl_path(
                 Some(serde_json::json!({
                     "path": jsonl_path.display().to_string(),
                     "reason": reason,
-                    "remediation": jsonl_inside_workspace_remediation(beads_dir)
+                    "remediation": "Move JSONL file inside .beads/ directory"
                 })),
             );
             return;
@@ -1800,10 +1945,8 @@ fn check_sync_jsonl_path(
 
         let is_external = config::resolved_jsonl_path_is_external(beads_dir, jsonl_path);
         if is_external {
-            let implicit_external =
-                config::implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path);
             match validate_sync_path_with_external(jsonl_path, beads_dir, true) {
-                Ok(()) if implicit_external => {
+                Ok(()) => {
                     push_check(
                         checks,
                         check_name,
@@ -1812,28 +1955,7 @@ fn check_sync_jsonl_path(
                         Some(serde_json::json!({
                             "path": jsonl_path.display().to_string(),
                             "beads_dir": beads_dir.display().to_string(),
-                            "db_path": db_path.display().to_string(),
-                            "external": true,
-                            "implicit_allow_external_jsonl": true
-                        })),
-                    );
-                }
-                Ok(()) => {
-                    push_check(
-                        checks,
-                        check_name,
-                        CheckStatus::Warn,
-                        Some(
-                            "Configured JSONL path is external and requires --allow-external-jsonl or an external sibling database"
-                                .to_string(),
-                        ),
-                        Some(serde_json::json!({
-                            "path": jsonl_path.display().to_string(),
-                            "beads_dir": beads_dir.display().to_string(),
-                            "db_path": db_path.display().to_string(),
-                            "external": true,
-                            "implicit_allow_external_jsonl": false,
-                            "remediation": jsonl_external_manual_sync_remediation(beads_dir)
+                            "external": true
                         })),
                     );
                 }
@@ -1846,9 +1968,7 @@ fn check_sync_jsonl_path(
                         Some(serde_json::json!({
                             "path": jsonl_path.display().to_string(),
                             "beads_dir": beads_dir.display().to_string(),
-                            "db_path": db_path.display().to_string(),
-                            "external": true,
-                            "implicit_allow_external_jsonl": implicit_external
+                            "external": true
                         })),
                     );
                 }
@@ -1879,11 +1999,11 @@ fn check_sync_jsonl_path(
                     checks,
                     check_name,
                     CheckStatus::Warn,
-                    Some(jsonl_outside_workspace_message(beads_dir)),
+                    Some("JSONL path is outside .beads/ directory".to_string()),
                     Some(serde_json::json!({
                         "path": path.display().to_string(),
                         "beads_dir": bd.display().to_string(),
-                        "remediation": jsonl_external_path_remediation(beads_dir)
+                        "remediation": "Use --allow-external-jsonl flag or move JSONL inside .beads/"
                     })),
                 );
             }
@@ -1917,11 +2037,11 @@ fn check_sync_jsonl_path(
                     checks,
                     check_name,
                     CheckStatus::Error,
-                    Some(jsonl_symlink_escape_message(beads_dir)),
+                    Some("JSONL path is a symlink pointing outside .beads/".to_string()),
                     Some(serde_json::json!({
                         "symlink": path.display().to_string(),
                         "target": target.display().to_string(),
-                        "remediation": jsonl_symlink_remediation(beads_dir)
+                        "remediation": "Remove symlink and use a regular file inside .beads/"
                     })),
                 );
             }
@@ -1958,7 +2078,7 @@ fn check_sync_jsonl_path(
                     Some("JSONL path targets git internals".to_string()),
                     Some(serde_json::json!({
                         "path": path.display().to_string(),
-                        "remediation": jsonl_inside_workspace_remediation(beads_dir)
+                        "remediation": "Move JSONL file inside .beads/ directory"
                     })),
                 );
             }
@@ -2059,17 +2179,32 @@ fn check_sync_metadata(
     let last_import: Option<String> = conn
         .query_row("SELECT value FROM metadata WHERE key = 'last_import_time'")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from));
+        .and_then(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        });
 
     let last_export: Option<String> = conn
         .query_row("SELECT value FROM metadata WHERE key = 'last_export_time'")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from));
+        .and_then(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        });
 
     let jsonl_hash: Option<String> = conn
         .query_row("SELECT value FROM metadata WHERE key = 'jsonl_content_hash'")
         .ok()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from));
+        .and_then(|row| {
+            row.get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        });
 
     // Check dirty issues count
     let dirty_count: i64 = conn
@@ -2191,14 +2326,14 @@ fn inspect_doctor_jsonl(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
     checks: &mut Vec<CheckResult>,
-) -> (Option<PathBuf>, Option<usize>) {
+) -> (Option<PathBuf>, JsonlCountState) {
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
-        check_sync_jsonl_path(path, beads_dir, &paths.db_path, checks);
+        check_sync_jsonl_path(path, beads_dir, checks);
         check_sync_conflict_markers(path, checks);
 
         match check_jsonl(path, checks) {
-            Ok(count) => Some(count),
+            Ok(count) => count,
             Err(err) => {
                 push_check(
                     checks,
@@ -2207,7 +2342,7 @@ fn inspect_doctor_jsonl(
                     Some(format!("Failed to read JSONL: {err}")),
                     Some(serde_json::json!({ "path": path.display().to_string() })),
                 );
-                None
+                JsonlCountState::Unreadable
             }
         }
     } else {
@@ -2215,10 +2350,10 @@ fn inspect_doctor_jsonl(
             checks,
             "jsonl.parse",
             CheckStatus::Warn,
-            Some(missing_jsonl_message(beads_dir)),
+            Some("No JSONL file found (.beads/issues.jsonl or .beads/beads.jsonl)".to_string()),
             None,
         );
-        None
+        JsonlCountState::Missing
     };
 
     (jsonl_path, jsonl_count)
@@ -2228,7 +2363,7 @@ fn inspect_doctor_database(
     beads_dir: &Path,
     db_path: &Path,
     jsonl_path: Option<&Path>,
-    jsonl_count: Option<usize>,
+    jsonl_count: JsonlCountState,
     checks: &mut Vec<CheckResult>,
 ) {
     if let Err(err) = check_recovery_artifacts(beads_dir, db_path, checks) {
@@ -2264,7 +2399,7 @@ fn inspect_doctor_database(
 fn inspect_existing_doctor_database(
     db_path: &Path,
     jsonl_path: Option<&Path>,
-    jsonl_count: Option<usize>,
+    jsonl_count: JsonlCountState,
     checks: &mut Vec<CheckResult>,
 ) {
     match config::with_database_family_snapshot(db_path, |snapshot_db_path| {
@@ -2389,7 +2524,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             repair_partial_indexes(&paths.db_path, &mut repair);
             let post_reindex = collect_doctor_report(&beads_dir, &paths)?;
             let repair_message = repair_outcome_message(
-                &beads_dir,
                 gitignore_repaired,
                 Some(&repair),
                 Some(REINDEX_INCOMPLETE_MESSAGE),
@@ -2413,16 +2547,11 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             ctx.json(&serde_json::json!({
                 "report": initial.report,
                 "repaired": gitignore_repaired,
-                "message": repair_outcome_message(&beads_dir, gitignore_repaired, None, None)
+                "message": repair_outcome_message(gitignore_repaired, None, None)
             }));
         } else {
             print_report(&initial.report, ctx)?;
-            ctx.info(&repair_outcome_message(
-                &beads_dir,
-                gitignore_repaired,
-                None,
-                None,
-            ));
+            ctx.info(&repair_outcome_message(gitignore_repaired, None, None));
         }
         return Ok(());
     }
@@ -2439,31 +2568,73 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     if report_has_partial_index_warnings(&initial.report) {
         repair_partial_indexes(&paths.db_path, &mut local_repair);
     }
-    let after_local_repair = if local_repair.applied() {
+
+    // VACUUM to fix page-level anomalies (free space corruption, malformed
+    // B-tree pages) caused by frankensqlite's B-tree layer differences with
+    // C sqlite3 (#237, #245).  VACUUM rewrites every page from scratch, so
+    // it fixes both index and table corruption.
+    if report_has_page_corruption(&initial.report) {
+        repair_via_vacuum(&paths.db_path, &mut local_repair);
+    }
+
+    let mut after_local_repair = if local_repair.applied() {
         collect_doctor_report(&beads_dir, &paths)?
     } else {
         initial.clone()
     };
 
-    if after_local_repair.report.ok {
-        let repair_message =
-            repair_outcome_message(&beads_dir, gitignore_repaired, Some(&local_repair), None);
-        if ctx.is_json() {
-            ctx.json(&serde_json::json!({
-                "report": initial.report,
-                "repaired": gitignore_repaired || local_repair.applied(),
-                "local_repair": local_repair,
-                "message": repair_message,
-                "post_repair": after_local_repair.report,
-                "verified": true,
-            }));
-        } else {
-            print_report(&initial.report, ctx)?;
-            ctx.info(&repair_message);
-            ctx.info("Post-repair verification:");
-            print_report(&after_local_repair.report, ctx)?;
+    // #253: the light-repair passes above (notably `reset_blocked_cache_table`
+    // via `repair_recoverable_db_state`) can leave orphaned pages behind that
+    // surface as WARN-level `page N: never used` integrity findings. These
+    // don't flip the DB into ERROR status, so the pre-repair
+    // `report_has_page_corruption` gate misses them — but they're still
+    // page-level residue that VACUUM resolves cleanly. Run VACUUM once to
+    // compact, and re-collect the report.  Guarded by `!local_repair.vacuumed`
+    // so we never loop.
+    if !local_repair.vacuumed && report_has_warn_level_page_anomaly(&after_local_repair.report) {
+        tracing::info!(
+            path = %paths.db_path.display(),
+            "Post-repair report has WARN-level page anomalies; running VACUUM to clean up orphaned pages"
+        );
+        repair_via_vacuum(&paths.db_path, &mut local_repair);
+        if local_repair.vacuumed {
+            after_local_repair = collect_doctor_report(&beads_dir, &paths)?;
         }
-        return Ok(());
+    }
+
+    if after_local_repair.report.ok {
+        // Issue #245: REINDEX can fix index ordering so integrity_check
+        // passes, but the underlying B-tree corruption may still cause
+        // writes to fail (reads work, writes get ISSUE_NOT_FOUND).  Run a
+        // write probe to confirm that the DB is truly healthy before
+        // declaring success.
+        let write_probe_ok = write_probe_after_repair(&paths.db_path);
+        if !write_probe_ok {
+            tracing::warn!(
+                "Post-repair write probe failed — local repair insufficient, \
+                 falling through to full JSONL rebuild"
+            );
+            // Don't return early — fall through to JSONL rebuild below.
+        } else {
+            let repair_message =
+                repair_outcome_message(gitignore_repaired, Some(&local_repair), None);
+            if ctx.is_json() {
+                ctx.json(&serde_json::json!({
+                    "report": initial.report,
+                    "repaired": gitignore_repaired || local_repair.applied(),
+                    "local_repair": local_repair,
+                    "message": repair_message,
+                    "post_repair": after_local_repair.report,
+                    "verified": true,
+                }));
+            } else {
+                print_report(&initial.report, ctx)?;
+                ctx.info(&repair_message);
+                ctx.info("Post-repair verification:");
+                print_report(&after_local_repair.report, ctx)?;
+            }
+            return Ok(());
+        }
     }
 
     let Some(jsonl_path) = initial.jsonl_path.as_ref() else {
@@ -2664,122 +2835,15 @@ mod tests {
     }
 
     #[test]
-    fn test_check_root_gitignore_warns_for_underscore_beads_patterns() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join("_beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-        fs::write(
-            temp.path().join(".gitignore"),
-            "_beads/\n/_beads/.gitignore\n!_beads/.gitignore\nkeep-me\n",
-        )
-        .unwrap();
-
-        let mut checks = Vec::new();
-        check_root_gitignore(&beads_dir, &mut checks);
-
-        let check = find_check(&checks, "gitignore.beads_inner").expect("gitignore check");
-        assert!(matches!(check.status, CheckStatus::Warn));
-
-        let offending = check
-            .details
-            .as_ref()
-            .and_then(|details| details.get("offending_patterns"))
-            .and_then(serde_json::Value::as_array)
-            .expect("offending patterns");
-
-        assert_eq!(
-            offending,
-            &vec![
-                serde_json::Value::String("_beads/".to_string()),
-                serde_json::Value::String("/_beads/.gitignore".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_fix_root_gitignore_if_warned_removes_underscore_beads_patterns() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join("_beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        let gitignore_path = temp.path().join(".gitignore");
-        fs::write(
-            &gitignore_path,
-            "_beads/\nkeep-me\n/_beads/.gitignore\n!_beads/.gitignore\n",
-        )
-        .unwrap();
-
-        let db_path = beads_dir.join("beads.db");
-        let jsonl_path = beads_dir.join("issues.jsonl");
-        let _storage = SqliteStorage::open(&db_path).unwrap();
-        fs::write(
-            &jsonl_path,
-            format!(
-                "{}\n",
-                serde_json::to_string(&sample_issue("bd-test02", "Valid issue")).unwrap()
-            ),
-        )
-        .unwrap();
-
-        let paths = config::ConfigPaths {
-            beads_dir: beads_dir.clone(),
-            db_path,
-            jsonl_path,
-            metadata: config::Metadata::default(),
-        };
-
-        let report_before = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
-        let before_check =
-            find_check(&report_before.report.checks, "gitignore.beads_inner").expect("warning");
-        assert!(matches!(before_check.status, CheckStatus::Warn));
-
-        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
-        assert!(fix_root_gitignore_if_warned(
-            &beads_dir,
-            &report_before.report,
-            &ctx
-        ));
-        assert_eq!(
-            fs::read_to_string(&gitignore_path).unwrap(),
-            "keep-me\n!_beads/.gitignore\n"
-        );
-
-        let report_after = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
-        let after_check =
-            find_check(&report_after.report.checks, "gitignore.beads_inner").expect("status");
-        assert!(matches!(after_check.status, CheckStatus::Ok));
-    }
-
-    #[test]
     fn test_repair_outcome_message_combines_gitignore_and_incomplete_reindex() {
-        let beads_dir = Path::new("_beads");
         let message = repair_outcome_message(
-            beads_dir,
             true,
             Some(&LocalRepairResult::default()),
             Some(REINDEX_INCOMPLETE_MESSAGE),
         );
 
-        assert!(message.contains(&root_gitignore_repair_message(beads_dir)));
+        assert!(message.contains(ROOT_GITIGNORE_REPAIR_MESSAGE));
         assert!(message.contains(REINDEX_INCOMPLETE_MESSAGE));
-    }
-
-    #[test]
-    fn test_check_merge_artifacts_message_uses_underscore_beads_workspace() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join("_beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-        fs::write(beads_dir.join("issues.base.jsonl"), "").unwrap();
-
-        let mut checks = Vec::new();
-        check_merge_artifacts(&beads_dir, &mut checks).unwrap();
-
-        let check = find_check(&checks, "jsonl.merge_artifacts").expect("merge artifacts check");
-        assert!(matches!(check.status, CheckStatus::Warn));
-        assert_eq!(
-            check.message.as_deref(),
-            Some("Merge artifacts detected in _beads/")
-        );
     }
 
     #[test]
@@ -2789,8 +2853,8 @@ mod tests {
         std::io::Write::write_all(file.as_file_mut(), b"{bad json}\n")?;
 
         let mut checks = Vec::new();
-        let count = check_jsonl(file.path(), &mut checks).unwrap();
-        assert_eq!(count, 2);
+        let state = check_jsonl(file.path(), &mut checks).unwrap();
+        assert_eq!(state, JsonlCountState::Invalid);
 
         let check = find_check(&checks, "jsonl.parse").expect("check present");
         assert!(matches!(check.status, CheckStatus::Error));
@@ -2808,8 +2872,8 @@ mod tests {
         std::io::Write::write_all(file.as_file_mut(), b"\n")?;
 
         let mut checks = Vec::new();
-        let count = check_jsonl(file.path(), &mut checks).unwrap();
-        assert_eq!(count, 1);
+        let state = check_jsonl(file.path(), &mut checks).unwrap();
+        assert_eq!(state, JsonlCountState::Invalid);
 
         let check = find_check(&checks, "jsonl.parse").expect("check present");
         assert!(matches!(check.status, CheckStatus::Error));
@@ -2823,6 +2887,68 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_check_jsonl_returns_count_only_for_valid_records() -> Result<()> {
+        let mut file = NamedTempFile::new().unwrap();
+        let issue = sample_issue("bd-good01", "Good issue");
+        let encoded = serde_json::to_string(&issue)?;
+        std::io::Write::write_all(file.as_file_mut(), encoded.as_bytes())?;
+        std::io::Write::write_all(file.as_file_mut(), b"\n")?;
+
+        let mut checks = Vec::new();
+        let state = check_jsonl(file.path(), &mut checks).unwrap();
+        assert_eq!(state, JsonlCountState::Available(1));
+
+        let check = find_check(&checks, "jsonl.parse").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_doctor_report_skips_count_comparison_for_invalid_jsonl() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .create_issue(
+                &sample_issue("bd-test01", "Doctor count source"),
+                "doctor-test",
+            )
+            .unwrap();
+
+        let valid_json =
+            serde_json::to_string(&sample_issue("bd-test01", "Doctor count source")).unwrap();
+        fs::write(&jsonl_path, format!("{valid_json}\n{{bad json}}\n")).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let parse_check = find_check(&report.report.checks, "jsonl.parse").expect("jsonl parse");
+        let counts_check =
+            find_check(&report.report.checks, "counts.db_vs_jsonl").expect("count check");
+
+        assert!(matches!(parse_check.status, CheckStatus::Error));
+        assert!(matches!(counts_check.status, CheckStatus::Warn));
+        assert!(
+            counts_check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("JSONL is invalid")),
+            "unexpected count-check message: {:?}",
+            counts_check.message
+        );
     }
 
     #[test]
@@ -2912,35 +3038,6 @@ mod tests {
     }
 
     #[test]
-    fn test_select_doctor_jsonl_path_falls_back_for_noncanonical_default_jsonl_path() {
-        let temp = TempDir::new().unwrap();
-        let workspace_root = temp.path().join("workspace");
-        let beads_dir = workspace_root.join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        let workspace_jsonl = beads_dir.join("issues.jsonl");
-        fs::write(&workspace_jsonl, "{\"id\":\"bd-legacy\"}\n").unwrap();
-
-        let configured_jsonl = workspace_root.join("nested/../.beads/issues.jsonl");
-        let paths = config::ConfigPaths {
-            beads_dir: beads_dir.clone(),
-            db_path: beads_dir.join("beads.db"),
-            jsonl_path: configured_jsonl,
-            metadata: config::Metadata {
-                database: "beads.db".to_string(),
-                jsonl_export: "issues.jsonl".to_string(),
-                backend: None,
-                deletions_retention_days: None,
-            },
-        };
-
-        assert_eq!(
-            select_doctor_jsonl_path(&beads_dir, &paths),
-            Some(workspace_jsonl)
-        );
-    }
-
-    #[test]
     fn test_collect_doctor_report_surfaces_missing_explicit_metadata_jsonl() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -2979,7 +3076,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_doctor_report_warns_for_external_jsonl_without_implicit_allow() {
+    fn test_collect_doctor_report_accepts_configured_external_jsonl() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         let external_dir = temp.path().join("external");
@@ -2997,127 +3094,6 @@ mod tests {
             jsonl_path: external_jsonl.clone(),
             metadata: config::Metadata {
                 database: "beads.db".to_string(),
-                jsonl_export: external_jsonl.to_string_lossy().into_owned(),
-                backend: None,
-                deletions_retention_days: None,
-            },
-        };
-
-        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
-        let sync_path_check =
-            find_check(&report.report.checks, "sync_jsonl_path").expect("sync path check");
-
-        assert!(matches!(sync_path_check.status, CheckStatus::Warn));
-        assert!(
-            sync_path_check
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("--allow-external-jsonl"))
-        );
-        assert_eq!(
-            sync_path_check
-                .details
-                .as_ref()
-                .and_then(|details| details.get("path"))
-                .and_then(serde_json::Value::as_str),
-            Some(external_jsonl.to_string_lossy().as_ref())
-        );
-        assert_eq!(
-            sync_path_check
-                .details
-                .as_ref()
-                .and_then(|details| details.get("implicit_allow_external_jsonl"))
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn test_collect_doctor_report_warns_with_underscore_beads_remediation() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join("_beads");
-        let external_dir = temp.path().join("external");
-        fs::create_dir_all(&beads_dir).unwrap();
-        fs::create_dir_all(&external_dir).unwrap();
-
-        let db_path = beads_dir.join("beads.db");
-        let external_jsonl = external_dir.join("issues.jsonl");
-        fs::write(&external_jsonl, "{\"id\":\"bd-external\"}\n").unwrap();
-        let _storage = SqliteStorage::open(&db_path).unwrap();
-
-        let paths = config::ConfigPaths {
-            beads_dir: beads_dir.clone(),
-            db_path,
-            jsonl_path: external_jsonl.clone(),
-            metadata: config::Metadata {
-                database: "beads.db".to_string(),
-                jsonl_export: external_jsonl.to_string_lossy().into_owned(),
-                backend: None,
-                deletions_retention_days: None,
-            },
-        };
-
-        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
-        let sync_path_check =
-            find_check(&report.report.checks, "sync_jsonl_path").expect("sync path check");
-
-        assert!(matches!(sync_path_check.status, CheckStatus::Warn));
-        assert_eq!(
-            sync_path_check.message.as_deref(),
-            Some("JSONL path is outside _beads/ directory")
-        );
-        assert_eq!(
-            sync_path_check
-                .details
-                .as_ref()
-                .and_then(|details| details.get("remediation"))
-                .and_then(serde_json::Value::as_str),
-            Some("Use --allow-external-jsonl flag or move JSONL inside _beads/")
-        );
-    }
-
-    #[test]
-    fn test_collect_doctor_report_missing_jsonl_message_uses_underscore_beads_workspace() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join("_beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        let paths = config::ConfigPaths {
-            beads_dir: beads_dir.clone(),
-            db_path: beads_dir.join("beads.db"),
-            jsonl_path: beads_dir.join("issues.jsonl"),
-            metadata: config::Metadata::default(),
-        };
-
-        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
-        let parse_check = find_check(&report.report.checks, "jsonl.parse").expect("jsonl parse");
-
-        assert!(matches!(parse_check.status, CheckStatus::Warn));
-        assert_eq!(
-            parse_check.message.as_deref(),
-            Some("No JSONL file found (_beads/issues.jsonl or _beads/beads.jsonl)")
-        );
-    }
-
-    #[test]
-    fn test_collect_doctor_report_accepts_external_jsonl_for_external_db_family() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        let external_dir = temp.path().join("external");
-        fs::create_dir_all(&beads_dir).unwrap();
-        fs::create_dir_all(&external_dir).unwrap();
-
-        let db_path = external_dir.join("beads.db");
-        let external_jsonl = external_dir.join("issues.jsonl");
-        fs::write(&external_jsonl, "{\"id\":\"bd-external\"}\n").unwrap();
-        let _storage = SqliteStorage::open(&db_path).unwrap();
-
-        let paths = config::ConfigPaths {
-            beads_dir: beads_dir.clone(),
-            db_path: db_path.clone(),
-            jsonl_path: external_jsonl.clone(),
-            metadata: config::Metadata {
-                database: db_path.to_string_lossy().into_owned(),
                 jsonl_export: external_jsonl.to_string_lossy().into_owned(),
                 backend: None,
                 deletions_retention_days: None,
@@ -3133,15 +3109,15 @@ mod tests {
             sync_path_check
                 .details
                 .as_ref()
-                .and_then(|details| details.get("external"))
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
+                .and_then(|details| details.get("path"))
+                .and_then(serde_json::Value::as_str),
+            Some(external_jsonl.to_string_lossy().as_ref())
         );
         assert_eq!(
             sync_path_check
                 .details
                 .as_ref()
-                .and_then(|details| details.get("implicit_allow_external_jsonl"))
+                .and_then(|details| details.get("external"))
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
@@ -3444,7 +3420,7 @@ mod tests {
         lock_conn.execute("BEGIN IMMEDIATE").unwrap();
 
         let mut checks = Vec::new();
-        inspect_existing_doctor_database(&db_path, None, None, &mut checks);
+        inspect_existing_doctor_database(&db_path, None, JsonlCountState::Missing, &mut checks);
 
         let check = find_check(&checks, "db.write_probe").expect("check present");
         assert!(
@@ -3678,5 +3654,107 @@ mod tests {
 
         let local_repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
         assert!(!local_repair.blocked_cache_rebuilt);
+    }
+
+    // ===================================================================
+    // #253: WARN-level page anomalies left by the light-repair pass
+    // should trigger a follow-up VACUUM so the DB ends in a clean state
+    // and subsequent `--repair` runs don't report "nothing to repair"
+    // with integrity_check still dirty.
+    // ===================================================================
+
+    #[test]
+    fn report_has_warn_level_page_anomaly_matches_orphan_page_warn() {
+        for msg in [
+            "page 55 is never used",
+            "*** in database main ***; Page 55: never used; Page 264: never used",
+            "database disk image is malformed",
+            "Tree 28 page 28: free space corruption",
+        ] {
+            let report = DoctorReport {
+                ok: true, // WARNs don't flip ok → false
+                checks: vec![CheckResult {
+                    name: "sqlite.integrity_check".to_string(),
+                    status: CheckStatus::Warn,
+                    message: Some(msg.to_string()),
+                    details: None,
+                }],
+            };
+            assert!(
+                report_has_warn_level_page_anomaly(&report),
+                "expected WARN-level page anomaly to match: {msg:?}"
+            );
+        }
+
+        // sqlite3 binary variant should also match (the C sqlite3 cross-check).
+        let report = DoctorReport {
+            ok: true,
+            checks: vec![CheckResult {
+                name: "sqlite3.integrity_check".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("Page 55: never used".to_string()),
+                details: None,
+            }],
+        };
+        assert!(report_has_warn_level_page_anomaly(&report));
+    }
+
+    #[test]
+    fn report_has_warn_level_page_anomaly_ignores_non_page_warns() {
+        // "missing from index" is a partial-index REINDEX case, not a VACUUM case.
+        let report = DoctorReport {
+            ok: true,
+            checks: vec![CheckResult {
+                name: "sqlite.integrity_check".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("row 42 missing from index idx_foo".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!report_has_warn_level_page_anomaly(&report));
+
+        // Out-of-order index warning: known frankensqlite DESC-index artifact,
+        // not a VACUUM case.
+        let report = DoctorReport {
+            ok: true,
+            checks: vec![CheckResult {
+                name: "sqlite.integrity_check".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("out of order index idx_foo".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!report_has_warn_level_page_anomaly(&report));
+    }
+
+    #[test]
+    fn report_has_warn_level_page_anomaly_ignores_error_level_findings() {
+        // ERROR-level findings are handled by the existing
+        // `report_has_page_corruption` path; this predicate is
+        // specifically scoped to WARN-level residue left after light repair.
+        let report = DoctorReport {
+            ok: false,
+            checks: vec![CheckResult {
+                name: "sqlite.integrity_check".to_string(),
+                status: CheckStatus::Error,
+                message: Some("page 55 is never used".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!report_has_warn_level_page_anomaly(&report));
+    }
+
+    #[test]
+    fn report_has_warn_level_page_anomaly_ignores_non_integrity_checks() {
+        let report = DoctorReport {
+            ok: true,
+            checks: vec![CheckResult {
+                name: "db.sidecars".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("WAL sidecar exists without a matching SHM sidecar".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!report_has_warn_level_page_anomaly(&report));
     }
 }

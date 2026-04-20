@@ -1,8 +1,6 @@
 //! Audit command implementation.
 
-use super::{
-    auto_import_storage_ctx_if_stale, open_storage_ctx_with_auto_import, resolve_issue_id,
-};
+use super::{auto_import_storage_ctx_if_stale, resolve_issue_id};
 use crate::cli::{AuditCommands, AuditLabelArgs, AuditLogArgs, AuditRecordArgs, AuditSummaryArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -209,7 +207,7 @@ fn execute_summary(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let storage_ctx = open_storage_ctx_with_auto_import(beads_dir, cli)?;
+    let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     let events = storage_ctx.storage.get_all_events(0)?;
 
     let cutoff = Utc::now() - chrono::Duration::days(i64::from(args.days));
@@ -494,10 +492,7 @@ fn append_entry(beads_dir: &Path, entry: &mut AuditEntry) -> Result<String> {
     file.write_all(&line)?;
     file.sync_all()?;
 
-    entry
-        .id
-        .clone()
-        .ok_or_else(|| BeadsError::Config("audit entry ID missing after append".to_string()))
+    Ok(entry.id.as_ref().expect("id set before append").clone())
 }
 
 fn interactions_file_path(beads_dir: &Path) -> PathBuf {
@@ -752,10 +747,11 @@ fn render_audit_summary_plain(days: u32, totals: &AuditTotals, actors: &[ActorSu
 }
 
 fn event_type_style(event_type: &EventType, theme: &Theme) -> rich_rust::Style {
+    use rich_rust::Color;
     match event_type {
-        EventType::Created => theme.success.clone(),
-        EventType::Closed => theme.accent.clone(),
-        EventType::Updated => theme.warning.clone(),
+        EventType::Created => Style::new().color(Color::parse("green").unwrap()),
+        EventType::Closed => Style::new().color(Color::parse("blue").unwrap()),
+        EventType::Updated => Style::new().color(Color::parse("yellow").unwrap()),
         EventType::Commented => theme.dimmed.clone(),
         _ => Style::new(),
     }

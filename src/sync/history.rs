@@ -86,59 +86,30 @@ enum BackupTarget {
     Absolute { path: String },
 }
 
-fn normalize_target_path_lexically(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return path.to_path_buf();
-                }
-            }
-        }
-    }
-
-    normalized
-}
-
 impl BackupTarget {
     fn from_target_path(beads_dir: &Path, target_path: &Path) -> Self {
-        let normalized_beads_dir = normalize_target_path_lexically(beads_dir);
-        let normalized_target = normalize_target_path_lexically(target_path);
-
-        if let Ok(relative) = normalized_target.strip_prefix(&normalized_beads_dir) {
+        if let Ok(relative) = target_path.strip_prefix(beads_dir) {
             return Self::Relative {
                 path: relative.to_string_lossy().into_owned(),
             };
         }
 
         Self::Absolute {
-            path: normalized_target.to_string_lossy().into_owned(),
+            path: target_path.to_string_lossy().into_owned(),
         }
     }
 
     fn resolve_path(&self, beads_dir: &Path) -> PathBuf {
         match self {
-            Self::Relative { path } => normalize_target_path_lexically(&beads_dir.join(path)),
-            Self::Absolute { path } => normalize_target_path_lexically(Path::new(path)),
+            Self::Relative { path } => beads_dir.join(path),
+            Self::Absolute { path } => PathBuf::from(path),
         }
     }
 
     fn key(&self) -> String {
         match self {
-            Self::Relative { path } => format!(
-                "relative:{}",
-                normalize_target_path_lexically(Path::new(path)).display()
-            ),
-            Self::Absolute { path } => format!(
-                "absolute:{}",
-                normalize_target_path_lexically(Path::new(path)).display()
-            ),
+            Self::Relative { path } => format!("relative:{path}"),
+            Self::Absolute { path } => format!("absolute:{path}"),
         }
     }
 }
@@ -345,6 +316,8 @@ fn write_backup_metadata(beads_dir: &Path, target_path: &Path, backup_path: &Pat
         Ok(())
     })();
 
+    drop(file);
+
     if let Err(err) = write_result {
         if let Err(cleanup_err) = fs::remove_file(&metadata_path) {
             tracing::warn!(
@@ -478,7 +451,7 @@ pub fn backup_before_export(
     // Check if the content is identical to the most recent backup (deduplication)
     // We match by full target identity so similarly named exports do not
     // collapse each other's history.
-    if let Some(latest) = get_latest_backup(&history_dir, &target_key, file_stem)?
+    if let Some(latest) = get_latest_backup(&history_dir, &target_key)?
         && files_are_identical(target_path, &latest.path)?
     {
         tracing::debug!(
@@ -500,7 +473,7 @@ pub fn backup_before_export(
     tracing::debug!("Created backup: {}", backup_path.display());
 
     // Rotate history for this specific target
-    rotate_history(&history_dir, config, &target_key, file_stem)?;
+    rotate_history(&history_dir, config, &target_key)?;
 
     Ok(())
 }
@@ -510,14 +483,8 @@ pub fn backup_before_export(
 /// # Errors
 ///
 /// Returns an error if listing or deleting backups fails.
-fn rotate_history(
-    history_dir: &Path,
-    config: &HistoryConfig,
-    target_key: &str,
-    file_stem: &str,
-) -> Result<()> {
-    let prefix = format!("{file_stem}.");
-    let mut backups: Vec<_> = list_backups(history_dir, Some(&prefix))?
+fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) -> Result<()> {
+    let mut backups: Vec<_> = list_backups(history_dir, None)?
         .into_iter()
         .filter(|entry| entry.target_key == target_key)
         .collect();
@@ -626,13 +593,8 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
     Ok(backups)
 }
 
-fn get_latest_backup(
-    history_dir: &Path,
-    target_key: &str,
-    file_stem: &str,
-) -> Result<Option<BackupEntry>> {
-    let prefix = format!("{file_stem}.");
-    Ok(list_backups(history_dir, Some(&prefix))?
+fn get_latest_backup(history_dir: &Path, target_key: &str) -> Result<Option<BackupEntry>> {
+    Ok(list_backups(history_dir, None)?
         .into_iter()
         .find(|entry| entry.target_key == target_key))
 }
@@ -774,7 +736,7 @@ mod tests {
 
         // Run rotation for "issues" stem
         let target_key = target_key_for_path(&beads_dir, &beads_dir.join("issues.jsonl"));
-        rotate_history(&history_dir, &config, &target_key, "issues").unwrap();
+        rotate_history(&history_dir, &config, &target_key).unwrap();
 
         // Should keep only max_count (2) newest files
         let remaining = list_backups(&history_dir, None).unwrap();
@@ -842,27 +804,6 @@ mod tests {
                 .len(),
             2
         );
-    }
-
-    #[test]
-    fn test_backup_before_export_deduplicates_noncanonical_internal_target_paths() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        let history_dir = beads_dir.join(".br_history");
-        fs::create_dir_all(beads_dir.join("nested")).unwrap();
-
-        let config = HistoryConfig::default();
-        let canonical_target = beads_dir.join("custom.jsonl");
-        let noncanonical_target = beads_dir.join("nested").join("..").join("custom.jsonl");
-        fs::write(&canonical_target, "same-content\n").unwrap();
-
-        backup_before_export(&beads_dir, &config, &canonical_target).unwrap();
-        backup_before_export(&beads_dir, &config, &noncanonical_target).unwrap();
-
-        let backups = list_backups(&history_dir, Some("custom.")).unwrap();
-        assert_eq!(backups.len(), 1);
-        assert_eq!(backups[0].target_path, canonical_target);
-        assert_eq!(backups[0].target_key, "relative:custom.jsonl");
     }
 
     #[test]
@@ -1128,34 +1069,6 @@ mod tests {
             backups[0].target_path,
             invalid_metadata_target_path(backup_name)
         );
-    }
-
-    #[test]
-    fn test_list_backups_normalizes_noncanonical_relative_metadata_targets() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        let history_dir = beads_dir.join(".br_history");
-        fs::create_dir_all(&history_dir).unwrap();
-
-        let backup_name = "custom.20260307_120000.jsonl";
-        let backup_path = history_dir.join(backup_name);
-        fs::write(&backup_path, "backup\n").unwrap();
-        fs::write(
-            backup_metadata_path(&backup_path),
-            serde_json::json!({
-                "target": {
-                    "kind": "relative",
-                    "path": "nested/../custom.jsonl",
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let backups = list_backups(&history_dir, None).unwrap();
-        assert_eq!(backups.len(), 1);
-        assert_eq!(backups[0].target_path, beads_dir.join("custom.jsonl"));
-        assert_eq!(backups[0].target_key, "relative:custom.jsonl");
     }
 
     #[cfg(unix)]

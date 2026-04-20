@@ -27,6 +27,7 @@ Thumbs.db
 # Beads ephemeral files (runtime artifacts, not issues.jsonl)
 .beads/last-touched
 .beads/.bv.lock
+.beads/*.lock
 
 # Coverage reports
 /coverage/
@@ -120,17 +121,24 @@ sample_beads_db_files/**/*.db-wal
 -memorytest.db
 *memorytest.db
 
-# Root-level test scratch files (agent-generated)
-/test_file
-/test_file.rs
-/test_lock
-/test_lock.rs
+# Root-level test scratch files (agent-generated one-offs).
+# Real tests live in /tests/, which is `tests` (no underscore) and not matched.
+/test_*
+/test.lock
+/child.json
+/parent.json
+
+# One-off sed-based refactor helper scripts (see AGENTS.md — never run scripts
+# that mutate code files; these are agent-generated dev scratch and must stay
+# out of the repo).
+/fix_*.sh
 
 # Beads snapshot backups (timestamped)
 .beads.snapshot_*/
 
 # UBS scan output
 ubs.json
+ubs.txt
 ubs_output.*
 rust-bug-scan.txt
 report.json
@@ -139,9 +147,3 @@ report.json
 .codex-local-check/
 .codex-bench/
 .codex-tmp/
-
-# Ephemeral test/debug files at repo root
-/child.json
-/parent.json
-/test_cycle.rs
-/test_jc1j.sh

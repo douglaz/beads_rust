@@ -86,25 +86,6 @@ panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols
 ```
 
-### Release Propagation
-
-Every `br` version change or release must also propagate to ACFS because `/dp/agentic_coding_flywheel_setup` installs `beads_rust` through a verified installer checksum gate.
-
-- **After every release/version bump, you MUST verify the `br` checksum entry in `/dp/agentic_coding_flywheel_setup/checksums.yaml`; if the installer hash changed, regenerate that file from the ACFS repo.**
-- **ACFS pins the raw installer script** at `https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh`, not the GitHub release tarball checksums.
-- **Treat this verification as a required release step even when the installer hash ends up unchanged.**
-- **Only replace ACFS `checksums.yaml` if the diff is limited to the timestamp header plus the `br` entry; if unrelated installer entries changed too, stop and investigate instead of overwriting the file.**
-- **If the only diff is the timestamp header:** leave ACFS `checksums.yaml` unchanged.
-- Preferred verification:
-  ```bash
-  candidate="$(mktemp)"
-  /dp/agentic_coding_flywheel_setup/scripts/lib/security.sh --update-checksums > "$candidate"
-  diff -u /dp/agentic_coding_flywheel_setup/checksums.yaml "$candidate" || [[ $? -eq 1 ]]
-  /dp/agentic_coding_flywheel_setup/scripts/lib/security.sh --checksum https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh
-  awk '/^  br:/{flag=1;print;next} flag && /^    /{print;next} flag{exit}' /dp/agentic_coding_flywheel_setup/checksums.yaml
-  awk '/^  br:/{flag=1;print;next} flag && /^    /{print;next} flag{exit}' "$candidate"
-  ```
-
 ---
 
 ## Code Editing Discipline

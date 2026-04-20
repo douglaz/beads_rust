@@ -5,9 +5,7 @@ use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 4;
-/// SQLite page cache size in KB (negative = KB). -8000 = 8 MB.
-const SQLITE_CACHE_SIZE_KB: &str = "-8000";
+pub const CURRENT_SCHEMA_VERSION: i32 = 5;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -17,7 +15,6 @@ pub const SCHEMA_SQL: &str = r"
     -- Note: TEXT fields use DEFAULT '' for bd (Go) compatibility.
     -- bd's sql.Scan doesn't handle NULL well when scanning into string fields.
     -- Closed-at invariant is enforced by the CHECK clause below.
-    -- Title limit must match validation::MAX_TITLE_CHARS (500).
     CREATE TABLE IF NOT EXISTS issues (
         id TEXT PRIMARY KEY,
         content_hash TEXT,
@@ -91,9 +88,12 @@ pub const SCHEMA_SQL: &str = r"
         AND pinned = 0
         AND is_template = 0;
 
-    -- Common active list path: non-terminal issues sorted by priority/created_at
+    -- Common active list path: non-terminal issues sorted by priority/created_at.
+    -- Uses ASC on created_at (not DESC) to avoid frankensqlite B-tree ordering
+    -- divergence with C sqlite3 integrity_check.  SQLite reverse-scans the ASC
+    -- index efficiently for ORDER BY ... created_at DESC queries.
     CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
-        ON issues(priority, created_at DESC)
+        ON issues(priority, created_at)
         WHERE status NOT IN ('closed', 'tombstone')
         AND (is_template = 0 OR is_template IS NULL);
 
@@ -375,6 +375,13 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
 ///
 /// Returns an error if the SQL execution fails or pragmas cannot be set.
 pub fn apply_schema(conn: &Connection) -> Result<()> {
+    // Detect a truly fresh (empty) database before any DDL runs.
+    // On a fresh DB, SCHEMA_SQL creates everything at the current version,
+    // so running migrations is unnecessary and harmful — e.g. the v3/v4
+    // migrations DROP+CREATE idx_issues_ready which orphans a page and
+    // causes doctor integrity warnings.
+    let is_fresh = !table_exists(conn, "issues");
+
     // Run pre-schema migrations first to fix any incompatible old tables
     // This must run BEFORE execute_batch because the batch includes CREATE INDEX
     // statements that will fail if old tables have missing columns
@@ -385,26 +392,55 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
 
     execute_batch(conn, SCHEMA_SQL)?;
 
-    // Run migrations for existing databases.
-    // If the issues table was rebuilt from scratch, skip migration checks
-    // that reference newly-added columns because fsqlite's in-memory schema
-    // cache may not have been updated yet.
-    run_migrations(conn, issues_rebuilt).map_err(|e| {
-        eprintln!("run_migrations failed: {:?}", e);
-        e
-    })?;
-
-    // Mark schema as applied so future opens can skip DDL/migration work.
-    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-        .map_err(|e| {
-            eprintln!("PRAGMA user_version failed: {:?}", e);
-            BeadsError::Database(e)
+    if is_fresh {
+        // Fresh database: SCHEMA_SQL already created everything at the
+        // current version. Skip migrations and stamp user_version directly.
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .map_err(|e| {
+                eprintln!("PRAGMA user_version failed: {:?}", e);
+                BeadsError::Database(e)
+            })?;
+    } else {
+        // Existing database: run migrations for schema upgrades.
+        // If the issues table was rebuilt from scratch, skip migration checks
+        // that reference newly-added columns because fsqlite's in-memory schema
+        // cache may not have been updated yet.
+        run_migrations(conn, issues_rebuilt).map_err(|e| {
+            eprintln!("run_migrations failed: {:?}", e);
+            e
         })?;
+
+        // Mark schema as applied so future opens can skip DDL/migration work.
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .map_err(|e| {
+                eprintln!("PRAGMA user_version failed: {:?}", e);
+                BeadsError::Database(e)
+            })?;
+    }
 
     apply_runtime_pragmas(conn).map_err(|e| {
         eprintln!("apply_runtime_pragmas failed: {:?}", e);
         e
     })?;
+
+    // On a truly fresh bootstrap, run a defensive `wal_checkpoint(TRUNCATE)`
+    // to reclaim any transient pages frankensqlite allocated while
+    // executing SCHEMA_SQL (CREATE TABLE + ~15 CREATE INDEX statements,
+    // several of which are partial indexes on columns of empty tables).
+    // Without this, a fresh `br init` can leave the database with
+    // unreachable pages that sqlite3's `PRAGMA integrity_check` surfaces
+    // as `Page N: never used` — see issue #225.
+    //
+    // Note: page-level anomalies from subsequent writes (e.g., "free space
+    // corruption" — issue #237) are addressed via VACUUM in the rebuild
+    // path and `br doctor --repair`, not here.  Running VACUUM here would
+    // conflict with connections opened immediately after init.
+    if is_fresh && let Err(e) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+        tracing::debug!(
+            error = %e,
+            "wal_checkpoint(TRUNCATE) after fresh bootstrap failed (non-fatal)"
+        );
+    }
 
     Ok(())
 }
@@ -440,13 +476,26 @@ pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
     conn.execute("PRAGMA synchronous = NORMAL")?;
     // Use memory for temp tables/indexes instead of disk
     conn.execute("PRAGMA temp_store = MEMORY")?;
-    // 8 MB page cache (default is ~2 MB), improves read-heavy workloads
-    conn.execute(&format!("PRAGMA cache_size = {SQLITE_CACHE_SIZE_KB}"))?;
+    // 8MB page cache (default is ~2MB), improves read-heavy workloads
+    conn.execute("PRAGMA cache_size = -8000")?;
+
+    // Issue #219: Limit WAL file size to 32MB.  Without this, concurrent
+    // writers can cause unbounded WAL growth, which slows reads and
+    // increases checkpoint contention.  SQLite will attempt to keep the WAL
+    // file at or below this size after each checkpoint.
+    conn.execute("PRAGMA journal_size_limit = 33554432")?;
+
+    // Issue #219: Disable the automatic WAL checkpoint that fires after
+    // every 1000 pages of WAL growth.  The auto-checkpoint uses PASSIVE
+    // mode internally but can still cause unexpected latency spikes during
+    // write-heavy concurrent operations.  We handle checkpointing manually
+    // in with_write_transaction using PASSIVE mode at a controlled interval.
+    conn.execute("PRAGMA wal_autocheckpoint = 0")?;
 
     Ok(())
 }
 
-fn table_exists(conn: &Connection, table: &str) -> bool {
+pub(crate) fn table_exists(conn: &Connection, table: &str) -> bool {
     let escaped_table = table.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='table' AND name='{escaped_table}'");
     conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
@@ -747,7 +796,6 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
         .chain(std::iter::once(("content_hash", "TEXT")))
         .chain(std::iter::once((
             "title",
-            // Must match validation::MAX_TITLE_CHARS
             "TEXT NOT NULL CHECK(length(title) <= 500)",
         )))
         .chain(
@@ -1105,6 +1153,21 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                  AND is_template = 0",
             )?;
         }
+
+        // v5: Drop the old DESC index so the idempotent CREATE INDEX IF NOT
+        // EXISTS below recreates it without DESC.  Frankensqlite's B-tree
+        // implementation stores DESC index entries in a different physical
+        // order than C sqlite3 expects, causing `PRAGMA integrity_check` to
+        // report "entries are out of order for their declared key directions".
+        // Removing DESC eliminates the false positive while SQLite's query
+        // planner still reverse-scans the ASC index efficiently for
+        // ORDER BY ... created_at DESC queries.
+        if user_version < 5 {
+            tracing::info!(
+                "Migrating database to schema version 5 (remove DESC from active list index)"
+            );
+            conn.execute("DROP INDEX IF EXISTS idx_issues_list_active_order")?;
+        }
     }
 
     // Note: source_repo and is_template column backfills are handled in
@@ -1139,7 +1202,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
 
         -- Common active list path: non-terminal issues sorted by priority/created_at
         CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
-            ON issues(priority, created_at DESC)
+            ON issues(priority, created_at)
             WHERE status NOT IN ('closed', 'tombstone')
             AND (is_template = 0 OR is_template IS NULL);
 

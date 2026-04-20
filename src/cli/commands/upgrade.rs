@@ -5,13 +5,21 @@
 use crate::cli::UpgradeArgs;
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
-use crate::{BIN_NAME, REPO_NAME, REPO_OWNER};
 use rich_rust::prelude::*;
 use self_update::backends::github;
 use self_update::cargo_crate_version;
 use self_update::update::ReleaseUpdate;
 use serde::Serialize;
 use std::env;
+
+/// Repo owner for GitHub releases.
+const REPO_OWNER: &str = "Dicklesworthstone";
+
+/// Repo name for GitHub releases.
+const REPO_NAME: &str = "beads_rust";
+
+/// Binary name.
+const BIN_NAME: &str = "br";
 
 /// Update check result.
 #[derive(Serialize)]
@@ -213,9 +221,9 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
                  This binary was built without archive support for the required format (e.g., .tar.gz).\n\
                  This is a known issue in some older versions (e.g., 0.1.21 - 0.1.26). Version 0.1.27 and later include the correct 'archive-tar' linkage.\n\n\
                  Please upgrade manually by running:\n\n  \
-                 curl -fsSL https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/install.sh | bash\n\n\
+                 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash\n\n\
                  Or by downloading the release from:\n  \
-                 https://github.com/{REPO_OWNER}/{REPO_NAME}/releases\n\n\
+                 https://github.com/Dicklesworthstone/beads_rust/releases\n\n\
                  After that, `br upgrade` will work correctly for future updates."
             ))
         } else {
@@ -261,19 +269,6 @@ fn resolve_auth_token() -> Option<String> {
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
-}
-
-/// Fetch the latest GitHub release version for this crate.
-pub(crate) fn fetch_latest_release_version(current_version: &str) -> Result<String> {
-    let updater = build_updater(current_version)?;
-    let latest = updater.get_latest_release().map_err(map_update_error)?;
-    Ok(normalize_release_version_tag(&latest.version).to_string())
-}
-
-/// Normalize a GitHub release tag or version string to plain semver text.
-pub(crate) fn normalize_release_version_tag(tag: &str) -> &str {
-    let trimmed = tag.trim();
-    trimmed.strip_prefix('v').unwrap_or(trimmed)
 }
 
 /// Map the Rust target triple to the asset name fragment used in GitHub releases.
@@ -556,12 +551,5 @@ mod tests {
     fn test_version_more_parts() {
         assert!(version_newer("0.1.0.1", "0.1.0"));
         assert!(!version_newer("0.1.0", "0.1.0.1"));
-    }
-
-    #[test]
-    fn test_normalize_release_version_tag_strips_v_prefix_and_whitespace() {
-        assert_eq!(normalize_release_version_tag("v0.2.0"), "0.2.0");
-        assert_eq!(normalize_release_version_tag("  v1.4.3  "), "1.4.3");
-        assert_eq!(normalize_release_version_tag("2.0.0"), "2.0.0");
     }
 }

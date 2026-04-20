@@ -84,7 +84,8 @@ impl OutputContext {
             OutputMode::Json
         } else if quiet {
             OutputMode::Quiet
-        } else if no_color || !std::io::stdout().is_terminal() {
+        } else if no_color || std::env::var("NO_COLOR").is_ok() || !std::io::stdout().is_terminal()
+        {
             OutputMode::Plain
         } else {
             OutputMode::Rich
@@ -107,7 +108,10 @@ impl OutputContext {
             OutputFormat::Text | OutputFormat::Csv => {
                 if quiet {
                     OutputMode::Quiet
-                } else if no_color || !std::io::stdout().is_terminal() {
+                } else if no_color
+                    || std::env::var("NO_COLOR").is_ok()
+                    || !std::io::stdout().is_terminal()
+                {
                     OutputMode::Plain
                 } else {
                     OutputMode::Rich
@@ -374,8 +378,9 @@ impl OutputContext {
     pub fn error(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                let panel = Panel::from_text(message).title(Text::new("Error"));
-                // .border_style(self.theme.error.clone()); // border_style missing?
+                let panel = Panel::from_text(message)
+                    .title(Text::new("Error"))
+                    .border_style(self.theme().error.clone());
                 self.console().print_renderable(&panel);
             }
             OutputMode::Plain | OutputMode::Quiet => eprintln!("Error: {}", message),
@@ -406,9 +411,7 @@ impl OutputContext {
 
     pub fn section(&self, title: &str) {
         if self.is_rich() {
-            let rule = Rule::with_title(Text::new(title))
-                // .style(self.theme.section.clone())
-                ;
+            let rule = Rule::with_title(Text::new(title)).style(self.theme().section.clone());
             self.console().print_renderable(&rule);
         } else if self.is_plain() {
             println!("\n─── {} ───\n", title);
@@ -430,8 +433,9 @@ impl OutputContext {
                     text.append(&format!("• {}\n", suggestion));
                 }
 
-                let panel = Panel::from_rich_text(&text, self.width()).title(Text::new(title));
-                // .border_style(self.theme.error.clone());
+                let panel = Panel::from_rich_text(&text, self.width())
+                    .title(Text::new(title))
+                    .border_style(self.theme().error.clone());
                 self.console().print_renderable(&panel);
             }
             OutputMode::Plain => {

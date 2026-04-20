@@ -3,7 +3,6 @@
 //! Shows project statistics including issue counts by status, type, priority,
 //! assignee, and label. Also supports recent activity tracking via git.
 
-use crate::cli::commands::open_storage_ctx_with_auto_import;
 use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::Result;
@@ -78,18 +77,18 @@ fn execute_inner(
     let owned_storage_ctx = if preloaded_storage.is_some() || preloaded_storage_ctx.is_some() {
         None
     } else {
-        Some(open_storage_ctx_with_auto_import(beads_dir, cli)?)
+        Some(config::open_storage_with_cli(beads_dir, cli)?)
     };
     let storage = preloaded_storage
         .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
         .or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage))
         .expect("stats should have an open storage handle");
-    let jsonl_path = resolve_active_jsonl_path(
-        beads_dir,
-        cli,
-        preloaded_storage_ctx,
-        owned_storage_ctx.as_ref(),
-    )?;
+    let jsonl_path = preloaded_storage_ctx
+        .or(owned_storage_ctx.as_ref())
+        .map_or_else(
+            || beads_dir.join("issues.jsonl"),
+            |ctx| ctx.paths.jsonl_path.clone(),
+        );
     let config_layer =
         if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
             storage_ctx.load_config(cli)?
@@ -173,23 +172,6 @@ fn execute_inner(
     }
 
     Ok(())
-}
-
-fn resolve_active_jsonl_path(
-    beads_dir: &Path,
-    cli: &config::CliOverrides,
-    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
-    owned_storage_ctx: Option<&config::OpenStorageResult>,
-) -> Result<PathBuf> {
-    if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx) {
-        return Ok(storage_ctx.paths.jsonl_path.clone());
-    }
-
-    Ok(
-        config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())?
-            .paths
-            .jsonl_path,
-    )
 }
 
 const fn should_include_activity(args: &StatsArgs) -> bool {
@@ -542,14 +524,13 @@ fn compute_recent_activity(
     jsonl_path: &Path,
     hours: u32,
 ) -> Option<RecentActivity> {
-    let resolved_jsonl_path = resolve_existing_jsonl_path(jsonl_path)?;
-    if !resolved_jsonl_path.exists() {
+    if !jsonl_path.exists() {
         debug!("No issues.jsonl found for activity tracking");
         return None;
     }
 
-    let repo_ctx = git_repo_context(resolved_jsonl_path.parent()?)?;
-    let pathspec = repo_relative_git_path(&resolved_jsonl_path, &repo_ctx.repo_root)?;
+    let repo_ctx = git_repo_context(jsonl_path.parent()?)?;
+    let pathspec = repo_relative_git_path(jsonl_path, &repo_ctx.repo_root)?;
     let pathspec_str = git_pathspec_string(&pathspec);
     let cache_key = recent_activity_cache_key(&pathspec_str, hours);
     let now_epoch = Utc::now().timestamp();
@@ -601,16 +582,6 @@ fn compute_recent_activity(
     }
 
     Some(activity)
-}
-
-fn resolve_existing_jsonl_path(jsonl_path: &Path) -> Option<PathBuf> {
-    if !jsonl_path.exists() {
-        return None;
-    }
-
-    dunce::canonicalize(jsonl_path)
-        .ok()
-        .or_else(|| Some(jsonl_path.to_path_buf()))
 }
 
 fn git_recent_activity(
@@ -1367,9 +1338,14 @@ mod tests {
             .add_dependency("t-2", "t-1", "blocks", "tester")
             .unwrap();
 
-        let blocked_ids = storage.get_blocked_by_blocks_deps_only().unwrap();
-        assert!(blocked_ids.contains("t-2"));
-        assert!(!blocked_ids.contains("t-1"));
+        let all_issues = [&blocking_issue, &dependent_issue]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+
+        assert_eq!(summary.blocked_issues, 1);
+        assert_eq!(summary.ready_issues, 1); // t-1 is ready, t-2 is blocked
     }
 
     #[test]
@@ -1450,9 +1426,14 @@ mod tests {
             .add_dependency("t-2", "t-1", "blocks", "tester")
             .unwrap();
 
-        let blocked_ids = storage.get_blocked_by_blocks_deps_only().unwrap();
+        let all_issues = [&blocking_issue, &dependent_issue]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+
         // t-2 should NOT be blocked because t-1 is closed
-        assert!(!blocked_ids.contains("t-2"));
+        assert_eq!(summary.blocked_issues, 0);
     }
 
     #[test]
@@ -1572,69 +1553,6 @@ mod tests {
             .expect("activity for committed custom jsonl");
         assert_eq!(activity.commit_count, 1);
         assert_eq!(activity.hours_tracked, 24);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_compute_recent_activity_follows_symlinked_jsonl_into_target_repo() {
-        use std::os::unix::fs::symlink;
-
-        let temp = TempDir::new().expect("tempdir");
-        let external_repo = temp.path().join("external");
-        let local_repo = temp.path().join("local");
-        fs::create_dir_all(&external_repo).expect("create external repo");
-        fs::create_dir_all(&local_repo).expect("create local repo");
-
-        git(&external_repo, &["init", "-q"]);
-        git(
-            &external_repo,
-            &["config", "user.email", "tester@example.com"],
-        );
-        git(&external_repo, &["config", "user.name", "Tester"]);
-        git(&local_repo, &["init", "-q"]);
-        git(&local_repo, &["config", "user.email", "tester@example.com"]);
-        git(&local_repo, &["config", "user.name", "Tester"]);
-
-        let external_jsonl = external_repo.join("tracking/issues.jsonl");
-        fs::create_dir_all(external_jsonl.parent().expect("external parent"))
-            .expect("create external jsonl dir");
-        fs::write(
-            &external_jsonl,
-            "{\"id\":\"bd-ext\",\"title\":\"External\"}\n",
-        )
-        .expect("write external jsonl");
-        git(&external_repo, &["add", "tracking/issues.jsonl"]);
-        git(
-            &external_repo,
-            &["commit", "-q", "-m", "Track bd-ext in external issues file"],
-        );
-
-        let local_jsonl = local_repo.join(".beads/issues.jsonl");
-        fs::create_dir_all(local_jsonl.parent().expect("local parent"))
-            .expect("create local beads dir");
-        symlink(&external_jsonl, &local_jsonl).expect("create symlink to external jsonl");
-
-        let activity =
-            compute_recent_activity(None, &local_jsonl, 24).expect("symlinked recent activity");
-        assert_eq!(activity.commit_count, 1);
-        assert_eq!(activity.hours_tracked, 24);
-    }
-
-    #[test]
-    fn test_resolve_active_jsonl_path_uses_startup_config_without_storage_ctx() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-        fs::write(
-            beads_dir.join("metadata.json"),
-            r#"{"database":"beads.db","jsonl_export":"custom/issues.snapshot.jsonl"}"#,
-        )
-        .expect("write metadata");
-
-        let jsonl_path =
-            resolve_active_jsonl_path(&beads_dir, &config::CliOverrides::default(), None, None)
-                .expect("resolve jsonl path");
-        assert_eq!(jsonl_path, beads_dir.join("custom/issues.snapshot.jsonl"));
     }
 
     #[test]

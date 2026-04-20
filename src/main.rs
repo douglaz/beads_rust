@@ -7,12 +7,9 @@ use beads_rust::sync::{auto_flush, auto_import_if_stale, compute_staleness_refre
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
-use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::debug;
-
-const SYNC_LOCK_FILENAME: &str = ".sync.lock";
 
 #[allow(clippy::too_many_lines)]
 fn main() {
@@ -40,6 +37,20 @@ fn main() {
             }
             StartupContext::empty(overrides.clone())
         }
+    };
+
+    // Phase 1.5: Acquire exclusive write lock for mutating commands.
+    //
+    // Issue #243: frankensqlite deadlocks when multiple processes attempt
+    // concurrent writes to the same database file. Serialize all mutating
+    // operations through a blocking flock on `.beads/.write.lock`. Read-only
+    // commands skip this lock entirely. The lock is held until main() exits.
+    let _write_lock = if needs_write_lock(&cli.command) && ctx.is_initialized() {
+        ctx.beads_dir
+            .as_deref()
+            .and_then(beads_rust::sync::blocking_write_lock)
+    } else {
+        None
     };
 
     // Phase 2: Open Storage (One-time)
@@ -76,7 +87,10 @@ fn main() {
                 .map_or(true, |staleness| staleness.jsonl_newer);
 
         if should_attempt_auto_import {
-            let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);
+            let _sync_lock = ctx
+                .beads_dir
+                .as_deref()
+                .and_then(beads_rust::sync::try_sync_lock);
             let allow_external_jsonl = config::implicit_external_jsonl_allowed(
                 &paths.beads_dir,
                 &paths.db_path,
@@ -205,7 +219,7 @@ fn main() {
         }
         Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
-        Commands::Info(args) => commands::info::execute(&args, &output_ctx, &overrides),
+        Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
@@ -307,7 +321,10 @@ fn main() {
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
     if is_mutating && !ctx.no_auto_flush() {
-        let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);
+        let _sync_lock = ctx
+            .beads_dir
+            .as_deref()
+            .and_then(beads_rust::sync::try_sync_lock);
         if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
             && let Err(e) = auto_flush(
                 &mut res.storage,
@@ -322,29 +339,6 @@ fn main() {
         {
             debug!(?e, "Auto-flush failed (non-fatal)");
         }
-    }
-}
-
-/// Try to acquire an exclusive advisory lock on `.beads/.sync.lock`.
-///
-/// Returns the lock file on success. The lock is held until the returned
-/// `File` is dropped.  If another process already holds the lock, returns
-/// `None` (non-blocking).
-#[allow(clippy::incompatible_msrv)]
-fn try_sync_lock(beads_dir: &Path) -> Option<File> {
-    let lock_path = beads_dir.join(SYNC_LOCK_FILENAME);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .ok()?;
-    // `try_lock()` is non-blocking: returns `Ok(())` if we got the exclusive
-    // lock, or `Err(WouldBlock)` if another process already holds it.
-    match file.try_lock() {
-        Ok(()) => Some(file),
-        Err(_) => None,
     }
 }
 
@@ -428,7 +422,7 @@ const fn should_preopen_storage(
     storage_enabled && (needs_bootstrap_context || should_auto_flush_now)
 }
 
-/// Determine if a command potentially mutates data.
+/// Determine if a command potentially mutates data and triggers auto-flush.
 const fn is_mutating_command(cmd: &Commands) -> bool {
     match cmd {
         Commands::Create(_)
@@ -457,6 +451,40 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
+        _ => false,
+    }
+}
+
+/// Determine if a command modifies the SQLite database and requires the `.write.lock`.
+const fn needs_write_lock(cmd: &Commands) -> bool {
+    if is_mutating_command(cmd) {
+        return true;
+    }
+    match cmd {
+        // Every sync mode except `--status` writes to the SQLite database.
+        // `--flush-only` looks like a "just rewrite JSONL" path but also calls
+        // `finalize_export` inside a `with_write_transaction`, updating dirty
+        // flags, export hashes, and metadata (jsonl_content_hash,
+        // last_export_time, needs_flush). Without the `.write.lock`, a
+        // concurrent `br sync --flush-only` racing with another process's
+        // auto-flush (or a second `--flush-only`) can trip fsqlite's
+        // concurrent-write deadlock that this lock was specifically added
+        // to prevent (issue #243). Only `--status` is truly read-only.
+        Commands::Sync(args) => !args.status,
+        Commands::Config { command } => matches!(
+            command,
+            beads_rust::cli::ConfigCommands::Set { .. }
+                | beads_rust::cli::ConfigCommands::Delete { .. }
+        ),
+        Commands::History(args) => matches!(
+            args.command,
+            Some(
+                beads_rust::cli::HistoryCommands::Restore { .. }
+                    | beads_rust::cli::HistoryCommands::Prune { .. }
+            )
+        ),
+        Commands::Doctor(args) => args.repair,
+        Commands::Init { .. } => true,
         _ => false,
     }
 }
@@ -728,6 +756,36 @@ mod tests {
         let sync_cmd = Cli::parse_from(["br", "sync"]).command;
         assert!(!is_mutating_command(&sync_cmd));
         assert!(!should_auto_import(&sync_cmd));
+    }
+
+    #[test]
+    fn sync_flush_only_requires_write_lock() {
+        // Regression: `br sync --flush-only` calls `finalize_export` inside a
+        // `with_write_transaction` (clears dirty flags, updates
+        // jsonl_content_hash + last_export_time + needs_flush metadata, writes
+        // export hashes). That makes it a write-side operation as far as
+        // fsqlite is concerned. Previously the `needs_write_lock` match arm
+        // excluded `--flush-only`, leaving two concurrent `br sync
+        // --flush-only` invocations — or one racing a mutating command's
+        // auto-flush — to hit the fsqlite concurrent-write deadlock that the
+        // `.write.lock` was specifically introduced (issue #243) to prevent.
+        let flush_only = Cli::parse_from(["br", "sync", "--flush-only"]).command;
+        let status = Cli::parse_from(["br", "sync", "--status"]).command;
+        let merge = Cli::parse_from(["br", "sync", "--merge"]).command;
+        let import_only = Cli::parse_from(["br", "sync", "--import-only"]).command;
+        let default_sync = Cli::parse_from(["br", "sync"]).command;
+
+        assert!(
+            needs_write_lock(&flush_only),
+            "`br sync --flush-only` writes DB metadata and must serialize via .write.lock"
+        );
+        assert!(
+            !needs_write_lock(&status),
+            "`br sync --status` is read-only and must not block on .write.lock"
+        );
+        assert!(needs_write_lock(&merge));
+        assert!(needs_write_lock(&import_only));
+        assert!(needs_write_lock(&default_sync));
     }
 
     #[test]

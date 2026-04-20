@@ -55,12 +55,23 @@ static DATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex"));
 static VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\((main|master|HEAD)@[a-f0-9]+\)").expect("version regex"));
+/// The build profile label embedded in `br --version` output, e.g., `(dev)`
+/// or `(release)`.  Snapshot tests may run under either profile depending on
+/// `cargo test` vs `cargo test --release`, so mask to a stable placeholder.
+static BUILD_PROFILE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\((dev|release)\)").expect("build profile regex"));
 static OWNER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Owner: [a-zA-Z0-9_-]+").expect("owner regex"));
 static VERSION_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
+/// `tracing` source-location annotation that appears in dev builds after the
+/// target-and-colon, e.g., `beads_rust::sync::path: src/sync/path.rs:123:`.
+/// Release builds omit it.  Normalize by deleting the segment entirely so the
+/// dev-vs-release formatter delta does not cause snapshot drift.
+static TRACING_SRC_LOC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r": src/[^\s]+\.rs:(\d+|LINE):").expect("tracing src loc regex"));
 static PATH_SEP_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\").expect("path separator regex"));
 static TRAILING_WS_RE: LazyLock<Regex> =
@@ -74,6 +85,15 @@ static USERS_PATH_RE: LazyLock<Regex> =
 static TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"/tmp/\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+").expect("tmp path regex")
 });
+/// Compact timestamp format used in backup filenames: `YYYYMMDD_HHMMSS_nano`.
+/// Produced by `sync::history` when writing rotation backups; differs run-to-run
+/// so snapshot tests mask it to a stable placeholder.
+static TS_COMPACT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d{8}_\d{6}_\d+").expect("compact timestamp regex"));
+/// PID-suffixed temp file segments (e.g., `issues.jsonl.3676561.tmp`).  The
+/// PID varies run-to-run; mask it so snapshot output is stable.
+static TMP_PID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\.jsonl|\.db)\.\d+\.tmp").expect("pid tmp file regex"));
 static DURATION_MS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d+(\.\d+)?\s*(ms|µs|ns|s)").expect("duration regex"));
 
@@ -345,6 +365,7 @@ impl TextDiff {
 }
 
 /// Apply normalization with logging of what was changed.
+#[allow(clippy::too_many_lines)]
 fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<String>) {
     let mut normalized = text.to_string();
     let mut log = Vec::new();
@@ -398,6 +419,21 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
             .to_string();
         log.push("timestamps".to_string());
     }
+    // 7b. Mask compact backup timestamps (YYYYMMDD_HHMMSS_nano) and PID
+    // suffixes on temp-file intermediates.  These are run-to-run variable
+    // strings that the golden snapshots need to treat as stable.
+    if config.mask_timestamps && TS_COMPACT_RE.is_match(&normalized) {
+        normalized = TS_COMPACT_RE
+            .replace_all(&normalized, "YYYYMMDD_HHMMSS_NANO")
+            .to_string();
+        log.push("compact_timestamps".to_string());
+    }
+    if config.mask_temp_paths && TMP_PID_RE.is_match(&normalized) {
+        normalized = TMP_PID_RE
+            .replace_all(&normalized, "$1.PID.tmp")
+            .to_string();
+        log.push("tmp_pid".to_string());
+    }
 
     // 8. Mask dates (after timestamps to avoid double-masking)
     if config.mask_dates && DATE_RE.is_match(&normalized) {
@@ -405,15 +441,27 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("dates".to_string());
     }
 
-    // 9. Mask git hashes
+    // 9. Mask git hashes and build-profile labels (dev / release)
     if config.mask_git_hashes && VERSION_RE.is_match(&normalized) {
         normalized = VERSION_RE
             .replace_all(&normalized, "(BRANCH@GIT_HASH)")
             .to_string();
         log.push("git_hashes".to_string());
     }
+    if config.mask_git_hashes && BUILD_PROFILE_RE.is_match(&normalized) {
+        normalized = BUILD_PROFILE_RE
+            .replace_all(&normalized, "(BUILD)")
+            .to_string();
+        log.push("build_profile".to_string());
+    }
 
-    // 10. Normalize line numbers
+    // 10. Normalize line numbers.  Drop the tracing source-location segment
+    // first (so we stay dev/release invariant) and then normalize any
+    // remaining `file.rs:123:` references to `file.rs:LINE:`.
+    if config.normalize_line_numbers && TRACING_SRC_LOC_RE.is_match(&normalized) {
+        normalized = TRACING_SRC_LOC_RE.replace_all(&normalized, ":").to_string();
+        log.push("tracing_src_loc".to_string());
+    }
     if config.normalize_line_numbers && LINE_NUM_RE.is_match(&normalized) {
         normalized = LINE_NUM_RE
             .replace_all(&normalized, ".rs:LINE:")

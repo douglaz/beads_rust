@@ -5,7 +5,6 @@
 
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
-use crate::{REPO_NAME, REPO_OWNER};
 use regex::Regex;
 use rich_rust::prelude::*;
 use std::fs;
@@ -26,16 +25,13 @@ pub const BLURB_END_MARKER: &str = "<!-- end-br-agent-instructions -->";
 pub const SUPPORTED_AGENT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "agents.md", "claude.md"];
 
 /// The agent instructions blurb to append to AGENTS.md files.
-pub static AGENT_BLURB: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let repo_url = format!("https://github.com/{REPO_OWNER}/{REPO_NAME}");
-    format!(
-        r#"<!-- br-agent-instructions-v1 -->
+pub const AGENT_BLURB: &str = r#"<!-- br-agent-instructions-v1 -->
 
 ---
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust]({repo_url}) (`br`/`bd`) for issue tracking. Issues are stored in the project beads workspace and tracked in git.
+This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`/`bd`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 ### Essential Commands
 
@@ -94,14 +90,7 @@ git push                # Push to remote
 - Use descriptive titles and set appropriate priority/type
 - Always sync before ending session
 
-<!-- end-br-agent-instructions -->"#
-    )
-});
-
-#[must_use]
-pub fn agent_blurb() -> &'static str {
-    AGENT_BLURB.as_str()
-}
+<!-- end-br-agent-instructions -->"#;
 
 /// Result of detecting an agent config file.
 #[derive(Debug, Clone, Default)]
@@ -366,7 +355,7 @@ pub fn detect_agent_file_in_project(work_dir: &Path) -> AgentFileDetection {
 #[must_use]
 pub fn append_blurb(content: &str) -> String {
     if content.is_empty() {
-        return format!("{}\n", agent_blurb());
+        return format!("{AGENT_BLURB}\n");
     }
 
     let mut result = content.to_string();
@@ -374,7 +363,7 @@ pub fn append_blurb(content: &str) -> String {
         result.push('\n');
     }
     result.push('\n');
-    result.push_str(agent_blurb());
+    result.push_str(AGENT_BLURB);
     result.push('\n');
     result
 }
@@ -620,14 +609,14 @@ pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
     // from the current state so the user sees what *would* happen.
     if args.dry_run && is_check {
         if ctx.is_json() {
-            return execute_json(&detection, &work_dir, args, ctx);
+            return execute_json(&detection, args, ctx);
         }
         return execute_dry_run_inferred(&detection, &work_dir, ctx);
     }
 
     if is_check || args.check {
         if ctx.is_json() {
-            return execute_json(&detection, &work_dir, args, ctx);
+            return execute_json(&detection, args, ctx);
         }
         return execute_check(&detection, &work_dir, ctx);
     }
@@ -672,13 +661,13 @@ fn execute_dry_run_inferred(
                 theme.dimmed.clone(),
             );
             // Show a truncated preview (first few lines)
-            for line in agent_blurb().lines().take(12) {
+            for line in AGENT_BLURB.lines().take(12) {
                 content.append_styled(line, theme.dimmed.clone());
                 content.append("\n");
             }
             content.append_styled("  ... (", theme.dimmed.clone());
             content.append_styled(
-                &format!("{} lines total", agent_blurb().lines().count()),
+                &format!("{} lines total", AGENT_BLURB.lines().count()),
                 theme.emphasis.clone(),
             );
             content.append_styled(")\n", theme.dimmed.clone());
@@ -693,7 +682,7 @@ fn execute_dry_run_inferred(
                 target_path.display()
             );
             println!("\n--- Preview ---");
-            println!("{}", agent_blurb());
+            println!("{AGENT_BLURB}");
         }
         return Ok(());
     }
@@ -744,7 +733,7 @@ fn execute_dry_run_inferred(
                 file_path.display()
             );
             println!("\n--- Preview ---");
-            println!("{}", agent_blurb());
+            println!("{AGENT_BLURB}");
         }
         return Ok(());
     }
@@ -764,17 +753,17 @@ fn execute_dry_run_inferred(
 #[allow(clippy::unnecessary_wraps)]
 fn execute_json(
     detection: &AgentFileDetection,
-    work_dir: &Path,
     args: &AgentsArgs,
     ctx: &OutputContext,
 ) -> Result<()> {
     if args.dry_run {
         let would_action = inferred_dry_run_action(detection);
 
+        let work_dir = std::env::current_dir().unwrap_or_default();
         let target_path = if detection.found() {
             detection.file_path.clone()
         } else {
-            Some(get_preferred_agent_file_path(work_dir))
+            Some(get_preferred_agent_file_path(&work_dir))
         };
 
         let output = serde_json::json!({
@@ -941,7 +930,7 @@ fn execute_add(
                 file_path.display()
             );
             println!("\n--- Preview ---");
-            println!("{}", agent_blurb());
+            println!("{AGENT_BLURB}");
         }
         return Ok(());
     }
@@ -1475,40 +1464,34 @@ fn render_update_success_rich(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::OutputContext;
     use std::env;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+
     use tempfile::TempDir;
 
-    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
-
     struct DirGuard {
-        previous_dir: PathBuf,
+        previous: PathBuf,
     }
 
     impl DirGuard {
-        fn new(path: &Path) -> Self {
-            let previous_dir = env::current_dir().expect("current dir");
-            env::set_current_dir(path).expect("set current dir");
-            Self { previous_dir }
+        fn new(target: &Path) -> Self {
+            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+            env::set_current_dir(target).expect("set current dir");
+            Self { previous }
         }
     }
 
     impl Drop for DirGuard {
         fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous_dir);
+            let _ = env::set_current_dir(&self.previous);
         }
     }
 
     #[test]
     fn test_contains_blurb() {
-        assert!(contains_blurb(agent_blurb()));
-    }
-
-    #[test]
-    fn test_agent_blurb_uses_workspace_neutral_storage_language() {
-        assert!(agent_blurb().contains("project beads workspace"));
-        assert!(!agent_blurb().contains("stored in `.beads/`"));
+        let content = "Some text\n<!-- br-agent-instructions-v1 -->\nblurb\n<!-- end-br-agent-instructions -->";
+        assert!(contains_blurb(content));
+        assert!(!contains_legacy_blurb(content));
     }
 
     #[test]
@@ -1521,10 +1504,8 @@ mod tests {
 
     #[test]
     fn test_contains_blurb_skips_incomplete_marker_before_valid_block() {
-        let content = format!(
-            "Example start marker: <!-- br-agent-instructions-v9 -->\n\n{}",
-            agent_blurb()
-        );
+        let content =
+            format!("Example start marker: <!-- br-agent-instructions-v9 -->\n\n{AGENT_BLURB}");
 
         assert!(contains_blurb(&content));
         assert_eq!(get_blurb_version(&content), 1);
@@ -1583,7 +1564,7 @@ mod tests {
     #[test]
     fn test_detect_agent_file_with_blurb() {
         let temp_dir = TempDir::new().unwrap();
-        let content = format!("# Agents\n\n{}\n", agent_blurb());
+        let content = format!("# Agents\n\n{AGENT_BLURB}\n");
         let agents_path = temp_dir.path().join("AGENTS.md");
         fs::write(&agents_path, content).unwrap();
 
@@ -1658,12 +1639,12 @@ mod tests {
         let result = append_blurb("");
 
         assert!(result.starts_with(BLURB_START_MARKER));
-        assert_eq!(result, format!("{}\n", agent_blurb()));
+        assert_eq!(result, format!("{AGENT_BLURB}\n"));
     }
 
     #[test]
     fn test_remove_blurb() {
-        let content = format!("# Agents\n\n{}\n\nMore content.", agent_blurb());
+        let content = format!("# Agents\n\n{AGENT_BLURB}\n\nMore content.");
         let result = remove_blurb(&content);
         assert!(!result.contains(BLURB_START_MARKER));
         assert!(result.contains("# Agents"));
@@ -1673,8 +1654,7 @@ mod tests {
     #[test]
     fn test_remove_blurb_ignores_earlier_end_marker_text() {
         let content = format!(
-            "# Agents\n\nLiteral marker: {BLURB_END_MARKER}\n\n{}\n\nMore content.",
-            agent_blurb()
+            "# Agents\n\nLiteral marker: {BLURB_END_MARKER}\n\n{AGENT_BLURB}\n\nMore content."
         );
 
         let result = remove_blurb(&content);
@@ -1688,8 +1668,7 @@ mod tests {
     #[test]
     fn test_remove_blurb_skips_incomplete_marker_before_valid_block() {
         let content = format!(
-            "# Agents\n\nBroken example: <!-- br-agent-instructions-v9 -->\n\n{}\n\nMore content.",
-            agent_blurb()
+            "# Agents\n\nBroken example: <!-- br-agent-instructions-v9 -->\n\n{AGENT_BLURB}\n\nMore content."
         );
 
         let result = remove_blurb(&content);
@@ -1780,7 +1759,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_force_creates_file() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
@@ -1804,7 +1783,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_requires_force() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
@@ -1829,7 +1808,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_dry_run_does_not_require_force() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
@@ -1852,7 +1831,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_remove_dry_run_without_file_errors() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
@@ -1878,7 +1857,7 @@ mod tests {
 
     #[test]
     fn test_execute_json_update_dry_run_without_file_errors() {
-        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);

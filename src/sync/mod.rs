@@ -4055,16 +4055,13 @@ pub(crate) struct PreservedTombstone {
 /// dependencies, and comments, so a rebuild can restore deletion-retention
 /// state that is not present in the JSONL export.
 ///
-/// This is best-effort: if the enumeration query fails outright we log and
-/// return an empty list (the rebuild still proceeds without tombstone
-/// preservation). Per-tombstone relation fetches also degrade gracefully to
-/// issue-row-only preservation.
-///
-/// # Errors
-///
-/// Does not currently return errors; the signature keeps `Result` for
-/// forward compatibility with future non-best-effort modes.
-pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Result<Vec<PreservedTombstone>> {
+/// This is fully best-effort — the function never returns an error: if
+/// the enumeration query fails outright we log and return an empty list
+/// (the rebuild still proceeds without tombstone preservation), and
+/// per-tombstone relation fetches also degrade gracefully to issue-row-
+/// only preservation.
+#[must_use]
+pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedTombstone> {
     let mut tombstones = Vec::new();
     let tombstone_ids = match storage.get_issue_ids_by_status(crate::model::Status::Tombstone) {
         Ok(ids) => ids,
@@ -4073,7 +4070,7 @@ pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Result<Vec<Preserv
                 error = %error,
                 "Failed to enumerate tombstones before rebuild; continuing without tombstone preservation"
             );
-            return Ok(tombstones);
+            return tombstones;
         }
     };
 
@@ -4132,7 +4129,7 @@ pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Result<Vec<Preserv
             comments,
         });
     }
-    Ok(tombstones)
+    tombstones
 }
 
 /// Restore preserved tombstones after a successful rebuild, wrapping any
@@ -4286,7 +4283,7 @@ pub(crate) fn tombstones_missing_from_jsonl_tombstones(
             if let Some(jsonl_updated_at) = jsonl_filter.non_tombstone_updated_at.get(id) {
                 let local_deleted_at = tombstone.issue.deleted_at;
                 let local_is_newer =
-                    local_deleted_at.map_or(true, |deleted_at| deleted_at > *jsonl_updated_at);
+                    local_deleted_at.is_none_or(|deleted_at| deleted_at > *jsonl_updated_at);
                 if !local_is_newer {
                     skipped_jsonl_newer += 1;
                     return false;

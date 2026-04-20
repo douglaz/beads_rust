@@ -198,7 +198,7 @@ pub fn execute(
         crate::sync::ensure_no_conflict_markers(&open_result.paths.jsonl_path)?;
         let jsonl_filter = scan_jsonl_for_tombstone_filter(&open_result.paths.jsonl_path)?;
         let preserved_pre_delegation_tombstones = tombstones_missing_from_jsonl_tombstones(
-            snapshot_tombstones(&open_result.storage)?,
+            snapshot_tombstones(&open_result.storage),
             &jsonl_filter,
         );
         // `recover_database_from_jsonl` sets `auto_rebuilt = true` on success,
@@ -1312,7 +1312,7 @@ fn execute_import(
 
     let preserved_tombstones = if args.force || args.rebuild {
         tombstones_missing_from_jsonl_tombstones(
-            snapshot_tombstones(storage)?,
+            snapshot_tombstones(storage),
             jsonl_filter
                 .as_ref()
                 .expect("force/rebuild imports should precompute JSONL tombstone filter"),
@@ -2027,7 +2027,7 @@ mod tests {
             .delete_issue("bd-delete", "test", "deleted for rebuild", None)
             .unwrap();
 
-        let tombstones = snapshot_tombstones(&storage).unwrap();
+        let tombstones = snapshot_tombstones(&storage);
         assert_eq!(tombstones.len(), 1);
         assert_eq!(tombstones[0].issue.id, "bd-delete");
         assert_eq!(
@@ -2079,7 +2079,7 @@ mod tests {
             .delete_issue("bd-delete", "test", "deleted for rebuild", None)
             .unwrap();
 
-        let tombstones = snapshot_tombstones(&storage).unwrap();
+        let tombstones = snapshot_tombstones(&storage);
 
         storage.reset_data_tables().unwrap();
         storage.upsert_issue_for_import(&keep).unwrap();
@@ -2119,7 +2119,7 @@ mod tests {
             .delete_issue("bd-second", "test", "deleted for rebuild", None)
             .unwrap();
 
-        let tombstones = snapshot_tombstones(&storage).unwrap();
+        let tombstones = snapshot_tombstones(&storage);
 
         storage.reset_data_tables().unwrap();
         restore_tombstones(&mut storage, &tombstones).unwrap();
@@ -2255,7 +2255,7 @@ mod tests {
         storage.execute_raw("DROP TABLE labels").unwrap();
         storage.execute_raw("DROP TABLE dependencies").unwrap();
 
-        let tombstones = snapshot_tombstones(&storage).unwrap();
+        let tombstones = snapshot_tombstones(&storage);
         assert_eq!(tombstones.len(), 1);
         assert_eq!(tombstones[0].issue.id, "bd-delete");
         assert_eq!(tombstones[0].issue.status, Status::Tombstone);
@@ -2280,7 +2280,7 @@ mod tests {
             .execute_raw("UPDATE issues SET updated_at = 'not-a-datetime' WHERE id = 'bd-open'")
             .unwrap();
 
-        let tombstones = snapshot_tombstones(&storage).unwrap();
+        let tombstones = snapshot_tombstones(&storage);
         assert_eq!(tombstones.len(), 1);
         assert_eq!(tombstones[0].issue.id, "bd-delete");
         assert_eq!(tombstones[0].issue.status, Status::Tombstone);
@@ -2298,7 +2298,7 @@ mod tests {
 
         storage.execute_raw("DROP TABLE issues").unwrap();
 
-        let tombstones = snapshot_tombstones(&storage).unwrap();
+        let tombstones = snapshot_tombstones(&storage);
         assert!(tombstones.is_empty());
     }
 

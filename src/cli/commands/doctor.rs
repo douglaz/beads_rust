@@ -780,17 +780,7 @@ fn preserved_tombstones_for_doctor_rebuild(
             return Vec::new();
         }
     };
-    let snapshot = match snapshot_tombstones(&storage) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "Failed to snapshot tombstones before doctor --repair JSONL rebuild"
-            );
-            return Vec::new();
-        }
-    };
+    let snapshot = snapshot_tombstones(&storage);
     drop(storage);
     if snapshot.is_empty() {
         return snapshot;

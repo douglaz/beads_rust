@@ -606,50 +606,16 @@ fn open_sqlite_storage_with_recovery_strategy(
     match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
             Ok(None) => Ok((storage, false, None)),
-            Ok(Some(anomaly)) => {
-                match recovery_strategy {
-                    JsonlRecoveryStrategy::RebuildFromJsonl => {
-                        warn!(
-                            db_path = %paths.db_path.display(),
-                            jsonl_path = %paths.jsonl_path.display(),
-                            anomaly = %anomaly,
-                            "Detected recoverable database anomaly after open; rebuilding from JSONL"
-                        );
-                        // Snapshot tombstones from the anomalous (but still
-                        // queryable) storage BEFORE we drop it. The anomaly
-                        // detector only flags duplicates on
-                        // `blocked_issues_cache` / its index and on
-                        // `config`/`metadata` kv duplicates — none of which
-                        // break a plain `SELECT … FROM issues`. Without this
-                        // snapshot, any unflushed local tombstones that
-                        // haven't landed in JSONL would be silently dropped by
-                        // the rebuild (which only imports what's in JSONL),
-                        // taking their deletion-retention state with them.
-                        let preserved_tombstones =
-                            preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
-                        drop(storage);
-                        let mut storage = rebuild_database_from_jsonl(
-                            beads_dir,
-                            paths,
-                            lock_timeout,
-                            bootstrap_layer,
-                        )?;
-                        restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
-                        Ok((storage, true, None))
-                    }
-                    JsonlRecoveryStrategy::DeferToExplicitImport => {
-                        warn!(
-                            db_path = %paths.db_path.display(),
-                            jsonl_path = %paths.jsonl_path.display(),
-                            anomaly = %anomaly,
-                            "Detected recoverable database anomaly after open; deferring JSONL recovery to explicit import semantics"
-                        );
-                        drop(storage);
-                        let (storage, backup_set) = prepare_fresh_storage()?;
-                        Ok((storage, false, Some(backup_set)))
-                    }
-                }
-            }
+            Ok(Some(anomaly)) => rebuild_or_defer_after_recoverable_anomaly(
+                storage,
+                &anomaly,
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                recovery_strategy,
+                &prepare_fresh_storage,
+            ),
             Err(probe_err) => {
                 if !should_attempt_jsonl_recovery_after_open(
                     &probe_err,
@@ -658,47 +624,16 @@ fn open_sqlite_storage_with_recovery_strategy(
                 ) {
                     return Err(probe_err);
                 }
-
-                match recovery_strategy {
-                    JsonlRecoveryStrategy::RebuildFromJsonl => {
-                        warn!(
-                            db_path = %paths.db_path.display(),
-                            jsonl_path = %paths.jsonl_path.display(),
-                            probe_error = %probe_err,
-                            "Post-open database probe failed; rebuilding from JSONL"
-                        );
-                        // Best-effort tombstone snapshot. If the probe failed
-                        // the storage may be in a strange state, but
-                        // `snapshot_tombstones` itself is fault-tolerant
-                        // (warn+empty on enumeration failure, warn+partial on
-                        // per-tombstone failure), so we try anyway: the worst
-                        // case is the same as the old behavior (no
-                        // preservation), the best case is we rescue the
-                        // unflushed tombstones the old code lost silently.
-                        let preserved_tombstones =
-                            preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
-                        drop(storage);
-                        let mut storage = rebuild_database_from_jsonl(
-                            beads_dir,
-                            paths,
-                            lock_timeout,
-                            bootstrap_layer,
-                        )?;
-                        restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
-                        Ok((storage, true, None))
-                    }
-                    JsonlRecoveryStrategy::DeferToExplicitImport => {
-                        warn!(
-                            db_path = %paths.db_path.display(),
-                            jsonl_path = %paths.jsonl_path.display(),
-                            probe_error = %probe_err,
-                            "Post-open database probe failed; deferring JSONL recovery to explicit import semantics"
-                        );
-                        drop(storage);
-                        let (storage, backup_set) = prepare_fresh_storage()?;
-                        Ok((storage, false, Some(backup_set)))
-                    }
-                }
+                rebuild_or_defer_after_probe_error(
+                    storage,
+                    &probe_err,
+                    beads_dir,
+                    paths,
+                    lock_timeout,
+                    bootstrap_layer,
+                    recovery_strategy,
+                    &prepare_fresh_storage,
+                )
             }
         },
         Err(open_err) => {
@@ -802,6 +737,136 @@ fn is_recoverable_database_internal_error(detail: &str) -> bool {
         || detail_lower.contains("missing from index")
 }
 
+/// Handle the `Ok(Some(anomaly))` branch from
+/// `detect_recoverable_open_anomaly`: either rebuild from JSONL while
+/// preserving local unflushed tombstones, or move the DB family aside
+/// and open a fresh placeholder for the explicit-import path.
+///
+/// Split out of `open_sqlite_storage_with_recovery_strategy` so the
+/// caller stays under the pedantic `too_many_lines` budget; the
+/// preservation comment lives here so the behavior is documented next to
+/// the code that performs it.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_or_defer_after_recoverable_anomaly(
+    storage: SqliteStorage,
+    anomaly: &str,
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+    prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    match recovery_strategy {
+        JsonlRecoveryStrategy::RebuildFromJsonl => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                anomaly = %anomaly,
+                "Detected recoverable database anomaly after open; rebuilding from JSONL"
+            );
+            // Snapshot tombstones from the anomalous (but still queryable)
+            // storage BEFORE we drop it. The anomaly detector only flags
+            // duplicates on `blocked_issues_cache` / its index and on
+            // `config`/`metadata` kv duplicates — none of which break a
+            // plain `SELECT … FROM issues`. Without this snapshot, any
+            // unflushed local tombstones that haven't landed in JSONL
+            // would be silently dropped by the rebuild (which only
+            // imports what's in JSONL), taking their deletion-retention
+            // state with them.
+            let storage = rebuild_with_tombstone_preservation(
+                storage,
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+            )?;
+            Ok((storage, true, None))
+        }
+        JsonlRecoveryStrategy::DeferToExplicitImport => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                anomaly = %anomaly,
+                "Detected recoverable database anomaly after open; deferring JSONL recovery to explicit import semantics"
+            );
+            drop(storage);
+            let (storage, backup_set) = prepare_fresh_storage()?;
+            Ok((storage, false, Some(backup_set)))
+        }
+    }
+}
+
+/// Handle the `Err(probe_err)` branch from
+/// `detect_recoverable_open_anomaly`. Counterpart of
+/// `rebuild_or_defer_after_recoverable_anomaly`; split out for the same
+/// reason and sharing the same preservation helper so both anomaly
+/// surfaces rescue unflushed tombstones consistently.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_or_defer_after_probe_error(
+    storage: SqliteStorage,
+    probe_err: &BeadsError,
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    recovery_strategy: JsonlRecoveryStrategy,
+    prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    match recovery_strategy {
+        JsonlRecoveryStrategy::RebuildFromJsonl => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                probe_error = %probe_err,
+                "Post-open database probe failed; rebuilding from JSONL"
+            );
+            // Best-effort tombstone snapshot. If the probe failed the
+            // storage may be in a strange state, but `snapshot_tombstones`
+            // itself is fault-tolerant (warn+empty on enumeration
+            // failure, warn+partial on per-tombstone failure), so we try
+            // anyway: the worst case is the same as the old behavior (no
+            // preservation), the best case is we rescue the unflushed
+            // tombstones the old code lost silently.
+            let storage = rebuild_with_tombstone_preservation(
+                storage,
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+            )?;
+            Ok((storage, true, None))
+        }
+        JsonlRecoveryStrategy::DeferToExplicitImport => {
+            warn!(
+                db_path = %paths.db_path.display(),
+                jsonl_path = %paths.jsonl_path.display(),
+                probe_error = %probe_err,
+                "Post-open database probe failed; deferring JSONL recovery to explicit import semantics"
+            );
+            drop(storage);
+            let (storage, backup_set) = prepare_fresh_storage()?;
+            Ok((storage, false, Some(backup_set)))
+        }
+    }
+}
+
+/// Snapshot unflushed tombstones from `storage`, drop the old connection,
+/// rebuild from JSONL, and restore the preserved tombstones atomically.
+fn rebuild_with_tombstone_preservation(
+    storage: SqliteStorage,
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+) -> Result<SqliteStorage> {
+    let preserved_tombstones = preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
+    drop(storage);
+    let mut storage = rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+    restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
+    Ok(storage)
+}
+
 fn rebuild_database_from_jsonl(
     beads_dir: &Path,
     paths: &ConfigPaths,
@@ -832,16 +897,7 @@ fn preserved_unflushed_tombstones(
     storage: &SqliteStorage,
     jsonl_path: &Path,
 ) -> Vec<PreservedTombstone> {
-    let snapshot = match snapshot_tombstones(storage) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "Failed to snapshot tombstones before startup auto-rebuild; proceeding without preservation"
-            );
-            return Vec::new();
-        }
-    };
+    let snapshot = snapshot_tombstones(storage);
     if snapshot.is_empty() {
         return snapshot;
     }
@@ -1099,19 +1155,21 @@ fn rebuild_database_family(
 /// Failure handling: on any failure (VACUUM INTO error, rename error, or
 /// reopen error after a successful rename) the helper leaves `*storage`
 /// in the best-available working state:
-///   * VACUUM INTO failed  → `*storage` is unchanged (still the
-///     pre-compaction connection).
-///   * Rename failed       → `*storage` is reopened against the still-
-///     intact original `db_path`; the compacted temp file is removed.
-///   * Reopen failed after a successful rename → `*storage` is left as
-///     the in-memory placeholder handle we swapped in; the persistent
-///     DB on disk IS correctly compacted, so the caller's next attempt
-///     (or the next invocation of `br`) will find a clean file.
-/// This helper never returns a Result because its only value is
-/// cosmetic (the file size / integrity-check output). Correctness of the
-/// DB contents is established by the VACUUM/REINDEX that runs before
-/// compaction; a missed compaction surfaces as upstream sqlite3's
-/// `Page N: never used` diagnostic, not as data loss.
+///
+/// * VACUUM INTO failed — `*storage` is unchanged (still the
+///   pre-compaction connection).
+/// * Rename failed — `*storage` is reopened against the still-intact
+///   original `db_path`; the compacted temp file is removed.
+/// * Reopen failed after a successful rename — `*storage` is left as
+///   the in-memory placeholder handle we swapped in; the persistent
+///   DB on disk IS correctly compacted, so the caller's next attempt
+///   (or the next invocation of `br`) will find a clean file.
+///
+/// This helper never returns a `Result` because its only value is
+/// cosmetic (the file size / integrity-check output). Correctness of
+/// the DB contents is established by the VACUUM/REINDEX that runs
+/// before compaction; a missed compaction surfaces as upstream
+/// sqlite3's `Page N: never used` diagnostic, not as data loss.
 ///
 /// This is called only in rebuild/force-import paths where the DB is
 /// known to have just been fully populated from JSONL.

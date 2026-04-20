@@ -1030,18 +1030,12 @@ fn rebuild_database_family(
     storage.set_config("issue_prefix", prefix)?;
     let import_result = import_from_jsonl(&mut storage, jsonl_path, import_config, Some(prefix))?;
 
-    // After a bulk import, fsqlite's pager/MVCC state can lag behind what
-    // was actually written: VACUUM runs against an old snapshot and fails
-    // with "database is busy (snapshot conflict on pages: page N > snapshot
-    // db_size M)", so the corruption it was supposed to clean up stays on
-    // disk. Drain the WAL to the main DB file (TRUNCATE checkpoint, safe
-    // here because we hold the `.write.lock` exclusively) so VACUUM's
-    // snapshot matches what is on disk. We intentionally do NOT drop and
-    // reopen the connection here: fsqlite's VACUUM/REINDEX implementation
-    // on a reopened connection can reorder or invalidate root pages
-    // (`OpenRead failed: could not open storage cursor on root page N`),
-    // which a later `get_issue` then trips over. Staying on the import
-    // connection keeps the cursor metadata coherent.
+    // Drain the WAL to the main DB file so the follow-up maintenance (VACUUM,
+    // REINDEX, VACUUM INTO) operates against what is actually on disk.
+    // Without this, fsqlite's post-import MVCC state can lag behind and
+    // maintenance silently fails with "database is busy (snapshot conflict
+    // on pages: page N > snapshot db_size M)", leaving the corruption it
+    // was supposed to clean up in place.
     if let Err(e) = storage.checkpoint_full() {
         tracing::warn!(
             error = %e,
@@ -1075,7 +1069,137 @@ fn rebuild_database_family(
         );
     }
 
+    // Compact the rebuilt DB via `VACUUM INTO` and atomic rename. This is
+    // the only reliable way to make upstream sqlite3's
+    // `PRAGMA integrity_check` report `ok` on a file produced by fsqlite's
+    // bulk-insert + REINDEX path (issue #248). In-place VACUUM alone —
+    // even called twice after a fresh checkpoint — does not truncate the
+    // trailing pages that fsqlite's REINDEX leaves orphaned: those pages
+    // exist in the file but are neither on the freelist nor referenced
+    // from any B-tree root. `VACUUM INTO` sidesteps fsqlite's in-place
+    // truncation bug because it writes a brand-new compacted file from
+    // the reachable page set — page count matches exactly what sqlite3's
+    // own `VACUUM INTO` produces. The subsequent atomic rename is
+    // crash-safe on POSIX (within a filesystem) and keeps the database
+    // family consistent with its sidecars, which we drop first.
+    compact_database_via_vacuum_into_in_place(&mut storage, db_path, lock_timeout);
     Ok((storage, import_result))
+}
+
+/// Compact a database at `db_path` by writing a fresh copy via `VACUUM
+/// INTO` to a temp file, atomically replacing the original, and reopening
+/// the storage connection in place. On any failure (VACUUM INTO error,
+/// rename error, reopen error) we leave the storage untouched — the
+/// caller keeps the original (possibly leaky) storage and only misses
+/// the compaction, never a correctness guarantee.
+///
+/// This is called only in rebuild/force-import paths where the DB is
+/// known to have just been fully populated from JSONL, so losing the
+/// compaction on error is a cosmetic integrity-check regression (upstream
+/// sqlite3 may flag trailing pages as `Page N: never used`) rather than a
+/// data-loss scenario.
+pub(crate) fn compact_database_via_vacuum_into_in_place(
+    storage: &mut SqliteStorage,
+    db_path: &Path,
+    lock_timeout: Option<u64>,
+) {
+    // Unique temp path next to the real DB so the subsequent rename is on
+    // the same filesystem (atomic) and so parallel rebuilds of different
+    // DBs don't collide.
+    let stem = db_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map_or_else(|| "beads".to_string(), str::to_string);
+    let temp_path = db_path.with_file_name(format!(".{stem}.vacuum.{}.tmp", std::process::id()));
+    // Defensive: if a previous aborted rebuild left a stale temp file
+    // behind, remove it before `VACUUM INTO` tries to open it.
+    let _ = fs::remove_file(&temp_path);
+
+    let temp_path_display = temp_path.display().to_string();
+    // Escape single quotes the SQL way (doubling) for the literal path
+    // embedded in the `VACUUM INTO` statement. The temp path is
+    // constructed from the DB path + our own PID suffix, so in practice
+    // it never contains a quote, but the doubling keeps us safe against
+    // unusual filesystem names.
+    let escaped_path = temp_path_display.replace('\'', "''");
+    let vacuum_into_sql = format!("VACUUM INTO '{escaped_path}'");
+    if let Err(err) = storage.execute_raw(&vacuum_into_sql) {
+        tracing::warn!(
+            error = %err,
+            db_path = %db_path.display(),
+            "`VACUUM INTO` compaction failed; keeping the in-place rebuild which may still show unused tail pages under upstream sqlite3"
+        );
+        let _ = fs::remove_file(&temp_path);
+        return;
+    }
+
+    // Replace `*storage` with a throwaway in-memory handle so we can close
+    // the on-disk connection (via `drop`) and swap its file under our own
+    // feet. On any failure in the remaining steps we reopen the original
+    // db_path to give the caller a working storage rather than leaving
+    // `*storage` pointing at an empty in-memory DB.
+    let Ok(placeholder) = SqliteStorage::open_memory() else {
+        // Extremely unlikely — open_memory only fails if we can't create a
+        // temp-dir file. Bail on the compaction path and keep the original.
+        let _ = fs::remove_file(&temp_path);
+        return;
+    };
+    let old = std::mem::replace(storage, placeholder);
+    drop(old);
+
+    // Atomic swap: rename `temp_path` onto `db_path`. On POSIX this
+    // atomically replaces the target, so there is never a moment when
+    // db_path does not exist (unlike a "remove then rename" sequence,
+    // which would leave a gap where another process could see db_path
+    // missing and create a fresh empty DB). The old sidecars are cleaned
+    // up AFTER the rename so any error there doesn't roll back the
+    // successful swap — stale `-wal`/`-shm` left alongside a clean DB
+    // are recovered automatically on next open.
+    if let Err(err) = fs::rename(&temp_path, db_path) {
+        tracing::warn!(
+            error = %err,
+            temp_path = %temp_path.display(),
+            db_path = %db_path.display(),
+            "Failed to atomically install compacted database; skipping VACUUM INTO compaction"
+        );
+        let _ = fs::remove_file(&temp_path);
+        // db_path is still the original file here (rename failed, so the
+        // old file is intact). Reopen it so *storage is a valid handle.
+        if let Ok(reopened) = SqliteStorage::open_with_timeout(db_path, lock_timeout) {
+            *storage = reopened;
+        }
+        return;
+    }
+
+    // Clean up the stale sidecars from the pre-compaction file. These
+    // describe a DIFFERENT file layout than the one we just installed, so
+    // leaving them in place can mislead the next open into a recovery
+    // attempt. Best-effort: if a sidecar can't be removed, log and
+    // continue — next open will still work because the compacted db_path
+    // header declares the canonical layout.
+    for sidecar_suffix in &["-wal", "-shm", "-journal"] {
+        let sidecar = PathBuf::from(format!("{}{}", db_path.to_string_lossy(), sidecar_suffix));
+        if fs::symlink_metadata(&sidecar).is_ok()
+            && let Err(err) = fs::remove_file(&sidecar)
+        {
+            tracing::debug!(
+                error = %err,
+                sidecar = %sidecar.display(),
+                "Failed to remove pre-compaction sidecar after VACUUM INTO; next open will re-derive it"
+            );
+        }
+    }
+
+    match SqliteStorage::open_with_timeout(db_path, lock_timeout) {
+        Ok(reopened) => *storage = reopened,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                db_path = %db_path.display(),
+                "Failed to reopen compacted database after VACUUM INTO; storage is now the placeholder in-memory handle"
+            );
+        }
+    }
 }
 
 pub(crate) fn rebuild_database_family_with_backup<T, F>(

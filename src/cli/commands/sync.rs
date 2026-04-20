@@ -1446,10 +1446,6 @@ fn execute_import(
         // post-import MVCC state lags behind and VACUUM fails silently with
         // "database is busy (snapshot conflict on pages)", leaving the
         // free-space / partial-index corruption that triggered issue #248.
-        // Reopening the connection at this point also works around the
-        // stale snapshot, but on fsqlite it can reorder root pages in a way
-        // the next reader cannot cope with, so we checkpoint in place
-        // instead.
         if let Err(e) = storage.checkpoint_full() {
             warn!(
                 error = %e,
@@ -1463,6 +1459,24 @@ fn execute_import(
         if let Err(e) = storage.execute_raw("REINDEX") {
             warn!(error = %e, "REINDEX after force/rebuild import failed (non-fatal); partial-index entries may be inconsistent");
         }
+        // Final compaction via `VACUUM INTO` + atomic rename. fsqlite's
+        // in-place VACUUM does not truncate the trailing pages that its
+        // REINDEX leaves orphaned, so upstream sqlite3's `PRAGMA
+        // integrity_check` reports `Page N: never used` on the rebuilt
+        // file (issue #248). `VACUUM INTO` sidesteps the bug because it
+        // writes a brand-new compacted file from the reachable page set,
+        // page count and layout matching what `sqlite3 "VACUUM INTO"`
+        // would produce. Best-effort: on any failure the helper leaves
+        // `*storage` as the pre-compaction handle, so we never lose data
+        // — we only miss the cosmetic compaction.
+        if let Err(e) = storage.checkpoint_full() {
+            warn!(
+                error = %e,
+                db_path = %db_path.display(),
+                "Full WAL checkpoint before VACUUM INTO failed (non-fatal)"
+            );
+        }
+        config::compact_database_via_vacuum_into_in_place(storage, db_path, cli.lock_timeout);
     }
 
     // Update content hash

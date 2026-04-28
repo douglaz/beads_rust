@@ -296,6 +296,16 @@ fn group_counts_for_filters(
     filters: &ListFilters,
     by: CountBy,
 ) -> Result<(usize, Vec<CountGroup>)> {
+    if by == CountBy::Label {
+        let total = storage.count_issues_with_filters(filters)?;
+        let groups = storage
+            .count_labels_with_filters(filters)?
+            .into_iter()
+            .map(|(group, count)| CountGroup { group, count })
+            .collect();
+        return Ok((total, groups));
+    }
+
     if should_use_full_issue_rows_for_count(filters) {
         let issues = storage.list_issues(filters)?;
         let groups = group_counts(storage, &issues, by)?;
@@ -539,6 +549,13 @@ mod tests {
 
         assert_eq!(map.get("backend"), Some(&1));
         assert_eq!(map.get("(no labels)"), Some(&1));
+
+        let (total, aggregate_groups) =
+            group_counts_for_filters(&storage, &filters, CountBy::Label)?;
+        let aggregate_map = groups_to_map(aggregate_groups);
+        assert_eq!(total, 2);
+        assert_eq!(aggregate_map.get("backend"), Some(&1));
+        assert_eq!(aggregate_map.get("(no labels)"), Some(&1));
         info!("test_group_counts_label_includes_unlabeled: assertions passed");
 
         Ok(())

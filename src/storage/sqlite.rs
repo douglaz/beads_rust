@@ -2852,6 +2852,141 @@ impl SqliteStorage {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
+    /// Count label buckets for issues matching the given filters.
+    ///
+    /// This mirrors the label grouping semantics used by `br count --by label`:
+    /// each labeled issue contributes once per label, and unlabeled issues
+    /// contribute to the synthetic `(no labels)` bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn count_labels_with_filters(&self, filters: &ListFilters) -> Result<Vec<(String, usize)>> {
+        let mut sql = String::from(
+            "SELECT labels.label, COUNT(*)
+             FROM issues
+             LEFT JOIN labels ON labels.issue_id = issues.id
+             WHERE 1=1",
+        );
+        let mut params: Vec<SqliteValue> = Vec::new();
+
+        let label_filters_can_use_uncorrelated_in =
+            filters.statuses.as_ref().is_none_or(Vec::is_empty)
+                && filters.types.as_ref().is_none_or(Vec::is_empty)
+                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+                && filters.assignee.is_none()
+                && filters.title_contains.is_none()
+                && filters.updated_before.is_none()
+                && filters.updated_after.is_none();
+        let label_candidate_ids = if label_filters_can_use_uncorrelated_in {
+            None
+        } else {
+            self.label_filter_candidate_ids(
+                filters.labels.as_deref().unwrap_or(&[]),
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            )?
+        };
+        if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        if label_filters_can_use_uncorrelated_in {
+            append_label_membership_filters(
+                &mut sql,
+                &mut params,
+                filters.labels.as_deref().unwrap_or(&[]),
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            );
+        } else if let Some(ref issue_ids) = label_candidate_ids {
+            append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
+        }
+
+        if let Some(ref statuses) = filters.statuses
+            && !statuses.is_empty()
+        {
+            let placeholders: Vec<String> = statuses.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND status IN ({}) ", placeholders.join(","));
+            for s in statuses {
+                params.push(SqliteValue::from(s.as_str()));
+            }
+        }
+
+        if let Some(ref types) = filters.types
+            && !types.is_empty()
+        {
+            let placeholders: Vec<String> = types.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND issue_type IN ({}) ", placeholders.join(","));
+            for t in types {
+                params.push(SqliteValue::from(t.as_str()));
+            }
+        }
+
+        if let Some(ref priorities) = filters.priorities
+            && !priorities.is_empty()
+        {
+            let placeholders: Vec<String> = priorities.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND priority IN ({}) ", placeholders.join(","));
+            for p in priorities {
+                params.push(SqliteValue::from(i64::from(p.0)));
+            }
+        }
+
+        if let Some(ref assignee) = filters.assignee {
+            sql.push_str(" AND assignee = ?");
+            params.push(SqliteValue::from(assignee.as_str()));
+        }
+
+        if filters.unassigned {
+            sql.push_str(" AND (assignee IS NULL OR assignee = '')");
+        }
+
+        if !filters.include_closed {
+            if filters.include_deferred {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            } else {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
+            }
+        } else if filters.statuses.as_ref().is_none_or(Vec::is_empty) {
+            sql.push_str(" AND status != 'tombstone'");
+        }
+
+        if !filters.include_templates {
+            sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        }
+
+        if let Some(ref title_contains) = filters.title_contains {
+            sql.push_str(" AND title LIKE ? ESCAPE '\\'");
+            let escaped = escape_like_pattern(title_contains);
+            params.push(SqliteValue::from(format!("%{escaped}%")));
+        }
+
+        if let Some(ts) = filters.updated_before {
+            sql.push_str(" AND updated_at <= ?");
+            params.push(SqliteValue::from(ts.to_rfc3339()));
+        }
+
+        if let Some(ts) = filters.updated_after {
+            sql.push_str(" AND updated_at >= ?");
+            params.push(SqliteValue::from(ts.to_rfc3339()));
+        }
+
+        sql.push_str(" GROUP BY labels.label ORDER BY labels.label");
+
+        let rows = self.conn.query_with_params(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let label = row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("(no labels)")
+                    .to_string();
+                let count = row.get(1).and_then(SqliteValue::as_integer)?;
+                Some((label, usize::try_from(count).unwrap_or(0)))
+            })
+            .collect())
+    }
+
     /// Search issues by query with optional filters.
     ///
     /// # Errors

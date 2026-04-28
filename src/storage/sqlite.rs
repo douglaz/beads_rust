@@ -51,8 +51,8 @@ fn append_label_membership_filters(
     params: &mut Vec<SqliteValue>,
     labels_and: &[String],
     labels_or: &[String],
+    allow_uncorrelated_in: bool,
 ) {
-    let can_use_uncorrelated_in = params.is_empty();
     let mut unique_labels_and = Vec::with_capacity(labels_and.len());
     let mut seen_labels_and = HashSet::with_capacity(labels_and.len());
     for label in labels_and {
@@ -64,7 +64,7 @@ fn append_label_membership_filters(
     match unique_labels_and.as_slice() {
         [] => {}
         [label] => {
-            if can_use_uncorrelated_in {
+            if allow_uncorrelated_in {
                 sql.push_str(" AND issues.id IN (SELECT issue_id FROM labels WHERE label = ?)");
             } else {
                 sql.push_str(
@@ -81,7 +81,7 @@ fn append_label_membership_filters(
         _ => {
             let placeholders: Vec<String> =
                 unique_labels_and.iter().map(|_| "?".to_string()).collect();
-            if can_use_uncorrelated_in {
+            if allow_uncorrelated_in {
                 let _ = write!(
                     sql,
                     " AND issues.id IN (
@@ -118,7 +118,7 @@ fn append_label_membership_filters(
 
     if !labels_or.is_empty() {
         let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-        if can_use_uncorrelated_in {
+        if allow_uncorrelated_in {
             let _ = write!(
                 sql,
                 " AND issues.id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
@@ -2421,6 +2421,22 @@ impl SqliteStorage {
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
+        let label_filters_can_use_uncorrelated_in =
+            filters.statuses.as_ref().is_none_or(Vec::is_empty)
+                && filters.types.as_ref().is_none_or(Vec::is_empty)
+                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+                && filters.assignee.is_none()
+                && filters.title_contains.is_none()
+                && filters.updated_before.is_none()
+                && filters.updated_after.is_none();
+        append_label_membership_filters(
+            &mut sql,
+            &mut params,
+            filters.labels.as_deref().unwrap_or(&[]),
+            filters.labels_or.as_deref().unwrap_or(&[]),
+            label_filters_can_use_uncorrelated_in,
+        );
+
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
         {
@@ -2491,13 +2507,6 @@ impl SqliteStorage {
             sql.push_str(" AND updated_at >= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
-
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            filters.labels.as_deref().unwrap_or(&[]),
-            filters.labels_or.as_deref().unwrap_or(&[]),
-        );
 
         // Apply custom sort if provided
         if let Some(ref sort_field) = filters.sort {
@@ -2591,6 +2600,22 @@ impl SqliteStorage {
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
+        let label_filters_can_use_uncorrelated_in =
+            filters.statuses.as_ref().is_none_or(Vec::is_empty)
+                && filters.types.as_ref().is_none_or(Vec::is_empty)
+                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+                && filters.assignee.is_none()
+                && filters.title_contains.is_none()
+                && filters.updated_before.is_none()
+                && filters.updated_after.is_none();
+        append_label_membership_filters(
+            &mut sql,
+            &mut params,
+            filters.labels.as_deref().unwrap_or(&[]),
+            filters.labels_or.as_deref().unwrap_or(&[]),
+            label_filters_can_use_uncorrelated_in,
+        );
+
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
         {
@@ -2659,13 +2684,6 @@ impl SqliteStorage {
             sql.push_str(" AND updated_at >= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
-
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            filters.labels.as_deref().unwrap_or(&[]),
-            filters.labels_or.as_deref().unwrap_or(&[]),
-        );
 
         let row = self.conn.query_row_with_params(&sql, &params)?;
         let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
@@ -2945,6 +2963,19 @@ impl SqliteStorage {
         sql.push_str(" FROM issues WHERE 1=1");
         let mut params: Vec<SqliteValue> = Vec::new();
 
+        let label_filters_can_use_uncorrelated_in =
+            filters.types.as_ref().is_none_or(Vec::is_empty)
+                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+                && filters.assignee.is_none()
+                && filters.parent.is_none();
+        append_label_membership_filters(
+            &mut sql,
+            &mut params,
+            &filters.labels_and,
+            &filters.labels_or,
+            label_filters_can_use_uncorrelated_in,
+        );
+
         // Ready condition 1: only `open` issues are "ready" (in_progress means
         // already claimed). Optionally include deferred issues when requested.
         if filters.include_deferred {
@@ -3037,13 +3068,6 @@ impl SqliteStorage {
                 params.push(SqliteValue::from(parent_id.as_str()));
             }
         }
-
-        append_label_membership_filters(
-            &mut sql,
-            &mut params,
-            &filters.labels_and,
-            &filters.labels_or,
-        );
 
         if apply_ordering {
             match sort {

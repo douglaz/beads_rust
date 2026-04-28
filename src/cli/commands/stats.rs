@@ -307,7 +307,8 @@ fn compute_summary(
     let blocked_by_blocks = if active_issue_ids.is_empty() {
         HashSet::new()
     } else {
-        let edges = storage.get_blocks_dep_edges()?;
+        let active_issue_id_list = active_issue_ids.iter().copied().collect::<Vec<_>>();
+        let edges = storage.get_blocks_dep_edges_for_issue_ids(&active_issue_id_list)?;
         let mut blocked = HashSet::new();
         for (issue_id, depends_on_id) in &edges {
             if active_issue_ids.contains(depends_on_id.as_str())
@@ -1546,6 +1547,28 @@ mod tests {
 
         assert_eq!(summary.blocked_issues, 1);
         assert_eq!(summary.ready_issues, 1); // t-1 is ready, t-2 is blocked
+    }
+
+    #[test]
+    fn test_blocked_by_parent_child_deps() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let epic = make_issue("t-epic", Status::Open, IssueType::Epic);
+        let child = make_issue("t-child", Status::Open, IssueType::Task);
+
+        storage.create_issue(&epic, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+        storage
+            .add_dependency("t-child", "t-epic", "parent-child", "tester")
+            .unwrap();
+
+        let all_issues = [&epic, &child]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_test_summary(&storage, &all_issues);
+
+        assert_eq!(summary.blocked_issues, 1);
     }
 
     #[test]

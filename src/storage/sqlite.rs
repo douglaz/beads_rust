@@ -88,6 +88,7 @@ const EXPORT_HASH_CHUNK_SIZE: usize = 32;
 const BLOCKED_CACHE_DELETE_CHUNK_SIZE: usize = 400;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
 const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
+const BLOCKS_DEP_EDGE_FILTER_LIMIT: usize = 400;
 const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
 const DEPENDENCY_TRAVERSAL_MAX_DEPTH: usize = 500;
 const BLOCKED_CACHE_STATE_KEY: &str = "blocked_cache_state";
@@ -3143,6 +3144,71 @@ impl SqliteStorage {
             "SELECT depends_on_id, issue_id FROM dependencies \
              WHERE type = 'parent-child'",
         )?;
+        for row in &rows2 {
+            if let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text)
+                && let Some(depends_on) = row.get(1).and_then(SqliteValue::as_text)
+            {
+                edges.push((issue_id.to_string(), depends_on.to_string()));
+            }
+        }
+
+        Ok(edges)
+    }
+
+    /// Get raw blocking dependency edges whose endpoints are in `issue_ids`.
+    ///
+    /// Returns `(issue_id, depends_on_id)` pairs, matching [`Self::get_blocks_dep_edges`].
+    /// For large active sets, falls back to the full edge scan to stay below
+    /// SQLite's parameter limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocks_dep_edges_for_issue_ids(
+        &self,
+        issue_ids: &[&str],
+    ) -> Result<Vec<(String, String)>> {
+        if issue_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if issue_ids.len() > BLOCKS_DEP_EDGE_FILTER_LIMIT {
+            return self.get_blocks_dep_edges();
+        }
+
+        let mut edges = Vec::new();
+        let placeholders: Vec<&str> = issue_ids.iter().map(|_| "?").collect();
+        let placeholders = placeholders.join(", ");
+
+        let mut params = Vec::with_capacity(issue_ids.len() * 2);
+        for issue_id in issue_ids {
+            params.push(SqliteValue::from(*issue_id));
+        }
+        for issue_id in issue_ids {
+            params.push(SqliteValue::from(*issue_id));
+        }
+
+        let standard_sql = format!(
+            "SELECT issue_id, depends_on_id FROM dependencies \
+             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for') \
+               AND issue_id IN ({placeholders}) \
+               AND depends_on_id IN ({placeholders})"
+        );
+        let rows1 = self.conn.query_with_params(&standard_sql, &params)?;
+        for row in &rows1 {
+            if let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text)
+                && let Some(depends_on) = row.get(1).and_then(SqliteValue::as_text)
+            {
+                edges.push((issue_id.to_string(), depends_on.to_string()));
+            }
+        }
+
+        let parent_child_sql = format!(
+            "SELECT depends_on_id, issue_id FROM dependencies \
+             WHERE type = 'parent-child' \
+               AND depends_on_id IN ({placeholders}) \
+               AND issue_id IN ({placeholders})"
+        );
+        let rows2 = self.conn.query_with_params(&parent_child_sql, &params)?;
         for row in &rows2 {
             if let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text)
                 && let Some(depends_on) = row.get(1).and_then(SqliteValue::as_text)

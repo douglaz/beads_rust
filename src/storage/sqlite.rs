@@ -3411,6 +3411,17 @@ impl SqliteStorage {
         apply_limit: bool,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
+        if sort == ReadySortPolicy::Hybrid
+            && apply_limit
+            && let Some(issues) = self.query_limited_ready_hybrid_high_bucket(
+                filters,
+                exclude_blocked_in_sql,
+                projection,
+            )?
+        {
+            return Ok(issues);
+        }
+
         let sort_hybrid_in_rust = sort == ReadySortPolicy::Hybrid && filters.limit.is_none();
         let (sql, params) = Self::build_ready_issue_candidates_query(
             filters,
@@ -3430,6 +3441,39 @@ impl SqliteStorage {
         }
 
         Ok(issues)
+    }
+
+    fn query_limited_ready_hybrid_high_bucket(
+        &self,
+        filters: &ReadyFilters,
+        exclude_blocked_in_sql: bool,
+        projection: ReadyIssueProjection,
+    ) -> Result<Option<Vec<Issue>>> {
+        let Some(limit) = filters.limit.filter(|limit| *limit > 0) else {
+            return Ok(None);
+        };
+
+        let priorities = ready_hybrid_high_bucket_priorities(filters.priorities.as_deref());
+        if priorities.is_empty() {
+            return Ok(None);
+        }
+
+        let mut high_bucket_filters = filters.clone();
+        high_bucket_filters.priorities = Some(priorities);
+        high_bucket_filters.limit = Some(limit);
+
+        let issues = self.query_ready_issue_candidates_with_projection(
+            &high_bucket_filters,
+            ReadySortPolicy::Oldest,
+            exclude_blocked_in_sql,
+            true,
+            projection,
+        )?;
+        if issues.len() == limit {
+            Ok(Some(issues))
+        } else {
+            Ok(None)
+        }
     }
 
     fn query_ready_issues_without_cache_with_projection(
@@ -7591,6 +7635,19 @@ fn sort_ready_hybrid(issues: &mut [Issue]) {
 
 const fn ready_hybrid_bucket(priority: Priority) -> i32 {
     if priority.0 <= 1 { 0 } else { 1 }
+}
+
+fn ready_hybrid_high_bucket_priorities(priorities: Option<&[Priority]>) -> Vec<Priority> {
+    priorities.map_or_else(
+        || vec![Priority::CRITICAL, Priority::HIGH],
+        |values| {
+            values
+                .iter()
+                .copied()
+                .filter(|priority| ready_hybrid_bucket(*priority) == 0)
+                .collect()
+        },
+    )
 }
 
 fn parse_status(s: Option<&str>) -> Status {
@@ -13761,6 +13818,23 @@ mod tests {
             .map(|issue| issue.id)
             .collect();
         assert_eq!(limited_ids, ["bd-high-old", "bd-critical-new"]);
+
+        let fallback_limited_ids: Vec<String> = storage
+            .get_ready_issues(
+                &ReadyFilters {
+                    limit: Some(3),
+                    ..ReadyFilters::default()
+                },
+                ReadySortPolicy::Hybrid,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+        assert_eq!(
+            fallback_limited_ids,
+            ["bd-high-old", "bd-critical-new", "bd-low-old"]
+        );
     }
 
     #[test]

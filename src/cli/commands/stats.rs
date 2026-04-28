@@ -514,12 +514,7 @@ fn compute_assignee_breakdown(issues: &[StatsIssueRow]) -> Breakdown {
 /// Compute breakdown by label.
 fn compute_label_breakdown(storage: &SqliteStorage, issues: &[StatsIssueRow]) -> Result<Breakdown> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    let issue_ids: Vec<String> = issues
-        .iter()
-        .filter(|issue| issue.status != Status::Tombstone)
-        .map(|issue| issue.id.clone())
-        .collect();
-    let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
+    let mut labels_map = storage.get_all_labels()?;
 
     for issue in issues {
         if issue.status == Status::Tombstone {

@@ -2541,6 +2541,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn list_issues(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
+        let sort_default_in_rust = should_sort_list_default_in_rust(filters);
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -2655,40 +2656,42 @@ impl SqliteStorage {
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
 
-        // Apply custom sort if provided
-        if let Some(ref sort_field) = filters.sort {
-            let order = if filters.reverse { "DESC" } else { "ASC" };
-            // Simple validation to prevent injection (though params should handle it,
-            // column names can't be parameterized)
-            match sort_field.as_str() {
-                "priority" => {
-                    let secondary_order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(
-                        sql,
-                        " ORDER BY priority {order}, created_at {secondary_order}"
-                    );
+        if !sort_default_in_rust {
+            // Apply custom sort if provided
+            if let Some(ref sort_field) = filters.sort {
+                let order = if filters.reverse { "DESC" } else { "ASC" };
+                // Simple validation to prevent injection (though params should handle it,
+                // column names can't be parameterized)
+                match sort_field.as_str() {
+                    "priority" => {
+                        let secondary_order = if filters.reverse { "ASC" } else { "DESC" };
+                        let _ = write!(
+                            sql,
+                            " ORDER BY priority {order}, created_at {secondary_order}"
+                        );
+                    }
+                    "created_at" | "created" => {
+                        let order = if filters.reverse { "ASC" } else { "DESC" };
+                        let _ = write!(sql, " ORDER BY created_at {order}");
+                    }
+                    "updated_at" | "updated" => {
+                        let order = if filters.reverse { "ASC" } else { "DESC" };
+                        let _ = write!(sql, " ORDER BY updated_at {order}");
+                    }
+                    "title" => {
+                        // Case-insensitive sort for title
+                        let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}");
+                    }
+                    _ => {
+                        // Default fallback
+                        sql.push_str(" ORDER BY priority ASC, created_at DESC");
+                    }
                 }
-                "created_at" | "created" => {
-                    let order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(sql, " ORDER BY created_at {order}");
-                }
-                "updated_at" | "updated" => {
-                    let order = if filters.reverse { "ASC" } else { "DESC" };
-                    let _ = write!(sql, " ORDER BY updated_at {order}");
-                }
-                "title" => {
-                    // Case-insensitive sort for title
-                    let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}");
-                }
-                _ => {
-                    // Default fallback
-                    sql.push_str(" ORDER BY priority ASC, created_at DESC");
-                }
+            } else if filters.reverse {
+                sql.push_str(" ORDER BY priority DESC, created_at ASC");
+            } else {
+                sql.push_str(" ORDER BY priority ASC, created_at DESC");
             }
-        } else if filters.reverse {
-            sql.push_str(" ORDER BY priority DESC, created_at ASC");
-        } else {
-            sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
 
         match (filters.limit, filters.offset) {
@@ -2710,6 +2713,9 @@ impl SqliteStorage {
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
+        }
+        if sort_default_in_rust {
+            sort_list_default(&mut issues);
         }
 
         Ok(issues)
@@ -7630,6 +7636,21 @@ fn sort_ready_hybrid(issues: &mut [Issue]) {
         ready_hybrid_bucket(left.priority)
             .cmp(&ready_hybrid_bucket(right.priority))
             .then_with(|| left.created_at.cmp(&right.created_at))
+    });
+}
+
+fn should_sort_list_default_in_rust(filters: &ListFilters) -> bool {
+    filters.sort.is_none()
+        && !filters.reverse
+        && filters.offset.is_none_or(|offset| offset == 0)
+        && filters.limit.is_none_or(|limit| limit == 0)
+}
+
+fn sort_list_default(issues: &mut [Issue]) {
+    issues.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| right.created_at.cmp(&left.created_at))
     });
 }
 

@@ -2635,14 +2635,6 @@ impl SqliteStorage {
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        sql.push_str(
-            " AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)",
-        );
-        let needle = trimmed.to_ascii_lowercase();
-        params.push(SqliteValue::from(needle.as_str()));
-        params.push(SqliteValue::from(needle.as_str()));
-        params.push(SqliteValue::from(needle));
-
         if let Some(ref labels) = filters.labels {
             for label in labels {
                 sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
@@ -2734,6 +2726,14 @@ impl SqliteStorage {
             sql.push_str(" AND updated_at >= ?");
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
+
+        sql.push_str(
+            " AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)",
+        );
+        let needle = trimmed.to_ascii_lowercase();
+        params.push(SqliteValue::from(needle.as_str()));
+        params.push(SqliteValue::from(needle.as_str()));
+        params.push(SqliteValue::from(needle));
 
         if let Some(ref sort_field) = filters.sort {
             let order = if filters.reverse { "DESC" } else { "ASC" };

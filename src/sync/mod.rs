@@ -2140,6 +2140,22 @@ pub fn auto_import_probe_refreshing_witnesses(
     Ok(probe.jsonl_newer)
 }
 
+/// Check whether auto-import needs to inspect JSONL contents without mutating metadata.
+///
+/// This variant is intended for read-only startup probes. It deliberately skips
+/// the opportunistic JSONL witness refresh that
+/// [`auto_import_probe_refreshing_witnesses`] performs, so callers can use a
+/// read-only SQLite handle and reopen writable storage only if import work is
+/// actually needed.
+///
+/// # Errors
+///
+/// Returns an error if reading JSONL metadata, stored witnesses, or hashing
+/// fails.
+pub fn auto_import_probe(storage: &SqliteStorage, jsonl_path: &Path) -> Result<bool> {
+    compute_jsonl_newer_impl(storage, jsonl_path).map(|probe| probe.jsonl_newer)
+}
+
 fn compute_staleness_impl(
     storage: &SqliteStorage,
     jsonl_path: &Path,

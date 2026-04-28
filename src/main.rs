@@ -3,7 +3,9 @@ use beads_rust::cli::{Cli, Commands, OutputFormat, command_requests_robot_json};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
 use beads_rust::output::OutputContext;
-use beads_rust::sync::{auto_flush, auto_import_if_stale, auto_import_probe_refreshing_witnesses};
+use beads_rust::sync::{
+    auto_flush, auto_import_if_stale, auto_import_probe, auto_import_probe_refreshing_witnesses,
+};
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
@@ -55,26 +57,29 @@ fn main() {
     //
     // Issue #243: frankensqlite deadlocks when multiple processes attempt
     // concurrent writes to the same database file. Serialize all mutating
-    // operations through a blocking flock on `.beads/.write.lock`. Storage open
-    // itself is not guaranteed read-only in recovery/schema paths, so commands
-    // that preopen storage for freshness checks also acquire it before Phase 2.
-    // The lock is held until main() exits so command bodies that open storage
-    // internally remain covered as well.
-    let write_lock =
-        if should_acquire_startup_write_lock(command_needs_write_lock, should_preopen_storage)
-            && ctx.is_initialized()
-        {
-            let lock_timeout = ctx.write_lock_timeout();
-            match ctx.beads_dir.as_deref().map(|beads_dir| {
-                beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
-            }) {
-                Some(Ok(lock)) => Some(lock),
-                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
-                None => None,
-            }
-        } else {
-            None
-        };
+    // operations through a blocking flock on `.beads/.write.lock`. Normal
+    // storage open is not guaranteed read-only in recovery/schema paths, so
+    // writable preopen paths also acquire it before Phase 2. The read-only
+    // auto-import probe is the exception: it defers the lock until the probe
+    // proves an import is needed and the code reopens writable storage.
+    let read_only_auto_import_probe = should_auto_import_now && overrides.read_only_fast_open;
+    let write_lock = if should_acquire_startup_write_lock(
+        command_needs_write_lock,
+        should_preopen_storage,
+        read_only_auto_import_probe,
+    ) && ctx.is_initialized()
+    {
+        let lock_timeout = ctx.write_lock_timeout();
+        match ctx.beads_dir.as_deref().map(|beads_dir| {
+            beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+        }) {
+            Some(Ok(lock)) => Some(lock),
+            Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+            None => None,
+        }
+    } else {
+        None
+    };
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
@@ -91,29 +96,61 @@ fn main() {
         None
     };
 
-    // Phase 3: Auto-Import. The staleness probe can opportunistically refresh
-    // JSONL witness metadata, so read commands that reach this path also need
-    // the write lock before probing.
-    if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
+    // Phase 3: Auto-Import. Normal staleness probes can opportunistically
+    // refresh JSONL witness metadata. Read-only startup probes skip that
+    // refresh and reopen writable storage only when an import is actually
+    // needed.
+    if let Some(paths) = ctx.paths.as_ref()
         && should_auto_import_now
+        && storage_result.is_some()
     {
-        let _auto_import_write_lock = if write_lock.is_some() {
-            None
-        } else {
+        let mut auto_import_write_lock = None;
+        if !ctx.overrides.read_only_fast_open && write_lock.is_none() {
             let lock_timeout = ctx.write_lock_timeout();
-            match ctx.beads_dir.as_deref().map(|beads_dir| {
+            auto_import_write_lock = match ctx.beads_dir.as_deref().map(|beads_dir| {
                 beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
             }) {
                 Some(Ok(lock)) => Some(lock),
                 Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
                 None => None,
+            };
+        }
+        let should_attempt_auto_import = {
+            match storage_result.as_mut() {
+                Some(res) if ctx.overrides.read_only_fast_open => {
+                    auto_import_probe(&res.storage, &paths.jsonl_path).unwrap_or(true)
+                }
+                Some(res) => {
+                    auto_import_probe_refreshing_witnesses(&mut res.storage, &paths.jsonl_path)
+                        .unwrap_or(true)
+                }
+                None => false,
             }
         };
-        let should_attempt_auto_import =
-            auto_import_probe_refreshing_witnesses(&mut res.storage, &paths.jsonl_path)
-                .unwrap_or(true);
 
         if should_attempt_auto_import {
+            if ctx.overrides.read_only_fast_open && write_lock.is_none() {
+                let lock_timeout = ctx.write_lock_timeout();
+                auto_import_write_lock = match ctx.beads_dir.as_deref().map(|beads_dir| {
+                    beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+                }) {
+                    Some(Ok(lock)) => Some(lock),
+                    Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+                    None => None,
+                };
+            }
+
+            if ctx.overrides.read_only_fast_open {
+                let mut writable_overrides = ctx.overrides.clone();
+                writable_overrides.read_only_fast_open = false;
+                drop(storage_result.take());
+                match config::open_storage_with_cli(&paths.beads_dir, &writable_overrides) {
+                    Ok(writable_res) => storage_result = Some(writable_res),
+                    Err(e) => handle_error(&e, json_error_mode, color_error_mode),
+                }
+            }
+
+            let _ = auto_import_write_lock.as_ref();
             let sync_lock = match ctx
                 .beads_dir
                 .as_deref()
@@ -127,7 +164,9 @@ fn main() {
                 Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
                 None => None,
             };
-            if sync_lock.is_some() {
+            if sync_lock.is_some()
+                && let Some(res) = storage_result.as_mut()
+            {
                 let allow_external_jsonl = config::implicit_external_jsonl_allowed(
                     &paths.beads_dir,
                     &paths.db_path,
@@ -516,8 +555,9 @@ const fn should_preopen_storage(
 const fn should_acquire_startup_write_lock(
     command_needs_write_lock: bool,
     should_preopen_storage: bool,
+    read_only_auto_import_probe: bool,
 ) -> bool {
-    command_needs_write_lock || should_preopen_storage
+    command_needs_write_lock || (should_preopen_storage && !read_only_auto_import_probe)
 }
 
 /// Determine if a command potentially mutates data and triggers auto-flush.
@@ -659,6 +699,13 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
     )
 }
 
+const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::List(_) | Commands::Stats(_) | Commands::Status(_)
+    )
+}
+
 fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
     match cmd {
         Commands::List(args) => args.format,
@@ -752,10 +799,10 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         no_auto_flush: if cli.no_auto_flush { Some(true) } else { None },
         no_auto_import: if cli.no_auto_import { Some(true) } else { None },
         lock_timeout: cli.lock_timeout,
-        read_only_fast_open: cli.no_auto_import
-            && cli.no_auto_flush
-            && !cli.no_db
-            && supports_read_only_fast_open(&cli.command),
+        read_only_fast_open: !cli.no_db
+            && supports_read_only_fast_open(&cli.command)
+            && ((cli.no_auto_import && cli.no_auto_flush)
+                || supports_auto_import_read_only_probe(&cli.command)),
     }
 }
 
@@ -870,7 +917,16 @@ mod tests {
     }
 
     #[test]
-    fn read_only_fast_open_requires_explicit_read_suppression() {
+    fn read_only_fast_open_supports_explicit_suppression_and_safe_list_probe() {
+        let list = Cli::parse_from(["br", "list"]);
+        assert!(build_cli_overrides(&list).read_only_fast_open);
+
+        let stats = Cli::parse_from(["br", "stats"]);
+        assert!(build_cli_overrides(&stats).read_only_fast_open);
+
+        let status = Cli::parse_from(["br", "status"]);
+        assert!(build_cli_overrides(&status).read_only_fast_open);
+
         let ready = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "ready"]);
         assert!(build_cli_overrides(&ready).read_only_fast_open);
 
@@ -1210,9 +1266,10 @@ mod tests {
 
     #[test]
     fn preopen_storage_requires_write_lock_before_open() {
-        assert!(should_acquire_startup_write_lock(false, true));
-        assert!(should_acquire_startup_write_lock(true, false));
-        assert!(should_acquire_startup_write_lock(true, true));
-        assert!(!should_acquire_startup_write_lock(false, false));
+        assert!(should_acquire_startup_write_lock(false, true, false));
+        assert!(should_acquire_startup_write_lock(true, false, false));
+        assert!(should_acquire_startup_write_lock(true, true, true));
+        assert!(!should_acquire_startup_write_lock(false, false, false));
+        assert!(!should_acquire_startup_write_lock(false, true, true));
     }
 }

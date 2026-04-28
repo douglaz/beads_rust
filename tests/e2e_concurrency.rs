@@ -156,7 +156,7 @@ where
     V: AsRef<OsStr>,
 {
     let start = Instant::now();
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("br"));
+    let mut cmd = Command::cargo_bin("br").expect("find br binary");
     cmd.current_dir(root);
     cmd.args(args);
     clear_inherited_br_env(&mut cmd);
@@ -657,16 +657,16 @@ fn e2e_read_command_witness_refresh_waits_for_write_lock() {
         .expect("open .write.lock");
     write_lock.lock().expect("hold .write.lock");
 
-    let mut blocked_list = spawn_br_child_in_dir(&root, ["list", "--json"]);
-    wait_for_child_to_block_on_write_lock(&mut blocked_list, "witness-refresh list");
+    let mut blocked_search = spawn_br_child_in_dir(&root, ["search", "Seed", "--json"]);
+    wait_for_child_to_block_on_write_lock(&mut blocked_search, "witness-refresh search");
 
     drop(write_lock);
-    let completed = blocked_list
+    let completed = blocked_search
         .wait_with_output()
-        .expect("collect list after lock release");
+        .expect("collect search after lock release");
     assert!(
         completed.status.success(),
-        "list after witness refresh failed: stdout={} stderr={}",
+        "search after witness refresh failed: stdout={} stderr={}",
         String::from_utf8_lossy(&completed.stdout),
         String::from_utf8_lossy(&completed.stderr)
     );

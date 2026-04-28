@@ -38,6 +38,7 @@ const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 /// jittered exponential backoff via thread::sleep) to provide proper
 /// desynchronization. This is critical for multi-agent concurrent access.
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 0;
+const SQLITE_VAR_LIMIT: usize = 900;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ListRelationMetadata {
@@ -46,19 +47,24 @@ pub(crate) struct ListRelationMetadata {
     pub(crate) dependent_count: usize,
 }
 
+fn unique_label_refs(labels: &[String]) -> Vec<&String> {
+    let mut unique_labels = Vec::with_capacity(labels.len());
+    let mut seen_labels = HashSet::with_capacity(labels.len());
+    for label in labels {
+        if seen_labels.insert(label.as_str()) {
+            unique_labels.push(label);
+        }
+    }
+    unique_labels
+}
+
 fn append_label_membership_filters(
     sql: &mut String,
     params: &mut Vec<SqliteValue>,
     labels_and: &[String],
     labels_or: &[String],
 ) {
-    let mut unique_labels_and = Vec::with_capacity(labels_and.len());
-    let mut seen_labels_and = HashSet::with_capacity(labels_and.len());
-    for label in labels_and {
-        if seen_labels_and.insert(label.as_str()) {
-            unique_labels_and.push(label);
-        }
-    }
+    let unique_labels_and = unique_label_refs(labels_and);
 
     match unique_labels_and.as_slice() {
         [] => {}
@@ -102,25 +108,55 @@ fn append_label_membership_filters(
     }
 }
 
-fn append_label_and_membership_joins(
+fn append_issue_source_with_label_and_joins(
     sql: &mut String,
     params: &mut Vec<SqliteValue>,
     labels_and: &[String],
 ) {
-    let mut seen_labels_and = HashSet::with_capacity(labels_and.len());
-    for label in labels_and {
-        if !seen_labels_and.insert(label.as_str()) {
-            continue;
-        }
-        let alias = format!("labels_and_{}", seen_labels_and.len());
+    let unique_labels_and = unique_label_refs(labels_and);
+
+    let Some((first_label, remaining_labels)) = unique_labels_and.split_first() else {
+        sql.push_str(" FROM issues");
+        return;
+    };
+
+    sql.push_str(
+        " FROM labels AS labels_and_1
+          JOIN issues
+            ON issues.id = labels_and_1.issue_id
+           AND labels_and_1.label = ?",
+    );
+    params.push(SqliteValue::from(first_label.as_str()));
+
+    for (index, label) in remaining_labels.iter().enumerate() {
+        let alias_number = index + 2;
         let _ = write!(
             sql,
-            " JOIN labels AS {alias}
-              ON {alias}.issue_id = issues.id
-             AND {alias}.label = ?"
+            " JOIN labels AS labels_and_{alias_number}
+                ON labels_and_{alias_number}.issue_id = issues.id
+               AND labels_and_{alias_number}.label = ?"
         );
         params.push(SqliteValue::from(label.as_str()));
     }
+}
+
+fn append_issue_id_membership_filter(
+    sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+    issue_ids: &[String],
+) {
+    sql.push_str(" AND (");
+    for (index, chunk) in issue_ids.chunks(SQLITE_VAR_LIMIT).enumerate() {
+        if index > 0 {
+            sql.push_str(" OR ");
+        }
+        let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+        let _ = write!(sql, "id IN ({})", placeholders.join(","));
+        for issue_id in chunk {
+            params.push(SqliteValue::from(issue_id.as_str()));
+        }
+    }
+    sql.push(')');
 }
 
 fn append_label_or_membership_exists(
@@ -2370,8 +2406,6 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_issues_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>> {
-        const SQLITE_VAR_LIMIT: usize = 900;
-
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -2406,6 +2440,100 @@ impl SqliteStorage {
         Ok(issues)
     }
 
+    fn label_filter_candidate_ids(
+        &self,
+        labels_and: &[String],
+        labels_or: &[String],
+    ) -> Result<Option<Vec<String>>> {
+        let all_label_ids = self.query_issue_ids_with_all_labels(labels_and)?;
+        let any_label_ids = self.query_issue_ids_with_any_label(labels_or)?;
+
+        let ids = match (all_label_ids, any_label_ids) {
+            (None, None) => return Ok(None),
+            (Some(ids), None) | (None, Some(ids)) => ids,
+            (Some(all_ids), Some(any_ids)) => {
+                let any_id_set: HashSet<&str> = any_ids.iter().map(String::as_str).collect();
+                all_ids
+                    .into_iter()
+                    .filter(|issue_id| any_id_set.contains(issue_id.as_str()))
+                    .collect()
+            }
+        };
+
+        Ok(Some(ids))
+    }
+
+    fn query_issue_ids_with_all_labels(&self, labels: &[String]) -> Result<Option<Vec<String>>> {
+        let unique_labels = unique_label_refs(labels);
+        let ids = match unique_labels.as_slice() {
+            [] => return Ok(None),
+            [label] => self.query_issue_ids_from_label_sql(
+                "SELECT issue_id FROM labels WHERE label = ? ORDER BY issue_id",
+                &[SqliteValue::from(label.as_str())],
+            )?,
+            _ => {
+                let placeholders: Vec<String> =
+                    unique_labels.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
+                    "SELECT issue_id
+                     FROM labels
+                     WHERE label IN ({})
+                     GROUP BY issue_id
+                     HAVING COUNT(DISTINCT label) = ?
+                     ORDER BY issue_id",
+                    placeholders.join(",")
+                );
+                let unique_label_count = unique_labels.len();
+                let mut params = Vec::with_capacity(unique_labels.len() + 1);
+                for label in unique_labels {
+                    params.push(SqliteValue::from(label.as_str()));
+                }
+                params.push(SqliteValue::from(
+                    i64::try_from(unique_label_count).unwrap_or(i64::MAX),
+                ));
+                self.query_issue_ids_from_label_sql(&sql, &params)?
+            }
+        };
+
+        Ok(Some(ids))
+    }
+
+    fn query_issue_ids_with_any_label(&self, labels: &[String]) -> Result<Option<Vec<String>>> {
+        if labels.is_empty() {
+            return Ok(None);
+        }
+
+        let placeholders: Vec<String> = labels.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT DISTINCT issue_id
+             FROM labels
+             WHERE label IN ({})
+             ORDER BY issue_id",
+            placeholders.join(",")
+        );
+        let params: Vec<SqliteValue> = labels
+            .iter()
+            .map(|label| SqliteValue::from(label.as_str()))
+            .collect();
+        Ok(Some(self.query_issue_ids_from_label_sql(&sql, &params)?))
+    }
+
+    fn query_issue_ids_from_label_sql(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<String>> {
+        let rows = self.conn.query_with_params(sql, params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
     /// List issues with optional filters.
     ///
     /// # Errors
@@ -2420,8 +2548,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template
-              FROM issues",
+                     sender, ephemeral, pinned, is_template",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -2434,26 +2561,27 @@ impl SqliteStorage {
                 && filters.title_contains.is_none()
                 && filters.updated_before.is_none()
                 && filters.updated_after.is_none();
+        let label_candidate_ids = if label_filters_can_use_uncorrelated_in {
+            None
+        } else {
+            self.label_filter_candidate_ids(
+                filters.labels.as_deref().unwrap_or(&[]),
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            )?
+        };
+        if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        sql.push_str(" FROM issues WHERE 1=1");
         if label_filters_can_use_uncorrelated_in {
-            sql.push_str(" WHERE 1=1");
             append_label_membership_filters(
                 &mut sql,
                 &mut params,
                 filters.labels.as_deref().unwrap_or(&[]),
                 filters.labels_or.as_deref().unwrap_or(&[]),
             );
-        } else {
-            append_label_and_membership_joins(
-                &mut sql,
-                &mut params,
-                filters.labels.as_deref().unwrap_or(&[]),
-            );
-            sql.push_str(" WHERE 1=1");
-            append_label_or_membership_exists(
-                &mut sql,
-                &mut params,
-                filters.labels_or.as_deref().unwrap_or(&[]),
-            );
+        } else if let Some(ref issue_ids) = label_candidate_ids {
+            append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
 
         if let Some(ref statuses) = filters.statuses
@@ -2615,7 +2743,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn count_issues_with_filters(&self, filters: &ListFilters) -> Result<usize> {
-        let mut sql = String::from("SELECT COUNT(*) FROM issues");
+        let mut sql = String::from("SELECT COUNT(*)");
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
@@ -2627,26 +2755,27 @@ impl SqliteStorage {
                 && filters.title_contains.is_none()
                 && filters.updated_before.is_none()
                 && filters.updated_after.is_none();
+        let label_candidate_ids = if label_filters_can_use_uncorrelated_in {
+            None
+        } else {
+            self.label_filter_candidate_ids(
+                filters.labels.as_deref().unwrap_or(&[]),
+                filters.labels_or.as_deref().unwrap_or(&[]),
+            )?
+        };
+        if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(0);
+        }
+        sql.push_str(" FROM issues WHERE 1=1");
         if label_filters_can_use_uncorrelated_in {
-            sql.push_str(" WHERE 1=1");
             append_label_membership_filters(
                 &mut sql,
                 &mut params,
                 filters.labels.as_deref().unwrap_or(&[]),
                 filters.labels_or.as_deref().unwrap_or(&[]),
             );
-        } else {
-            append_label_and_membership_joins(
-                &mut sql,
-                &mut params,
-                filters.labels.as_deref().unwrap_or(&[]),
-            );
-            sql.push_str(" WHERE 1=1");
-            append_label_or_membership_exists(
-                &mut sql,
-                &mut params,
-                filters.labels_or.as_deref().unwrap_or(&[]),
-            );
+        } else if let Some(ref issue_ids) = label_candidate_ids {
+            append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
 
         if let Some(ref statuses) = filters.statuses
@@ -2993,7 +3122,6 @@ impl SqliteStorage {
         apply_ordering: bool,
     ) -> (String, Vec<SqliteValue>) {
         let mut sql = String::from(projection.select_clause());
-        sql.push_str(" FROM issues");
         let mut params: Vec<SqliteValue> = Vec::new();
 
         let label_filters_can_use_uncorrelated_in =
@@ -3002,7 +3130,7 @@ impl SqliteStorage {
                 && filters.assignee.is_none()
                 && filters.parent.is_none();
         if label_filters_can_use_uncorrelated_in {
-            sql.push_str(" WHERE 1=1");
+            sql.push_str(" FROM issues WHERE 1=1");
             append_label_membership_filters(
                 &mut sql,
                 &mut params,
@@ -3010,7 +3138,7 @@ impl SqliteStorage {
                 &filters.labels_or,
             );
         } else {
-            append_label_and_membership_joins(&mut sql, &mut params, &filters.labels_and);
+            append_issue_source_with_label_and_joins(&mut sql, &mut params, &filters.labels_and);
             sql.push_str(" WHERE 1=1");
             append_label_or_membership_exists(&mut sql, &mut params, &filters.labels_or);
         }

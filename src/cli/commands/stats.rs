@@ -97,6 +97,7 @@ fn execute_inner(
         args.robot,
     );
     let quiet = cli.quiet.unwrap_or(false);
+    let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
     let storage_ctx_for_config = preloaded_storage_ctx.or(owned_storage_ctx.as_ref());
     let mut config_layer: Option<config::ConfigLayer> = None;
 
@@ -144,7 +145,7 @@ fn execute_inner(
         breakdowns.push(compute_label_breakdown(storage, &all_issues)?);
     }
 
-    let recent_activity = if should_include_activity(args) {
+    let recent_activity = if should_collect_activity(args, early_ctx.mode()) {
         compute_recent_activity(Some(storage), &jsonl_path, args.activity_hours)
     } else {
         None
@@ -272,6 +273,10 @@ fn load_stats_config_layer(
 
 const fn should_include_activity(args: &StatsArgs) -> bool {
     !args.no_activity
+}
+
+const fn should_collect_activity(args: &StatsArgs, output_mode: OutputMode) -> bool {
+    should_include_activity(args) && !matches!(output_mode, OutputMode::Quiet)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2135,6 +2140,25 @@ mod tests {
             no_activity: true,
             ..StatsArgs::default()
         }));
+    }
+
+    #[test]
+    fn test_should_collect_activity_skips_true_quiet_mode() {
+        assert!(should_collect_activity(
+            &StatsArgs::default(),
+            OutputMode::Json
+        ));
+        assert!(!should_collect_activity(
+            &StatsArgs::default(),
+            OutputMode::Quiet
+        ));
+        assert!(!should_collect_activity(
+            &StatsArgs {
+                no_activity: true,
+                ..StatsArgs::default()
+            },
+            OutputMode::Json
+        ));
     }
 
     #[test]

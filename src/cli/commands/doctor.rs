@@ -1858,6 +1858,37 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
     }
 }
 
+fn push_recoverable_anomalies_check(checks: &mut Vec<CheckResult>, findings: &[String]) {
+    if findings.is_empty() {
+        push_check(
+            checks,
+            "db.recoverable_anomalies",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+    } else if findings
+        .iter()
+        .all(|finding| finding == BLOCKED_CACHE_STALE_FINDING)
+    {
+        push_check(
+            checks,
+            "db.recoverable_anomalies",
+            CheckStatus::Warn,
+            Some(BLOCKED_CACHE_STALE_FINDING.to_string()),
+            Some(serde_json::json!({ "findings": findings })),
+        );
+    } else {
+        push_check(
+            checks,
+            "db.recoverable_anomalies",
+            CheckStatus::Error,
+            Some(findings[0].clone()),
+            Some(serde_json::json!({ "findings": findings })),
+        );
+    }
+}
+
 fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
     let duplicate_schema_rows = conn.query(
         "SELECT type, name, COUNT(*) AS row_count
@@ -1941,24 +1972,7 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
         findings.push(BLOCKED_CACHE_STALE_FINDING.to_string());
     }
 
-    if findings.is_empty() {
-        push_check(
-            checks,
-            "db.recoverable_anomalies",
-            CheckStatus::Ok,
-            None,
-            None,
-        );
-    } else {
-        push_check(
-            checks,
-            "db.recoverable_anomalies",
-            CheckStatus::Error,
-            Some(findings[0].clone()),
-            Some(serde_json::json!({ "findings": findings })),
-        );
-    }
-
+    push_recoverable_anomalies_check(checks, &findings);
     Ok(())
 }
 
@@ -3103,19 +3117,31 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     if initial.report.ok {
-        // Even when there are no errors, partial-index warnings can be repaired
-        // via REINDEX.  Run it when --repair is passed and the warnings are present.
-        if report_has_partial_index_warnings(&initial.report) {
-            let mut repair = LocalRepairResult::default();
-            repair_partial_indexes(&paths.db_path, &mut repair);
+        let has_blocked_cache_stale = report_has_blocked_cache_stale_finding(&initial.report);
+        let has_partial_index_warnings = report_has_partial_index_warnings(&initial.report);
+
+        // Even when there are no errors, planned deferred cache rebuilds and
+        // partial-index warnings can be repaired.  Run those local repairs when
+        // --repair is passed and the warnings are present.
+        if has_blocked_cache_stale || has_partial_index_warnings {
+            let mut repair = if has_blocked_cache_stale {
+                repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report)
+            } else {
+                LocalRepairResult::default()
+            };
+
+            if has_partial_index_warnings {
+                repair_partial_indexes(&paths.db_path, &mut repair);
+            }
+
             let post_reindex = collect_doctor_report(&beads_dir, &paths)?;
             let repair_message = repair_outcome_message(
                 gitignore_repaired,
                 Some(&repair),
-                Some(REINDEX_INCOMPLETE_MESSAGE),
+                has_partial_index_warnings.then_some(REINDEX_INCOMPLETE_MESSAGE),
             );
             let recovery_audit = local_repair_audit_record(
-                "doctor.partial_index_repair",
+                "doctor.warn_repair",
                 if post_reindex.report.ok {
                     "verified"
                 } else {
@@ -4177,6 +4203,24 @@ mod tests {
             }),
             "expected duplicate metadata finding: {findings:?}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_recoverable_anomalies_treats_stale_blocked_cache_as_warning() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.mark_blocked_cache_stale()?;
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_recoverable_anomalies(&conn, &mut checks)?;
+
+        let check = find_check(&checks, "db.recoverable_anomalies").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert_eq!(check.message.as_deref(), Some(BLOCKED_CACHE_STALE_FINDING));
 
         Ok(())
     }

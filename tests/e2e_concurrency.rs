@@ -335,6 +335,79 @@ fn assert_doctor_healthy(root: &PathBuf) {
     );
 }
 
+fn assert_doctor_has_no_page_anomalies(root: &PathBuf, label: &str) {
+    let doctor = run_br_in_dir(root, ["doctor", "--json"]);
+    assert!(
+        doctor.success,
+        "{label}: doctor failed: stdout={} stderr={}",
+        doctor.stdout, doctor.stderr
+    );
+
+    let payload = extract_json_payload(&doctor.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(&payload).expect("doctor output should be valid json");
+    let checks = report
+        .get("checks")
+        .and_then(serde_json::Value::as_array)
+        .expect("doctor report should include checks array");
+
+    let page_anomalies: Vec<String> = checks
+        .iter()
+        .filter_map(|check| {
+            let name = check
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if name != "sqlite.integrity_check" && name != "sqlite3.integrity_check" {
+                return None;
+            }
+
+            let message = check
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let lower = message.to_ascii_lowercase();
+            (lower.contains("never used")
+                || lower.contains("free space corruption")
+                || lower.contains("malformed")
+                || lower.contains("disk image"))
+            .then(|| format!("{name}: {message}"))
+        })
+        .collect();
+
+    assert!(
+        page_anomalies.is_empty(),
+        "{label}: doctor reported page anomalies: {page_anomalies:?}\nstdout={}\nstderr={}",
+        doctor.stdout,
+        doctor.stderr
+    );
+}
+
+fn assert_upstream_sqlite_integrity_ok(root: &Path, label: &str) {
+    let db_path = root.join(".beads").join("beads.db");
+    let output = StdCommand::new("sqlite3")
+        .arg(&db_path)
+        .arg("PRAGMA integrity_check;")
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            eprintln!("{label}: sqlite3 unavailable, skipping upstream integrity check: {err}");
+            return;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.trim() == "ok",
+        "{label}: upstream sqlite3 integrity_check failed for {}: status={:?} stdout={stdout} stderr={stderr}",
+        db_path.display(),
+        output.status.code()
+    );
+}
+
 fn create_routes_file(root: &Path, entries: &[(&str, &Path)]) {
     let routes_path = root.join(".beads").join("routes.jsonl");
     let content = entries
@@ -2526,6 +2599,191 @@ fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
         let show = run_br_in_dir(&root, ["--no-auto-import", "show", issue_id, "--json"]);
         assert!(show.success, "show reopen target failed: {}", show.stderr);
     }
+}
+
+/// Regression for the ts2 report: mixed DB-backed commands in parallel must
+/// serialize cleanly and leave no upstream `sqlite3` page-integrity residue.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_parallel_mixed_db_commands_preserve_sqlite_integrity() {
+    let _log = common::test_log("e2e_parallel_mixed_db_commands_preserve_sqlite_integrity");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    let mut issue_ids = Vec::new();
+    for idx in 0..14 {
+        let created = run_br_in_dir(&root, ["create", &format!("ts2 mixed issue {idx}")]);
+        assert!(
+            created.success,
+            "seed create {idx} failed: stdout={} stderr={}",
+            created.stdout, created.stderr
+        );
+        issue_ids.push(parse_created_id(&created.stdout));
+    }
+
+    let barrier = Arc::new(Barrier::new(4));
+    let shared_root = Arc::new(root.clone());
+
+    let updater = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let issue_ids = issue_ids.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for (idx, issue_id) in issue_ids.iter().take(10).enumerate() {
+                let args = vec![
+                    "--lock-timeout".to_string(),
+                    "15000".to_string(),
+                    "update".to_string(),
+                    issue_id.clone(),
+                    "--title".to_string(),
+                    format!("ts2 mixed updated {idx}"),
+                    "--priority".to_string(),
+                    (idx % 5).to_string(),
+                    "--json".to_string(),
+                ];
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(5));
+            }
+            results
+        })
+    };
+
+    let depper = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let issue_ids = issue_ids.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for idx in 1..issue_ids.len() {
+                let args = vec![
+                    "--lock-timeout".to_string(),
+                    "15000".to_string(),
+                    "dep".to_string(),
+                    "add".to_string(),
+                    issue_ids[idx].clone(),
+                    issue_ids[idx - 1].clone(),
+                    "--json".to_string(),
+                ];
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(5));
+            }
+            results
+        })
+    };
+
+    let creator = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for idx in 0..8 {
+                let args = vec![
+                    "--lock-timeout".to_string(),
+                    "15000".to_string(),
+                    "create".to_string(),
+                    format!("ts2 mixed concurrent create {idx}"),
+                    "--json".to_string(),
+                ];
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(5));
+            }
+            results
+        })
+    };
+
+    let reader = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let issue_ids = issue_ids.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for idx in 0..12 {
+                let args = match idx % 4 {
+                    0 => vec![
+                        "--lock-timeout".to_string(),
+                        "15000".to_string(),
+                        "show".to_string(),
+                        issue_ids[idx % issue_ids.len()].clone(),
+                        "--json".to_string(),
+                    ],
+                    1 => vec![
+                        "--lock-timeout".to_string(),
+                        "15000".to_string(),
+                        "status".to_string(),
+                        "--no-activity".to_string(),
+                        "--json".to_string(),
+                    ],
+                    2 => vec![
+                        "--lock-timeout".to_string(),
+                        "15000".to_string(),
+                        "ready".to_string(),
+                        "--json".to_string(),
+                    ],
+                    _ => vec![
+                        "--lock-timeout".to_string(),
+                        "15000".to_string(),
+                        "doctor".to_string(),
+                        "--json".to_string(),
+                    ],
+                };
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(5));
+            }
+            results
+        })
+    };
+
+    let update_results = updater.join().expect("updater panicked");
+    let dep_results = depper.join().expect("depper panicked");
+    let create_results = creator.join().expect("creator panicked");
+    let read_results = reader.join().expect("reader panicked");
+
+    for (role, results) in [
+        ("update", &update_results),
+        ("dep add", &dep_results),
+        ("create", &create_results),
+        ("read/status/doctor", &read_results),
+    ] {
+        assert_no_integrity_failure_signals(role, results);
+        for (idx, result) in results.iter().enumerate() {
+            assert!(
+                result.success,
+                "{role}[{idx}] failed under mixed parallel DB load: stdout={} stderr={}",
+                result.stdout, result.stderr
+            );
+        }
+    }
+
+    assert_doctor_has_no_page_anomalies(&root, "after mixed parallel DB load");
+    assert_upstream_sqlite_integrity_ok(&root, "after mixed parallel DB load");
+
+    for round in 0..4 {
+        let status = run_br_in_dir(&root, ["status", "--no-activity", "--json"]);
+        assert!(
+            status.success,
+            "post-load status round {round} failed: stdout={} stderr={}",
+            status.stdout, status.stderr
+        );
+
+        let doctor = run_br_in_dir(&root, ["doctor", "--json"]);
+        assert!(
+            doctor.success,
+            "post-load doctor round {round} failed: stdout={} stderr={}",
+            doctor.stdout, doctor.stderr
+        );
+    }
+
+    assert_doctor_has_no_page_anomalies(&root, "after repeated status/doctor reads");
+    assert_upstream_sqlite_integrity_ok(&root, "after repeated status/doctor reads");
 }
 
 /// Test that routed access remains bounded even while the routed workspace

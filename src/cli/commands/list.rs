@@ -416,7 +416,6 @@ fn should_use_full_relation_scan(
     !client_filters
         && user_limit == 0
         && user_offset == 0
-        && args.all
         && args.status.is_empty()
         && args.type_.is_empty()
         && args.priority.is_empty()
@@ -746,6 +745,41 @@ mod tests {
         .expect_err("invalid sort should fail");
 
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "sort"));
+    }
+
+    #[test]
+    fn test_full_relation_scan_covers_unbounded_default_json_list() {
+        init_logging();
+        assert!(should_use_full_relation_scan(
+            &ListArgs {
+                limit: Some(0),
+                ..Default::default()
+            },
+            false,
+            0,
+            0,
+        ));
+
+        assert!(!should_use_full_relation_scan(
+            &ListArgs {
+                limit: Some(50),
+                ..Default::default()
+            },
+            false,
+            50,
+            0,
+        ));
+
+        assert!(!should_use_full_relation_scan(
+            &ListArgs {
+                limit: Some(0),
+                label: vec!["backend".to_string()],
+                ..Default::default()
+            },
+            false,
+            0,
+            0,
+        ));
     }
 
     #[test]

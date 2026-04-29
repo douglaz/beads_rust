@@ -5802,6 +5802,13 @@ impl SqliteStorage {
             return Ok(counts);
         }
 
+        let tombstone_exists = self
+            .conn
+            .query("SELECT 1 FROM issues WHERE status = 'tombstone' LIMIT 1")?;
+        if tombstone_exists.is_empty() {
+            return Ok(counts);
+        }
+
         let tombstone_rows = self.conn.query(
             "SELECT l.label, COUNT(*) as count
              FROM labels l

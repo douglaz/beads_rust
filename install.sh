@@ -1468,33 +1468,37 @@ check_conflicts() {
     fi
 
     if [ ${#conflicts[@]} -gt 0 ]; then
-        log_warn "Found br in multiple locations:"
-        log_step "  Installed: $installed_path"
-        for conflict in "${conflicts[@]}"; do
-            log_step "  Conflict:  $conflict"
-        done
-
-        # Check PATH priority
         local active_br
-        active_br=$(command -v br 2>/dev/null || echo "")
+        active_br=$(command -v "$BINARY_NAME" 2>/dev/null || echo "")
+
         if [ -n "$active_br" ] && [ "$active_br" != "$installed_path" ]; then
             log_warn "The active br ($active_br) differs from the newly installed version!"
-            log_warn "To use the new version, either:"
-            log_step "  1. Remove the conflicting binary: rm $active_br"
-            log_step "  2. Adjust PATH so $DEST comes first"
+            log_step "  Installed: $installed_path"
+            log_warn "Additional br location(s):"
+            for conflict in "${conflicts[@]}"; do
+                log_step "  Conflict:  $conflict"
+            done
+            log_warn "To use the new version, either adjust PATH so $DEST comes first, or move/remove the conflicting binary manually."
+
+            # Offer to remove conflicts in easy mode.
+            if [ "$EASY" -eq 1 ]; then
+                for conflict in "${conflicts[@]}"; do
+                    if [ -t 0 ] && [[ "$GUM_AVAILABLE" == "true" ]]; then
+                        if gum confirm "Remove conflicting binary at $conflict?"; then
+                            rm -f "$conflict"
+                            log_success "Removed $conflict"
+                        fi
+                    fi
+                done
+            fi
+
+            return 0
         fi
 
-        # Offer to remove conflicts in easy mode
-        if [ "$EASY" -eq 1 ]; then
-            for conflict in "${conflicts[@]}"; do
-                if [ -t 0 ] && [[ "$GUM_AVAILABLE" == "true" ]]; then
-                    if gum confirm "Remove conflicting binary at $conflict?"; then
-                        rm -f "$conflict"
-                        log_success "Removed $conflict"
-                    fi
-                fi
-            done
-        fi
+        log_step "Found additional br location(s); $installed_path remains active"
+        for conflict in "${conflicts[@]}"; do
+            log_step "  Other:     $conflict"
+        done
     fi
 }
 

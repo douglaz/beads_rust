@@ -681,29 +681,29 @@ const fn should_auto_import(cmd: &Commands) -> bool {
 }
 
 const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
-    matches!(
-        cmd,
+    match cmd {
+        Commands::Stats(args) | Commands::Status(args) => args.no_activity,
         Commands::List(_)
-            | Commands::Show(_)
-            | Commands::Search(_)
-            | Commands::Ready(_)
-            | Commands::Blocked(_)
-            | Commands::Count(_)
-            | Commands::Stale(_)
-            | Commands::Stats(_)
-            | Commands::Status(_)
-            | Commands::Comments(beads_rust::cli::CommentsArgs {
-                command: None | Some(beads_rust::cli::CommentCommands::List(_)),
-                ..
-            })
-    )
+        | Commands::Show(_)
+        | Commands::Search(_)
+        | Commands::Ready(_)
+        | Commands::Blocked(_)
+        | Commands::Count(_)
+        | Commands::Stale(_)
+        | Commands::Comments(beads_rust::cli::CommentsArgs {
+            command: None | Some(beads_rust::cli::CommentCommands::List(_)),
+            ..
+        }) => true,
+        _ => false,
+    }
 }
 
 const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
-    matches!(
-        cmd,
-        Commands::List(_) | Commands::Stats(_) | Commands::Status(_)
-    )
+    match cmd {
+        Commands::List(_) => true,
+        Commands::Stats(args) | Commands::Status(args) => args.no_activity,
+        _ => false,
+    }
 }
 
 fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
@@ -922,10 +922,16 @@ mod tests {
         assert!(build_cli_overrides(&list).read_only_fast_open);
 
         let stats = Cli::parse_from(["br", "stats"]);
-        assert!(build_cli_overrides(&stats).read_only_fast_open);
+        assert!(!build_cli_overrides(&stats).read_only_fast_open);
+
+        let stats_no_activity = Cli::parse_from(["br", "stats", "--no-activity"]);
+        assert!(build_cli_overrides(&stats_no_activity).read_only_fast_open);
 
         let status = Cli::parse_from(["br", "status"]);
-        assert!(build_cli_overrides(&status).read_only_fast_open);
+        assert!(!build_cli_overrides(&status).read_only_fast_open);
+
+        let status_no_activity = Cli::parse_from(["br", "status", "--no-activity"]);
+        assert!(build_cli_overrides(&status_no_activity).read_only_fast_open);
 
         let ready = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "ready"]);
         assert!(build_cli_overrides(&ready).read_only_fast_open);

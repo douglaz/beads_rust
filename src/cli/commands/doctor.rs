@@ -614,10 +614,13 @@ fn report_has_page_corruption(report: &DoctorReport) -> bool {
     })
 }
 
-/// Compact the database via VACUUM to fix page-level anomalies (free space
-/// corruption, B-tree malformation) that arise from frankensqlite's B-tree
-/// layer.  VACUUM rewrites every page from scratch, eliminating any internal
-/// accounting discrepancies.
+/// Compact the database to fix page-level anomalies (free space corruption,
+/// orphaned pages, B-tree malformation) that arise from frankensqlite's B-tree
+/// layer.
+///
+/// Run in-place VACUUM first, then try to install a compacted copy via VACUUM
+/// INTO. If upstream sqlite3 still reports `Page N: never used` afterward,
+/// the caller escalates to a JSONL rebuild.
 fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
     if !db_path.is_file() {
         tracing::debug!(
@@ -626,16 +629,30 @@ fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
         );
         return;
     }
-    match Connection::open(db_path.to_string_lossy().into_owned()) {
-        Ok(conn) => match conn.execute("VACUUM") {
-            Ok(_) => {
-                repair.vacuumed = true;
-                tracing::info!(path = %db_path.display(), "VACUUM completed successfully");
-            }
-            Err(err) => {
+    match SqliteStorage::open(db_path) {
+        Ok(storage) => {
+            if let Err(err) = storage.execute_raw("VACUUM") {
                 tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
+                return;
             }
-        },
+
+            repair.vacuumed = true;
+            match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
+                Ok(_storage) => {
+                    tracing::info!(
+                        path = %db_path.display(),
+                        "VACUUM plus VACUUM INTO compaction completed successfully"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "VACUUM INTO compaction failed after VACUUM"
+                    );
+                }
+            }
+        }
         Err(err) => {
             tracing::warn!(
                 path = %db_path.display(),
@@ -727,22 +744,28 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
 ///
 /// See #253 for the original report and the exact sequence that leaves the
 /// DB in this state.
-fn report_has_warn_level_page_anomaly(report: &DoctorReport) -> bool {
-    report.checks.iter().any(|check| {
-        if !matches!(check.status, CheckStatus::Warn) {
-            return false;
-        }
-        if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
-            return false;
-        }
-        check.message.as_deref().is_some_and(|msg| {
-            let lower = msg.to_lowercase();
-            lower.contains("never used")
-                || lower.contains("free space corruption")
-                || lower.contains("malformed")
-                || lower.contains("disk image")
-        })
+fn is_warn_level_page_anomaly_check(check: &CheckResult) -> bool {
+    if !matches!(check.status, CheckStatus::Warn) {
+        return false;
+    }
+    if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
+        return false;
+    }
+    check.message.as_deref().is_some_and(|msg| {
+        let lower = msg.to_lowercase();
+        lower.contains("never used")
+            || lower.contains("free space corruption")
+            || lower.contains("malformed")
+            || lower.contains("disk image")
     })
+}
+
+fn report_has_warn_level_page_anomaly(report: &DoctorReport) -> bool {
+    report.checks.iter().any(is_warn_level_page_anomaly_check)
+}
+
+fn repair_report_verified(report: &DoctorReport) -> bool {
+    report.ok && !report_has_warn_level_page_anomaly(report)
 }
 
 /// Return true if any integrity check reported partial-index row mismatches
@@ -760,6 +783,18 @@ fn report_has_partial_index_warnings(report: &DoctorReport) -> bool {
             .as_deref()
             .is_some_and(|msg| msg.to_lowercase().contains("missing from index"))
     })
+}
+
+fn warning_repair_verified(
+    report: &DoctorReport,
+    repaired_blocked_cache_stale: bool,
+    repaired_partial_index_warnings: bool,
+    repaired_page_anomalies: bool,
+) -> bool {
+    report.ok
+        && (!repaired_blocked_cache_stale || !report_has_blocked_cache_stale_finding(report))
+        && (!repaired_partial_index_warnings || !report_has_partial_index_warnings(report))
+        && (!repaired_page_anomalies || !report_has_warn_level_page_anomaly(report))
 }
 
 fn local_repair_message(local_repair: &LocalRepairResult) -> String {
@@ -1299,7 +1334,9 @@ fn write_jsonl_rebuild_verification_failed_marker(
         .report
         .checks
         .iter()
-        .filter(|check| matches!(check.status, CheckStatus::Error))
+        .filter(|check| {
+            matches!(check.status, CheckStatus::Error) || is_warn_level_page_anomaly_check(check)
+        })
         .collect::<Vec<_>>();
     let payload = serde_json::json!({
         "phase": "doctor.jsonl_rebuild",
@@ -3116,56 +3153,88 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
+    let mut local_repair = LocalRepairResult::default();
+
     if initial.report.ok {
         let has_blocked_cache_stale = report_has_blocked_cache_stale_finding(&initial.report);
         let has_partial_index_warnings = report_has_partial_index_warnings(&initial.report);
+        let has_warn_page_anomalies = report_has_warn_level_page_anomaly(&initial.report);
 
         // Even when there are no errors, planned deferred cache rebuilds and
-        // partial-index warnings can be repaired.  Run those local repairs when
+        // integrity warnings can be repaired. Run those local repairs when
         // --repair is passed and the warnings are present.
-        if has_blocked_cache_stale || has_partial_index_warnings {
-            let mut repair = if has_blocked_cache_stale {
+        if has_blocked_cache_stale || has_partial_index_warnings || has_warn_page_anomalies {
+            local_repair = if has_blocked_cache_stale {
                 repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report)
             } else {
                 LocalRepairResult::default()
             };
 
             if has_partial_index_warnings {
-                repair_partial_indexes(&paths.db_path, &mut repair);
+                repair_partial_indexes(&paths.db_path, &mut local_repair);
             }
 
-            let post_reindex = collect_doctor_report(&beads_dir, &paths)?;
+            if has_warn_page_anomalies {
+                repair_via_vacuum(&paths.db_path, &mut local_repair);
+            }
+
+            let post_warning_repair = collect_doctor_report(&beads_dir, &paths)?;
+            let verified = warning_repair_verified(
+                &post_warning_repair.report,
+                has_blocked_cache_stale,
+                has_partial_index_warnings,
+                has_warn_page_anomalies,
+            );
             let repair_message = repair_outcome_message(
                 gitignore_repaired,
-                Some(&repair),
+                Some(&local_repair),
                 has_partial_index_warnings.then_some(REINDEX_INCOMPLETE_MESSAGE),
             );
             let recovery_audit = local_repair_audit_record(
                 "doctor.warn_repair",
-                if post_reindex.report.ok {
+                if verified {
                     "verified"
+                } else if has_warn_page_anomalies {
+                    "needs_jsonl_rebuild"
                 } else {
                     "verification_failed"
                 },
-                &repair,
-                None,
+                &local_repair,
+                (!verified).then(|| {
+                    if has_warn_page_anomalies {
+                        "local warning repair did not clear page-level integrity warnings"
+                            .to_string()
+                    } else {
+                        "local warning repair did not clear all requested warnings".to_string()
+                    }
+                }),
             );
             emit_recovery_audit_record(&recovery_audit);
-            if ctx.is_json() {
-                ctx.json(&serde_json::json!({
-                    "report": initial.report,
-                    "repaired": gitignore_repaired || repair.applied(),
-                    "local_repair": repair,
-                    "recovery_audit": recovery_audit,
-                    "message": repair_message,
-                    "post_repair": post_reindex.report,
-                    "verified": post_reindex.report.ok,
-                }));
-            } else {
-                print_report(&initial.report, ctx)?;
+            if verified {
+                if ctx.is_json() {
+                    ctx.json(&serde_json::json!({
+                        "report": initial.report,
+                        "repaired": gitignore_repaired || local_repair.applied(),
+                        "local_repair": local_repair,
+                        "recovery_audit": recovery_audit,
+                        "message": repair_message,
+                        "post_repair": post_warning_repair.report,
+                        "verified": true,
+                    }));
+                } else {
+                    print_report(&initial.report, ctx)?;
+                    ctx.info(&repair_message);
+                    ctx.info("Post-repair verification:");
+                    print_report(&post_warning_repair.report, ctx)?;
+                }
+                return Ok(());
+            }
+
+            if !ctx.is_json() {
                 ctx.info(&repair_message);
-                ctx.info("Post-repair verification:");
-                print_report(&post_reindex.report, ctx)?;
+                ctx.info(
+                    "Local warning repair did not clear all integrity warnings; rebuilding DB from JSONL...",
+                );
             }
         } else {
             let recovery_audit = no_op_repair_audit_record(gitignore_repaired);
@@ -3181,20 +3250,19 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 print_report(&initial.report, ctx)?;
                 ctx.info(&repair_outcome_message(gitignore_repaired, None, None));
             }
+            return Ok(());
         }
-        return Ok(());
     }
 
-    let mut local_repair = if report_has_blocked_cache_stale_finding(&initial.report)
-        || report_has_sidecar_anomaly(&initial.report)
+    if !local_repair.applied()
+        && (report_has_blocked_cache_stale_finding(&initial.report)
+            || report_has_sidecar_anomaly(&initial.report))
     {
-        repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report)
-    } else {
-        LocalRepairResult::default()
-    };
+        local_repair = repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report);
+    }
 
     // Also attempt REINDEX if partial-index warnings are present alongside errors.
-    if report_has_partial_index_warnings(&initial.report) {
+    if !local_repair.indexes_reindexed && report_has_partial_index_warnings(&initial.report) {
         repair_partial_indexes(&paths.db_path, &mut local_repair);
     }
 
@@ -3231,7 +3299,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
-    if after_local_repair.report.ok {
+    if repair_report_verified(&after_local_repair.report) {
         // Issue #245: REINDEX can fix index ordering so integrity_check
         // passes, but the underlying B-tree corruption may still cause
         // writes to fail (reads work, writes get ISSUE_NOT_FOUND).  Run a
@@ -3276,11 +3344,16 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             return Ok(());
         }
     } else if local_repair.applied() {
+        let reason = if after_local_repair.report.ok {
+            "local repair did not clear page-level integrity warnings"
+        } else {
+            "local repair did not clear doctor errors"
+        };
         let recovery_audit = local_repair_audit_record(
             "doctor.local_repair",
             "needs_jsonl_rebuild",
             &local_repair,
-            Some("local repair did not clear doctor errors".to_string()),
+            Some(reason.to_string()),
         );
         emit_recovery_audit_record(&recovery_audit);
     }
@@ -3347,7 +3420,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     let post_repair = collect_doctor_report(&beads_dir, &paths)?;
-    let verification_failure_marker = if post_repair.report.ok {
+    let post_repair_verified = repair_report_verified(&post_repair.report);
+    let verification_failure_marker = if post_repair_verified {
         None
     } else {
         Some(write_jsonl_rebuild_verification_failed_marker(
@@ -3365,7 +3439,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     });
     let recovery_audit = jsonl_rebuild_audit_record(
         "doctor.jsonl_rebuild",
-        if post_repair.report.ok {
+        if post_repair_verified {
             "verified"
         } else {
             "verification_failed"
@@ -3386,7 +3460,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "fk_violations_cleaned": repair_result.fk_violations_cleaned,
             "verified_backups": &repair_result.verified_backups,
             "post_repair": post_repair.report,
-            "verified": post_repair.report.ok,
+            "verified": post_repair_verified,
             "recovery_failure_marker": verification_failure_marker
                 .as_ref()
                 .map(|path| path.display().to_string()),
@@ -3403,7 +3477,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         print_report(&post_repair.report, ctx)?;
     }
 
-    if !post_repair.report.ok {
+    if !post_repair_verified {
         return Err(BeadsError::Config(
             "Repair completed, but post-repair verification still found issues".to_string(),
         ));
@@ -4973,5 +5047,34 @@ mod tests {
             }],
         };
         assert!(!report_has_warn_level_page_anomaly(&report));
+    }
+
+    #[test]
+    fn warning_repair_verified_requires_repaired_page_warning_to_clear() {
+        let dirty_report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "sqlite3.integrity_check".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("Page 55: never used".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!warning_repair_verified(&dirty_report, false, false, true));
+
+        let clean_report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "sqlite3.integrity_check".to_string(),
+                status: CheckStatus::Ok,
+                message: None,
+                details: None,
+            }],
+        };
+        assert!(warning_repair_verified(&clean_report, false, false, true));
     }
 }

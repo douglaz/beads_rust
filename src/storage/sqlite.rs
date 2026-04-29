@@ -4492,21 +4492,35 @@ impl SqliteStorage {
     ///
     /// Returns an error if the dependency probe query fails.
     pub fn has_external_dependencies(&self, blocking_only: bool) -> Result<bool> {
-        let sql = if blocking_only {
+        // `external;` is the next ASCII boundary after the `external:` prefix,
+        // making the range equivalent to LIKE 'external:%' under SQLite's
+        // default binary TEXT collation while staying index-friendly.
+        let target_sql = if blocking_only {
             "SELECT 1
              FROM dependencies
-             WHERE (depends_on_id LIKE 'external:%'
-                    AND type IN ('blocks', 'conditional-blocks', 'waits-for'))
-                OR (issue_id LIKE 'external:%' AND type = 'parent-child')
+             WHERE depends_on_id >= 'external:'
+               AND depends_on_id < 'external;'
+               AND type IN ('blocks', 'conditional-blocks', 'waits-for')
              LIMIT 1"
         } else {
             "SELECT 1
              FROM dependencies
-             WHERE depends_on_id LIKE 'external:%'
-                OR (issue_id LIKE 'external:%' AND type = 'parent-child')
+             WHERE depends_on_id >= 'external:'
+               AND depends_on_id < 'external;'
              LIMIT 1"
         };
-        let rows = self.conn.query(sql)?;
+        let rows = self.conn.query(target_sql)?;
+        if !rows.is_empty() {
+            return Ok(true);
+        }
+
+        let parent_sql = "SELECT 1
+             FROM dependencies
+             WHERE issue_id >= 'external:'
+               AND issue_id < 'external;'
+               AND type = 'parent-child'
+             LIMIT 1";
+        let rows = self.conn.query(parent_sql)?;
         Ok(!rows.is_empty())
     }
 

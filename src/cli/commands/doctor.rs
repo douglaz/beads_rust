@@ -135,7 +135,6 @@ struct SidecarInspection {
     /// Warning-level findings that are informational but do not require repair.
     warning_findings: Vec<String>,
     quarantine_candidates: Vec<PathBuf>,
-    wal_requires_reconciliation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -912,9 +911,9 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     if wal_kind.is_regular_file() && !shm_kind.exists() {
         // frankensqlite manages the WAL index in process-local memory rather than in an SHM
         // file, so a WAL without a sibling SHM is the normal operating state — not an error.
-        // We record this as a warning finding so callers can observe it, but we do not set
-        // wal_requires_reconciliation and do not quarantine the WAL, because the WAL is
-        // valid and the database is accessible.  The db.write_probe check validates liveness.
+        // We record this as a warning finding so callers can observe it, but we do not
+        // quarantine the WAL, because the WAL is valid and the database is accessible.
+        // The db.write_probe check validates liveness.
         inspection.warning_findings.push(format!(
             "WAL sidecar exists without a matching SHM sidecar at {} (expected for frankensqlite)",
             PathBuf::from(format!("{}-wal", db_path.to_string_lossy())).display()
@@ -1495,10 +1494,7 @@ fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
 
 fn repair_database_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
     match inspect_database_sidecars(db_path) {
-        Ok(initial_inspection) => {
-            checkpoint_anomalous_wal(db_path, &initial_inspection, repair);
-            quarantine_anomalous_sidecars(beads_dir, db_path, repair);
-        }
+        Ok(_) => quarantine_anomalous_sidecars(beads_dir, db_path, repair),
         Err(err) => tracing::warn!(
             path = %db_path.display(),
             error = %err,
@@ -1507,50 +1503,13 @@ fn repair_database_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut Local
     }
 }
 
-fn checkpoint_anomalous_wal(
-    db_path: &Path,
-    inspection: &SidecarInspection,
-    repair: &mut LocalRepairResult,
-) {
-    if !inspection.wal_requires_reconciliation || !db_path.is_file() {
-        return;
-    }
-
-    match SqliteStorage::open(db_path) {
-        Ok(storage) => match storage.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)") {
-            Ok(()) => repair.wal_checkpoint_completed = true,
-            Err(err) => tracing::warn!(
-                path = %db_path.display(),
-                error = %err,
-                "Failed to checkpoint anomalous WAL sidecar before quarantine"
-            ),
-        },
-        Err(err) => tracing::warn!(
-            path = %db_path.display(),
-            error = %err,
-            "Failed to open database while reconciling anomalous sidecars"
-        ),
-    }
-}
-
 fn quarantine_anomalous_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
     match inspect_database_sidecars(db_path) {
         Ok(post_checkpoint_inspection) => {
-            let mut quarantine_paths: BTreeSet<_> = post_checkpoint_inspection
+            let quarantine_paths: BTreeSet<_> = post_checkpoint_inspection
                 .quarantine_candidates
                 .into_iter()
                 .collect();
-            let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
-
-            if post_checkpoint_inspection.wal_requires_reconciliation
-                && !repair.wal_checkpoint_completed
-                && quarantine_paths.remove(&wal_path)
-            {
-                tracing::warn!(
-                    path = %wal_path.display(),
-                    "Skipping WAL quarantine because checkpoint reconciliation did not succeed"
-                );
-            }
 
             if !quarantine_paths.is_empty() {
                 match config::quarantine_database_artifacts(

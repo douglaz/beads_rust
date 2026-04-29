@@ -79,7 +79,7 @@ fn main() {
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
-        match open_storage_from_ctx(&mut ctx) {
+        match open_storage_from_ctx(&mut ctx, write_lock.is_some()) {
             Ok(res) => Some(res),
             Err(e) => {
                 if should_auto_import_now {
@@ -533,9 +533,16 @@ impl StartupContext {
     }
 }
 
-fn open_storage_from_ctx(ctx: &mut StartupContext) -> Result<config::OpenStorageResult> {
+fn open_storage_from_ctx(
+    ctx: &mut StartupContext,
+    write_lock_already_held: bool,
+) -> Result<config::OpenStorageResult> {
     let startup = ctx.startup.take().ok_or(BeadsError::NotInitialized)?;
-    config::open_storage_with_startup_config(startup, &ctx.overrides, false)
+    if write_lock_already_held {
+        config::open_storage_with_startup_config_under_write_lock(startup, &ctx.overrides, false)
+    } else {
+        config::open_storage_with_startup_config(startup, &ctx.overrides, false)
+    }
 }
 
 fn resolve_auto_import_expected_prefix(
@@ -1161,7 +1168,7 @@ mod tests {
         )
         .expect("rewrite metadata");
 
-        let storage_ctx = open_storage_from_ctx(&mut ctx).expect("preopened storage");
+        let storage_ctx = open_storage_from_ctx(&mut ctx, false).expect("preopened storage");
 
         assert_eq!(storage_ctx.paths.jsonl_path, first_jsonl);
         assert_ne!(storage_ctx.paths.jsonl_path, second_jsonl);

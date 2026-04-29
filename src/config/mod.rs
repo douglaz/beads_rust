@@ -16,9 +16,9 @@ use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedTombstone, auto_flush,
-    compute_jsonl_hash, export_to_jsonl_with_policy, finalize_export, import_from_jsonl,
-    preflight_import, restore_tombstones_after_rebuild, scan_jsonl_for_tombstone_filter,
-    snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+    blocking_write_lock_with_timeout, compute_jsonl_hash, export_to_jsonl_with_policy,
+    finalize_export, import_from_jsonl, preflight_import, restore_tombstones_after_rebuild,
+    scan_jsonl_for_tombstone_filter, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
 };
 use crate::util::id::{
     IdConfig, abbreviate_prefix, normalize_prefix, parse_id, split_prefix_remainder,
@@ -541,6 +541,21 @@ fn open_sqlite_storage_with_recovery(
         bootstrap_layer,
         JsonlRecoveryStrategy::RebuildFromJsonl,
     )
+}
+
+fn open_sqlite_storage_with_recovery_after_fast_open_miss(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    write_lock_already_held: bool,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    let _write_lock = if write_lock_already_held {
+        None
+    } else {
+        Some(blocking_write_lock_with_timeout(beads_dir, lock_timeout)?)
+    };
+    open_sqlite_storage_with_recovery(beads_dir, paths, lock_timeout, bootstrap_layer)
 }
 
 fn open_sqlite_storage_with_deferred_jsonl_recovery(
@@ -2472,6 +2487,74 @@ pub fn open_storage_with_startup_config(
     cli: &CliOverrides,
     defer_jsonl_recovery: bool,
 ) -> Result<OpenStorageResult> {
+    open_storage_with_startup_config_impl(startup, cli, defer_jsonl_recovery, false)
+}
+
+/// Open storage with a preloaded startup snapshot while a caller-held write lock
+/// already serializes recovery and schema side effects.
+///
+/// # Errors
+///
+/// Returns an error if JSONL import or storage setup fails.
+pub fn open_storage_with_startup_config_under_write_lock(
+    startup: StartupConfig,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+) -> Result<OpenStorageResult> {
+    open_storage_with_startup_config_impl(startup, cli, defer_jsonl_recovery, true)
+}
+
+fn open_sqlite_storage_for_startup(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    defer_jsonl_recovery: bool,
+    read_only_fast_open: bool,
+    write_lock_already_held: bool,
+) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
+    if defer_jsonl_recovery {
+        open_sqlite_storage_with_deferred_jsonl_recovery(
+            beads_dir,
+            paths,
+            lock_timeout,
+            bootstrap_layer,
+        )
+    } else if read_only_fast_open {
+        match SqliteStorage::open_current_read_only(&paths.db_path) {
+            Ok(Some(storage)) => Ok((storage, false, None)),
+            Ok(None) => open_sqlite_storage_with_recovery_after_fast_open_miss(
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                write_lock_already_held,
+            ),
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "read-only fast open failed; falling back to normal storage open"
+                );
+                open_sqlite_storage_with_recovery_after_fast_open_miss(
+                    beads_dir,
+                    paths,
+                    lock_timeout,
+                    bootstrap_layer,
+                    write_lock_already_held,
+                )
+            }
+        }
+    } else {
+        open_sqlite_storage_with_recovery(beads_dir, paths, lock_timeout, bootstrap_layer)
+    }
+}
+
+fn open_storage_with_startup_config_impl(
+    startup: StartupConfig,
+    cli: &CliOverrides,
+    defer_jsonl_recovery: bool,
+    write_lock_already_held: bool,
+) -> Result<OpenStorageResult> {
     let StartupConfig {
         paths,
         layers: startup_layers,
@@ -2540,43 +2623,15 @@ pub fn open_storage_with_startup_config(
             pending_recovery_backup: None,
         })
     } else {
-        let (storage, auto_rebuilt, pending_recovery_backup) = if defer_jsonl_recovery {
-            open_sqlite_storage_with_deferred_jsonl_recovery(
-                &beads_dir,
-                &paths,
-                resolved_lock_timeout,
-                &merged_layer,
-            )?
-        } else if cli.read_only_fast_open {
-            match SqliteStorage::open_current_read_only(&paths.db_path) {
-                Ok(Some(storage)) => (storage, false, None),
-                Ok(None) => open_sqlite_storage_with_recovery(
-                    &beads_dir,
-                    &paths,
-                    resolved_lock_timeout,
-                    &merged_layer,
-                )?,
-                Err(err) => {
-                    tracing::debug!(
-                        error = %err,
-                        "read-only fast open failed; falling back to normal storage open"
-                    );
-                    open_sqlite_storage_with_recovery(
-                        &beads_dir,
-                        &paths,
-                        resolved_lock_timeout,
-                        &merged_layer,
-                    )?
-                }
-            }
-        } else {
-            open_sqlite_storage_with_recovery(
-                &beads_dir,
-                &paths,
-                resolved_lock_timeout,
-                &merged_layer,
-            )?
-        };
+        let (storage, auto_rebuilt, pending_recovery_backup) = open_sqlite_storage_for_startup(
+            &beads_dir,
+            &paths,
+            resolved_lock_timeout,
+            &merged_layer,
+            defer_jsonl_recovery,
+            cli.read_only_fast_open,
+            write_lock_already_held,
+        )?;
         Ok(OpenStorageResult {
             storage,
             paths,
@@ -5815,6 +5870,32 @@ routing:
 
         assert_eq!(issue.title, "Recovered from JSONL only");
         assert!(db_path.is_file(), "database should be rebuilt from JSONL");
+    }
+
+    #[test]
+    fn read_only_fast_open_miss_waits_for_write_lock_before_rebuild() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-recovered", "Recovered from JSONL only");
+        let _held_lock = crate::sync::blocking_write_lock(&beads_dir).expect("hold write lock");
+        let cli = CliOverrides {
+            lock_timeout: Some(1),
+            read_only_fast_open: true,
+            ..CliOverrides::default()
+        };
+
+        let err = open_storage_with_cli(&beads_dir, &cli)
+            .expect_err("read-only miss should wait for recovery lock");
+        let message = err.to_string();
+        assert!(
+            message.contains("Timed out after 1ms waiting for write lock"),
+            "{message}"
+        );
+        assert!(!db_path.exists(), "rebuild must not run without write lock");
     }
 
     #[test]

@@ -61,21 +61,23 @@ fn main() {
     // fsqlite can still return SQLITE_BUSY for read-only SELECTs during
     // concurrent writers, so every preopened DB command acquires the advisory
     // lock before Phase 2.
-    let write_lock =
-        if should_acquire_startup_write_lock(command_needs_write_lock, should_preopen_storage)
-            && ctx.is_initialized()
-        {
-            let lock_timeout = ctx.write_lock_timeout();
-            match ctx.beads_dir.as_deref().map(|beads_dir| {
-                beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
-            }) {
-                Some(Ok(lock)) => Some(lock),
-                Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
-                None => None,
-            }
-        } else {
-            None
-        };
+    let write_lock = if should_acquire_startup_write_lock(
+        command_needs_write_lock,
+        should_preopen_storage,
+        overrides.read_only_fast_open,
+    ) && ctx.is_initialized()
+    {
+        let lock_timeout = ctx.write_lock_timeout();
+        match ctx.beads_dir.as_deref().map(|beads_dir| {
+            beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+        }) {
+            Some(Ok(lock)) => Some(lock),
+            Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+            None => None,
+        }
+    } else {
+        None
+    };
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
@@ -572,8 +574,9 @@ const fn should_preopen_storage(
 const fn should_acquire_startup_write_lock(
     command_needs_write_lock: bool,
     should_preopen_storage: bool,
+    read_only_fast_open: bool,
 ) -> bool {
-    command_needs_write_lock || should_preopen_storage
+    should_preopen_storage || (command_needs_write_lock && !read_only_fast_open)
 }
 
 /// Determine if a command potentially mutates data and triggers auto-flush.
@@ -699,8 +702,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
-        | Commands::Query { .. }
-        | Commands::Orphans(_) => true,
+        | Commands::Query { .. } => true,
 
         Commands::Init { .. }
         | Commands::Sync(_)
@@ -711,6 +713,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Version(_)
         | Commands::Completions(_)
         | Commands::Audit { .. }
+        | Commands::Orphans(_)
         | Commands::Config { .. }
         | Commands::History(_)
         | Commands::Agents(_) => false,
@@ -1023,6 +1026,22 @@ mod tests {
     }
 
     #[test]
+    fn read_only_fast_open_skips_eager_startup_write_lock() {
+        assert!(
+            !should_acquire_startup_write_lock(true, false, true),
+            "read-only fast-open commands should not serialize at startup when no preopen is needed"
+        );
+        assert!(
+            should_acquire_startup_write_lock(true, true, true),
+            "auto-import or auto-flush preopen still requires the startup lock"
+        );
+        assert!(
+            should_acquire_startup_write_lock(true, false, false),
+            "non-fast-open DB-family commands must keep the startup lock"
+        );
+    }
+
+    #[test]
     fn help_includes_core_commands() {
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("create"));
@@ -1124,6 +1143,7 @@ mod tests {
             &["br", "schema"],
             &["br", "config", "path"],
             &["br", "history", "list"],
+            &["br", "orphans"],
         ];
 
         for argv in cases {
@@ -1136,9 +1156,9 @@ mod tests {
     }
 
     #[test]
-    fn orphans_uses_preopen_auto_import_and_write_lock() {
+    fn orphans_defers_auto_import_but_keeps_write_lock_when_initialized() {
         let command = Cli::parse_from(["br", "orphans"]).command;
-        assert!(should_auto_import(&command));
+        assert!(!should_auto_import(&command));
         assert!(needs_write_lock(&command));
     }
 
@@ -1348,9 +1368,11 @@ mod tests {
 
     #[test]
     fn preopen_storage_requires_write_lock_before_open() {
-        assert!(should_acquire_startup_write_lock(false, true));
-        assert!(should_acquire_startup_write_lock(true, false));
-        assert!(should_acquire_startup_write_lock(true, true));
-        assert!(!should_acquire_startup_write_lock(false, false));
+        assert!(should_acquire_startup_write_lock(false, true, false));
+        assert!(should_acquire_startup_write_lock(false, true, true));
+        assert!(should_acquire_startup_write_lock(true, false, false));
+        assert!(should_acquire_startup_write_lock(true, true, false));
+        assert!(!should_acquire_startup_write_lock(false, false, false));
+        assert!(!should_acquire_startup_write_lock(true, false, true));
     }
 }

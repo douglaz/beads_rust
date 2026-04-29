@@ -72,7 +72,6 @@ struct DoctorRun {
 #[derive(Debug, Clone, Default, Serialize)]
 struct LocalRepairResult {
     blocked_cache_rebuilt: bool,
-    wal_checkpoint_completed: bool,
     indexes_reindexed: bool,
     vacuumed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -149,7 +148,6 @@ enum FilesystemPathKind {
 impl LocalRepairResult {
     fn applied(&self) -> bool {
         self.blocked_cache_rebuilt
-            || self.wal_checkpoint_completed
             || self.indexes_reindexed
             || self.vacuumed
             || !self.quarantined_artifacts.is_empty()
@@ -160,9 +158,6 @@ fn local_repair_applied_actions(repair: &LocalRepairResult) -> Vec<String> {
     let mut actions = Vec::new();
     if repair.blocked_cache_rebuilt {
         actions.push("blocked_cache_rebuilt".to_string());
-    }
-    if repair.wal_checkpoint_completed {
-        actions.push("wal_checkpoint_completed".to_string());
     }
     if repair.indexes_reindexed {
         actions.push("indexes_reindexed".to_string());
@@ -799,9 +794,6 @@ fn local_repair_message(local_repair: &LocalRepairResult) -> String {
     let mut actions = Vec::new();
     if local_repair.blocked_cache_rebuilt {
         actions.push("rebuilt the stale blocked cache".to_string());
-    }
-    if local_repair.wal_checkpoint_completed {
-        actions.push("checkpointed database WAL state".to_string());
     }
     if local_repair.indexes_reindexed {
         actions.push("rebuilt all indexes via REINDEX".to_string());
@@ -3659,7 +3651,6 @@ mod tests {
     fn test_local_repair_audit_records_applied_actions_and_artifacts() {
         let repair = LocalRepairResult {
             blocked_cache_rebuilt: true,
-            wal_checkpoint_completed: false,
             indexes_reindexed: true,
             vacuumed: false,
             quarantined_artifacts: vec![".beads/.br_recovery/beads.db-shm.test".to_string()],
@@ -4392,10 +4383,6 @@ mod tests {
         };
 
         let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
-        assert!(
-            !repair.wal_checkpoint_completed,
-            "no checkpoint should be attempted for a Warn-level sidecar check"
-        );
         assert!(
             repair.quarantined_artifacts.is_empty(),
             "WAL should not be quarantined for a Warn-level sidecar check"

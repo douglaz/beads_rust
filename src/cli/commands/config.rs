@@ -510,12 +510,19 @@ enum AllowedEditor {
     Code,
     CodeInsiders,
     Codium,
+    Cursor,
+    CursorInsiders,
     Emacs,
+    EmacsClient,
     Helix,
     Hx,
+    Neovim,
+    Neovide,
+    NotepadPlusPlus,
     Mate,
     Micro,
     Nano,
+    Pico,
     Notepad,
     Subl,
     True,
@@ -533,18 +540,26 @@ impl AllowedEditor {
             .unwrap_or(program)
             .trim();
         let normalized = name.strip_suffix(".exe").unwrap_or(name);
+        let normalized = normalized.strip_suffix(".EXE").unwrap_or(normalized);
 
         match normalized {
             "code" => Ok(Self::Code),
             "code-insiders" => Ok(Self::CodeInsiders),
             "codium" => Ok(Self::Codium),
+            "cursor" => Ok(Self::Cursor),
+            "cursor-insiders" => Ok(Self::CursorInsiders),
             "emacs" => Ok(Self::Emacs),
+            "emacsclient" => Ok(Self::EmacsClient),
             "helix" => Ok(Self::Helix),
             "hx" => Ok(Self::Hx),
+            "nvim" => Ok(Self::Neovim),
+            "neovide" => Ok(Self::Neovide),
             "mate" => Ok(Self::Mate),
             "micro" => Ok(Self::Micro),
             "nano" => Ok(Self::Nano),
             "notepad" => Ok(Self::Notepad),
+            "notepad++" => Ok(Self::NotepadPlusPlus),
+            "pico" => Ok(Self::Pico),
             "subl" => Ok(Self::Subl),
             "true" => Ok(Self::True),
             "vi" => Ok(Self::Vi),
@@ -563,13 +578,20 @@ impl AllowedEditor {
             Self::Code => Command::new("code"),
             Self::CodeInsiders => Command::new("code-insiders"),
             Self::Codium => Command::new("codium"),
+            Self::Cursor => Command::new("cursor"),
+            Self::CursorInsiders => Command::new("cursor-insiders"),
             Self::Emacs => Command::new("emacs"),
+            Self::EmacsClient => Command::new("emacsclient"),
             Self::Helix => Command::new("helix"),
             Self::Hx => Command::new("hx"),
+            Self::Neovim => Command::new("nvim"),
+            Self::Neovide => Command::new("neovide"),
             Self::Mate => Command::new("mate"),
             Self::Micro => Command::new("micro"),
             Self::Nano => Command::new("nano"),
             Self::Notepad => Command::new("notepad"),
+            Self::NotepadPlusPlus => Command::new("notepad++"),
+            Self::Pico => Command::new("pico"),
             Self::Subl => Command::new("subl"),
             Self::True => Command::new("true"),
             Self::Vi => Command::new("vi"),
@@ -584,13 +606,20 @@ const ALLOWED_EDITORS: &[&str] = &[
     "code",
     "code-insiders",
     "codium",
+    "cursor",
+    "cursor-insiders",
     "emacs",
+    "emacsclient",
     "helix",
     "hx",
+    "neovide",
+    "nvim",
     "mate",
     "micro",
     "nano",
     "notepad",
+    "notepad++",
+    "pico",
     "subl",
     "true",
     "vi",
@@ -1284,6 +1313,30 @@ mod tests {
         assert_eq!(
             AllowedEditor::from_program("/usr/bin/vim").unwrap(),
             AllowedEditor::Vim
+        );
+    }
+
+    #[test]
+    fn test_allowed_editor_accepts_common_visual_editor_aliases() {
+        assert_eq!(
+            AllowedEditor::from_program("/opt/homebrew/bin/nvim").unwrap(),
+            AllowedEditor::Neovim
+        );
+        assert_eq!(
+            AllowedEditor::from_program("emacsclient").unwrap(),
+            AllowedEditor::EmacsClient
+        );
+        assert_eq!(
+            AllowedEditor::from_program("cursor").unwrap(),
+            AllowedEditor::Cursor
+        );
+    }
+
+    #[test]
+    fn test_allowed_editor_accepts_windows_exe_suffix() {
+        assert_eq!(
+            AllowedEditor::from_program("notepad.EXE").unwrap(),
+            AllowedEditor::Notepad
         );
     }
 

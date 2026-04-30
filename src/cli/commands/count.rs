@@ -9,6 +9,8 @@ use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+const LABEL_COUNT_SMALL_RESULT_THRESHOLD: usize = 64;
+
 #[derive(Serialize)]
 struct CountOutput {
     count: usize,
@@ -298,6 +300,11 @@ fn group_counts_for_filters(
 ) -> Result<(usize, Vec<CountGroup>)> {
     if by == CountBy::Label {
         let total = storage.count_issues_with_filters(filters)?;
+        if total <= LABEL_COUNT_SMALL_RESULT_THRESHOLD {
+            let issues = storage.list_issues(filters)?;
+            let groups = group_counts(storage, &issues, by)?;
+            return Ok((total, groups));
+        }
         let groups = storage
             .count_labels_with_filters(filters)?
             .into_iter()

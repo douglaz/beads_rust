@@ -108,8 +108,11 @@ fn open_storage_for_graph(
         && !args.all
     {
         let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-        let routed_write_lock =
-            acquire_routed_workspace_write_lock(&route.beads_dir, route.is_external)?;
+        let routed_write_lock = acquire_routed_workspace_write_lock(
+            &route.beads_dir,
+            route.is_external,
+            cli.lock_timeout,
+        )?;
         let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, cli)?;
         auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
         return Ok((storage_ctx, routed_write_lock));
@@ -140,7 +143,11 @@ pub fn execute_with_storage_ctx(
         if route.is_external {
             let mut route_cli = cli.clone();
             route_cli.db = None;
-            let _routed_write_lock = acquire_routed_workspace_write_lock(&route.beads_dir, true)?;
+            let _routed_write_lock = acquire_routed_workspace_write_lock(
+                &route.beads_dir,
+                true,
+                route_cli.lock_timeout,
+            )?;
             let mut routed_storage_ctx =
                 config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
             auto_import_storage_ctx_if_stale(&mut routed_storage_ctx, &route_cli)?;

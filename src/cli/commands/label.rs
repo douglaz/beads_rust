@@ -358,8 +358,11 @@ fn execute_label_list_command(
     if let Some(input) = &args.issue {
         let route = config::routing::resolve_route(input, beads_dir)?;
         let route_cli = routed_cli_for_batch(cli, route.is_external);
-        let _routed_write_lock =
-            acquire_routed_workspace_write_lock(&route.beads_dir, route.is_external)?;
+        let _routed_write_lock = acquire_routed_workspace_write_lock(
+            &route.beads_dir,
+            route.is_external,
+            route_cli.lock_timeout,
+        )?;
         let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
         auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
         let config_layer = storage_ctx.load_config(&route_cli)?;
@@ -385,8 +388,11 @@ fn prepare_label_routes(
 
     for batch in routed_batches {
         let batch_cli = routed_cli_for_batch(cli, batch.is_external);
-        let routed_write_lock =
-            acquire_routed_workspace_write_lock(&batch.beads_dir, batch.is_external)?;
+        let routed_write_lock = acquire_routed_workspace_write_lock(
+            &batch.beads_dir,
+            batch.is_external,
+            batch_cli.lock_timeout,
+        )?;
         let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
         auto_import_storage_ctx_if_stale(&mut storage_ctx, &batch_cli)?;
         let config_layer = storage_ctx.load_config(&batch_cli)?;

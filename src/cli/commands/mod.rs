@@ -6,7 +6,7 @@ use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::sync::auto_import_if_stale;
 use crate::util::id::IdResolver;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::Path;
 
 pub mod agents;
@@ -331,34 +331,13 @@ impl RoutedWorkspaceWriteLock {
 pub(super) fn acquire_routed_workspace_write_lock(
     beads_dir: &Path,
     is_external: bool,
+    lock_timeout_ms: Option<u64>,
 ) -> crate::Result<RoutedWorkspaceWriteLock> {
     if !is_external {
         return Ok(RoutedWorkspaceWriteLock::local());
     }
 
-    let lock_path = beads_dir.join(".write.lock");
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|err| {
-            BeadsError::Config(format!(
-                "Failed to open routed target write lock at {}: {err}",
-                lock_path.display()
-            ))
-        })?;
-
-    #[allow(clippy::incompatible_msrv)]
-    file.try_lock().map_err(|err| {
-        BeadsError::Config(format!(
-            "Routed external workspace is busy: could not acquire target write lock at {}: {err}. \
-             Retry after the target workspace command completes.",
-            lock_path.display()
-        ))
-    })?;
-
+    let file = crate::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout_ms)?;
     Ok(RoutedWorkspaceWriteLock { _lock: Some(file) })
 }
 
@@ -445,9 +424,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
-        rebuild_blocked_cache_after_partial_mutation, retry_mutation_with_jsonl_recovery,
-        should_attempt_mutation_jsonl_recovery,
+        acquire_routed_workspace_write_lock, finalize_batched_blocked_cache_refresh,
+        preserve_blocked_cache_on_error, rebuild_blocked_cache_after_partial_mutation,
+        retry_mutation_with_jsonl_recovery, should_attempt_mutation_jsonl_recovery,
     };
     use crate::config::{CliOverrides, OpenStorageResult, open_storage_with_cli};
     use crate::error::BeadsError;
@@ -490,6 +469,25 @@ mod tests {
         let storage_ctx =
             open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage ctx");
         (temp, storage_ctx)
+    }
+
+    #[test]
+    fn routed_workspace_write_lock_respects_external_timeout() -> std::result::Result<(), String> {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let _held = crate::sync::blocking_write_lock(&beads_dir).expect("hold write lock");
+        let result = acquire_routed_workspace_write_lock(&beads_dir, true, Some(1));
+        let err = result.err().ok_or_else(|| {
+            "external routed lock should wait for and time out on held lock".to_string()
+        })?;
+        let message = err.to_string();
+        assert!(
+            message.contains("Timed out after 1ms waiting for write lock"),
+            "{message}"
+        );
+        Ok(())
     }
 
     #[test]

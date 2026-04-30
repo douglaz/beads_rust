@@ -210,7 +210,8 @@ fn execute_defer_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<DeferResult> {
-    let _routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
+    let _routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
@@ -462,7 +463,8 @@ fn execute_undefer_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<UndeferResult> {
-    let _routed_write_lock = acquire_routed_workspace_write_lock(beads_dir, auto_flush_external)?;
+    let _routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;

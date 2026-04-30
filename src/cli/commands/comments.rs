@@ -137,8 +137,11 @@ fn open_routed_storage_for_input(
     if route.is_external {
         route_cli.db = None;
     }
-    let routed_write_lock =
-        acquire_routed_workspace_write_lock(&route.beads_dir, route.is_external)?;
+    let routed_write_lock = acquire_routed_workspace_write_lock(
+        &route.beads_dir,
+        route.is_external,
+        route_cli.lock_timeout,
+    )?;
     let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
     Ok((storage_ctx, route_cli, route.is_external, routed_write_lock))

@@ -3111,13 +3111,12 @@ impl SqliteStorage {
         }
 
         sql.push_str(
-            " AND (title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\')",
+            " AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)",
         );
-        let escaped = escape_like_pattern(trimmed);
-        let pattern = format!("%{escaped}%");
-        params.push(SqliteValue::from(pattern.as_str()));
-        params.push(SqliteValue::from(pattern.as_str()));
-        params.push(SqliteValue::from(pattern));
+        let needle = trimmed.to_ascii_lowercase();
+        params.push(SqliteValue::from(needle.as_str()));
+        params.push(SqliteValue::from(needle.as_str()));
+        params.push(SqliteValue::from(needle));
 
         if let Some(ref sort_field) = filters.sort {
             let order = if filters.reverse { "DESC" } else { "ASC" };

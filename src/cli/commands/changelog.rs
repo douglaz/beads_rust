@@ -66,11 +66,8 @@ enum ChangelogRenderMode {
 ///
 /// # Errors
 ///
-/// Returns an error if config loading, git lookup, or storage access fails.
-///
-/// # Panics
-///
-/// Panics if JSON serialization of the output fails (should never happen with valid data).
+/// Returns an error if config loading, git lookup, storage access, or output
+/// serialization fails.
 pub fn execute(
     args: &ChangelogArgs,
     json: bool,
@@ -86,11 +83,8 @@ pub fn execute(
 ///
 /// # Errors
 ///
-/// Returns an error if git lookup or storage access fails.
-///
-/// # Panics
-///
-/// Panics if JSON serialization of the output fails (should never happen with valid data).
+/// Returns an error if git lookup, storage access, or output serialization
+/// fails.
 pub fn execute_with_storage_ctx(
     args: &ChangelogArgs,
     json: bool,
@@ -173,10 +167,7 @@ pub fn execute_with_storage_ctx(
             } else {
                 // Robot mode requests JSON even though the shared output context only
                 // sees global flags.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&output).expect("Failed to serialize JSON output")
-                );
+                println!("{}", serde_json::to_string_pretty(&output)?);
             }
         }
         ChangelogRenderMode::Toon => {

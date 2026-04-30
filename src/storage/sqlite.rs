@@ -7697,10 +7697,11 @@ pub enum ReadySortPolicy {
 }
 
 fn sort_ready_hybrid(issues: &mut [Issue]) {
-    issues.sort_by(|left, right| {
+    issues.sort_unstable_by(|left, right| {
         ready_hybrid_bucket(left.priority)
             .cmp(&ready_hybrid_bucket(right.priority))
             .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.id.cmp(&right.id))
     });
 }
 
@@ -7712,10 +7713,11 @@ fn should_sort_list_default_in_rust(filters: &ListFilters) -> bool {
 }
 
 fn sort_list_default(issues: &mut [Issue]) {
-    issues.sort_by(|left, right| {
+    issues.sort_unstable_by(|left, right| {
         left.priority
             .cmp(&right.priority)
             .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.id.cmp(&right.id))
     });
 }
 

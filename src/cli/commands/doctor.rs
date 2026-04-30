@@ -2089,24 +2089,6 @@ fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
     ));
 }
 
-fn check_live_issue_write_probe(db_path: &Path, checks: &mut Vec<CheckResult>) {
-    match Connection::open(db_path.to_string_lossy().into_owned()) {
-        Ok(conn) => {
-            let _ = conn.execute("PRAGMA busy_timeout=0");
-            check_issue_write_probe(&conn, checks);
-        }
-        Err(err) => push_check(
-            checks,
-            "db.write_probe",
-            CheckStatus::Error,
-            Some(format!(
-                "Failed to open live DB for rollback-only write probe: {err}"
-            )),
-            Some(serde_json::json!({ "path": db_path.display().to_string() })),
-        ),
-    }
-}
-
 fn sqlite_cli_integrity_messages(db_path: &Path) -> Result<Vec<String>> {
     let output = Command::new("sqlite3")
         .arg(db_path)
@@ -3015,10 +2997,10 @@ fn inspect_existing_doctor_database(
             );
         }
         check_sync_metadata(&conn, snapshot_db_path, jsonl_path, checks);
+        check_issue_write_probe(&conn, checks);
         Ok(())
     }) {
         Ok(()) => {
-            check_live_issue_write_probe(db_path, checks);
             check_sqlite_cli_integrity(db_path, checks);
         }
         Err(err) => {
@@ -4467,7 +4449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inspect_existing_doctor_database_uses_live_write_probe() {
+    fn test_inspect_existing_doctor_database_uses_snapshot_write_probe() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
@@ -4488,13 +4470,13 @@ mod tests {
 
         let check = find_check(&checks, "db.write_probe").expect("check present");
         assert!(
-            matches!(check.status, CheckStatus::Warn),
-            "unexpected live write probe status: {:?}",
+            matches!(check.status, CheckStatus::Ok),
+            "unexpected snapshot write probe status: {:?}",
             check.status
         );
         assert!(
             check.message.as_deref().is_some_and(|message| {
-                message.contains("Failed to begin rollback-only write probe")
+                message.contains("Rollback-only issue write succeeded for bd-probe")
             }),
             "unexpected check message: {:?}",
             check.message

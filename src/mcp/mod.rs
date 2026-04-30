@@ -86,24 +86,62 @@ fn dirty_auto_flush_incomplete_error(remaining_dirty: usize) -> BeadsError {
 ///
 /// Storage is intentionally **not** held open: `fsqlite::Connection` uses
 /// `Rc` internally and therefore cannot satisfy `Send + Sync`.  Each
-/// handler call opens a fresh connection via [`open_storage`].
+/// handler call opens a fresh connection via [`open_read_storage`] or
+/// [`open_storage`] depending on whether the operation may mutate state.
 pub struct BeadsState {
     pub db_path: PathBuf,
     pub beads_dir: PathBuf,
     pub jsonl_path: PathBuf,
+    pub write_lock_timeout_ms: Option<u64>,
     pub allow_external_jsonl: bool,
     pub actor: String,
     pub issue_prefix: Option<String>,
 }
 
 impl BeadsState {
-    /// Open a fresh `SqliteStorage` connection.
+    /// Open a fresh writable `SqliteStorage` connection.
     ///
     /// # Errors
     ///
     /// Returns an error if the database file cannot be opened.
     pub fn open_storage(&self) -> crate::Result<SqliteStorage> {
         SqliteStorage::open(&self.db_path)
+    }
+
+    /// Open a fresh read-oriented storage connection.
+    ///
+    /// Current-schema databases open read-only to avoid schema, recovery, or
+    /// metadata writes for MCP resources, prompts, and read-only tools. If the
+    /// read-only fast path is unavailable, fall back to normal storage open
+    /// while holding the workspace write lock because that path may repair or
+    /// initialize database state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if storage cannot be opened.
+    pub fn open_read_storage(&self) -> crate::Result<SqliteStorage> {
+        match SqliteStorage::open_current_read_only(&self.db_path) {
+            Ok(Some(storage)) => Ok(storage),
+            Ok(None) => {
+                let _write_lock = crate::sync::blocking_write_lock_with_timeout(
+                    &self.beads_dir,
+                    self.write_lock_timeout_ms,
+                )?;
+                SqliteStorage::open(&self.db_path)
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    db_path = %self.db_path.display(),
+                    "MCP read-only storage open failed; falling back to locked writable open"
+                );
+                let _write_lock = crate::sync::blocking_write_lock_with_timeout(
+                    &self.beads_dir,
+                    self.write_lock_timeout_ms,
+                )?;
+                SqliteStorage::open(&self.db_path)
+            }
+        }
     }
 
     /// Execute a mutating closure against the storage, acquiring the cross-process
@@ -113,7 +151,11 @@ impl BeadsState {
         F: FnMut(&mut SqliteStorage) -> fastmcp_rust::McpResult<R>,
     {
         // 1. Acquire the cross-process write lock.
-        let _write_lock = crate::sync::blocking_write_lock(&self.beads_dir).map_err(to_mcp)?;
+        let _write_lock = crate::sync::blocking_write_lock_with_timeout(
+            &self.beads_dir,
+            self.write_lock_timeout_ms,
+        )
+        .map_err(to_mcp)?;
 
         // 2. Acquire the sync lock before committing a mutation. MCP writes
         // should not report success when JSONL export is known to be unguarded
@@ -214,10 +256,27 @@ mod tests {
             db_path,
             beads_dir,
             jsonl_path,
+            write_lock_timeout_ms: Some(25),
             allow_external_jsonl: false,
             actor: "mcp-test".to_string(),
             issue_prefix: Some("br".to_string()),
         }
+    }
+
+    #[test]
+    fn open_read_storage_uses_read_only_fast_path_without_write_lock() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let state = test_state(&temp, jsonl_path);
+        let _held_lock =
+            crate::sync::blocking_write_lock(&state.beads_dir).expect("hold write lock");
+
+        let storage = state
+            .open_read_storage()
+            .expect("current schema read storage should not wait for write lock");
+
+        assert_eq!(storage.count_all_issues().unwrap(), 0);
     }
 
     #[test]
@@ -347,7 +406,16 @@ pub struct ServeArgs {
 /// cannot be opened.
 pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(overrides)?;
-    let res = config::open_storage_with_cli(&beads_dir, overrides)?;
+    let startup = config::load_startup_config_with_paths(&beads_dir, overrides.db.as_ref())?;
+    let mut startup_layers = startup.layers.clone();
+    startup_layers.push(overrides.as_layer());
+    let merged_layer = config::ConfigLayer::merge_layers(&startup_layers);
+    let lock_timeout = overrides
+        .lock_timeout
+        .or_else(|| config::lock_timeout_from_layer(&merged_layer))
+        .or(Some(crate::sync::default_write_lock_timeout_ms()));
+    let write_lock = crate::sync::blocking_write_lock_with_timeout(&beads_dir, lock_timeout)?;
+    let res = config::open_storage_with_startup_config_under_write_lock(startup, overrides, false)?;
 
     let prefix = res.storage.get_config("issue_prefix")?;
     let db_path = res.paths.db_path.clone();
@@ -357,11 +425,13 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
 
     // Eagerly drop the bootstrap connection; handlers will open their own.
     drop(res.storage);
+    drop(write_lock);
 
     let state = std::sync::Arc::new(BeadsState {
         db_path,
         beads_dir,
         jsonl_path,
+        write_lock_timeout_ms: lock_timeout,
         allow_external_jsonl,
         actor: args.actor.clone(),
         issue_prefix: prefix,

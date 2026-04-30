@@ -83,7 +83,7 @@ impl ResourceHandler for ProjectInfoResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
 
         let config = read_project_config(&storage)?;
         let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
@@ -160,7 +160,7 @@ impl ResourceHandler for IssueResource {
             McpError::invalid_params("'id' parameter is required in the URI template")
         })?;
 
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
 
         let maybe_details = storage
             .get_issue_details(id, true, true, 20)
@@ -340,7 +340,7 @@ impl ResourceHandler for LabelsResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
         let labels = storage.get_unique_labels_with_counts().map_err(to_mcp)?;
 
         let result = json!({
@@ -389,7 +389,7 @@ impl ResourceHandler for ReadyIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
         let ready = storage
             .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
             .map_err(to_mcp)?;
@@ -446,7 +446,7 @@ impl ResourceHandler for BlockedIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
         let blocked = storage.get_blocked_issues().map_err(to_mcp)?;
 
         let result = json!({
@@ -500,7 +500,7 @@ impl ResourceHandler for InProgressResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
         let filters = ListFilters {
             statuses: Some(vec![Status::InProgress]),
             include_closed: false,
@@ -562,7 +562,7 @@ impl ResourceHandler for EventsResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
         let events = storage.get_all_events(50).map_err(to_mcp)?;
 
         let result = json!({
@@ -618,7 +618,7 @@ impl ResourceHandler for DeferredIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
         let filters = ListFilters {
             statuses: Some(vec![Status::Deferred]),
             include_deferred: true,
@@ -806,7 +806,7 @@ impl ResourceHandler for GraphHealthResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
         let health = compute_graph_health(&storage)?;
 
         Ok(vec![ResourceContent {
@@ -905,7 +905,7 @@ impl ResourceHandler for BottlenecksResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_storage().map_err(to_mcp)?;
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
         let bottlenecks = compute_bottlenecks(&storage)?;
 
         Ok(vec![ResourceContent {

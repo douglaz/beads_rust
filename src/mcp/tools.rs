@@ -402,7 +402,7 @@ fn storage_read_warning(operation: &str, err: &crate::BeadsError) -> serde_json:
 }
 
 fn open(state: &BeadsState) -> McpResult<SqliteStorage> {
-    state.open_storage().map_err(beads_to_mcp)
+    state.open_read_storage().map_err(beads_to_mcp)
 }
 
 // ---------------------------------------------------------------------------
@@ -2225,6 +2225,7 @@ mod tests {
             db_path,
             beads_dir: beads_dir.clone(),
             jsonl_path: beads_dir.join("issues.jsonl"),
+            write_lock_timeout_ms: Some(25),
             allow_external_jsonl: false,
             actor: "mcp-test".to_string(),
             issue_prefix: Some("br".to_string()),

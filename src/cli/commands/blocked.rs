@@ -97,6 +97,15 @@ fn execute_inner(
         args.robot,
     );
     let quiet = overrides.quiet.unwrap_or(false);
+    let fast_ctx = OutputContext::from_output_format(output_format, quiet, true);
+    if matches!(output_format, OutputFormat::Json | OutputFormat::Toon)
+        && !storage.may_have_blocked_command_results()?
+    {
+        let blocked_issues = Vec::new();
+        output_structured_blocked(args, output_format, &fast_ctx, &blocked_issues);
+        return Ok(());
+    }
+
     let has_external_dependencies = storage.has_external_dependencies(true)?;
     let needs_config = has_external_dependencies
         || matches!(output_format, OutputFormat::Text | OutputFormat::Csv);
@@ -218,13 +227,8 @@ fn execute_inner(
     }
 
     match output_format {
-        OutputFormat::Json => {
-            let output = blocked_issue_outputs(&blocked_issues);
-            ctx.json_pretty(&output);
-        }
-        OutputFormat::Toon => {
-            let output = blocked_issue_outputs(&blocked_issues);
-            ctx.toon_with_stats(&output, args.stats);
+        OutputFormat::Json | OutputFormat::Toon => {
+            output_structured_blocked(args, output_format, &ctx, &blocked_issues);
         }
         OutputFormat::Text | OutputFormat::Csv => {
             let max_width = if args.wrap { ctx.width() } else { 0 };
@@ -245,6 +249,20 @@ fn include_in_blocked_list(status: &crate::model::Status) -> bool {
 
 fn blocked_issue_outputs(blocked_issues: &[BlockedIssue]) -> Vec<BlockedIssueOutput> {
     blocked_issues.iter().map(blocked_issue_output).collect()
+}
+
+fn output_structured_blocked(
+    args: &BlockedArgs,
+    output_format: OutputFormat,
+    ctx: &OutputContext,
+    blocked_issues: &[BlockedIssue],
+) {
+    let output = blocked_issue_outputs(blocked_issues);
+    match output_format {
+        OutputFormat::Json => ctx.json_pretty(&output),
+        OutputFormat::Toon => ctx.toon_with_stats(&output, args.stats),
+        OutputFormat::Text | OutputFormat::Csv => {}
+    }
 }
 
 fn blocked_issue_output(bi: &BlockedIssue) -> BlockedIssueOutput {

@@ -4485,6 +4485,60 @@ impl SqliteStorage {
         Ok(blocked_issues)
     }
 
+    /// Return true unless the blocked command can safely emit an empty result.
+    ///
+    /// The false result is deliberately narrow: the blocked cache must be fresh,
+    /// there must be no cached local blockers, and there must be no external
+    /// blocking dependencies that could create command-only blocked rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocked-cache stale marker cannot be read.
+    pub fn may_have_blocked_command_results(&self) -> Result<bool> {
+        if self.blocked_cache_marked_stale()? {
+            return Ok(true);
+        }
+
+        let rows = match self.conn.query(
+            "SELECT
+                 EXISTS(SELECT 1 FROM blocked_issues_cache LIMIT 1),
+                 EXISTS(
+                     SELECT 1
+                     FROM dependencies INDEXED BY idx_dependencies_depends_on
+                     WHERE depends_on_id >= 'external:'
+                       AND depends_on_id < 'external;'
+                       AND type IN ('blocks', 'conditional-blocks', 'waits-for')
+                     LIMIT 1
+                 ),
+                 EXISTS(
+                     SELECT 1
+                     FROM dependencies INDEXED BY idx_dependencies_issue
+                     WHERE issue_id >= 'external:'
+                       AND issue_id < 'external;'
+                       AND type = 'parent-child'
+                     LIMIT 1
+                 )",
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "Blocked command candidate probe failed; falling back to full query"
+                );
+                return Ok(true);
+            }
+        };
+
+        let Some(row) = rows.first() else {
+            return Ok(true);
+        };
+        Ok(
+            row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
+                || row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
+                || row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
+        )
+    }
+
     /// Check if the project has any external dependencies.
     ///
     /// # Errors
@@ -4496,14 +4550,14 @@ impl SqliteStorage {
         // default binary TEXT collation while staying index-friendly.
         let target_sql = if blocking_only {
             "SELECT 1
-             FROM dependencies
+             FROM dependencies INDEXED BY idx_dependencies_depends_on
              WHERE depends_on_id >= 'external:'
                AND depends_on_id < 'external;'
                AND type IN ('blocks', 'conditional-blocks', 'waits-for')
              LIMIT 1"
         } else {
             "SELECT 1
-             FROM dependencies
+             FROM dependencies INDEXED BY idx_dependencies_depends_on
              WHERE depends_on_id >= 'external:'
                AND depends_on_id < 'external;'
              LIMIT 1"
@@ -4514,7 +4568,7 @@ impl SqliteStorage {
         }
 
         let parent_sql = "SELECT 1
-             FROM dependencies
+             FROM dependencies INDEXED BY idx_dependencies_issue
              WHERE issue_id >= 'external:'
                AND issue_id < 'external;'
                AND type = 'parent-child'
@@ -9511,6 +9565,41 @@ mod tests {
 
         assert!(storage.has_external_dependencies(true).unwrap());
         assert!(storage.has_external_dependencies(false).unwrap());
+    }
+
+    #[test]
+    fn test_blocked_command_candidate_probe_empty_cache_and_no_external_deps_is_false() {
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        assert!(!storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_blocked_command_candidate_probe_detects_local_blocked_cache() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 4, 0, 0, 0).unwrap();
+        let blocker = make_issue("bd-blocker", "Blocker", Status::Open, 2, None, t1, None);
+        let blocked = make_issue("bd-blocked", "Blocked", Status::Open, 2, None, t1, None);
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency("bd-blocked", "bd-blocker", "blocks", "tester")
+            .unwrap();
+
+        assert!(storage.may_have_blocked_command_results().unwrap());
+    }
+
+    #[test]
+    fn test_blocked_command_candidate_probe_detects_external_blockers() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 5, 0, 0, 0).unwrap();
+        let issue = make_issue("bd-p1", "Parent", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_dependency("bd-p1", "external:extproj:capability", "blocks", "tester")
+            .unwrap();
+
+        assert!(storage.may_have_blocked_command_results().unwrap());
     }
 
     #[test]

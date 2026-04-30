@@ -534,13 +534,7 @@ enum AllowedEditor {
 
 impl AllowedEditor {
     fn from_program(program: &str) -> Result<Self> {
-        let name = Path::new(program)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(program)
-            .trim();
-        let normalized = name.strip_suffix(".exe").unwrap_or(name);
-        let normalized = normalized.strip_suffix(".EXE").unwrap_or(normalized);
+        let normalized = strip_windows_exe_suffix(editor_program_name(program));
 
         match normalized {
             "code" => Ok(Self::Code),
@@ -599,6 +593,27 @@ impl AllowedEditor {
             Self::Vscodium => Command::new("vscodium"),
             Self::Zed => Command::new("zed"),
         }
+    }
+}
+
+fn editor_program_name(program: &str) -> &str {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .trim();
+    name.rsplit(['/', '\\']).next().unwrap_or(name).trim()
+}
+
+fn strip_windows_exe_suffix(name: &str) -> &str {
+    let suffix_start = name.len().saturating_sub(4);
+    let Some(suffix) = name.get(suffix_start..) else {
+        return name;
+    };
+    if suffix.eq_ignore_ascii_case(".exe") {
+        name.get(..suffix_start).unwrap_or(name)
+    } else {
+        name
     }
 }
 
@@ -684,14 +699,14 @@ fn set_config_value(
     overrides: &CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let (key, value) = match args.len() {
-        1 => args[0]
+    let (key, value) = match args {
+        [arg] => arg
             .split_once('=')
             .ok_or_else(|| crate::error::BeadsError::Validation {
                 field: "config".to_string(),
                 reason: "Invalid format. Use: --set key=value or --set key value".to_string(),
             })?,
-        2 => (args[0].as_str(), args[1].as_str()),
+        [key, value] => (key.as_str(), value.as_str()),
         _ => {
             return Err(crate::error::BeadsError::Validation {
                 field: "config".to_string(),
@@ -804,23 +819,23 @@ fn parse_scalar_config_value(value: &str) -> serde_yml::Value {
 }
 
 fn set_yaml_value(config: &mut serde_yml::Value, parts: &[&str], value: serde_yml::Value) {
-    if parts.is_empty() {
+    let Some((part, remaining_parts)) = parts.split_first() else {
         return;
-    }
+    };
 
     if !matches!(config, serde_yml::Value::Mapping(_)) {
         *config = serde_yml::Value::Mapping(serde_yml::Mapping::default());
     }
 
-    if parts.len() == 1 {
+    if remaining_parts.is_empty() {
         if let serde_yml::Value::Mapping(map) = config {
-            map.insert(serde_yml::Value::String(parts[0].to_string()), value);
+            map.insert(serde_yml::Value::String((*part).to_string()), value);
         }
         return;
     }
 
     if let serde_yml::Value::Mapping(map) = config {
-        let key = serde_yml::Value::String(parts[0].to_string());
+        let key = serde_yml::Value::String((*part).to_string());
         let entry = map
             .entry(key)
             .or_insert_with(|| serde_yml::Value::Mapping(serde_yml::Mapping::default()));
@@ -829,22 +844,20 @@ fn set_yaml_value(config: &mut serde_yml::Value, parts: &[&str], value: serde_ym
             *entry = serde_yml::Value::Mapping(serde_yml::Mapping::default());
         }
 
-        set_yaml_value(entry, &parts[1..], value);
+        set_yaml_value(entry, remaining_parts, value);
     }
 }
 
 fn get_yaml_value(value: &serde_yml::Value, parts: &[&str]) -> Option<String> {
-    if parts.is_empty() {
-        return None;
-    }
+    let (part, remaining_parts) = parts.split_first()?;
 
     if let serde_yml::Value::Mapping(map) = value {
-        let key = serde_yml::Value::String(parts[0].to_string());
+        let key = serde_yml::Value::String((*part).to_string());
         let child = map.get(&key)?;
-        if parts.len() == 1 {
+        if remaining_parts.is_empty() {
             return yaml_value_to_string(child);
         }
-        return get_yaml_value(child, &parts[1..]);
+        return get_yaml_value(child, remaining_parts);
     }
 
     None
@@ -1015,19 +1028,19 @@ fn delete_from_yaml(value: &mut serde_yml::Value, key: &str) -> bool {
 }
 
 fn delete_nested(value: &mut serde_yml::Value, path: &[&str]) -> bool {
-    if path.is_empty() {
+    let Some((part, remaining_path)) = path.split_first() else {
         return false;
-    }
+    };
 
     if let serde_yml::Value::Mapping(map) = value {
-        let key = serde_yml::Value::String(path[0].to_string());
+        let key = serde_yml::Value::String((*part).to_string());
 
-        if path.len() == 1 {
+        if remaining_path.is_empty() {
             return map.remove(&key).is_some();
         }
 
         if let Some(child) = map.get_mut(&key) {
-            return delete_nested(child, &path[1..]);
+            return delete_nested(child, remaining_path);
         }
     }
     false
@@ -1230,8 +1243,9 @@ fn output_layer(layer: &ConfigLayer, source: ConfigSource, _json_mode: bool, ctx
             println!("  (empty)");
         } else {
             for key in all_keys {
-                let value = layer.get(key).unwrap();
-                println!("  {key}: {value}");
+                if let Some(value) = layer.get(key) {
+                    println!("  {key}: {value}");
+                }
             }
         }
     }
@@ -1289,9 +1303,7 @@ mod tests {
     fn test_nested_key_parsing() {
         // Test the key parsing logic - "display.color" should have 2 parts
         let parts: Vec<&str> = "display.color".split('.').collect();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], "display");
-        assert_eq!(parts[1], "color");
+        assert_eq!(parts.as_slice(), ["display", "color"]);
     }
 
     #[test]
@@ -1336,6 +1348,10 @@ mod tests {
     fn test_allowed_editor_accepts_windows_exe_suffix() {
         assert_eq!(
             AllowedEditor::from_program("notepad.EXE").unwrap(),
+            AllowedEditor::Notepad
+        );
+        assert_eq!(
+            AllowedEditor::from_program(r"C:\Windows\System32\notepad.ExE").unwrap(),
             AllowedEditor::Notepad
         );
     }

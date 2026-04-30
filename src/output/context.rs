@@ -103,10 +103,11 @@ fn sanitize_toon_value(value: &mut JsonValue) {
 }
 
 fn sanitize_toon_string(value: &str) -> Cow<'_, str> {
-    if value
-        .chars()
-        .all(|ch| matches!(ch, '\n' | '\t') || !ch.is_control())
-    {
+    if ascii_toon_string_is_clean(value).unwrap_or_else(|| {
+        value
+            .chars()
+            .all(|ch| matches!(ch, '\n' | '\t') || !ch.is_control())
+    }) {
         return Cow::Borrowed(value);
     }
 
@@ -123,6 +124,19 @@ fn sanitize_toon_string(value: &str) -> Cow<'_, str> {
     }
 
     Cow::Owned(escaped)
+}
+
+fn ascii_toon_string_is_clean(value: &str) -> Option<bool> {
+    let mut saw_non_ascii = false;
+    for byte in value.bytes() {
+        match byte {
+            b'\n' | b'\t' => {}
+            0x00..=0x1f | 0x7f => return Some(false),
+            0x80..=0xff => saw_non_ascii = true,
+            _ => {}
+        }
+    }
+    (!saw_non_ascii).then_some(true)
 }
 
 impl OutputContext {

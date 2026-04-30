@@ -384,20 +384,20 @@ fn main() {
             }
         }
         Commands::Query { command } => commands::query::execute(&command, &overrides, &output_ctx),
-        Commands::Graph(args) => storage_result.as_ref().map_or_else(
-            || commands::graph::execute(&args, &overrides, &output_ctx),
-            |res| {
+        Commands::Graph(args) => {
+            if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
+            {
                 commands::graph::execute_with_storage_ctx(
                     &args,
                     &overrides,
                     &output_ctx,
-                    ctx.beads_dir
-                        .as_deref()
-                        .expect("preopened graph storage should have a beads dir"),
+                    beads_dir,
                     res,
                 )
-            },
-        ),
+            } else {
+                commands::graph::execute(&args, &overrides, &output_ctx)
+            }
+        }
         Commands::Agents(args) => {
             let agents_args = commands::agents::AgentsArgs {
                 add: args.add,

@@ -7834,13 +7834,11 @@ fn query_external_project_capabilities(
     db_path: &Path,
     capabilities: &HashSet<String>,
 ) -> Result<HashSet<String>> {
-    const SQLITE_VAR_LIMIT: usize = 900;
-
     if capabilities.is_empty() {
         return Ok(HashSet::new());
     }
 
-    let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+    let conn = open_existing_read_only_connection(db_path)?;
     let labels: Vec<String> = capabilities
         .iter()
         .map(|cap| format!("provides:{cap}"))
@@ -7923,6 +7921,21 @@ fn query_external_project_capabilities(
     // Explicitly close the connection to avoid fsqlite drop_close warnings.
     let _ = conn.close();
     Ok(satisfied)
+}
+
+fn open_existing_read_only_connection(path: &Path) -> Result<Connection> {
+    if !path.is_file() {
+        return Err(BeadsError::Config(format!(
+            "external project database not found: {}",
+            path.display()
+        )));
+    }
+
+    open_with_flags(
+        path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(Into::into)
 }
 
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
@@ -10878,6 +10891,27 @@ mod tests {
 
         assert!(satisfied.contains("closed-cap"));
         assert!(!satisfied.contains("deleted-cap"));
+    }
+
+    #[test]
+    fn test_external_project_capability_probe_does_not_create_missing_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("missing-external.db");
+        let capabilities = HashSet::from(["capability".to_string()]);
+
+        let error = query_external_project_capabilities(&db_path, &capabilities)
+            .expect_err("missing external database should be an unsatisfied dependency");
+
+        assert!(
+            error
+                .to_string()
+                .contains("external project database not found"),
+            "{error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "read-only external dependency probe must not create missing DB files"
+        );
     }
 
     #[test]

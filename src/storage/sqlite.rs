@@ -5752,15 +5752,11 @@ impl SqliteStorage {
             .query("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
         let dependency_rows = self
             .conn
-            .query("SELECT issue_id, COUNT(*) FROM dependencies GROUP BY issue_id")?;
-        let dependent_rows = self
-            .conn
-            .query("SELECT depends_on_id, COUNT(*) FROM dependencies GROUP BY depends_on_id")?;
+            .query("SELECT issue_id, depends_on_id FROM dependencies")?;
 
         let capacity = label_rows
             .len()
-            .saturating_add(dependency_rows.len())
-            .saturating_add(dependent_rows.len());
+            .saturating_add(dependency_rows.len().saturating_mul(2));
         let mut map: HashMap<String, ListRelationMetadata> = HashMap::with_capacity(capacity);
 
         for row in &label_rows {
@@ -5783,23 +5779,16 @@ impl SqliteStorage {
                 .and_then(SqliteValue::as_text)
                 .unwrap_or("")
                 .to_string();
-            let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
-            if count > 0 {
-                map.entry(issue_id).or_default().dependency_count =
-                    usize::try_from(count).unwrap_or(0);
-            }
-        }
-
-        for row in &dependent_rows {
-            let issue_id = row
-                .get(0)
+            let depends_on_id = row
+                .get(1)
                 .and_then(SqliteValue::as_text)
                 .unwrap_or("")
                 .to_string();
-            let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
-            if count > 0 {
-                map.entry(issue_id).or_default().dependent_count =
-                    usize::try_from(count).unwrap_or(0);
+            if !issue_id.is_empty() {
+                map.entry(issue_id).or_default().dependency_count += 1;
+            }
+            if !depends_on_id.is_empty() {
+                map.entry(depends_on_id).or_default().dependent_count += 1;
             }
         }
 

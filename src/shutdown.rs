@@ -19,8 +19,8 @@
 //! [`Drop`] / `panic = "abort"` interaction; the public surface here is
 //! a no-op so callers don't need `cfg(unix)` at every call site.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// Set when one of the registered termination signals has been
 /// observed. Public callers should use [`is_requested`] /
@@ -150,11 +150,12 @@ mod tests {
 
     #[test]
     fn exit_code_is_none_until_signal_fires() {
-        // We don't fire a real signal in unit tests because that would
-        // race with cargo's own Ctrl-C handling. Instead this asserts
-        // the documented invariant for the unsignalled state — the
-        // signalled state is exercised end-to-end by the shutdown
-        // integration test in tests/.
+        // We don't fire a real signal in unit tests because that
+        // would race with cargo's own Ctrl-C handling and make
+        // assertions order-dependent across the rest of the test
+        // binary. Asserting the unsignalled invariant here pins down
+        // the API contract, while the signalled path is verified
+        // implicitly by the binary's exit-code behaviour at runtime.
         if !is_requested() {
             assert_eq!(exit_code(), None);
         }

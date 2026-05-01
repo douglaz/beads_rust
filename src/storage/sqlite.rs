@@ -14536,8 +14536,15 @@ mod tests {
         {
             let mut storage = SqliteStorage::open(&db_path).unwrap();
             let now = Utc::now();
-            let issue =
-                make_issue("bd-drop-1", "drop-checkpoint", Status::Open, 2, None, now, None);
+            let issue = make_issue(
+                "bd-drop-1",
+                "drop-checkpoint",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            );
             storage.create_issue(&issue, "tester").unwrap();
             assert!(
                 storage.mutation_count > 0,

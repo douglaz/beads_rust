@@ -2561,6 +2561,7 @@ fn open_storage_with_startup_config_impl(
         ..
     } = startup;
     let beads_dir = paths.beads_dir.clone();
+    let write_lock_already_held = write_lock_already_held || cli.holds_write_lock_for(&beads_dir);
     let cli_layer = cli.as_layer();
 
     let mut all_layers = startup_layers.clone();
@@ -3073,10 +3074,21 @@ pub struct CliOverrides {
     pub no_auto_flush: Option<bool>,
     pub no_auto_import: Option<bool>,
     pub lock_timeout: Option<u64>,
+    /// `.beads` directory whose `.write.lock` is already held by the caller.
+    ///
+    /// This is process-local execution state, not persisted configuration. It
+    /// lets command-local storage opens reuse the startup lock kept alive by
+    /// `main` instead of trying to acquire the same advisory lock again.
+    pub held_write_lock_beads_dir: Option<PathBuf>,
     pub read_only_fast_open: bool,
 }
 
 impl CliOverrides {
+    #[must_use]
+    pub fn holds_write_lock_for(&self, beads_dir: &Path) -> bool {
+        self.held_write_lock_beads_dir.as_deref() == Some(beads_dir)
+    }
+
     #[must_use]
     pub fn as_layer(&self) -> ConfigLayer {
         let mut layer = ConfigLayer::default();
@@ -4628,6 +4640,7 @@ labels:
             no_auto_import: Some(true),
             lock_timeout: Some(5000),
             identity: None,
+            held_write_lock_beads_dir: None,
             read_only_fast_open: false,
         };
 
@@ -5896,6 +5909,35 @@ routing:
             "{message}"
         );
         assert!(!db_path.exists(), "rebuild must not run without write lock");
+    }
+
+    #[test]
+    fn read_only_fast_open_miss_reuses_caller_write_lock_before_rebuild() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-recovered", "Recovered from JSONL only");
+        let _held_lock = crate::sync::blocking_write_lock(&beads_dir).expect("hold write lock");
+        let cli = CliOverrides {
+            lock_timeout: Some(1),
+            held_write_lock_beads_dir: Some(beads_dir.clone()),
+            read_only_fast_open: true,
+            ..CliOverrides::default()
+        };
+
+        let storage_ctx = open_storage_with_cli(&beads_dir, &cli)
+            .expect("caller-held write lock should not be reacquired");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-recovered")
+            .expect("query issue")
+            .expect("issue should exist after rebuild");
+
+        assert_eq!(issue.title, "Recovered from JSONL only");
+        assert!(db_path.is_file(), "database should be rebuilt from JSONL");
     }
 
     #[test]

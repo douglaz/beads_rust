@@ -31,7 +31,7 @@ fn main() {
         eprintln!("Failed to initialize logging: {e}");
     }
 
-    let overrides = build_cli_overrides(&cli);
+    let mut overrides = build_cli_overrides(&cli);
 
     // Phase 1: Startup & Discovery (One-time)
     let mut ctx = match StartupContext::init(&overrides) {
@@ -79,6 +79,9 @@ fn main() {
         } else {
             None
         };
+    if write_lock.is_some() {
+        overrides.held_write_lock_beads_dir = ctx.beads_dir.clone();
+    }
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
@@ -869,6 +872,7 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         no_auto_flush: if cli.no_auto_flush { Some(true) } else { None },
         no_auto_import: if cli.no_auto_import { Some(true) } else { None },
         lock_timeout: cli.lock_timeout,
+        held_write_lock_beads_dir: None,
         read_only_fast_open: !cli.no_db
             && supports_read_only_fast_open(&cli.command)
             && ((cli.no_auto_import && cli.no_auto_flush)
@@ -1107,6 +1111,23 @@ mod tests {
             should_acquire_startup_write_lock(false, true),
             "non-fast-open DB-family commands must keep the startup lock"
         );
+    }
+
+    #[test]
+    fn caller_write_lock_scope_is_path_specific() {
+        let mut overrides = build_cli_overrides(&Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "list",
+        ]));
+        let beads_dir = PathBuf::from("/tmp/beads/.beads");
+        let other_dir = PathBuf::from("/tmp/other/.beads");
+
+        overrides.held_write_lock_beads_dir = Some(beads_dir.clone());
+
+        assert!(overrides.holds_write_lock_for(&beads_dir));
+        assert!(!overrides.holds_write_lock_for(&other_dir));
     }
 
     #[test]

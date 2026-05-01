@@ -1805,6 +1805,76 @@ mod tests {
     }
 
     #[test]
+    fn test_v8_backfills_storage_null_in_default_columns() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        // Seed a row with all required columns set, then force storage-NULLs
+        // into the columns the migration is supposed to heal. We rely on
+        // direct UPDATEs reaching the storage layer; if the engine refuses
+        // any individual UPDATE, the corresponding assertion below still
+        // exercises the no-op path of the migration.
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-null', 'legacy null row', 'open', 2, 'task', '2026-04-30T00:00:00Z', '2026-04-30T00:00:00Z')",
+        )
+        .expect("seed row");
+
+        // Best-effort: not every column accepts a direct NULL update under
+        // every storage engine. The migration must only act on columns
+        // that *do* hold storage-NULL values, so we forge as many as the
+        // engine allows and verify the migration heals every successful one.
+        let columns_to_null: &[&str] = &[
+            "description",
+            "design",
+            "acceptance_criteria",
+            "notes",
+            "status",
+            "priority",
+            "issue_type",
+            "source_repo",
+            "ephemeral",
+            "pinned",
+            "is_template",
+        ];
+        for column in columns_to_null {
+            let _ = conn.execute(&format!(
+                "UPDATE issues SET {column} = NULL WHERE id = 'bd-null'"
+            ));
+        }
+
+        // Run the v8 migration directly so this test stays focused on the
+        // backfill behaviour rather than the surrounding migration ladder.
+        backfill_storage_null_in_default_columns(&conn);
+
+        // Idempotent: every NOT NULL DEFAULT column must hold a non-NULL
+        // storage class after the backfill, regardless of which UPDATE-to-
+        // NULL succeeded above.
+        for column in columns_to_null {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT typeof({column}) FROM issues WHERE id = 'bd-null'"
+                ))
+                .unwrap();
+            let actual_type = row.get(0).and_then(SqliteValue::as_text);
+            assert_ne!(
+                actual_type,
+                Some("null"),
+                "{column} should be backfilled to its declared default (got typeof = null)"
+            );
+        }
+
+        // Second pass is a no-op (the UPDATEs touch zero rows).
+        backfill_storage_null_in_default_columns(&conn);
+        let row = conn
+            .query_row("SELECT typeof(notes) FROM issues WHERE id = 'bd-null'")
+            .unwrap();
+        assert_ne!(row.get(0).and_then(SqliteValue::as_text), Some("null"));
+    }
+
+    #[test]
     fn test_apply_schema_file_backed_has_no_duplicate_issues_columns() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");

@@ -732,8 +732,9 @@ const fn should_auto_import(cmd: &Commands) -> bool {
 const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
     match cmd {
         Commands::Sync(args) => args.status,
-        Commands::Stats(args) | Commands::Status(args) => args.no_activity,
-        Commands::List(_)
+        Commands::Stats(_)
+        | Commands::Status(_)
+        | Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
         | Commands::Ready(_)
@@ -990,11 +991,18 @@ mod tests {
         let stats = Cli::parse_from(["br", "stats"]);
         assert!(!build_cli_overrides(&stats).read_only_fast_open);
 
+        let stats_no_auto = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "stats"]);
+        assert!(build_cli_overrides(&stats_no_auto).read_only_fast_open);
+
         let stats_no_activity = Cli::parse_from(["br", "stats", "--no-activity"]);
         assert!(build_cli_overrides(&stats_no_activity).read_only_fast_open);
 
         let status = Cli::parse_from(["br", "status"]);
         assert!(!build_cli_overrides(&status).read_only_fast_open);
+
+        let status_no_auto =
+            Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "status"]);
+        assert!(build_cli_overrides(&status_no_auto).read_only_fast_open);
 
         let status_no_activity = Cli::parse_from(["br", "status", "--no-activity"]);
         assert!(build_cli_overrides(&status_no_activity).read_only_fast_open);

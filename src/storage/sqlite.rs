@@ -2888,6 +2888,91 @@ impl SqliteStorage {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
+    /// Count default-visible issues grouped by status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_statuses(&self) -> Result<Vec<(String, usize)>> {
+        self.count_default_visible_text_groups("status", "status")
+    }
+
+    /// Count default-visible issues grouped by issue type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_types(&self) -> Result<Vec<(String, usize)>> {
+        self.count_default_visible_text_groups("issue_type", "issue_type")
+    }
+
+    /// Count default-visible issues grouped by assignee.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_assignees(&self) -> Result<Vec<(String, usize)>> {
+        self.count_default_visible_text_groups(
+            "COALESCE(NULLIF(assignee, ''), '(unassigned)')",
+            "COALESCE(NULLIF(assignee, ''), '(unassigned)')",
+        )
+    }
+
+    /// Count default-visible issues grouped by priority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_default_visible_priorities(&self) -> Result<Vec<(String, usize)>> {
+        let rows = self.conn.query(
+            "SELECT priority, COUNT(*)
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone', 'deferred')
+               AND (is_template = 0 OR is_template IS NULL)
+             GROUP BY priority
+             ORDER BY priority",
+        )?;
+        rows.iter()
+            .map(|row| {
+                let priority = row
+                    .get(0)
+                    .and_then(SqliteValue::as_integer)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .map(Priority)
+                    .unwrap_or_default();
+                let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+                Ok((priority.to_string(), usize::try_from(count).unwrap_or(0)))
+            })
+            .collect()
+    }
+
+    fn count_default_visible_text_groups(
+        &self,
+        select_expr: &str,
+        order_expr: &str,
+    ) -> Result<Vec<(String, usize)>> {
+        let sql = format!(
+            "SELECT {select_expr}, COUNT(*)
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone', 'deferred')
+               AND (is_template = 0 OR is_template IS NULL)
+             GROUP BY {select_expr}
+             ORDER BY {order_expr}"
+        );
+        let rows = self.conn.query(&sql)?;
+        rows.iter()
+            .map(|row| {
+                let group = row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("")
+                    .to_string();
+                let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+                Ok((group, usize::try_from(count).unwrap_or(0)))
+            })
+            .collect()
+    }
+
     /// Count label buckets for issues matching the given filters.
     ///
     /// This mirrors the label grouping semantics used by `br count --by label`:

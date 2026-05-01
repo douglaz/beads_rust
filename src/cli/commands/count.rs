@@ -298,6 +298,10 @@ fn group_counts_for_filters(
     filters: &ListFilters,
     by: CountBy,
 ) -> Result<(usize, Vec<CountGroup>)> {
+    if let Some(result) = default_visible_group_counts(storage, filters, by)? {
+        return Ok(result);
+    }
+
     if by == CountBy::Label {
         let total = storage.count_issues_with_filters(filters)?;
         if total <= COUNT_SMALL_RESULT_THRESHOLD {
@@ -335,6 +339,51 @@ fn group_counts_for_filters(
         .collect::<Vec<_>>();
     let groups = group_stats_counts(storage, &rows, by)?;
     Ok((rows.len(), groups))
+}
+
+fn default_visible_group_counts(
+    storage: &SqliteStorage,
+    filters: &ListFilters,
+    by: CountBy,
+) -> Result<Option<(usize, Vec<CountGroup>)>> {
+    if !is_default_visible_group_count(filters) {
+        return Ok(None);
+    }
+
+    let rows = match by {
+        CountBy::Status => storage.count_default_visible_statuses()?,
+        CountBy::Priority => storage.count_default_visible_priorities()?,
+        CountBy::Type => storage.count_default_visible_types()?,
+        CountBy::Assignee => storage.count_default_visible_assignees()?,
+        CountBy::Label => return Ok(None),
+    };
+    let total = rows.iter().map(|(_, count)| *count).sum();
+    let groups = rows
+        .into_iter()
+        .map(|(group, count)| CountGroup { group, count })
+        .collect();
+
+    Ok(Some((total, groups)))
+}
+
+fn is_default_visible_group_count(filters: &ListFilters) -> bool {
+    filters.statuses.as_ref().is_none_or(Vec::is_empty)
+        && filters.types.as_ref().is_none_or(Vec::is_empty)
+        && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+        && filters.assignee.is_none()
+        && !filters.unassigned
+        && !filters.include_closed
+        && !filters.include_deferred
+        && !filters.include_templates
+        && filters.title_contains.is_none()
+        && filters.limit.is_none()
+        && filters.offset.is_none()
+        && filters.sort.is_none()
+        && !filters.reverse
+        && filters.labels.as_ref().is_none_or(Vec::is_empty)
+        && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && filters.updated_before.is_none()
+        && filters.updated_after.is_none()
 }
 
 fn should_use_full_issue_rows_for_count(filters: &ListFilters) -> bool {
@@ -609,6 +658,43 @@ mod tests {
         assert_eq!(total, full_issues.len());
         assert_eq!(groups_to_map(actual_groups), expected);
         info!("test_lean_group_counts_match_full_issue_filtering: assertions passed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_visible_group_counts_match_default_filtering() -> Result<()> {
+        init_logging();
+        info!("test_default_visible_group_counts_match_default_filtering: starting");
+        let mut storage = SqliteStorage::open_memory()?;
+
+        let task = make_issue("bd-1", Status::Open, Priority::HIGH, IssueType::Task);
+        let bug = make_issue("bd-2", Status::InProgress, Priority::MEDIUM, IssueType::Bug);
+        let mut closed = make_issue("bd-3", Status::Closed, Priority::LOW, IssueType::Task);
+        closed.closed_at = Some(Utc::now());
+        let deferred = make_issue(
+            "bd-4",
+            Status::Deferred,
+            Priority::CRITICAL,
+            IssueType::Feature,
+        );
+        let mut template = make_issue("bd-5", Status::Open, Priority::HIGH, IssueType::Task);
+        template.is_template = true;
+
+        storage.create_issue(&task, "tester")?;
+        storage.create_issue(&bug, "tester")?;
+        storage.create_issue(&closed, "tester")?;
+        storage.create_issue(&deferred, "tester")?;
+        storage.create_issue(&template, "tester")?;
+
+        let filters = ListFilters::default();
+        let full_issues = storage.list_issues(&filters)?;
+        let expected = groups_to_map(group_counts(&storage, &full_issues, CountBy::Status)?);
+        let (total, actual_groups) = group_counts_for_filters(&storage, &filters, CountBy::Status)?;
+
+        assert_eq!(total, full_issues.len());
+        assert_eq!(groups_to_map(actual_groups), expected);
+        info!("test_default_visible_group_counts_match_default_filtering: assertions passed");
 
         Ok(())
     }

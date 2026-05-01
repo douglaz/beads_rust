@@ -80,7 +80,9 @@ fn main() {
             None
         };
     if write_lock.is_some() {
-        overrides.held_write_lock_beads_dir = ctx.beads_dir.clone();
+        overrides
+            .held_write_lock_beads_dir
+            .clone_from(&ctx.beads_dir);
     }
 
     // Phase 2: Open Storage (One-time)

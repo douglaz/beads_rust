@@ -7763,7 +7763,6 @@ fn should_sort_list_default_in_rust(filters: &ListFilters) -> bool {
         && !filters.reverse
         && filters.offset.is_none_or(|offset| offset == 0)
         && filters.limit.is_none_or(|limit| limit == 0)
-        && false
 }
 
 fn sort_list_default(issues: &mut [Issue]) {

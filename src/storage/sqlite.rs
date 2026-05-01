@@ -20,7 +20,7 @@ use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -5839,56 +5839,32 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_unique_labels_with_counts(&self) -> Result<Vec<(String, i64)>> {
-        let rows = self.conn.query(
-            "SELECT label, COUNT(*) as count
-             FROM labels
-             GROUP BY label
-             ORDER BY label",
-        )?;
-        let mut counts: Vec<(String, i64)> = rows
+        let tombstone_rows = self
+            .conn
+            .query("SELECT id FROM issues WHERE status = 'tombstone'")?;
+        let tombstone_ids: HashSet<String> = tombstone_rows
             .iter()
-            .filter_map(|r| {
-                let label = r.get(0).and_then(SqliteValue::as_text)?.to_string();
-                let count = r.get(1).and_then(SqliteValue::as_integer)?;
-                Some((label, count))
-            })
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
             .collect();
 
-        if counts.is_empty() {
-            return Ok(counts);
-        }
+        let rows = self.conn.query("SELECT label, issue_id FROM labels")?;
+        let mut counts = BTreeMap::new();
 
-        let tombstone_exists = self
-            .conn
-            .query("SELECT 1 FROM issues WHERE status = 'tombstone' LIMIT 1")?;
-        if tombstone_exists.is_empty() {
-            return Ok(counts);
-        }
-
-        let tombstone_rows = self.conn.query(
-            "SELECT l.label, COUNT(*) as count
-             FROM labels l
-             JOIN issues i ON l.issue_id = i.id
-             WHERE i.status = 'tombstone'
-             GROUP BY l.label
-             ORDER BY l.label",
-        )?;
-
-        for row in &tombstone_rows {
+        for row in &rows {
             let Some(label) = row.get(0).and_then(SqliteValue::as_text) else {
                 continue;
             };
-            let Some(tombstone_count) = row.get(1).and_then(SqliteValue::as_integer) else {
+            let Some(issue_id) = row.get(1).and_then(SqliteValue::as_text) else {
                 continue;
             };
-            if let Ok(index) = counts.binary_search_by(|(existing, _)| existing.as_str().cmp(label))
-            {
-                counts[index].1 = counts[index].1.saturating_sub(tombstone_count).max(0);
+            if tombstone_ids.contains(issue_id) {
+                continue;
             }
-        }
-        counts.retain(|(_, count)| *count > 0);
 
-        Ok(counts)
+            *counts.entry(label.to_string()).or_insert(0) += 1;
+        }
+
+        Ok(counts.into_iter().collect())
     }
 
     /// Rename a label across all issues.

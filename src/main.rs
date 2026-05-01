@@ -12,6 +12,9 @@ use clap_complete::CompleteEnv;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[allow(clippy::too_many_lines)]
 fn main() {
     CompleteEnv::with_factory(Cli::command).complete();

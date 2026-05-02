@@ -4940,10 +4940,12 @@ impl SqliteStorage {
             }
         }
 
-        Ok(blockers
-            .into_iter()
-            .map(|(k, v)| (k, v.into_iter().collect()))
-            .collect())
+        for refs in blockers.values_mut() {
+            refs.sort();
+            refs.dedup();
+        }
+
+        Ok(blockers)
     }
 
     fn list_external_dependency_ids(&self, blocking_only: bool) -> Result<HashSet<String>> {
@@ -9822,6 +9824,54 @@ mod tests {
         );
         let child_blockers = blockers.get("bd-c1").expect("child blockers");
         assert!(child_blockers.iter().any(|b| b == "bd-p1:parent-blocked"));
+    }
+
+    #[test]
+    fn test_external_blockers_return_sorted_blocker_refs() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-external-blocked",
+            "External blocked",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .add_dependency(
+                "bd-external-blocked",
+                "external:zproj:zcap",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+        storage
+            .add_dependency(
+                "bd-external-blocked",
+                "external:aproj:acap",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        let external_statuses = HashMap::from([
+            ("external:zproj:zcap".to_string(), false),
+            ("external:aproj:acap".to_string(), false),
+        ]);
+        let blockers = storage.external_blockers(&external_statuses).unwrap();
+        let expected = vec![
+            "external:aproj:acap:blocked".to_string(),
+            "external:zproj:zcap:blocked".to_string(),
+        ];
+        assert_eq!(
+            blockers.get("bd-external-blocked"),
+            Some(&expected),
+            "external blocker refs should not inherit dependency row order"
+        );
     }
 
     #[test]

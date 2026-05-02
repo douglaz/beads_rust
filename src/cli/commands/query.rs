@@ -14,6 +14,7 @@ use tracing::{debug, info};
 
 /// Prefix for saved query keys in the config table.
 const QUERY_KEY_PREFIX: &str = "saved_query:";
+const LIST_ARGS_DEFAULT_LIMIT: usize = 50;
 
 /// A saved query stored in the config table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,7 +192,7 @@ impl SavedFilters {
             title_contains: cli.title_contains.clone().or(base.title_contains),
             desc_contains: cli.desc_contains.clone().or(base.desc_contains),
             notes_contains: cli.notes_contains.clone().or(base.notes_contains),
-            limit: cli.limit.or(base.limit),
+            limit: merge_limit_override(base.limit, cli.limit),
             offset: cli.offset.or(base.offset),
             sort: cli.sort.clone().or(base.sort),
             // Bool fields: CLI true overrides saved
@@ -208,6 +209,17 @@ impl SavedFilters {
             stats: cli.stats,
             fields: cli.fields.clone(),
         }
+    }
+}
+
+fn merge_limit_override(saved: Option<usize>, cli: Option<usize>) -> Option<usize> {
+    // `query run` flattens `ListArgs`, whose Clap default supplies `Some(50)`
+    // even when the operator did not pass `--limit`. Treat that default as
+    // absent when a saved query already has an explicit limit.
+    match (saved, cli) {
+        (Some(saved), Some(LIST_ARGS_DEFAULT_LIMIT)) => Some(saved),
+        (_, Some(cli)) => Some(cli),
+        (saved, None) => saved,
     }
 }
 
@@ -660,6 +672,50 @@ mod tests {
         assert_eq!(merged.status, vec!["closed"]); // CLI wins
         assert_eq!(merged.assignee, Some("alice".to_string())); // Saved retained
         assert_eq!(merged.limit, Some(20)); // CLI wins
+    }
+
+    #[test]
+    fn test_merge_preserves_saved_limit_when_cli_uses_list_default() {
+        let saved = SavedFilters {
+            limit: Some(10),
+            ..Default::default()
+        };
+
+        let cli = ListArgs {
+            limit: Some(LIST_ARGS_DEFAULT_LIMIT),
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, Some(10));
+    }
+
+    #[test]
+    fn test_merge_preserves_saved_unlimited_limit_when_cli_uses_list_default() {
+        let saved = SavedFilters {
+            limit: Some(0),
+            ..Default::default()
+        };
+
+        let cli = ListArgs {
+            limit: Some(LIST_ARGS_DEFAULT_LIMIT),
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, Some(0));
+    }
+
+    #[test]
+    fn test_merge_uses_cli_default_limit_when_saved_limit_missing() {
+        let saved = SavedFilters::default();
+        let cli = ListArgs {
+            limit: Some(LIST_ARGS_DEFAULT_LIMIT),
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, Some(LIST_ARGS_DEFAULT_LIMIT));
     }
 
     #[test]

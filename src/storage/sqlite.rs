@@ -1277,7 +1277,12 @@ impl SqliteStorage {
 
         for (issue_id, content_hash) in exports {
             if let Some(position) = positions.get(issue_id).copied() {
-                deduped[position].1.clone_from(content_hash);
+                if let Some((_, stored_hash)) = deduped.get_mut(position) {
+                    stored_hash.clone_from(content_hash);
+                } else {
+                    positions.insert(issue_id.clone(), deduped.len());
+                    deduped.push((issue_id.clone(), content_hash.clone()));
+                }
             } else {
                 positions.insert(issue_id.clone(), deduped.len());
                 deduped.push((issue_id.clone(), content_hash.clone()));
@@ -1533,8 +1538,8 @@ impl SqliteStorage {
                     "SELECT id FROM issues WHERE external_ref = ? LIMIT 1",
                     &[SqliteValue::from(ext_ref.as_str())],
                 )?;
-                if !existing_ext.is_empty() {
-                    let other_id = existing_ext[0]
+                if let Some(existing_row) = existing_ext.first() {
+                    let other_id = existing_row
                         .get(0)
                         .and_then(SqliteValue::as_text)
                         .unwrap_or_default()
@@ -2057,8 +2062,8 @@ impl SqliteStorage {
                         "SELECT id FROM issues WHERE external_ref = ? AND id != ? LIMIT 1",
                         &[SqliteValue::from(ext_ref.as_str()), SqliteValue::from(id)],
                     )?;
-                    if !existing_ext.is_empty() {
-                        let other_id = existing_ext[0]
+                    if let Some(existing_row) = existing_ext.first() {
+                        let other_id = existing_row
                             .get(0)
                             .and_then(SqliteValue::as_text)
                             .unwrap_or_default()
@@ -9415,6 +9420,25 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn test_dedupe_export_hash_batch_keeps_last_hash_in_first_position() {
+        let exports = vec![
+            ("bd-a".to_string(), "hash-a1".to_string()),
+            ("bd-b".to_string(), "hash-b".to_string()),
+            ("bd-a".to_string(), "hash-a2".to_string()),
+        ];
+
+        let deduped = SqliteStorage::dedupe_export_hash_batch(&exports);
+
+        assert_eq!(
+            deduped,
+            vec![
+                ("bd-a".to_string(), "hash-a2".to_string()),
+                ("bd-b".to_string(), "hash-b".to_string()),
+            ]
+        );
     }
 
     fn insert_external_parent_child_dependency(

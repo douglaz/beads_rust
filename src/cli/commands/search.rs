@@ -106,10 +106,7 @@ fn collect_search_results(
     };
 
     if needs_post_query_ordering {
-        apply_issue_sort(&mut issues, list_args.sort.as_deref())?;
-        if list_args.reverse {
-            issues.reverse();
-        }
+        apply_issue_sort(&mut issues, list_args.sort.as_deref(), list_args.reverse)?;
         if let Some(offset) = offset
             && offset > 0
         {
@@ -544,22 +541,74 @@ fn apply_client_filters(
 fn apply_sort_by_issue<T>(
     items: &mut [T],
     sort: Option<&str>,
+    reverse: bool,
     mut issue_of: impl FnMut(&T) -> &crate::model::Issue,
 ) -> Result<()> {
-    let Some(sort_key) = sort else {
-        return Ok(());
-    };
-
-    match sort_key {
-        "priority" => items.sort_by_key(|item| issue_of(item).priority),
-        "created_at" | "created" => {
-            items.sort_by_key(|item| std::cmp::Reverse(issue_of(item).created_at));
+    match sort {
+        None | Some("priority") => {
+            if reverse {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (
+                        std::cmp::Reverse(issue.priority),
+                        issue.created_at,
+                        issue.id.clone(),
+                    )
+                });
+            } else {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (
+                        issue.priority,
+                        std::cmp::Reverse(issue.created_at),
+                        issue.id.clone(),
+                    )
+                });
+            }
         }
-        "updated_at" | "updated" => {
-            items.sort_by_key(|item| std::cmp::Reverse(issue_of(item).updated_at));
+        Some("created_at" | "created") => {
+            if reverse {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (issue.created_at, issue.id.clone())
+                });
+            } else {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (std::cmp::Reverse(issue.created_at), issue.id.clone())
+                });
+            }
         }
-        "title" => items.sort_by_cached_key(|item| issue_of(item).title.to_lowercase()),
-        _ => {
+        Some("updated_at" | "updated") => {
+            if reverse {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (issue.updated_at, issue.id.clone())
+                });
+            } else {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (std::cmp::Reverse(issue.updated_at), issue.id.clone())
+                });
+            }
+        }
+        Some("title") => {
+            if reverse {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (
+                        std::cmp::Reverse(issue.title.to_lowercase()),
+                        issue.id.clone(),
+                    )
+                });
+            } else {
+                items.sort_by_cached_key(|item| {
+                    let issue = issue_of(item);
+                    (issue.title.to_lowercase(), issue.id.clone())
+                });
+            }
+        }
+        Some(sort_key) => {
             return Err(BeadsError::Validation {
                 field: "sort".to_string(),
                 reason: format!("invalid sort field '{sort_key}'"),
@@ -571,12 +620,16 @@ fn apply_sort_by_issue<T>(
 }
 
 #[cfg(test)]
-fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> {
-    apply_sort_by_issue(issues, sort, |issue| &issue.issue)
+fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>, reverse: bool) -> Result<()> {
+    apply_sort_by_issue(issues, sort, reverse, |issue| &issue.issue)
 }
 
-fn apply_issue_sort(issues: &mut [crate::model::Issue], sort: Option<&str>) -> Result<()> {
-    apply_sort_by_issue(issues, sort, |issue| issue)
+fn apply_issue_sort(
+    issues: &mut [crate::model::Issue],
+    sort: Option<&str>,
+    reverse: bool,
+) -> Result<()> {
+    apply_sort_by_issue(issues, sort, reverse, |issue| issue)
 }
 
 #[cfg(test)]
@@ -746,7 +799,7 @@ mod tests {
             older_created_but_newer_updated,
         ];
 
-        apply_issue_sort(&mut items, Some("updated")).expect("sort");
+        apply_issue_sort(&mut items, Some("updated"), false).expect("sort");
         items.truncate(1);
         assert_eq!(items[0].id, "bd-b");
     }
@@ -870,16 +923,38 @@ mod tests {
 
         let mut issues = storage.search_issues("match", &filters).expect("search");
 
-        apply_issue_sort(&mut issues, args.sort.as_deref()).expect("sort");
-        if args.reverse {
-            issues.reverse();
-        }
+        apply_issue_sort(&mut issues, args.sort.as_deref(), args.reverse).expect("sort");
         if let Some(limit) = limit {
             issues.truncate(limit);
         }
 
         assert_eq!(issues[0].id, "bd-old");
         assert_eq!(issues[1].id, "bd-new");
+    }
+
+    #[test]
+    fn test_search_client_filter_reverse_keeps_id_tiebreaker_ascending() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let timestamp = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        for issue in [
+            make_issue("bd-tie-b", "match tie b", Some("needle"), timestamp),
+            make_issue("bd-tie-a", "match tie a", Some("needle"), timestamp),
+        ] {
+            storage.create_issue(&issue, "tester").expect("create");
+        }
+
+        let args = ListArgs {
+            desc_contains: Some("needle".to_string()),
+            reverse: true,
+            limit: Some(2),
+            ..Default::default()
+        };
+
+        let results = collect_search_results(&storage, "match", &args).expect("search");
+        let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["bd-tie-a", "bd-tie-b"]);
     }
 
     #[test]
@@ -903,9 +978,9 @@ mod tests {
             },
         ];
 
-        apply_sort(&mut items, Some("title")).expect("sort");
+        apply_sort(&mut items, Some("title"), false).expect("sort");
         assert_eq!(items[0].issue.title, "Alpha");
-        items.reverse();
+        apply_sort(&mut items, Some("title"), true).expect("sort");
         assert_eq!(items[0].issue.title, "Beta");
     }
 
@@ -930,7 +1005,7 @@ mod tests {
             },
         ];
 
-        apply_sort(&mut items, Some("created_at")).expect("sort");
+        apply_sort(&mut items, Some("created_at"), false).expect("sort");
         assert_eq!(items[0].issue.id, "bd-new");
     }
 

@@ -296,6 +296,7 @@ fn build_filters(args: &LintArgs) -> Result<ListFilters> {
         filters.statuses = Some(vec![status]);
     } else if status_filter.eq_ignore_ascii_case("all") {
         filters.include_closed = true;
+        filters.include_deferred = true;
     }
 
     Ok(filters)

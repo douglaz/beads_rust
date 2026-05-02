@@ -479,6 +479,7 @@ fn apply_client_filters(
     // Deferred issues are included by default when no status filter is specified,
     // except `--overdue` keeps deferred work hidden unless requested.
     let include_deferred = args.deferred
+        || args.all
         || (!args.overdue && args.status.is_empty())
         || args
             .status
@@ -933,6 +934,22 @@ mod tests {
             .map(|issue| issue.id.as_str())
             .collect();
         assert_eq!(overdue_with_deferred_ids, vec!["bd-deferred", "bd-open"]);
+
+        let overdue_with_all = collect_search_results(
+            &storage,
+            "match",
+            &ListArgs {
+                overdue: true,
+                all: true,
+                ..Default::default()
+            },
+        )
+        .expect("search overdue with all");
+        let overdue_with_all_ids: Vec<_> = overdue_with_all
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect();
+        assert_eq!(overdue_with_all_ids, vec!["bd-deferred", "bd-open"]);
     }
 
     #[test]

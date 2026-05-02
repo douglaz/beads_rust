@@ -961,8 +961,8 @@ fn e2e_saved_queries_lifecycle() {
     );
 }
 
-/// Regression: `query run` must not replace a saved `--limit` when the operator
-/// did not pass a run-time limit.
+/// Regression: `query run` must not replace saved pagination when the operator
+/// did not pass run-time pagination flags.
 #[test]
 fn e2e_query_run_preserves_saved_limit_without_override() {
     let _log = common::test_log("e2e_query_run_preserves_saved_limit_without_override");
@@ -983,7 +983,8 @@ fn e2e_query_run_preserves_saved_limit_without_override() {
     let save = run_br(
         &workspace,
         [
-            "query", "save", "one-open", "--status", "open", "--limit", "1",
+            "query", "save", "one-open", "--status", "open", "--limit", "1", "--offset", "1",
+            "--sort", "title",
         ],
         "query_limit_save",
     );
@@ -1002,10 +1003,12 @@ fn e2e_query_run_preserves_saved_limit_without_override() {
     let saved_payload = extract_json_payload(&saved_run.stdout);
     let saved_json: Value = serde_json::from_str(&saved_payload).expect("saved run json");
     assert_eq!(saved_json["limit"], 1);
+    assert_eq!(saved_json["offset"], 1);
     assert_eq!(
         saved_json["issues"].as_array().expect("issues array").len(),
         1
     );
+    assert_eq!(saved_json["issues"][0]["title"], "Limit issue B");
 
     let override_run = run_br(
         &workspace,
@@ -1020,6 +1023,7 @@ fn e2e_query_run_preserves_saved_limit_without_override() {
     let override_payload = extract_json_payload(&override_run.stdout);
     let override_json: Value = serde_json::from_str(&override_payload).expect("override run json");
     assert_eq!(override_json["limit"], 2);
+    assert_eq!(override_json["offset"], 1);
     assert_eq!(
         override_json["issues"]
             .as_array()
@@ -1027,6 +1031,8 @@ fn e2e_query_run_preserves_saved_limit_without_override() {
             .len(),
         2
     );
+    assert_eq!(override_json["issues"][0]["title"], "Limit issue B");
+    assert_eq!(override_json["issues"][1]["title"], "Limit issue C");
 }
 
 /// E2E tests for saved query error cases.

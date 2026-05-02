@@ -65,6 +65,8 @@ pub struct SavedFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub reverse: bool,
@@ -98,6 +100,7 @@ impl From<&ListArgs> for SavedFilters {
             notes_contains: args.notes_contains.clone(),
             all: args.all,
             limit: args.limit,
+            offset: args.offset,
             sort: args.sort.clone(),
             reverse: args.reverse,
             deferred: args.deferred,
@@ -126,7 +129,7 @@ impl SavedFilters {
             notes_contains: self.notes_contains.clone(),
             all: self.all,
             limit: self.limit,
-            offset: Some(0),
+            offset: self.offset,
             sort: self.sort.clone(),
             reverse: self.reverse,
             deferred: self.deferred,
@@ -615,6 +618,7 @@ mod tests {
             type_: vec!["bug".to_string()],
             assignee: Some("alice".to_string()),
             priority: vec!["1".to_string(), "2".to_string()],
+            offset: Some(3),
             ..Default::default()
         };
 
@@ -623,6 +627,7 @@ mod tests {
         assert_eq!(filters.type_, vec!["bug"]);
         assert_eq!(filters.assignee, Some("alice".to_string()));
         assert_eq!(filters.priority, vec!["1", "2"]);
+        assert_eq!(filters.offset, Some(3));
     }
 
     #[test]
@@ -631,6 +636,7 @@ mod tests {
             status: vec!["open".to_string()],
             assignee: Some("bob".to_string()),
             all: true,
+            offset: Some(3),
             ..Default::default()
         };
 
@@ -638,6 +644,7 @@ mod tests {
         assert_eq!(args.status, vec!["open"]);
         assert_eq!(args.assignee, Some("bob".to_string()));
         assert!(args.all);
+        assert_eq!(args.offset, Some(3));
     }
 
     #[test]
@@ -800,6 +807,7 @@ mod tests {
         assert!(filters.notes_contains.is_none());
         assert!(!filters.all);
         assert!(filters.limit.is_none());
+        assert!(filters.offset.is_none());
         assert!(filters.sort.is_none());
         assert!(!filters.reverse);
         assert!(!filters.deferred);
@@ -954,6 +962,7 @@ mod tests {
             desc_contains: Some("error".to_string()),
             notes_contains: Some("important".to_string()),
             limit: Some(100),
+            offset: Some(5),
             sort: Some("priority".to_string()),
             ..Default::default()
         };
@@ -968,6 +977,7 @@ mod tests {
         assert_eq!(merged.desc_contains, Some("error".to_string()));
         assert_eq!(merged.notes_contains, Some("important".to_string()));
         assert_eq!(merged.limit, Some(100));
+        assert_eq!(merged.offset, Some(5));
         assert_eq!(merged.sort, Some("priority".to_string()));
 
         // CLI with Some values - cli wins
@@ -979,6 +989,7 @@ mod tests {
             desc_contains: Some("new".to_string()),
             notes_contains: Some("todo".to_string()),
             limit: Some(50),
+            offset: Some(2),
             sort: Some("updated".to_string()),
             ..Default::default()
         };
@@ -990,6 +1001,7 @@ mod tests {
         assert_eq!(merged2.desc_contains, Some("new".to_string()));
         assert_eq!(merged2.notes_contains, Some("todo".to_string()));
         assert_eq!(merged2.limit, Some(50));
+        assert_eq!(merged2.offset, Some(2));
         assert_eq!(merged2.sort, Some("updated".to_string()));
     }
 
@@ -1046,6 +1058,7 @@ mod tests {
             notes_contains: Some("notes search".to_string()),
             all: true,
             limit: Some(25),
+            offset: Some(5),
             sort: Some("created".to_string()),
             reverse: true,
             deferred: true,
@@ -1070,6 +1083,7 @@ mod tests {
         assert_eq!(parsed.notes_contains, filters.notes_contains);
         assert_eq!(parsed.all, filters.all);
         assert_eq!(parsed.limit, filters.limit);
+        assert_eq!(parsed.offset, filters.offset);
         assert_eq!(parsed.sort, filters.sort);
         assert_eq!(parsed.reverse, filters.reverse);
         assert_eq!(parsed.deferred, filters.deferred);

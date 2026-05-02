@@ -109,11 +109,12 @@ fn execute_routed(
             let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
             let mut batch_cli = cli.clone();
             batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
-            let _routed_write_lock = acquire_routed_workspace_write_lock(
+            let routed_write_lock = acquire_routed_workspace_write_lock(
                 &batch_beads_dir,
                 !use_preloaded,
                 batch_cli.lock_timeout,
             )?;
+            routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);
             let (batch_details, _) = load_issue_details_for_route(
                 &batch_args,
                 &batch_cli,
@@ -159,11 +160,12 @@ fn execute_routed(
         let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
         let mut batch_cli = cli.clone();
         batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
-        let _routed_write_lock = acquire_routed_workspace_write_lock(
+        let routed_write_lock = acquire_routed_workspace_write_lock(
             &batch.beads_dir,
             !use_preloaded,
             batch_cli.lock_timeout,
         )?;
+        routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);
         let (batch_details, use_color) = load_issue_details_for_route(
             &batch_args,
             &batch_cli,

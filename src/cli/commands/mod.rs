@@ -7,7 +7,7 @@ use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::sync::auto_import_if_stale;
 use crate::util::id::IdResolver;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub mod agents;
 pub mod audit;
@@ -319,12 +319,22 @@ pub(super) fn auto_import_storage_ctx_if_stale(
 
 pub(super) struct RoutedWorkspaceWriteLock {
     _lock: Option<File>,
+    beads_dir: Option<PathBuf>,
 }
 
 impl RoutedWorkspaceWriteLock {
     #[must_use]
     pub(super) const fn local() -> Self {
-        Self { _lock: None }
+        Self {
+            _lock: None,
+            beads_dir: None,
+        }
+    }
+
+    pub(super) fn mark_cli_write_lock_held(&self, cli: &mut crate::config::CliOverrides) {
+        if let Some(beads_dir) = &self.beads_dir {
+            cli.held_write_lock_beads_dir = Some(beads_dir.clone());
+        }
     }
 }
 
@@ -338,7 +348,10 @@ pub(super) fn acquire_routed_workspace_write_lock(
     }
 
     let file = crate::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout_ms)?;
-    Ok(RoutedWorkspaceWriteLock { _lock: Some(file) })
+    Ok(RoutedWorkspaceWriteLock {
+        _lock: Some(file),
+        beads_dir: Some(beads_dir.to_path_buf()),
+    })
 }
 
 pub(super) fn retry_mutation_with_jsonl_recovery<T, F>(
@@ -433,9 +446,11 @@ mod tests {
     use crate::model::Issue;
     use crate::storage::SqliteStorage;
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
+    use chrono::Utc;
     use fsqlite::Connection;
     use fsqlite_error::FrankenError;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn storage_ctx_with_exported_issue() -> (TempDir, OpenStorageResult) {
@@ -471,6 +486,19 @@ mod tests {
         (temp, storage_ctx)
     }
 
+    fn write_single_issue_jsonl(path: &Path, id: &str, title: &str) {
+        let now = Utc::now();
+        let issue = Issue {
+            id: id.to_string(),
+            title: title.to_string(),
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+        let json = serde_json::to_string(&issue).expect("serialize issue");
+        fs::write(path, format!("{json}\n")).expect("write jsonl");
+    }
+
     #[test]
     fn routed_workspace_write_lock_respects_external_timeout() -> std::result::Result<(), String> {
         let temp = TempDir::new().expect("tempdir");
@@ -488,6 +516,40 @@ mod tests {
             "{message}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn routed_workspace_write_lock_marks_cli_for_fast_open_recovery() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        write_single_issue_jsonl(
+            &jsonl_path,
+            "bd-routed",
+            "Recovered under routed write lock",
+        );
+
+        let routed_write_lock =
+            acquire_routed_workspace_write_lock(&beads_dir, true, Some(1)).expect("routed lock");
+        let mut cli = CliOverrides {
+            lock_timeout: Some(1),
+            read_only_fast_open: true,
+            ..CliOverrides::default()
+        };
+        routed_write_lock.mark_cli_write_lock_held(&mut cli);
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &cli).expect("recovery should reuse routed lock");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-routed")
+            .expect("query issue")
+            .expect("issue should be rebuilt from JSONL");
+
+        assert_eq!(issue.title, "Recovered under routed write lock");
+        assert!(db_path.is_file(), "database should be rebuilt from JSONL");
     }
 
     #[test]

@@ -310,12 +310,13 @@ fn resolve_issues(
     let mut issues_by_input = std::collections::HashMap::new();
 
     for batch in routed_batches {
-        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
-        let _routed_write_lock = acquire_routed_workspace_write_lock(
+        let mut batch_cli = routed_cli_for_batch(cli, batch.is_external);
+        let routed_write_lock = acquire_routed_workspace_write_lock(
             &batch.beads_dir,
             batch.is_external,
             batch_cli.lock_timeout,
         )?;
+        routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);
         let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
         auto_import_storage_ctx_if_stale(&mut storage_ctx, &batch_cli)?;
         let config_layer = storage_ctx.load_config(&batch_cli)?;

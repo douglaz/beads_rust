@@ -3,7 +3,10 @@
 //! Primary discovery interface with classic filter semantics and
 //! paginated `ListPage` JSON output. Supports text, JSON, and CSV formats.
 
-use crate::cli::{ListArgs, OutputFormat, resolve_output_format_with_outer_mode};
+use crate::cli::{
+    DEFAULT_LIST_LIMIT, DEFAULT_LIST_OFFSET, ListArgs, OutputFormat,
+    resolve_output_format_with_outer_mode,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
@@ -72,8 +75,8 @@ fn execute_inner(
     let is_json_output = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);
 
     // The effective limit and offset from the user's request.
-    let user_limit = args.limit.unwrap_or(50);
-    let user_offset = args.offset.unwrap_or(0);
+    let user_limit = args.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    let user_offset = args.offset.unwrap_or(DEFAULT_LIST_OFFSET);
 
     // For paginated structured SQL-path queries, run a COUNT(*) query using the
     // same filters (without LIMIT/OFFSET) so we can include pagination metadata.
@@ -371,8 +374,8 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         include_deferred,
         include_templates: false,
         title_contains: args.title_contains.clone(),
-        limit: args.limit,
-        offset: args.offset,
+        limit: Some(args.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
+        offset: Some(args.offset.unwrap_or(DEFAULT_LIST_OFFSET)),
         sort: args.sort.clone(),
         reverse: args.reverse,
         labels: if args.label.is_empty() {
@@ -616,6 +619,15 @@ mod tests {
         let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
         assert_eq!(values, vec![0, 2]);
         info!("test_build_filters_parses_priorities: assertions passed");
+    }
+
+    #[test]
+    fn test_build_filters_applies_list_defaults_when_cli_omits_pagination() {
+        init_logging();
+        let filters = build_filters(&ListArgs::default()).expect("build filters");
+
+        assert_eq!(filters.limit, Some(DEFAULT_LIST_LIMIT));
+        assert_eq!(filters.offset, Some(DEFAULT_LIST_OFFSET));
     }
 
     #[test]

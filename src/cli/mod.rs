@@ -19,6 +19,9 @@ use crate::model::{IssueType, Status};
 
 pub mod commands;
 
+pub(crate) const DEFAULT_LIST_LIMIT: usize = 50;
+pub(crate) const DEFAULT_LIST_OFFSET: usize = 0;
+
 #[derive(Clone, Copy)]
 enum IssueCompletionFilter {
     Any,
@@ -1485,11 +1488,11 @@ pub struct ListArgs {
     pub all: bool,
 
     /// Maximum number of results (0 = unlimited, default: 50)
-    #[arg(long, default_value = "50")]
+    #[arg(long)]
     pub limit: Option<usize>,
 
     /// Number of results to skip (for pagination, default: 0)
-    #[arg(long, default_value = "0")]
+    #[arg(long)]
     pub offset: Option<usize>,
 
     /// Sort field (`priority`, `created_at`, `updated_at`, `title`)
@@ -2580,7 +2583,7 @@ mod tests {
     const CLI_REFERENCE: &str = include_str!("../../docs/CLI_REFERENCE.md");
 
     #[test]
-    fn test_list_limit_defaults_to_50() {
+    fn test_list_limit_is_none_when_omitted() {
         let cli = Cli::parse_from(["br", "list"]);
         assert!(
             matches!(&cli.command, Commands::List(_)),
@@ -2589,7 +2592,7 @@ mod tests {
         let Commands::List(args) = cli.command else {
             return;
         };
-        assert_eq!(args.limit, Some(50));
+        assert_eq!(args.limit, None);
     }
 
     #[test]

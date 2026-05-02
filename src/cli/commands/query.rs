@@ -14,7 +14,6 @@ use tracing::{debug, info};
 
 /// Prefix for saved query keys in the config table.
 const QUERY_KEY_PREFIX: &str = "saved_query:";
-const LIST_ARGS_DEFAULT_LIMIT: usize = 50;
 
 /// A saved query stored in the config table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,7 +191,7 @@ impl SavedFilters {
             title_contains: cli.title_contains.clone().or(base.title_contains),
             desc_contains: cli.desc_contains.clone().or(base.desc_contains),
             notes_contains: cli.notes_contains.clone().or(base.notes_contains),
-            limit: merge_limit_override(base.limit, cli.limit),
+            limit: cli.limit.or(base.limit),
             offset: cli.offset.or(base.offset),
             sort: cli.sort.clone().or(base.sort),
             // Bool fields: CLI true overrides saved
@@ -209,17 +208,6 @@ impl SavedFilters {
             stats: cli.stats,
             fields: cli.fields.clone(),
         }
-    }
-}
-
-fn merge_limit_override(saved: Option<usize>, cli: Option<usize>) -> Option<usize> {
-    // `query run` flattens `ListArgs`, whose Clap default supplies `Some(50)`
-    // even when the operator did not pass `--limit`. Treat that default as
-    // absent when a saved query already has an explicit limit.
-    match (saved, cli) {
-        (Some(saved), Some(LIST_ARGS_DEFAULT_LIMIT)) => Some(saved),
-        (_, Some(cli)) => Some(cli),
-        (saved, None) => saved,
     }
 }
 
@@ -617,7 +605,7 @@ fn render_query_delete_rich(name: &str, ctx: &OutputContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::OutputFormat;
+    use crate::cli::{DEFAULT_LIST_LIMIT, OutputFormat};
     use crate::storage::SqliteStorage;
 
     #[test]
@@ -675,47 +663,53 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_preserves_saved_limit_when_cli_uses_list_default() {
+    fn test_merge_preserves_saved_limit_when_cli_limit_absent() {
         let saved = SavedFilters {
             limit: Some(10),
             ..Default::default()
         };
 
-        let cli = ListArgs {
-            limit: Some(LIST_ARGS_DEFAULT_LIMIT),
-            ..Default::default()
-        };
+        let cli = ListArgs::default();
 
         let merged = saved.merge_with_cli(&cli);
         assert_eq!(merged.limit, Some(10));
     }
 
     #[test]
-    fn test_merge_preserves_saved_unlimited_limit_when_cli_uses_list_default() {
+    fn test_merge_preserves_saved_unlimited_limit_when_cli_limit_absent() {
         let saved = SavedFilters {
             limit: Some(0),
             ..Default::default()
         };
 
-        let cli = ListArgs {
-            limit: Some(LIST_ARGS_DEFAULT_LIMIT),
-            ..Default::default()
-        };
+        let cli = ListArgs::default();
 
         let merged = saved.merge_with_cli(&cli);
         assert_eq!(merged.limit, Some(0));
     }
 
     #[test]
-    fn test_merge_uses_cli_default_limit_when_saved_limit_missing() {
+    fn test_merge_keeps_limit_absent_when_saved_and_cli_omit_limit() {
         let saved = SavedFilters::default();
+        let cli = ListArgs::default();
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, None);
+    }
+
+    #[test]
+    fn test_merge_cli_limit_can_override_saved_with_default_limit_value() {
+        let saved = SavedFilters {
+            limit: Some(10),
+            ..Default::default()
+        };
         let cli = ListArgs {
-            limit: Some(LIST_ARGS_DEFAULT_LIMIT),
+            limit: Some(DEFAULT_LIST_LIMIT),
             ..Default::default()
         };
 
         let merged = saved.merge_with_cli(&cli);
-        assert_eq!(merged.limit, Some(LIST_ARGS_DEFAULT_LIMIT));
+        assert_eq!(merged.limit, Some(DEFAULT_LIST_LIMIT));
     }
 
     #[test]

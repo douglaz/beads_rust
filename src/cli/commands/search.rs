@@ -2,7 +2,10 @@
 //!
 //! Classic bd-style LIKE search across title/description/id with list-like filters.
 
-use crate::cli::{ListArgs, OutputFormat, SearchArgs, resolve_output_format_with_outer_mode};
+use crate::cli::{
+    DEFAULT_LIST_LIMIT, DEFAULT_LIST_OFFSET, ListArgs, OutputFormat, SearchArgs,
+    resolve_output_format_with_outer_mode,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{
@@ -400,8 +403,8 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         include_deferred,
         include_templates: false,
         title_contains: args.title_contains.clone(),
-        limit: args.limit,
-        offset: args.offset,
+        limit: Some(args.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
+        offset: Some(args.offset.unwrap_or(DEFAULT_LIST_OFFSET)),
         sort: args.sort.clone(),
         reverse: args.reverse,
         labels: if args.label.is_empty() {
@@ -755,6 +758,14 @@ mod tests {
         };
 
         assert!(!needs_client_filters(&args));
+    }
+
+    #[test]
+    fn test_search_build_filters_applies_list_defaults_when_cli_omits_pagination() {
+        let filters = build_filters(&ListArgs::default()).expect("build filters");
+
+        assert_eq!(filters.limit, Some(DEFAULT_LIST_LIMIT));
+        assert_eq!(filters.offset, Some(DEFAULT_LIST_OFFSET));
     }
 
     #[test]

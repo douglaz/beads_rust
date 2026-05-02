@@ -443,8 +443,10 @@ fn apply_client_filters(
     let max_priority = args.priority_max.map(i32::from);
     let desc_needle = args.desc_contains.as_deref().map(str::to_lowercase);
     let notes_needle = args.notes_contains.as_deref().map(str::to_lowercase);
-    // Deferred issues are included by default when no status filter is specified
+    // Deferred issues are included by default when no status filter is specified,
+    // except `--overdue` keeps deferred work hidden unless requested.
     let include_deferred = args.deferred
+        || args.all
         || (!args.overdue && args.status.is_empty())
         || args
             .status
@@ -721,7 +723,7 @@ mod tests {
         assert_eq!(overdue_only_ids, vec!["bd-1"]);
 
         let overdue_with_deferred = apply_client_filters(
-            vec![overdue_open, overdue_deferred],
+            vec![overdue_open.clone(), overdue_deferred.clone()],
             &ListArgs {
                 overdue: true,
                 deferred: true,
@@ -734,6 +736,21 @@ mod tests {
             .map(|issue| issue.id.as_str())
             .collect();
         assert_eq!(overdue_with_deferred_ids, vec!["bd-1", "bd-2"]);
+
+        let overdue_with_all = apply_client_filters(
+            vec![overdue_open, overdue_deferred],
+            &ListArgs {
+                overdue: true,
+                all: true,
+                ..Default::default()
+            },
+        )
+        .expect("overdue with all filter");
+        let overdue_with_all_ids: Vec<_> = overdue_with_all
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect();
+        assert_eq!(overdue_with_all_ids, vec!["bd-1", "bd-2"]);
     }
 
     #[test]

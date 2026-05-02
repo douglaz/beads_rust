@@ -476,9 +476,10 @@ fn apply_client_filters(
             .ok()
     });
 
-    // Deferred issues are included by default when no status filter is specified
+    // Deferred issues are included by default when no status filter is specified,
+    // except `--overdue` keeps deferred work hidden unless requested.
     let include_deferred = args.deferred
-        || args.status.is_empty()
+        || (!args.overdue && args.status.is_empty())
         || args
             .status
             .iter()
@@ -885,6 +886,53 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "bd-old");
+    }
+
+    #[test]
+    fn test_search_overdue_excludes_deferred_unless_requested() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let created_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let overdue_at = Utc::now() - chrono::Duration::days(1);
+
+        let mut open_overdue = make_issue("bd-open", "match open overdue", None, created_at);
+        open_overdue.due_at = Some(overdue_at);
+
+        let mut deferred_overdue =
+            make_issue("bd-deferred", "match deferred overdue", None, created_at);
+        deferred_overdue.status = Status::Deferred;
+        deferred_overdue.due_at = Some(overdue_at);
+
+        for issue in [open_overdue, deferred_overdue] {
+            storage.create_issue(&issue, "tester").expect("create");
+        }
+
+        let overdue_only = collect_search_results(
+            &storage,
+            "match",
+            &ListArgs {
+                overdue: true,
+                ..Default::default()
+            },
+        )
+        .expect("search overdue");
+        let overdue_only_ids: Vec<_> = overdue_only.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(overdue_only_ids, vec!["bd-open"]);
+
+        let overdue_with_deferred = collect_search_results(
+            &storage,
+            "match",
+            &ListArgs {
+                overdue: true,
+                deferred: true,
+                ..Default::default()
+            },
+        )
+        .expect("search overdue with deferred");
+        let overdue_with_deferred_ids: Vec<_> = overdue_with_deferred
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect();
+        assert_eq!(overdue_with_deferred_ids, vec!["bd-deferred", "bd-open"]);
     }
 
     #[test]

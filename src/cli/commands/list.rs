@@ -80,7 +80,8 @@ fn execute_inner(
     // Unlimited output already materializes the full matching set, so its exact
     // total is the issue vector length after the list query.
     // For client-filter path, the total count is determined after filtering in Rust.
-    let needs_sql_total = is_json_output && !client_filters && user_limit != 0;
+    let needs_sql_total =
+        is_json_output && !client_filters && (user_limit != 0 || user_offset != 0);
     let sql_total: Option<usize> = if needs_sql_total {
         Some(storage.count_issues_with_filters(&filters)?)
     } else {

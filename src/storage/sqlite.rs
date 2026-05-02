@@ -8304,13 +8304,13 @@ fn datetime_from_epoch_auto(n: i64) -> Result<DateTime<Utc>> {
     const NS_THRESHOLD: i64 = 10_000_000_000_000_000;
 
     let abs = n.unsigned_abs();
-    let (secs, sub_nanos): (i64, u32) = if abs < MS_THRESHOLD as u64 {
+    let (secs, sub_nanos): (i64, u32) = if abs <= MS_THRESHOLD as u64 {
         (n, 0)
-    } else if abs < US_THRESHOLD as u64 {
+    } else if abs <= US_THRESHOLD as u64 {
         let secs = n.div_euclid(1_000);
         let rem = epoch_remainder_u32(n, 1_000)?;
         (secs, rem * 1_000_000)
-    } else if abs < NS_THRESHOLD as u64 {
+    } else if abs <= NS_THRESHOLD as u64 {
         let secs = n.div_euclid(1_000_000);
         let rem = epoch_remainder_u32(n, 1_000_000)?;
         (secs, rem * 1_000)
@@ -14984,6 +14984,33 @@ mod tests {
     }
 
     #[test]
+    fn test_datetime_from_epoch_auto_keeps_exact_unit_boundaries() {
+        let seconds = datetime_from_epoch_auto(10_000_000_000).unwrap();
+        assert_eq!(seconds.timestamp(), 10_000_000_000);
+        assert_eq!(seconds.timestamp_subsec_nanos(), 0);
+
+        let milliseconds = datetime_from_epoch_auto(10_000_000_000_000).unwrap();
+        assert_eq!(milliseconds.timestamp(), 10_000_000_000);
+        assert_eq!(milliseconds.timestamp_subsec_nanos(), 0);
+
+        let microseconds = datetime_from_epoch_auto(10_000_000_000_000_000).unwrap();
+        assert_eq!(microseconds.timestamp(), 10_000_000_000);
+        assert_eq!(microseconds.timestamp_subsec_nanos(), 0);
+
+        let negative_seconds = datetime_from_epoch_auto(-10_000_000_000).unwrap();
+        assert_eq!(negative_seconds.timestamp(), -10_000_000_000);
+        assert_eq!(negative_seconds.timestamp_subsec_nanos(), 0);
+
+        let negative_milliseconds = datetime_from_epoch_auto(-10_000_000_000_000).unwrap();
+        assert_eq!(negative_milliseconds.timestamp(), -10_000_000_000);
+        assert_eq!(negative_milliseconds.timestamp_subsec_nanos(), 0);
+
+        let negative_microseconds = datetime_from_epoch_auto(-10_000_000_000_000_000).unwrap();
+        assert_eq!(negative_microseconds.timestamp(), -10_000_000_000);
+        assert_eq!(negative_microseconds.timestamp_subsec_nanos(), 0);
+    }
+
+    #[test]
     fn test_parse_datetime_value_null_is_epoch() {
         assert_eq!(
             parse_datetime_value(Some(&SqliteValue::Null)).unwrap(),
@@ -15063,9 +15090,8 @@ mod tests {
         assert_eq!(dt.timestamp(), -3600);
         assert_eq!(dt.timestamp_subsec_nanos(), 0);
 
-        // Negative microseconds pick up div_euclid/rem_euclid's floor
-        // semantics: -1_500_000 µs = -1.5 s → (secs=-2, nanos=5e8). Must
-        // match datetime_from_epoch_seconds_f64(-1.5).
+        // Negative microsecond-range values pick up div_euclid/rem_euclid's
+        // floor semantics instead of truncating toward zero.
         let v = SqliteValue::Integer(-1_500_000_000_000_000); // µs-range magnitude
         let dt = parse_datetime_value(Some(&v)).unwrap();
         assert_eq!(dt.timestamp(), -1_500_000_000);

@@ -13,28 +13,10 @@ use crate::format::{
 };
 use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
-use crate::storage::{ListFilters, ListJsonIssueRow};
+use crate::storage::ListFilters;
 use chrono::Utc;
-use serde::Serialize;
 use std::collections::HashSet;
 use std::io::IsTerminal;
-
-#[derive(Serialize)]
-struct ListJsonIssueWithCounts {
-    #[serde(flatten)]
-    issue: ListJsonIssueRow,
-    dependency_count: usize,
-    dependent_count: usize,
-}
-
-#[derive(Serialize)]
-struct RawListJsonPage {
-    issues: Vec<ListJsonIssueWithCounts>,
-    total: usize,
-    limit: usize,
-    offset: usize,
-    has_more: bool,
-}
 
 /// Execute the list command.
 ///
@@ -92,7 +74,6 @@ fn execute_inner(
     // The effective limit and offset from the user's request.
     let user_limit = args.limit.unwrap_or(50);
     let user_offset = args.offset.unwrap_or(0);
-    let quiet = cli.quiet.unwrap_or(false);
 
     // For paginated structured SQL-path queries, run a COUNT(*) query using the
     // same filters (without LIMIT/OFFSET) so we can include pagination metadata.
@@ -129,36 +110,6 @@ fn execute_inner(
 
     // Validate sort key before query
     validate_sort_key(args.sort.as_deref())?;
-
-    if should_use_full_json_projection(args, client_filters, user_limit, user_offset, output_format)
-        && let Some(mut issues) = storage.list_unfiltered_all_json_rows()?
-    {
-        let mut relation_metadata = storage.get_all_list_relation_metadata()?;
-        let total = issues.len();
-        let issues = issues
-            .drain(..)
-            .map(|mut issue| {
-                let metadata = relation_metadata.remove(&issue.id).unwrap_or_default();
-                issue.labels = metadata.labels;
-
-                ListJsonIssueWithCounts {
-                    issue,
-                    dependency_count: metadata.dependency_count,
-                    dependent_count: metadata.dependent_count,
-                }
-            })
-            .collect();
-
-        let ctx = OutputContext::from_output_format(output_format, quiet, true);
-        ctx.json_pretty(&RawListJsonPage {
-            issues,
-            total,
-            limit: user_limit,
-            offset: user_offset,
-            has_more: false,
-        });
-        return Ok(());
-    }
 
     // Query issues
     let mut issues = storage.list_issues(&filters)?;
@@ -199,6 +150,7 @@ fn execute_inner(
         false
     };
 
+    let quiet = cli.quiet.unwrap_or(false);
     let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
 
     // Warn on stderr when results were truncated (skip for structured output)
@@ -472,19 +424,6 @@ fn should_use_full_relation_scan(
         && args.title_contains.is_none()
         && args.label.is_empty()
         && args.label_any.is_empty()
-}
-
-fn should_use_full_json_projection(
-    args: &ListArgs,
-    client_filters: bool,
-    user_limit: usize,
-    user_offset: usize,
-    output_format: OutputFormat,
-) -> bool {
-    matches!(output_format, OutputFormat::Json)
-        && args.sort.is_none()
-        && !args.reverse
-        && should_use_full_relation_scan(args, client_filters, user_limit, user_offset)
 }
 
 fn apply_client_filters(

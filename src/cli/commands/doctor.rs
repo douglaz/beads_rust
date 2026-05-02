@@ -1220,7 +1220,7 @@ fn repair_database_from_jsonl(
 
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
 
-    let fk_violations_cleaned = cleanup_repair_missing_issue_references(&storage)?;
+    let fk_violations_cleaned = cleanup_repair_missing_issue_references(&mut storage)?;
 
     Ok(DoctorRepairResult {
         imported: import_result.imported_count,
@@ -1230,7 +1230,7 @@ fn repair_database_from_jsonl(
     })
 }
 
-fn cleanup_repair_missing_issue_references(storage: &SqliteStorage) -> Result<usize> {
+fn cleanup_repair_missing_issue_references(storage: &mut SqliteStorage) -> Result<usize> {
     let missing_references = storage.missing_issue_references()?;
     if missing_references.is_empty() {
         return Ok(0);
@@ -1253,6 +1253,7 @@ fn cleanup_repair_missing_issue_references(storage: &SqliteStorage) -> Result<us
         ("child_counters", "parent_id"),
     ];
     let mut cleaned = 0usize;
+    let mut dependency_rows_cleaned = 0usize;
 
     for (table, col) in orphan_tables {
         let external_dependency_filter = match (*table, *col) {
@@ -1263,7 +1264,11 @@ fn cleanup_repair_missing_issue_references(storage: &SqliteStorage) -> Result<us
         let cleanup = format!(
             "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues){external_dependency_filter}"
         );
-        cleaned += storage.execute_raw_count(&cleanup)?;
+        let removed = storage.execute_raw_count(&cleanup)?;
+        if *table == "dependencies" {
+            dependency_rows_cleaned += removed;
+        }
+        cleaned += removed;
     }
 
     let remaining = storage.missing_issue_references()?;
@@ -1272,6 +1277,10 @@ fn cleanup_repair_missing_issue_references(storage: &SqliteStorage) -> Result<us
             "Repair import finished with orphaned issue references still present: {}",
             remaining.join(", ")
         )));
+    }
+
+    if dependency_rows_cleaned > 0 {
+        storage.rebuild_blocked_cache(true)?;
     }
 
     Ok(cleaned)
@@ -3616,7 +3625,7 @@ mod tests {
             )
             .unwrap();
 
-        let cleaned = cleanup_repair_missing_issue_references(&storage).unwrap();
+        let cleaned = cleanup_repair_missing_issue_references(&mut storage).unwrap();
 
         assert_eq!(cleaned, 1, "only the real local orphan should be removed");
         let external_rows = storage
@@ -3630,6 +3639,42 @@ mod tests {
             external_rows.len(),
             1,
             "external dependency endpoints must survive doctor repair cleanup"
+        );
+    }
+
+    #[test]
+    fn test_repair_orphan_cleanup_rebuilds_blocked_cache_after_dependency_cleanup() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = sample_issue("bd-local", "Local");
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-local', 'bd-missing', 'blocks', '2026-01-01T00:00:00Z', 'tester');
+                 INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at)
+                 VALUES ('bd-local', '[\"bd-missing\"]', '2026-01-01T00:00:00Z');
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let cleaned = cleanup_repair_missing_issue_references(&mut storage).unwrap();
+
+        assert_eq!(
+            cleaned, 1,
+            "only the missing dependency row should be removed"
+        );
+        let cache_rows = storage
+            .execute_raw_query(
+                "SELECT issue_id
+                 FROM blocked_issues_cache
+                 WHERE issue_id = 'bd-local'",
+            )
+            .unwrap();
+        assert!(
+            cache_rows.is_empty(),
+            "dependency cleanup must rebuild stale blocked cache rows"
         );
     }
 

@@ -10759,7 +10759,10 @@ mod tests {
         let deps = storage.get_dependencies_with_metadata("bd-a1").unwrap();
         let ids: Vec<_> = deps.iter().map(|dep| dep.id.as_str()).collect();
 
-        assert_eq!(ids, vec!["bd-critical", "external:proj:capability", "bd-low"]);
+        assert_eq!(
+            ids,
+            vec!["bd-critical", "external:proj:capability", "bd-low"]
+        );
         assert_eq!(deps[1].priority, Priority::MEDIUM);
     }
 

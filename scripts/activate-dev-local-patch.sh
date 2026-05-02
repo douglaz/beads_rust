@@ -25,7 +25,26 @@ if [[ ! -d ../frankensqlite/crates/fsqlite ]]; then
   exit 1
 fi
 
+if [[ "${1:-}" != "" && "${1:-}" != "--fastmcp" ]]; then
+  echo "error: unknown flag '${1}'" >&2
+  echo "       supported: (none) | --fastmcp" >&2
+  exit 1
+fi
+
 mkdir -p .cargo
+
+# Refuse to clobber a `.cargo/config.toml` that wasn't planted by this script.
+# The dev-local template starts with the literal marker comment below, so any
+# config.toml that doesn't begin with that line is something the contributor
+# wrote themselves and we leave it alone.
+ACTIVATION_MARKER='# Local contributor template:'
+if [[ -f .cargo/config.toml ]] \
+   && ! head -1 .cargo/config.toml | grep -Fq "$ACTIVATION_MARKER"; then
+  echo "error: .cargo/config.toml exists and was not activated by this script" >&2
+  echo "       move it aside (e.g., \`mv .cargo/config.toml .cargo/config.toml.bak\`)" >&2
+  echo "       before activating, or merge its contents into the dev-local template" >&2
+  exit 1
+fi
 
 if [[ "${1:-}" == "--fastmcp" ]]; then
   # Strip the leading `# ` from the fastmcp_rust block so those entries activate too.

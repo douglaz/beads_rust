@@ -20,7 +20,6 @@ use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
-use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Read;
@@ -46,84 +45,6 @@ pub(crate) struct ListRelationMetadata {
     pub(crate) labels: Vec<String>,
     pub(crate) dependency_count: usize,
     pub(crate) dependent_count: usize,
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_false_for_json_projection(value: &bool) -> bool {
-    !*value
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ListJsonIssueRow {
-    pub(crate) id: String,
-    pub(crate) title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) design: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) acceptance_criteria: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) notes: Option<String>,
-    #[serde(default)]
-    pub(crate) status: String,
-    #[serde(default)]
-    pub(crate) priority: i32,
-    #[serde(default)]
-    pub(crate) issue_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) assignee: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) owner: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) estimated_minutes: Option<i32>,
-    pub(crate) created_at: String,
-    #[serde(skip)]
-    pub(crate) created_sort_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) created_by: Option<String>,
-    pub(crate) updated_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) closed_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) close_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) closed_by_session: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) due_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) defer_until: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) external_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) source_system: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) source_repo: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) deleted_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) deleted_by: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) delete_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) original_type: Option<String>,
-    pub(crate) compaction_level: i32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) compacted_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) compacted_at_commit: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) original_size: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) sender: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false_for_json_projection")]
-    pub(crate) ephemeral: bool,
-    #[serde(default, skip_serializing_if = "is_false_for_json_projection")]
-    pub(crate) pinned: bool,
-    #[serde(default, skip_serializing_if = "is_false_for_json_projection")]
-    pub(crate) is_template: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub(crate) labels: Vec<String>,
 }
 
 fn unique_label_refs(labels: &[String]) -> Vec<&String> {
@@ -2828,45 +2749,6 @@ impl SqliteStorage {
         }
 
         Ok(issues)
-    }
-
-    /// List all non-template, non-tombstone issues as a raw JSON projection.
-    ///
-    /// This is a fast path for `br list --json --all --limit 0`: it keeps the
-    /// public JSON shape but avoids parsing timestamp strings into
-    /// `DateTime<Utc>` only to serialize them back to RFC 3339. If the database
-    /// contains a timestamp storage class or textual offset this projection does
-    /// not understand, callers fall back to [`Self::list_issues`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database query fails.
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn list_unfiltered_all_json_rows(
-        &self,
-    ) -> Result<Option<Vec<ListJsonIssueRow>>> {
-        let rows = self.conn.query(
-            r"SELECT id, title, description, design, acceptance_criteria, notes,
-                     status, priority, issue_type, assignee, owner, estimated_minutes,
-                     created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system, source_repo,
-                     deleted_at, deleted_by, delete_reason, original_type,
-                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template
-              FROM issues
-              WHERE status != 'tombstone'
-                AND (is_template = 0 OR is_template IS NULL)",
-        )?;
-        let mut issues = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let Some(issue) = Self::list_json_issue_from_row(row) else {
-                return Ok(None);
-            };
-            issues.push(issue);
-        }
-        sort_list_json_default(&mut issues);
-
-        Ok(Some(issues))
     }
 
     /// Get lean issue rows for stats computation without hydrating large text fields.
@@ -7515,75 +7397,6 @@ impl SqliteStorage {
         })
     }
 
-    fn list_json_issue_from_row(row: &fsqlite::Row) -> Option<ListJsonIssueRow> {
-        let get_str = |idx: usize| -> String {
-            row.get(idx)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string()
-        };
-        let get_opt_str = |idx: usize| -> Option<String> {
-            row.get(idx)
-                .and_then(SqliteValue::as_text)
-                .map(str::to_string)
-        };
-        let get_non_empty_str = |idx: usize| -> Option<String> {
-            row.get(idx)
-                .and_then(SqliteValue::as_text)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-        let get_bool = |idx: usize| -> bool {
-            row.get(idx).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
-        };
-        let get_opt_i32 = |idx: usize| -> Option<i32> { sql_value_i32(row.get(idx)) };
-        let optional_datetime =
-            |idx: usize| -> Option<Option<String>> { optional_json_datetime_text(row.get(idx)) };
-
-        let (created_at, created_sort_key) = json_datetime_text(row.get(12))?;
-        let (updated_at, _) = json_datetime_text(row.get(14))?;
-
-        Some(ListJsonIssueRow {
-            id: get_str(0),
-            title: get_str(1),
-            description: get_non_empty_str(2),
-            design: get_non_empty_str(3),
-            acceptance_criteria: get_non_empty_str(4),
-            notes: get_non_empty_str(5),
-            status: normalize_status_json_text(row.get(6)),
-            priority: get_opt_i32(7).unwrap_or_else(|| Priority::default().0),
-            issue_type: normalize_issue_type_json_text(row.get(8)),
-            assignee: get_non_empty_str(9),
-            owner: get_non_empty_str(10),
-            estimated_minutes: get_opt_i32(11),
-            created_at,
-            created_sort_key,
-            created_by: get_non_empty_str(13),
-            updated_at,
-            closed_at: optional_datetime(15)?,
-            close_reason: get_non_empty_str(16),
-            closed_by_session: get_non_empty_str(17),
-            due_at: optional_datetime(18)?,
-            defer_until: optional_datetime(19)?,
-            external_ref: get_opt_str(20),
-            source_system: get_non_empty_str(21),
-            source_repo: get_non_empty_str(22),
-            deleted_at: optional_datetime(23)?,
-            deleted_by: get_non_empty_str(24),
-            delete_reason: get_non_empty_str(25),
-            original_type: get_non_empty_str(26),
-            compaction_level: get_opt_i32(27).unwrap_or(0),
-            compacted_at: optional_datetime(28)?,
-            compacted_at_commit: get_opt_str(29),
-            original_size: get_opt_i32(30),
-            sender: get_non_empty_str(31),
-            ephemeral: get_bool(32),
-            pinned: get_bool(33),
-            is_template: get_bool(34),
-            labels: Vec::new(),
-        })
-    }
-
     fn issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
@@ -8047,15 +7860,6 @@ fn sort_list_default(issues: &mut [Issue]) {
     });
 }
 
-fn sort_list_json_default(issues: &mut [ListJsonIssueRow]) {
-    issues.sort_unstable_by(|left, right| {
-        left.priority
-            .cmp(&right.priority)
-            .then_with(|| right.created_sort_key.cmp(&left.created_sort_key))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-}
-
 const fn ready_hybrid_bucket(priority: Priority) -> i32 {
     if priority.0 <= 1 { 0 } else { 1 }
 }
@@ -8082,124 +7886,6 @@ fn parse_status(s: Option<&str>) -> Status {
 
 fn parse_issue_type(s: Option<&str>) -> IssueType {
     s.and_then(|s| s.parse().ok()).unwrap_or_default()
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn sql_value_i32(value: Option<&SqliteValue>) -> Option<i32> {
-    value.and_then(SqliteValue::as_integer).map(|value| value as i32)
-}
-
-fn normalize_status_json_text(value: Option<&SqliteValue>) -> String {
-    normalize_known_json_text(
-        value,
-        "open",
-        &[
-            "open",
-            "in_progress",
-            "blocked",
-            "deferred",
-            "draft",
-            "closed",
-            "tombstone",
-            "pinned",
-        ],
-    )
-}
-
-fn normalize_issue_type_json_text(value: Option<&SqliteValue>) -> String {
-    normalize_known_json_text(
-        value,
-        "task",
-        &[
-            "task", "bug", "feature", "epic", "chore", "docs", "question",
-        ],
-    )
-}
-
-fn normalize_known_json_text(
-    value: Option<&SqliteValue>,
-    default_value: &str,
-    known_values: &[&str],
-) -> String {
-    let raw = value.and_then(SqliteValue::as_text).unwrap_or(default_value);
-    known_values
-        .iter()
-        .find(|candidate| raw.eq_ignore_ascii_case(candidate))
-        .map_or_else(|| raw.to_string(), |candidate| (*candidate).to_string())
-}
-
-fn json_datetime_text(value: Option<&SqliteValue>) -> Option<(String, String)> {
-    match value {
-        None | Some(SqliteValue::Null) => Some((
-            "1970-01-01T00:00:00Z".to_string(),
-            "1970-01-01T00:00:00.000000000".to_string(),
-        )),
-        Some(SqliteValue::Text(s)) if s.is_empty() => Some((
-            "1970-01-01T00:00:00Z".to_string(),
-            "1970-01-01T00:00:00.000000000".to_string(),
-        )),
-        Some(SqliteValue::Text(s)) => canonical_utc_datetime_text(s.as_ref()),
-        Some(SqliteValue::Integer(_) | SqliteValue::Float(_) | SqliteValue::Blob(_)) => None,
-    }
-}
-
-fn optional_json_datetime_text(value: Option<&SqliteValue>) -> Option<Option<String>> {
-    match value {
-        None | Some(SqliteValue::Null) => Some(None),
-        Some(SqliteValue::Text(s)) if s.is_empty() => Some(None),
-        Some(SqliteValue::Text(s)) => {
-            canonical_utc_datetime_text(s.as_ref()).map(|(json, _)| Some(json))
-        }
-        Some(SqliteValue::Integer(_) | SqliteValue::Float(_) | SqliteValue::Blob(_)) => None,
-    }
-}
-
-fn canonical_utc_datetime_text(value: &str) -> Option<(String, String)> {
-    if let Some(core) = value.strip_suffix("+00:00") {
-        let sort_key = utc_datetime_sort_key(core)?;
-        let mut json = String::with_capacity(core.len() + 1);
-        json.push_str(core);
-        json.push('Z');
-        Some((json, sort_key))
-    } else if let Some(core) = value.strip_suffix('Z') {
-        let sort_key = utc_datetime_sort_key(core)?;
-        Some((value.to_string(), sort_key))
-    } else {
-        None
-    }
-}
-
-fn utc_datetime_sort_key(core: &str) -> Option<String> {
-    let (base, fraction) = core.split_once('.').map_or((core, ""), |parts| parts);
-    if !is_rfc3339_utc_base(base)
-        || fraction.len() > 9
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-
-    let mut key = String::with_capacity(30);
-    key.push_str(base);
-    key.push('.');
-    key.push_str(fraction);
-    for _ in fraction.len()..9 {
-        key.push('0');
-    }
-    Some(key)
-}
-
-fn is_rfc3339_utc_base(base: &str) -> bool {
-    let bytes = base.as_bytes();
-    bytes.len() == 19
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[10] == b'T'
-        && bytes[13] == b':'
-        && bytes[16] == b':'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(idx, byte)| matches!(idx, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
 }
 
 fn dependency_metadata_from_row(

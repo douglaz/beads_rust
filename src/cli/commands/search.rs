@@ -299,6 +299,8 @@ fn snippet_around_match(text: &str, start: usize, end: usize, radius: usize) -> 
     if text.is_empty() {
         return String::new();
     }
+    let start = start.min(text.len());
+    let end = end.min(text.len()).max(start);
 
     let mut char_starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
     char_starts.push(text.len());
@@ -310,13 +312,21 @@ fn snippet_around_match(text: &str, start: usize, end: usize, radius: usize) -> 
     let snippet_start_char = start_char.saturating_sub(radius);
     let snippet_end_char = (end_char + radius).min(total_chars);
 
-    let snippet_start_byte = char_starts[snippet_start_char];
-    let snippet_end_byte = char_starts[snippet_end_char];
+    let (Some(&snippet_start_byte), Some(&snippet_end_byte)) = (
+        char_starts.get(snippet_start_char),
+        char_starts.get(snippet_end_char),
+    ) else {
+        return String::new();
+    };
 
-    let mut snippet = text[snippet_start_byte..snippet_end_byte]
-        .trim()
-        .to_string();
+    let Some(snippet_slice) = text.get(snippet_start_byte..snippet_end_byte) else {
+        return String::new();
+    };
+    let mut snippet = snippet_slice.trim().to_string();
     snippet = normalize_whitespace(&snippet);
+    if snippet.is_empty() {
+        return snippet;
+    }
 
     if snippet_start_char > 0 {
         snippet.insert_str(0, "...");
@@ -685,6 +695,17 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn test_snippet_around_match_clamps_invalid_offsets() {
+        assert_eq!(snippet_around_match("alpha beta", 999, 1000, 0), "");
+
+        let snippet = snippet_around_match("alpha beta", 999, 1000, 5);
+        assert_eq!(snippet, "...beta");
+
+        let multibyte = snippet_around_match("alpha βeta", 7, 6, 2);
+        assert_eq!(multibyte, "...βet...");
     }
 
     #[test]

@@ -6227,7 +6227,7 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.depends_on_id = i.id
              WHERE d.issue_id = ?
-            ORDER BY i.priority ASC, i.created_at DESC, d.depends_on_id ASC",
+            ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.depends_on_id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -6250,7 +6250,7 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
              WHERE d.depends_on_id = ?
-            ORDER BY i.priority ASC, i.created_at DESC, d.issue_id ASC",
+            ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.issue_id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
 
@@ -6272,7 +6272,7 @@ impl SqliteStorage {
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
              WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child')
-             ORDER BY i.priority ASC, i.created_at DESC, d.issue_id ASC",
+             ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.issue_id ASC",
         )?;
 
         let mut map: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
@@ -10732,6 +10732,35 @@ mod tests {
         assert_eq!(deps[0].status, Status::Blocked);
         assert_eq!(deps[0].priority, Priority::MEDIUM);
         assert_eq!(deps[0].dep_type, "blocks");
+    }
+
+    #[test]
+    fn test_get_dependencies_with_metadata_sorts_external_placeholder_as_medium_priority() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        let critical = make_issue("bd-critical", "Critical", Status::Open, 0, None, t1, None);
+        let low = make_issue("bd-low", "Low", Status::Open, 3, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&critical, "tester").unwrap();
+        storage.create_issue(&low, "tester").unwrap();
+
+        storage
+            .add_dependency("bd-a1", "external:proj:capability", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-a1", "bd-low", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-a1", "bd-critical", "blocks", "tester")
+            .unwrap();
+
+        let deps = storage.get_dependencies_with_metadata("bd-a1").unwrap();
+        let ids: Vec<_> = deps.iter().map(|dep| dep.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["bd-critical", "external:proj:capability", "bd-low"]);
+        assert_eq!(deps[1].priority, Priority::MEDIUM);
     }
 
     #[test]

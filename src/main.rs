@@ -369,7 +369,7 @@ fn main() {
         Commands::Undefer(args) => {
             commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
-        Commands::Orphans(args) => {
+        Commands::Orphans(args) if !args.fix => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
                 commands::orphans::execute_with_storage_ctx(
@@ -383,6 +383,9 @@ fn main() {
             } else {
                 commands::orphans::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
             }
+        }
+        Commands::Orphans(args) => {
+            commands::orphans::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Changelog(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
@@ -637,6 +640,7 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
+        Commands::Orphans(args) => args.fix,
         _ => false,
     }
 }
@@ -1306,6 +1310,8 @@ mod tests {
         let label_add = Cli::parse_from(["br", "label", "add", "bd-123", "--label", "ops"]).command;
         let comments_list = Cli::parse_from(["br", "comments", "bd-123"]).command;
         let comments_add = Cli::parse_from(["br", "comments", "add", "bd-123", "hello"]).command;
+        let orphans = Cli::parse_from(["br", "orphans"]).command;
+        let orphans_fix = Cli::parse_from(["br", "orphans", "--fix"]).command;
 
         assert!(!is_mutating_command(&dep_list));
         assert!(is_mutating_command(&dep_add));
@@ -1313,6 +1319,8 @@ mod tests {
         assert!(is_mutating_command(&label_add));
         assert!(!is_mutating_command(&comments_list));
         assert!(is_mutating_command(&comments_add));
+        assert!(!is_mutating_command(&orphans));
+        assert!(is_mutating_command(&orphans_fix));
     }
 
     #[test]
@@ -1391,6 +1399,14 @@ mod tests {
     #[test]
     fn orphans_defers_auto_import_but_keeps_write_lock_when_initialized() {
         let command = Cli::parse_from(["br", "orphans"]).command;
+        assert!(!should_auto_import(&command));
+        assert!(needs_write_lock(&command));
+    }
+
+    #[test]
+    fn orphans_fix_uses_mutating_flush_pipeline_without_startup_auto_import() {
+        let command = Cli::parse_from(["br", "orphans", "--fix"]).command;
+        assert!(is_mutating_command(&command));
         assert!(!should_auto_import(&command));
         assert!(needs_write_lock(&command));
     }

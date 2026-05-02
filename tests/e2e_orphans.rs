@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env, run_br_with_stdin};
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
@@ -223,6 +223,55 @@ fn e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state() {
 }
 
 #[test]
+fn e2e_orphans_fix_auto_flushes_closed_issue_to_jsonl() {
+    common::init_test_logging();
+    info!("e2e_orphans_fix_auto_flushes_closed_issue_to_jsonl: starting");
+    let workspace = BrWorkspace::new();
+
+    init_git(&workspace, "git_init");
+    let init = run_br(&workspace, ["init"], "br_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Close via orphans fix"],
+        "create_issue",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    git_commit(
+        &workspace,
+        &format!("Implement orphaned issue {issue_id}"),
+        "commit_ref",
+    );
+
+    let fix = run_br_with_stdin(&workspace, ["orphans", "--fix"], "y\n", "orphans_fix");
+    assert!(fix.status.success(), "orphans --fix failed: {}", fix.stderr);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let exported_issue = fs::read_to_string(&jsonl_path)
+        .expect("read issues.jsonl")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse issue json"))
+        .find(|issue| issue["id"].as_str() == Some(issue_id.as_str()))
+        .expect("exported issue");
+
+    assert_eq!(
+        exported_issue["status"].as_str(),
+        Some("closed"),
+        "orphans --fix must auto-flush the nested close to JSONL"
+    );
+    assert_eq!(
+        exported_issue["close_reason"].as_str(),
+        Some("Implemented (detected by orphans scan)")
+    );
+
+    info!("e2e_orphans_fix_auto_flushes_closed_issue_to_jsonl: assertions passed");
+}
+
+#[test]
 fn e2e_orphans_detects_issue_without_parens() {
     common::init_test_logging();
     info!("e2e_orphans_detects_issue_without_parens: starting");
@@ -420,6 +469,31 @@ fn e2e_orphans_before_init_returns_empty() {
         orphans.stdout
     );
     info!("e2e_orphans_before_init_returns_empty: assertions passed");
+}
+
+#[test]
+fn e2e_orphans_fix_before_init_returns_empty() {
+    common::init_test_logging();
+    info!("e2e_orphans_fix_before_init_returns_empty: starting");
+    let workspace = BrWorkspace::new();
+
+    let orphans = run_br_with_stdin(
+        &workspace,
+        ["orphans", "--fix"],
+        "\n",
+        "orphans_fix_no_init",
+    );
+    assert!(
+        orphans.status.success(),
+        "orphans --fix should succeed before init: {}",
+        orphans.stderr
+    );
+    assert!(
+        orphans.stdout.contains("No orphan"),
+        "expected empty orphans message, got: {}",
+        orphans.stdout
+    );
+    info!("e2e_orphans_fix_before_init_returns_empty: assertions passed");
 }
 
 #[test]

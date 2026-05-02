@@ -8346,10 +8346,16 @@ fn datetime_from_epoch_seconds_f64(f: f64) -> Result<DateTime<Utc>> {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    let secs = floor_seconds as i64;
-    let nanos_f64 = ((f - floor_seconds) * 1_000_000_000.0)
-        .round()
-        .clamp(0.0, 999_999_999.0);
+    let mut secs = floor_seconds as i64;
+    let nanos_f64 = ((f - floor_seconds) * 1_000_000_000.0).round();
+    let nanos_f64 = if nanos_f64 >= 1_000_000_000.0 {
+        secs = secs.checked_add(1).ok_or_else(|| {
+            BeadsError::Config(format!("invalid epoch value in datetime column: {f}"))
+        })?;
+        0.0
+    } else {
+        nanos_f64.clamp(0.0, 999_999_999.0)
+    };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let nanos = nanos_f64 as u32;
     DateTime::<Utc>::from_timestamp(secs, nanos)
@@ -15010,6 +15016,17 @@ mod tests {
         let dt = datetime_from_epoch_seconds_f64(1_776_651_488.25).unwrap();
         assert_eq!(dt.timestamp(), 1_776_651_488);
         assert_eq!(dt.timestamp_subsec_nanos(), 250_000_000);
+    }
+
+    #[test]
+    fn test_datetime_from_epoch_seconds_f64_carries_rounded_nanoseconds() {
+        let dt = datetime_from_epoch_seconds_f64(1.999_999_999_6).unwrap();
+        assert_eq!(dt.timestamp(), 2);
+        assert_eq!(dt.timestamp_subsec_nanos(), 0);
+
+        let dt = datetime_from_epoch_seconds_f64(-0.000_000_000_4).unwrap();
+        assert_eq!(dt.timestamp(), 0);
+        assert_eq!(dt.timestamp_subsec_nanos(), 0);
     }
 
     #[test]

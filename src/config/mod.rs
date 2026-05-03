@@ -3258,7 +3258,7 @@ pub struct StartupConfig {
     pub merged_config: ConfigLayer,
 }
 
-const STARTUP_CACHE_VERSION: u32 = 1;
+const STARTUP_CACHE_VERSION: u32 = 2;
 const STARTUP_CACHE_ENABLE_ENV: &str = "BR_STARTUP_CACHE";
 const STARTUP_CACHE_DIR_ENV: &str = "BR_STARTUP_CACHE_DIR";
 
@@ -3383,7 +3383,9 @@ struct StartupUnixFileWitness {
     dev: u64,
     ino: u64,
     mode: u32,
+    mtime_sec: i64,
     mtime_nsec: i64,
+    ctime_sec: i64,
     ctime_nsec: i64,
 }
 
@@ -3395,7 +3397,9 @@ fn startup_unix_file_witness(metadata: &fs::Metadata) -> StartupUnixFileWitness 
         dev: metadata.dev(),
         ino: metadata.ino(),
         mode: metadata.mode(),
+        mtime_sec: metadata.mtime(),
         mtime_nsec: metadata.mtime_nsec(),
+        ctime_sec: metadata.ctime(),
         ctime_nsec: metadata.ctime_nsec(),
     }
 }
@@ -3547,7 +3551,7 @@ fn startup_cache_dir_from_env() -> PathBuf {
 
 fn startup_cache_key(beads_dir: &Path, witness: &StartupCacheWitness) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"br-startup-cache-v1");
+    hasher.update(b"br-startup-cache-v2");
     hasher.update(beads_dir.to_string_lossy().as_bytes());
     hasher.update(b"\0");
     if let Some(db_override) = &witness.db_override {
@@ -6329,6 +6333,60 @@ routing:
             StartupCacheWitness::capture(&beads_dir, Some(&db_a)),
             StartupCacheWitness::capture(&beads_dir, Some(&db_b)),
             "CLI database override changes must not reuse a stale cache entry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_file_witness_tracks_ctime_when_mtime_is_preserved() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config.yaml");
+        fs::write(&config_path, "no-db: true\n").expect("write config");
+
+        let file = fs::File::open(&config_path).expect("open config");
+        let metadata = file.metadata().expect("metadata");
+        let original_accessed = metadata.accessed().expect("accessed");
+        let original_modified = metadata.modified().expect("modified");
+        let before = StartupFileWitness::capture(config_path.clone());
+
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        fs::write(&config_path, "no-db: false\n").expect("rewrite config");
+        let file = fs::File::open(&config_path).expect("reopen config");
+        file.set_times(
+            fs::FileTimes::new()
+                .set_accessed(original_accessed)
+                .set_modified(original_modified),
+        )
+        .expect("restore mtime");
+
+        let after = StartupFileWitness::capture(config_path);
+        assert_ne!(
+            before, after,
+            "preserved-mtime rewrites still need to invalidate startup cache hits"
+        );
+
+        let (
+            StartupPathState::Present {
+                modified_nanos: before_modified,
+                unix: Some(before_unix),
+                ..
+            },
+            StartupPathState::Present {
+                modified_nanos: after_modified,
+                unix: Some(after_unix),
+                ..
+            },
+        ) = (&before.state, &after.state)
+        else {
+            panic!("expected Unix file witnesses");
+        };
+        assert_eq!(
+            before_modified, after_modified,
+            "test setup should preserve visible mtime"
+        );
+        assert_ne!(
+            before_unix.ctime_sec, after_unix.ctime_sec,
+            "ctime seconds must participate in the startup cache witness"
         );
     }
 

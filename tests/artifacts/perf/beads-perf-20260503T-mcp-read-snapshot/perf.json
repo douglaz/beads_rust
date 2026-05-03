@@ -6,21 +6,28 @@
   "iterations": 250,
   "supported_surfaces": [
     "MCP tool project_overview",
-    "MCP tool list_issues"
+    "MCP tool list_issues",
+    "MCP tool show_issue"
   ],
   "project_overview": {
-    "direct_total_ns": 13032576740,
-    "cached_total_ns": 11780547,
-    "speedup": 1106.2794231880744
+    "direct_total_ns": 13589217999,
+    "cached_total_ns": 11954750,
+    "speedup": 1136.7212195152554
   },
   "list_issues": {
-    "direct_total_ns": 11731773591,
-    "cached_total_ns": 259934097,
-    "speedup": 45.133646283426984
+    "direct_total_ns": 11944344416,
+    "cached_total_ns": 284558668,
+    "speedup": 41.97498006281081
+  },
+  "show_issue": {
+    "direct_total_ns": 11518930782,
+    "cached_total_ns": 7386033,
+    "speedup": 1559.5558240803962
   },
   "correctness": {
     "project_overview": "cached JSON equaled direct project_overview_json output before timing and after the cached loop",
     "list_issues": "cached JSON equaled direct list_issues_json output before timing and after the cached loop",
-    "freshness": "unit tests cover stable cache hits, JSONL witness mismatch rejection, mutation cache clearing, and tool-level stale-count invalidation"
+    "show_issue": "cached JSON equaled direct show_issue_json output before timing and after the cached loop",
+    "freshness": "unit tests cover stable cache hits, JSONL witness mismatch rejection, mutation cache clearing, tool-level stale-count invalidation, and show_issue stale-title invalidation"
   }
 }

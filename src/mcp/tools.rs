@@ -1150,6 +1150,98 @@ impl ShowIssueTool {
     }
 }
 
+fn show_issue_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
+    let maybe_details = storage
+        .get_issue_details(id, true, true, 20)
+        .map_err(beads_to_mcp)?;
+    let Some(details) = maybe_details else {
+        return Err(issue_not_found_err(storage, id)?);
+    };
+
+    let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("labels".into(), json!(details.labels));
+        obj.insert("comments".into(), json!(details.comments));
+        obj.insert(
+            "dependencies".into(),
+            json!(
+                details
+                    .dependencies
+                    .iter()
+                    .map(|d| {
+                        json!({
+                            "id": d.id,
+                            "title": d.title,
+                            "status": d.status,
+                            "dep_type": d.dep_type
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            ),
+        );
+        obj.insert(
+            "dependents".into(),
+            json!(
+                details
+                    .dependents
+                    .iter()
+                    .map(|d| {
+                        json!({
+                            "id": d.id,
+                            "title": d.title,
+                            "status": d.status,
+                            "dep_type": d.dep_type
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if let Some(parent) = &details.parent {
+            obj.insert("parent".into(), json!(parent));
+        }
+        obj.insert(
+            "recent_events".into(),
+            json!(
+                details
+                    .events
+                    .iter()
+                    .take(10)
+                    .map(|e| {
+                        json!({
+                            "type": e.event_type,
+                            "actor": e.actor,
+                            "old_value": e.old_value,
+                            "new_value": e.new_value,
+                            "created_at": e.created_at
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            ),
+        );
+
+        // Contextual next_actions based on issue state
+        let mut actions: Vec<String> = Vec::new();
+        if details.issue.status == Status::Blocked {
+            actions.push(
+                "This issue is blocked. Use manage_dependencies action 'list' to see blockers."
+                    .into(),
+            );
+        }
+        if details.issue.assignee.is_none() && details.issue.status != Status::Closed {
+            actions.push("No assignee — consider assigning with update_issue.".into());
+        }
+        if details.issue.status == Status::Closed {
+            actions.push("This issue is closed. Use list_issues to find open work.".into());
+        } else {
+            actions.push("Use update_issue to modify fields or add a comment.".into());
+            actions.push("Use manage_dependencies to link to other issues.".into());
+        }
+        obj.insert("next_actions".into(), json!(actions));
+    }
+
+    Ok(result)
+}
+
 impl ToolHandler for ShowIssueTool {
     fn definition(&self) -> Tool {
         Tool {
@@ -1197,96 +1289,8 @@ impl ToolHandler for ShowIssueTool {
             return Err(err);
         }
 
-        let storage = open(&self.0)?;
-
-        let maybe_details = storage
-            .get_issue_details(&id, true, true, 20)
-            .map_err(beads_to_mcp)?;
-        let Some(details) = maybe_details else {
-            return Err(issue_not_found_err(&storage, &id)?);
-        };
-
-        let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
-        if let Some(obj) = result.as_object_mut() {
-            obj.insert("labels".into(), json!(details.labels));
-            obj.insert("comments".into(), json!(details.comments));
-            obj.insert(
-                "dependencies".into(),
-                json!(
-                    details
-                        .dependencies
-                        .iter()
-                        .map(|d| {
-                            json!({
-                                "id": d.id,
-                                "title": d.title,
-                                "status": d.status,
-                                "dep_type": d.dep_type
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                ),
-            );
-            obj.insert(
-                "dependents".into(),
-                json!(
-                    details
-                        .dependents
-                        .iter()
-                        .map(|d| {
-                            json!({
-                                "id": d.id,
-                                "title": d.title,
-                                "status": d.status,
-                                "dep_type": d.dep_type
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                ),
-            );
-            if let Some(parent) = &details.parent {
-                obj.insert("parent".into(), json!(parent));
-            }
-            obj.insert(
-                "recent_events".into(),
-                json!(
-                    details
-                        .events
-                        .iter()
-                        .take(10)
-                        .map(|e| {
-                            json!({
-                                "type": e.event_type,
-                                "actor": e.actor,
-                                "old_value": e.old_value,
-                                "new_value": e.new_value,
-                                "created_at": e.created_at
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                ),
-            );
-
-            // Contextual next_actions based on issue state
-            let mut actions: Vec<String> = Vec::new();
-            if details.issue.status == Status::Blocked {
-                actions.push(
-                    "This issue is blocked. Use manage_dependencies action 'list' to see blockers."
-                        .into(),
-                );
-            }
-            if details.issue.assignee.is_none() && details.issue.status != Status::Closed {
-                actions.push("No assignee — consider assigning with update_issue.".into());
-            }
-            if details.issue.status == Status::Closed {
-                actions.push("This issue is closed. Use list_issues to find open work.".into());
-            } else {
-                actions.push("Use update_issue to modify fields or add a comment.".into());
-                actions.push("Use manage_dependencies to link to other issues.".into());
-            }
-            obj.insert("next_actions".into(), json!(actions));
-        }
-
+        let key = format!("tool:show_issue:{id}");
+        let result = cached_read_json(&self.0, key, |storage| show_issue_json(storage, &id))?;
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -2230,15 +2234,15 @@ impl ToolHandler for ProjectOverviewTool {
 mod tests {
     use super::{
         CreateIssueTool, ListIssuesTool, ManageDependenciesTool, ProjectOverviewTool,
-        UpdateIssueTool, build_list_filters, generate_issue_id_with_checked_lookup,
+        ShowIssueTool, UpdateIssueTool, build_list_filters, generate_issue_id_with_checked_lookup,
         issue_not_found_err, list_issues_json, next_available_child_id, optional_label_array_arg,
-        optional_string_array_arg, parse_update_fields, project_overview_json,
+        optional_string_array_arg, parse_update_fields, project_overview_json, show_issue_json,
         storage_read_warning,
     };
     use crate::error::BeadsError;
     use crate::mcp::{BeadsState, McpReadSnapshotCache};
     use crate::model::{DependencyType, Issue, IssueType, Priority, Status};
-    use crate::storage::SqliteStorage;
+    use crate::storage::{IssueUpdate, SqliteStorage};
     use chrono::{TimeZone, Utc};
     use fastmcp_rust::{Content, Cx, McpContext, McpErrorCode, ToolHandler};
     use serde_json::json;
@@ -2352,6 +2356,65 @@ mod tests {
     }
 
     #[test]
+    fn show_issue_snapshot_matches_direct_json_and_invalidates() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state_with_read_snapshot(&temp, true);
+        let id = "br-mcp-show-1";
+        insert_test_issue(&state, id, "cached show first title");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ShowIssueTool::new(Arc::clone(&state));
+        let args = json!({"id": id});
+
+        let first_content = tool
+            .call(&ctx, args.clone())
+            .expect("cached show_issue call");
+        let first = content_json(&first_content);
+        let direct = {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            show_issue_json(&storage, id).expect("direct show")
+        };
+        assert_eq!(first, direct);
+        assert!(first["next_actions"].as_array().is_some_and(|actions| {
+            actions.iter().any(|action| {
+                action.as_str() == Some("No assignee — consider assigning with update_issue.")
+            })
+        }));
+
+        {
+            let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            let update = IssueUpdate {
+                title: Some("cached show updated title".to_string()),
+                ..IssueUpdate::default()
+            };
+            storage
+                .update_issue(id, &update, "mcp-test")
+                .expect("update issue title");
+        }
+        fs::write(&state.jsonl_path, "{\"id\":\"br-mcp-show-1\"}\n").expect("update jsonl witness");
+
+        let second_content = tool
+            .call(&ctx, args)
+            .expect("fresh show_issue after witness mismatch");
+        let second = content_json(&second_content);
+        assert_eq!(second["title"].as_str(), Some("cached show updated title"));
+    }
+
+    fn time_repeated_json_reads<F>(
+        iterations: u32,
+        mut read: F,
+    ) -> (std::time::Duration, serde_json::Value)
+    where
+        F: FnMut() -> serde_json::Value,
+    {
+        let started = Instant::now();
+        let mut last = serde_json::Value::Null;
+        for _ in 0..iterations {
+            last = read();
+        }
+        (started.elapsed(), last)
+    }
+
+    #[test]
     #[ignore = "perf probe for MCP read snapshot evidence"]
     fn mcp_read_snapshot_perf_probe() {
         let temp = TempDir::new().expect("tempdir");
@@ -2367,69 +2430,71 @@ mod tests {
         let ctx = McpContext::new(Cx::for_testing(), 1);
         let overview_tool = ProjectOverviewTool::new(Arc::clone(&state));
         let list_tool = ListIssuesTool::new(Arc::clone(&state));
+        let show_tool = ShowIssueTool::new(Arc::clone(&state));
         let list_args = json!({"limit": 250, "sort": "created"});
+        let show_args = json!({"id": "br-mcp-perf-0000"});
         let iterations = 250_u32;
 
-        let direct_overview = {
-            let started = Instant::now();
-            let mut last = serde_json::Value::Null;
-            for _ in 0..iterations {
-                let storage = SqliteStorage::open(&state.db_path).expect("open storage");
-                last = project_overview_json(&state, &storage).expect("direct overview");
-            }
-            (started.elapsed(), last)
-        };
+        let direct_overview = time_repeated_json_reads(iterations, || {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            project_overview_json(&state, &storage).expect("direct overview")
+        });
 
         let first_cached_overview = overview_tool
             .call(&ctx, json!({}))
             .expect("warm overview snapshot");
         assert_eq!(content_json(&first_cached_overview), direct_overview.1);
 
-        let cached_overview = {
-            let started = Instant::now();
-            let mut last = serde_json::Value::Null;
-            for _ in 0..iterations {
-                let content = overview_tool
-                    .call(&ctx, json!({}))
-                    .expect("cached overview call");
-                last = content_json(&content);
-            }
-            (started.elapsed(), last)
-        };
+        let cached_overview = time_repeated_json_reads(iterations, || {
+            let content = overview_tool
+                .call(&ctx, json!({}))
+                .expect("cached overview call");
+            content_json(&content)
+        });
         assert_eq!(cached_overview.1, direct_overview.1);
 
-        let direct_list = {
-            let started = Instant::now();
-            let mut last = serde_json::Value::Null;
-            for _ in 0..iterations {
-                let storage = SqliteStorage::open(&state.db_path).expect("open storage");
-                last = list_issues_json(&storage, &list_args).expect("direct list");
-            }
-            (started.elapsed(), last)
-        };
+        let direct_list = time_repeated_json_reads(iterations, || {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            list_issues_json(&storage, &list_args).expect("direct list")
+        });
 
         let first_cached_list = list_tool
             .call(&ctx, list_args.clone())
             .expect("warm list snapshot");
         assert_eq!(content_json(&first_cached_list), direct_list.1);
 
-        let cached_list = {
-            let started = Instant::now();
-            let mut last = serde_json::Value::Null;
-            for _ in 0..iterations {
-                let content = list_tool
-                    .call(&ctx, list_args.clone())
-                    .expect("cached list call");
-                last = content_json(&content);
-            }
-            (started.elapsed(), last)
-        };
+        let cached_list = time_repeated_json_reads(iterations, || {
+            let content = list_tool
+                .call(&ctx, list_args.clone())
+                .expect("cached list call");
+            content_json(&content)
+        });
         assert_eq!(cached_list.1, direct_list.1);
+
+        let direct_show = time_repeated_json_reads(iterations, || {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            show_issue_json(&storage, "br-mcp-perf-0000").expect("direct show")
+        });
+
+        let first_cached_show = show_tool
+            .call(&ctx, show_args.clone())
+            .expect("warm show snapshot");
+        assert_eq!(content_json(&first_cached_show), direct_show.1);
+
+        let cached_show = time_repeated_json_reads(iterations, || {
+            let content = show_tool
+                .call(&ctx, show_args.clone())
+                .expect("cached show call");
+            content_json(&content)
+        });
+        assert_eq!(cached_show.1, direct_show.1);
 
         let direct_overview_ns = direct_overview.0.as_nanos();
         let cached_overview_ns = cached_overview.0.as_nanos();
         let direct_list_ns = direct_list.0.as_nanos();
         let cached_list_ns = cached_list.0.as_nanos();
+        let direct_show_ns = direct_show.0.as_nanos();
+        let cached_show_ns = cached_show.0.as_nanos();
 
         println!(
             "{}",
@@ -2445,6 +2510,11 @@ mod tests {
                     "direct_total_ns": direct_list_ns,
                     "cached_total_ns": cached_list_ns,
                     "speedup": direct_list_ns as f64 / cached_list_ns.max(1) as f64,
+                },
+                "show_issue": {
+                    "direct_total_ns": direct_show_ns,
+                    "cached_total_ns": cached_show_ns,
+                    "speedup": direct_show_ns as f64 / cached_show_ns.max(1) as f64,
                 },
             })
         );

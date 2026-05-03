@@ -3,10 +3,11 @@
 Bead: `beads_rust-72yf.3`
 
 This artifact covers the first opt-in MCP read snapshot prototype. The committed
-probe exercises two supported read surfaces:
+probe exercises three supported read surfaces:
 
 - `project_overview`
 - `list_issues`
+- `show_issue`
 
 The implementation does not cache SQLite connections. It caches JSON read
 projections only when `BR_MCP_READ_SNAPSHOT` is truthy and validates each hit
@@ -26,11 +27,12 @@ The probe created 250 issues and executed 250 repeated reads per surface.
 
 | Surface | Direct total ns | Cached total ns | Speedup |
 | --- | ---: | ---: | ---: |
-| `project_overview` | 13032576740 | 11780547 | 1106.28x |
-| `list_issues` | 11731773591 | 259934097 | 45.13x |
+| `project_overview` | 13589217999 | 11954750 | 1136.72x |
+| `list_issues` | 11944344416 | 284558668 | 41.97x |
+| `show_issue` | 11518930782 | 7386033 | 1559.56x |
 
 The test asserted cached JSON equality against the direct builder output before
-timing and after the cached loop for both surfaces.
+timing and after the cached loop for each surface.
 
 ## Freshness Tests
 
@@ -41,3 +43,4 @@ Focused MCP tests also cover:
 - mutation-time cache clearing
 - `project_overview` stale-count invalidation
 - `list_issues` stale-count invalidation
+- `show_issue` stale-title invalidation

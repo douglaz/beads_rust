@@ -342,6 +342,12 @@ enum ReadyIssueProjection {
 }
 
 #[derive(Clone, Copy)]
+enum SearchIssueProjection {
+    Full,
+    CommandText,
+}
+
+#[derive(Clone, Copy)]
 enum BlockedIssueProjection {
     Full,
     Command,
@@ -408,6 +414,37 @@ impl ReadyIssueProjection {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::Command => SqliteStorage::ready_issue_from_row(row),
+        }
+    }
+}
+
+impl SearchIssueProjection {
+    const fn select_clause(self) -> &'static str {
+        match self {
+            Self::Full => {
+                r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
+                         status, priority, issue_type, assignee, owner, estimated_minutes,
+                         created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                         due_at, defer_until, external_ref, source_system, source_repo,
+                         deleted_at, deleted_by, delete_reason, original_type,
+                         compaction_level, compacted_at, compacted_at_commit, original_size,
+                         sender, ephemeral, pinned, is_template
+                  FROM issues
+                  WHERE 1=1"
+            }
+            Self::CommandText => {
+                r"SELECT id, title, description, status, priority, issue_type, assignee,
+                         created_at, updated_at
+                  FROM issues
+                  WHERE 1=1"
+            }
+        }
+    }
+
+    fn parse_issue(self, row: &fsqlite::Row) -> Result<Issue> {
+        match self {
+            Self::Full => SqliteStorage::issue_from_row(row),
+            Self::CommandText => SqliteStorage::search_command_issue_from_row(row),
         }
     }
 }
@@ -3703,25 +3740,39 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    #[allow(clippy::too_many_lines)]
     pub fn search_issues(&self, query: &str, filters: &ListFilters) -> Result<Vec<Issue>> {
+        self.search_issues_with_projection(query, filters, SearchIssueProjection::Full)
+    }
+
+    /// Search command issues without hydrating fields text/rich search output never renders.
+    ///
+    /// This keeps `description` for rich context snippets while omitting large
+    /// structured fields used only by JSON/TOON/CSV or client-side filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn search_issues_for_command_output(
+        &self,
+        query: &str,
+        filters: &ListFilters,
+    ) -> Result<Vec<Issue>> {
+        self.search_issues_with_projection(query, filters, SearchIssueProjection::CommandText)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn search_issues_with_projection(
+        &self,
+        query: &str,
+        filters: &ListFilters,
+        projection: SearchIssueProjection,
+    ) -> Result<Vec<Issue>> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut sql = String::from(
-            r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
-                     status, priority, issue_type, assignee, owner, estimated_minutes,
-                     created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system, source_repo,
-                     deleted_at, deleted_by, delete_reason, original_type,
-                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template
-              FROM issues
-              WHERE 1=1",
-        );
-
+        let mut sql = String::from(projection.select_clause());
         let mut params: Vec<SqliteValue> = Vec::new();
 
         if let Some(ref labels) = filters.labels {
@@ -3877,7 +3928,7 @@ impl SqliteStorage {
         let rows = self.conn.query_with_params(&sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::issue_from_row(row)?);
+            issues.push(projection.parse_issue(row)?);
         }
 
         Ok(issues)
@@ -8546,6 +8597,69 @@ impl SqliteStorage {
         })
     }
 
+    fn search_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: get_non_empty_str(2),
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
+            priority: Priority(get_opt_i32(4).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(5).and_then(SqliteValue::as_text)),
+            assignee: get_non_empty_str(6),
+            owner: None,
+            estimated_minutes: None,
+            created_at: parse_datetime_value(row.get(7))?,
+            created_by: None,
+            updated_at: parse_datetime_value(row.get(8))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
     fn command_summary_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
@@ -10507,7 +10621,9 @@ impl SqliteStorage {
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
-    use crate::format::{BlockedIssueOutput, ReadyIssue, StaleIssue};
+    use crate::format::{
+        BlockedIssueOutput, ReadyIssue, StaleIssue, TextFormatOptions, format_issue_line_with,
+    };
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
     use std::fs;
@@ -15660,6 +15776,108 @@ mod tests {
         let case_results = storage.search_issues("authentication", &filters).unwrap();
         let case_ids: Vec<_> = case_results.iter().map(|issue| issue.id.as_str()).collect();
         assert_eq!(case_ids, vec!["bd-s-description"]);
+    }
+
+    #[test]
+    fn test_search_issues_for_command_output_matches_text_fields() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        let mut description_match = make_issue(
+            "bd-search-proj-a",
+            "Command projection alpha",
+            Status::Open,
+            1,
+            Some("agent-a"),
+            t1,
+            None,
+        );
+        description_match.description =
+            Some("description carries projection needle context".to_string());
+        description_match.design = Some("unused design".repeat(512));
+        description_match.acceptance_criteria = Some("unused ac".repeat(512));
+        description_match.notes = Some("unused notes".repeat(512));
+        description_match.owner = Some("owner".to_string());
+        description_match.sender = Some("cli".to_string());
+
+        let title_match = make_issue(
+            "bd-search-proj-b",
+            "Projection needle title",
+            Status::Open,
+            2,
+            Some("agent-b"),
+            t1 + chrono::Duration::minutes(1),
+            None,
+        );
+
+        storage.create_issue(&description_match, "tester").unwrap();
+        storage.create_issue(&title_match, "tester").unwrap();
+
+        let filters = ListFilters {
+            limit: Some(0),
+            ..ListFilters::default()
+        };
+        let full = storage
+            .search_issues("projection needle", &filters)
+            .unwrap();
+        let projected = storage
+            .search_issues_for_command_output("projection needle", &filters)
+            .unwrap();
+
+        let full_summary = full
+            .iter()
+            .map(|issue| {
+                (
+                    issue.id.as_str(),
+                    issue.title.as_str(),
+                    issue.description.as_deref(),
+                    issue.status.clone(),
+                    issue.priority,
+                    issue.issue_type.clone(),
+                    issue.assignee.as_deref(),
+                    issue.created_at,
+                    issue.updated_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        let projected_summary = projected
+            .iter()
+            .map(|issue| {
+                (
+                    issue.id.as_str(),
+                    issue.title.as_str(),
+                    issue.description.as_deref(),
+                    issue.status.clone(),
+                    issue.priority,
+                    issue.issue_type.clone(),
+                    issue.assignee.as_deref(),
+                    issue.created_at,
+                    issue.updated_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projected_summary, full_summary);
+
+        let full_lines = full
+            .iter()
+            .map(|issue| format_issue_line_with(issue, TextFormatOptions::plain()))
+            .collect::<Vec<_>>();
+        let projected_lines = projected
+            .iter()
+            .map(|issue| format_issue_line_with(issue, TextFormatOptions::plain()))
+            .collect::<Vec<_>>();
+        assert_eq!(projected_lines, full_lines);
+
+        let projected_description_match = projected
+            .iter()
+            .find(|issue| issue.id == "bd-search-proj-a")
+            .unwrap();
+        assert!(projected_description_match.description.is_some());
+        assert!(projected_description_match.design.is_none());
+        assert!(projected_description_match.acceptance_criteria.is_none());
+        assert!(projected_description_match.notes.is_none());
+        assert!(projected_description_match.owner.is_none());
+        assert!(projected_description_match.sender.is_none());
     }
 
     #[test]

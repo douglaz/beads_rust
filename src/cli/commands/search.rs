@@ -60,14 +60,19 @@ pub fn execute_with_storage_ctx(
 ) -> Result<()> {
     let query = validate_query(args)?;
     let storage = &storage_ctx.storage;
-    let issues = collect_search_results(storage, query, &args.filters)?;
+    let output_format = resolve_output_format_with_outer_mode(
+        args.filters.format,
+        outer_ctx.inherited_output_mode(),
+        false,
+    );
+    let issues = collect_search_results_for_output(storage, query, &args.filters, output_format)?;
     render_search_results(
         storage,
         issues,
         query,
         &args.filters,
+        output_format,
         cli,
-        outer_ctx,
         storage_ctx,
     )
 }
@@ -83,10 +88,34 @@ fn validate_query(args: &SearchArgs) -> Result<&str> {
     Ok(query)
 }
 
+#[cfg(test)]
 fn collect_search_results(
     storage: &SqliteStorage,
     query: &str,
     list_args: &ListArgs,
+) -> Result<Vec<Issue>> {
+    collect_search_results_with_projection(storage, query, list_args, false)
+}
+
+fn collect_search_results_for_output(
+    storage: &SqliteStorage,
+    query: &str,
+    list_args: &ListArgs,
+    output_format: OutputFormat,
+) -> Result<Vec<Issue>> {
+    collect_search_results_with_projection(
+        storage,
+        query,
+        list_args,
+        matches!(output_format, OutputFormat::Text),
+    )
+}
+
+fn collect_search_results_with_projection(
+    storage: &SqliteStorage,
+    query: &str,
+    list_args: &ListArgs,
+    use_text_projection: bool,
 ) -> Result<Vec<Issue>> {
     let mut filters = build_filters(list_args)?;
     let client_filters = needs_client_filters(list_args);
@@ -101,7 +130,11 @@ fn collect_search_results(
         filters.reverse = false;
     }
 
-    let issues = storage.search_issues(query, &filters)?;
+    let issues = if use_text_projection && !client_filters {
+        storage.search_issues_for_command_output(query, &filters)?
+    } else {
+        storage.search_issues(query, &filters)?
+    };
     let mut issues = if client_filters {
         apply_client_filters(issues, list_args)?
     } else {
@@ -136,16 +169,10 @@ fn render_search_results(
     issues: Vec<Issue>,
     query: &str,
     list_args: &ListArgs,
+    output_format: OutputFormat,
     cli: &config::CliOverrides,
-    outer_ctx: &OutputContext,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<()> {
-    let output_format = resolve_output_format_with_outer_mode(
-        list_args.format,
-        outer_ctx.inherited_output_mode(),
-        false,
-    );
-
     let quiet = cli.quiet.unwrap_or(false);
     let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
     if matches!(early_ctx.mode(), OutputMode::Quiet) {

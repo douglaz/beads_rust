@@ -2241,11 +2241,11 @@ pub struct SyncArgs {
     )]
     pub witness_chunk_lines: usize,
 
-    /// Parallel worker cap for read-only JSONL witness work planning
+    /// Parallel worker cap for read-only JSONL witness hashing and work planning
     ///
-    /// Only used with --witness and a base snapshot. When omitted, br uses a
-    /// deterministic 64-worker planning cap rather than host-dependent CPU
-    /// detection so robot output remains stable across machines.
+    /// Only used with --witness. When omitted, br uses a deterministic
+    /// 64-worker cap rather than host-dependent CPU detection so robot output
+    /// remains stable across machines.
     #[arg(
         long = "witness-parallelism",
         value_name = "WORKERS",

@@ -10,7 +10,7 @@ use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::witness::{
     JsonlMerkleWitness, JsonlWitnessComparison, JsonlWitnessParallelWorkPlan,
-    JsonlWitnessReusePlan, build_jsonl_merkle_witness, compare_jsonl_merkle_witnesses,
+    JsonlWitnessReusePlan, build_jsonl_merkle_witness_parallel, compare_jsonl_merkle_witnesses,
     plan_jsonl_witness_parallel_work, plan_jsonl_witness_reuse,
 };
 use crate::sync::{
@@ -910,11 +910,13 @@ fn execute_witness(
         )));
     }
 
-    let witness = build_witness_for_path(jsonl_path, args.witness_chunk_lines)?;
+    let witness_parallelism = effective_witness_parallelism(args);
+    let witness =
+        build_witness_for_path(jsonl_path, args.witness_chunk_lines, witness_parallelism)?;
     let base_artifacts = build_base_witness_artifacts(
         path_policy,
         args.witness_chunk_lines,
-        effective_witness_parallelism(args),
+        witness_parallelism,
         &witness,
     )?;
     let result = SyncWitnessResult {
@@ -947,6 +949,7 @@ fn effective_witness_parallelism(args: &SyncArgs) -> usize {
 fn build_witness_for_path(
     jsonl_path: &Path,
     chunk_size_lines: usize,
+    max_parallelism: usize,
 ) -> Result<JsonlMerkleWitness> {
     crate::sync::ensure_no_conflict_markers(jsonl_path)?;
     let file = File::open(jsonl_path).map_err(|err| {
@@ -955,12 +958,13 @@ fn build_witness_for_path(
             jsonl_path.display()
         ))
     })?;
-    build_jsonl_merkle_witness(BufReader::new(file), chunk_size_lines).map_err(|err| {
-        BeadsError::Config(format!(
-            "Failed to build JSONL witness for {}: {err}",
-            jsonl_path.display()
-        ))
-    })
+    build_jsonl_merkle_witness_parallel(BufReader::new(file), chunk_size_lines, max_parallelism)
+        .map_err(|err| {
+            BeadsError::Config(format!(
+                "Failed to build JSONL witness for {}: {err}",
+                jsonl_path.display()
+            ))
+        })
 }
 
 fn build_base_witness_artifacts(
@@ -979,7 +983,7 @@ fn build_base_witness_artifacts(
         });
     }
 
-    let base_witness = build_witness_for_path(&base_jsonl_path, chunk_size_lines)?;
+    let base_witness = build_witness_for_path(&base_jsonl_path, chunk_size_lines, max_parallelism)?;
     let comparison = compare_jsonl_merkle_witnesses(&base_witness, current_witness);
     let reuse_plan = plan_jsonl_witness_reuse(&base_witness, current_witness);
     let parallel_work_plan = plan_jsonl_witness_parallel_work(&reuse_plan, max_parallelism)

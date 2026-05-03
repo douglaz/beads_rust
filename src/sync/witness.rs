@@ -8,7 +8,11 @@
 use crate::util::hex_encode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::{self, BufRead};
+use std::{
+    io::{self, BufRead},
+    sync::mpsc,
+    thread,
+};
 
 /// Schema marker for JSONL Merkle witnesses.
 pub const JSONL_WITNESS_SCHEMA_VERSION: &str = "br.jsonl-witness.v1";
@@ -194,6 +198,52 @@ pub fn build_jsonl_merkle_witness<R: BufRead>(
         chunks.push(chunk_builder.finish());
     }
 
+    let root_hash = compute_root_hash(chunk_size_lines, line_count, byte_count, &chunks)?;
+
+    Ok(JsonlMerkleWitness {
+        schema_version: JSONL_WITNESS_SCHEMA_VERSION.to_string(),
+        chunk_size_lines,
+        line_count,
+        byte_count,
+        root_hash,
+        chunks,
+    })
+}
+
+/// Build a deterministic JSONL witness with bounded parallel chunk hashing.
+///
+/// The input stream is still read in order, but complete chunks are sent to a
+/// fixed worker set and then reassembled by chunk index before computing the
+/// root hash. `max_parallelism == 1` uses the serial implementation exactly.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when `chunk_size_lines` or
+/// `max_parallelism` is zero. Returns I/O errors from the reader or worker
+/// coordination.
+pub fn build_jsonl_merkle_witness_parallel<R: BufRead>(
+    reader: R,
+    chunk_size_lines: usize,
+    max_parallelism: usize,
+) -> io::Result<JsonlMerkleWitness> {
+    if max_parallelism == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_parallelism must be greater than zero",
+        ));
+    }
+    if max_parallelism == 1 {
+        return build_jsonl_merkle_witness(reader, chunk_size_lines);
+    }
+    if chunk_size_lines == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chunk_size_lines must be greater than zero",
+        ));
+    }
+
+    let (chunks, line_count, byte_count) =
+        build_parallel_chunks(reader, chunk_size_lines, max_parallelism)?;
     let root_hash = compute_root_hash(chunk_size_lines, line_count, byte_count, &chunks)?;
 
     Ok(JsonlMerkleWitness {
@@ -649,6 +699,215 @@ fn sum_chunk_bytes(chunks: &[JsonlChunkWitness]) -> u64 {
     chunks.iter().map(|chunk| chunk.byte_count).sum()
 }
 
+struct PendingChunk {
+    index: usize,
+    start_line: usize,
+    line_count: usize,
+    byte_count: u64,
+    bytes: Vec<u8>,
+    line_lengths: Vec<usize>,
+}
+
+impl PendingChunk {
+    fn new(index: usize, start_line: usize, chunk_size_lines: usize) -> Self {
+        Self {
+            index,
+            start_line,
+            line_count: 0,
+            byte_count: 0,
+            bytes: Vec::new(),
+            line_lengths: Vec::with_capacity(chunk_size_lines),
+        }
+    }
+
+    fn is_full(&self, chunk_size_lines: usize) -> bool {
+        self.line_count == chunk_size_lines
+    }
+
+    fn push_line(&mut self, line: &[u8], bytes_read: usize) -> io::Result<()> {
+        self.line_count = self
+            .line_count
+            .checked_add(1)
+            .ok_or_else(|| io_invalid_data("chunk line count overflowed usize"))?;
+        self.byte_count = checked_add_bytes(self.byte_count, bytes_read, "chunk byte count")?;
+        self.line_lengths.push(bytes_read);
+        self.bytes.extend_from_slice(line);
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<JsonlChunkWitness> {
+        let mut hasher = Sha256::new();
+        hasher.update(CHUNK_DOMAIN);
+        hasher.update(index_to_bytes(self.index)?);
+        hasher.update(index_to_bytes(self.start_line)?);
+
+        let mut first_line_hash = None;
+        let mut last_line_hash = None;
+        let mut offset = 0usize;
+
+        for (line_index, bytes_read) in self.line_lengths.iter().copied().enumerate() {
+            let next_offset = offset
+                .checked_add(bytes_read)
+                .ok_or_else(|| io_invalid_data("chunk byte offset overflowed usize"))?;
+            let line = self
+                .bytes
+                .get(offset..next_offset)
+                .ok_or_else(|| io_invalid_data("chunk line range exceeded buffered bytes"))?;
+            let line_hash = sha256_hex(line);
+
+            if first_line_hash.is_none() {
+                first_line_hash = Some(line_hash.clone());
+            }
+            last_line_hash = Some(line_hash);
+
+            hasher.update(index_to_bytes(line_index)?);
+            hasher.update(length_to_bytes(bytes_read)?);
+            hasher.update(line);
+            offset = next_offset;
+        }
+
+        Ok(JsonlChunkWitness {
+            index: self.index,
+            start_line: self.start_line,
+            line_count: self.line_count,
+            byte_count: self.byte_count,
+            hash: hex_encode(&hasher.finalize()),
+            first_line_hash,
+            last_line_hash,
+        })
+    }
+}
+
+fn build_parallel_chunks<R: BufRead>(
+    mut reader: R,
+    chunk_size_lines: usize,
+    max_parallelism: usize,
+) -> io::Result<(Vec<JsonlChunkWitness>, usize, u64)> {
+    thread::scope(|scope| {
+        let (result_sender, result_receiver) =
+            mpsc::channel::<(usize, io::Result<JsonlChunkWitness>)>();
+        let mut task_senders = Vec::with_capacity(max_parallelism);
+        let mut handles = Vec::with_capacity(max_parallelism);
+
+        for _ in 0..max_parallelism {
+            let (task_sender, task_receiver) = mpsc::sync_channel::<PendingChunk>(1);
+            let result_sender = result_sender.clone();
+            task_senders.push(task_sender);
+            handles.push(scope.spawn(move || {
+                while let Ok(chunk) = task_receiver.recv() {
+                    let index = chunk.index;
+                    if result_sender.send((index, chunk.finish())).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(result_sender);
+
+        let mut line_count = 0usize;
+        let mut byte_count = 0u64;
+        let mut chunk_count = 0usize;
+        let mut next_worker = 0usize;
+        let mut current_chunk = PendingChunk::new(0, 0, chunk_size_lines);
+        let mut line = Vec::new();
+
+        loop {
+            line.clear();
+            let bytes_read = reader.read_until(b'\n', &mut line)?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            if current_chunk.is_full(chunk_size_lines) {
+                send_pending_chunk(&task_senders, &mut next_worker, current_chunk)?;
+                chunk_count = chunk_count
+                    .checked_add(1)
+                    .ok_or_else(|| io_invalid_data("JSONL chunk count overflowed usize"))?;
+                current_chunk = PendingChunk::new(chunk_count, line_count, chunk_size_lines);
+            }
+
+            let next_line_count = line_count
+                .checked_add(1)
+                .ok_or_else(|| io_invalid_data("JSONL line count overflowed usize"))?;
+            let next_byte_count = checked_add_bytes(byte_count, bytes_read, "JSONL byte count")?;
+            current_chunk.push_line(&line, bytes_read)?;
+            line_count = next_line_count;
+            byte_count = next_byte_count;
+        }
+
+        if current_chunk.line_count > 0 {
+            send_pending_chunk(&task_senders, &mut next_worker, current_chunk)?;
+            chunk_count = chunk_count
+                .checked_add(1)
+                .ok_or_else(|| io_invalid_data("JSONL chunk count overflowed usize"))?;
+        }
+        drop(task_senders);
+
+        let chunks = collect_parallel_chunks(&result_receiver, chunk_count)?;
+
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("parallel JSONL witness worker panicked"))?;
+        }
+
+        Ok((chunks, line_count, byte_count))
+    })
+}
+
+fn send_pending_chunk(
+    task_senders: &[mpsc::SyncSender<PendingChunk>],
+    next_worker: &mut usize,
+    chunk: PendingChunk,
+) -> io::Result<()> {
+    let sender = task_senders
+        .get(*next_worker)
+        .ok_or_else(|| io_invalid_data("parallel JSONL witness worker set was empty"))?;
+    *next_worker = (*next_worker + 1) % task_senders.len();
+    sender.send(chunk).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "parallel JSONL witness worker disconnected",
+        )
+    })
+}
+
+fn collect_parallel_chunks(
+    result_receiver: &mpsc::Receiver<(usize, io::Result<JsonlChunkWitness>)>,
+    chunk_count: usize,
+) -> io::Result<Vec<JsonlChunkWitness>> {
+    let mut chunks_by_index = vec![None; chunk_count];
+
+    for _ in 0..chunk_count {
+        let (index, chunk) = result_receiver.recv().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "parallel JSONL witness worker result channel closed",
+            )
+        })?;
+        let slot = chunks_by_index
+            .get_mut(index)
+            .ok_or_else(|| io_invalid_data("parallel JSONL witness chunk index out of range"))?;
+        if slot.replace(chunk?).is_some() {
+            return Err(io_invalid_data(
+                "parallel JSONL witness duplicate chunk index",
+            ));
+        }
+    }
+
+    chunks_by_index
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            chunk.ok_or_else(|| {
+                io_invalid_data(format!(
+                    "parallel JSONL witness missing chunk index {index}"
+                ))
+            })
+        })
+        .collect()
+}
+
 struct ChunkBuilder {
     index: usize,
     start_line: usize,
@@ -822,6 +1081,34 @@ mod tests {
             first.chunks[1].last_line_hash.as_deref(),
             Some(sha256_hex(b"{\"id\":\"c\"}\n").as_str())
         );
+    }
+
+    #[test]
+    fn parallel_witness_matches_serial_witness() {
+        let input =
+            b"{\"id\":\"a\"}\n{\"id\":\"b\"}\n{\"id\":\"c\"}\n{\"id\":\"d\"}\n{\"id\":\"e\"}";
+        let serial = build_jsonl_merkle_witness(Cursor::new(input), 2).unwrap();
+
+        let parallel = build_jsonl_merkle_witness_parallel(Cursor::new(input), 2, 3).unwrap();
+
+        assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn parallel_witness_parallelism_one_uses_serial_output() {
+        let input = b"a\nb\nc\n";
+        let serial = build_jsonl_merkle_witness(Cursor::new(input), 1).unwrap();
+
+        let parallel = build_jsonl_merkle_witness_parallel(Cursor::new(input), 1, 1).unwrap();
+
+        assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn parallel_witness_rejects_zero_parallelism() {
+        let err = build_jsonl_merkle_witness_parallel(Cursor::new(b"a\n"), 1, 0).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

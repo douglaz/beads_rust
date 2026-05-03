@@ -1,6 +1,7 @@
 # Build artifacts (all target directories)
 target/
 target*/
+.rch-target/
 
 # Cargo.lock IS tracked — beads_rust is a binary CLI, so a committed
 # lockfile gives reproducible builds for `nix build`, `cargo install --git`,

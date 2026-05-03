@@ -6365,20 +6365,17 @@ routing:
             "preserved-mtime rewrites still need to invalidate startup cache hits"
         );
 
-        let (
-            StartupPathState::Present {
-                modified_nanos: before_modified,
-                unix: Some(before_unix),
-                ..
-            },
-            StartupPathState::Present {
-                modified_nanos: after_modified,
-                unix: Some(after_unix),
-                ..
-            },
-        ) = (&before.state, &after.state)
-        else {
-            panic!("expected Unix file witnesses");
+        let before_parts = unix_file_witness_parts(&before.state);
+        let after_parts = unix_file_witness_parts(&after.state);
+        assert!(
+            before_parts.is_some() && after_parts.is_some(),
+            "expected Unix file witnesses"
+        );
+        let Some((before_modified, before_unix)) = before_parts else {
+            return;
+        };
+        let Some((after_modified, after_unix)) = after_parts else {
+            return;
         };
         assert_eq!(
             before_modified, after_modified,
@@ -6388,6 +6385,22 @@ routing:
             before_unix.ctime_sec, after_unix.ctime_sec,
             "ctime seconds must participate in the startup cache witness"
         );
+    }
+
+    #[cfg(unix)]
+    fn unix_file_witness_parts(
+        state: &StartupPathState,
+    ) -> Option<(Option<u128>, &StartupUnixFileWitness)> {
+        match state {
+            StartupPathState::Present {
+                modified_nanos,
+                unix: Some(unix),
+                ..
+            } => Some((*modified_nanos, unix)),
+            StartupPathState::Missing
+            | StartupPathState::Unreadable { .. }
+            | StartupPathState::Present { .. } => None,
+        }
     }
 
     #[test]

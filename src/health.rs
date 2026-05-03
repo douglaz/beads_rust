@@ -91,6 +91,7 @@ pub enum AnomalyClass {
         expected: bool,
         actual: bool,
     },
+    BlockedCacheContentMismatch,
     ExportHashMismatch {
         db_hash: String,
         jsonl_hash: String,
@@ -129,6 +130,7 @@ impl AnomalyClass {
             Self::BlockedCacheStale => "blocked_cache_stale",
             Self::NullInNotNullColumn { .. } => "null_in_not_null_column",
             Self::DirtyFlagMismatch { .. } => "dirty_flag_mismatch",
+            Self::BlockedCacheContentMismatch => "blocked_cache_content_mismatch",
             Self::ExportHashMismatch { .. } => "export_hash_mismatch",
             Self::ChildCountDrift { .. } => "child_count_drift",
             Self::WriteProbeFailed { .. } => "write_probe_failed",
@@ -160,6 +162,7 @@ impl AnomalyClass {
             | Self::BlockedCacheStale
             | Self::NullInNotNullColumn { .. }
             | Self::DirtyFlagMismatch { .. }
+            | Self::BlockedCacheContentMismatch
             | Self::ExportHashMismatch { .. }
             | Self::ChildCountDrift { .. }
             | Self::JournalSidecarPresent
@@ -227,6 +230,9 @@ impl fmt::Display for AnomalyClass {
                     f,
                     "dirty flag '{flag}' mismatch (expected={expected}, actual={actual})"
                 )
+            }
+            Self::BlockedCacheContentMismatch => {
+                f.write_str("blocked_issues_cache content differs from dependency graph")
             }
             Self::ExportHashMismatch {
                 db_hash,

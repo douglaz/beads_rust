@@ -57,6 +57,38 @@ pub(crate) struct ChangelogIssueRow {
     pub(crate) closed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedCacheProjectionHealth {
+    pub(crate) parity_status: String,
+    pub(crate) direct_blocked_rows: Option<usize>,
+    pub(crate) cached_missing_rows: Option<usize>,
+    pub(crate) cached_extra_rows: Option<usize>,
+    pub(crate) cached_mismatched_rows: Option<usize>,
+}
+
+impl BlockedCacheProjectionHealth {
+    fn unavailable(direct_blocked_rows: Option<usize>) -> Self {
+        Self {
+            parity_status: "unavailable".to_string(),
+            direct_blocked_rows,
+            cached_missing_rows: None,
+            cached_extra_rows: None,
+            cached_mismatched_rows: None,
+        }
+    }
+
+    pub(crate) fn has_mismatch(&self) -> bool {
+        [
+            self.cached_missing_rows,
+            self.cached_extra_rows,
+            self.cached_mismatched_rows,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|count| count > 0)
+    }
+}
+
 fn unique_label_refs(labels: &[String]) -> Vec<&String> {
     let mut unique_labels = Vec::with_capacity(labels.len());
     let mut seen_labels = HashSet::with_capacity(labels.len());
@@ -4057,6 +4089,66 @@ impl SqliteStorage {
         });
 
         Ok(blocked_issues_map)
+    }
+
+    pub(crate) fn blocked_cache_projection_health(
+        conn: &Connection,
+    ) -> BlockedCacheProjectionHealth {
+        let direct_map = Self::compute_blocked_issues_map_impl(conn).ok();
+        let cached_map = Self::load_blocked_cache_projection_map(conn).ok();
+        Self::compare_blocked_cache_projection(cached_map.as_ref(), direct_map.as_ref())
+    }
+
+    fn compare_blocked_cache_projection(
+        cached: Option<&HashMap<String, Vec<String>>>,
+        direct: Option<&HashMap<String, Vec<String>>>,
+    ) -> BlockedCacheProjectionHealth {
+        let direct_blocked_rows = direct.map(HashMap::len);
+        let (Some(cached), Some(direct)) = (cached, direct) else {
+            return BlockedCacheProjectionHealth::unavailable(direct_blocked_rows);
+        };
+
+        let missing_rows = direct.keys().filter(|id| !cached.contains_key(*id)).count();
+        let extra_rows = cached.keys().filter(|id| !direct.contains_key(*id)).count();
+        let mismatched_rows = direct
+            .iter()
+            .filter(|(id, blockers)| {
+                cached
+                    .get(id.as_str())
+                    .is_some_and(|cached_blockers| cached_blockers != *blockers)
+            })
+            .count();
+        let parity_status = if missing_rows == 0 && extra_rows == 0 && mismatched_rows == 0 {
+            "matches"
+        } else {
+            "mismatch"
+        };
+
+        BlockedCacheProjectionHealth {
+            parity_status: parity_status.to_string(),
+            direct_blocked_rows,
+            cached_missing_rows: Some(missing_rows),
+            cached_extra_rows: Some(extra_rows),
+            cached_mismatched_rows: Some(mismatched_rows),
+        }
+    }
+
+    fn load_blocked_cache_projection_map(
+        conn: &Connection,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let rows = conn.query("SELECT issue_id, blocked_by FROM blocked_issues_cache")?;
+        let mut cached_map = HashMap::new();
+        for row in &rows {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let mut blockers =
+                parse_blocked_by_json(issue_id, row.get(1).and_then(SqliteValue::as_text))?;
+            blockers.sort();
+            blockers.dedup();
+            cached_map.insert(issue_id.to_string(), blockers);
+        }
+        Ok(cached_map)
     }
 
     fn blocker_refs_to_issue_ids(blockers: &[String]) -> Vec<String> {

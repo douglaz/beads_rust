@@ -5,13 +5,14 @@ use crate::config;
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::output::{OutputContext, OutputMode};
+use crate::storage::SqliteStorage;
 use crate::util::parse_id;
 use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -285,15 +286,13 @@ fn build_projection_info(conn: &Connection) -> ProjectionInfo {
     let blocked_cache_stale = blocked_cache_state == "stale";
     let cached_blocked_rows = projection_row_count(conn, "blocked_issues_cache");
     let child_counter_rows = projection_row_count(conn, "child_counters");
-    let direct_blocked_map = compute_direct_blocked_map(conn);
-    let cached_blocked_map = load_cached_blocked_map(conn);
-    let parity = projection_parity(cached_blocked_map.as_ref(), direct_blocked_map.as_ref());
+    let projection_health = SqliteStorage::blocked_cache_projection_health(conn);
 
     let mut rebuild_reasons = Vec::new();
     if blocked_cache_stale {
         rebuild_reasons.push("blocked_cache_marked_stale".to_string());
     }
-    if parity.has_mismatch() {
+    if projection_health.has_mismatch() {
         rebuild_reasons.push("blocked_cache_content_mismatch".to_string());
     }
     if cached_blocked_rows.is_none() {
@@ -307,230 +306,18 @@ fn build_projection_info(conn: &Connection) -> ProjectionInfo {
         schema_version: "br.graph-projections.v1".to_string(),
         blocked_cache_state,
         blocked_cache_stale,
-        parity_status: parity.status,
+        parity_status: projection_health.parity_status,
         rebuild_needed: !rebuild_reasons.is_empty(),
         rebuild_reasons,
         issue_rows: query_issue_count(conn),
         dependency_rows: projection_row_count(conn, "dependencies"),
         cached_blocked_rows,
-        direct_blocked_rows: direct_blocked_map.as_ref().map(HashMap::len),
-        cached_missing_rows: parity.missing_rows,
-        cached_extra_rows: parity.extra_rows,
-        cached_mismatched_rows: parity.mismatched_rows,
+        direct_blocked_rows: projection_health.direct_blocked_rows,
+        cached_missing_rows: projection_health.cached_missing_rows,
+        cached_extra_rows: projection_health.cached_extra_rows,
+        cached_mismatched_rows: projection_health.cached_mismatched_rows,
         child_counter_rows,
     }
-}
-
-struct ProjectionParity {
-    status: String,
-    missing_rows: Option<usize>,
-    extra_rows: Option<usize>,
-    mismatched_rows: Option<usize>,
-}
-
-impl ProjectionParity {
-    fn has_mismatch(&self) -> bool {
-        [self.missing_rows, self.extra_rows, self.mismatched_rows]
-            .into_iter()
-            .flatten()
-            .any(|count| count > 0)
-    }
-}
-
-fn projection_parity(
-    cached: Option<&HashMap<String, Vec<String>>>,
-    direct: Option<&HashMap<String, Vec<String>>>,
-) -> ProjectionParity {
-    let (Some(cached), Some(direct)) = (cached, direct) else {
-        return ProjectionParity {
-            status: "unavailable".to_string(),
-            missing_rows: None,
-            extra_rows: None,
-            mismatched_rows: None,
-        };
-    };
-
-    let missing = direct.keys().filter(|id| !cached.contains_key(*id)).count();
-    let extra = cached.keys().filter(|id| !direct.contains_key(*id)).count();
-    let mismatched = direct
-        .iter()
-        .filter(|(id, blockers)| {
-            cached
-                .get(id.as_str())
-                .is_some_and(|cached_blockers| cached_blockers != *blockers)
-        })
-        .count();
-    let status = if missing == 0 && extra == 0 && mismatched == 0 {
-        "matches"
-    } else {
-        "mismatch"
-    };
-
-    ProjectionParity {
-        status: status.to_string(),
-        missing_rows: Some(missing),
-        extra_rows: Some(extra),
-        mismatched_rows: Some(mismatched),
-    }
-}
-
-fn compute_direct_blocked_map(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
-    let mut blocked = load_direct_blockers(conn)?;
-    let children_by_parent = load_local_parent_child_edges(conn)?;
-    propagate_blocked_parents(&mut blocked, &children_by_parent);
-    for (parent_id, mut blockers) in load_local_open_child_blockers(conn)? {
-        blocked.entry(parent_id).or_default().append(&mut blockers);
-    }
-    normalize_blocker_map(&mut blocked);
-    Some(blocked)
-}
-
-fn load_cached_blocked_map(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
-    let rows = conn
-        .query("SELECT issue_id, blocked_by FROM blocked_issues_cache")
-        .ok()?;
-    let mut cached = HashMap::new();
-    for row in &rows {
-        let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
-            continue;
-        };
-        let blockers_json = row.get(1).and_then(SqliteValue::as_text)?;
-        let mut blockers: Vec<String> = serde_json::from_str(blockers_json).ok()?;
-        blockers.sort();
-        blockers.dedup();
-        cached.insert(issue_id.to_string(), blockers);
-    }
-    Some(cached)
-}
-
-fn load_direct_blockers(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
-    let rows = conn
-        .query(
-            "SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
-             FROM dependencies d
-             LEFT JOIN issues i ON d.depends_on_id = i.id
-             WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
-               AND d.depends_on_id NOT LIKE 'external:%'
-               AND (
-                 i.status NOT IN ('closed', 'tombstone')
-                 OR i.id IS NULL
-               )
-               AND (i.is_template = 0 OR i.is_template IS NULL OR i.id IS NULL)",
-        )
-        .ok()?;
-    let mut blocked = HashMap::new();
-    for row in &rows {
-        let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
-            continue;
-        };
-        let Some(blocker_ref) = row.get(1).and_then(SqliteValue::as_text) else {
-            continue;
-        };
-        if issue_id.is_empty() || blocker_ref.is_empty() {
-            continue;
-        }
-        blocked
-            .entry(issue_id.to_string())
-            .or_insert_with(Vec::new)
-            .push(blocker_ref.to_string());
-    }
-    Some(blocked)
-}
-
-fn load_local_parent_child_edges(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
-    let rows = conn
-        .query(
-            "SELECT issue_id, depends_on_id
-             FROM dependencies
-             WHERE type = 'parent-child'
-               AND issue_id NOT LIKE 'external:%'
-               AND depends_on_id NOT LIKE 'external:%'",
-        )
-        .ok()?;
-    let mut children_by_parent = HashMap::new();
-    for row in &rows {
-        let Some(child_id) = row.get(0).and_then(SqliteValue::as_text) else {
-            continue;
-        };
-        let Some(parent_id) = row.get(1).and_then(SqliteValue::as_text) else {
-            continue;
-        };
-        children_by_parent
-            .entry(parent_id.to_string())
-            .or_insert_with(Vec::new)
-            .push(child_id.to_string());
-    }
-    Some(children_by_parent)
-}
-
-fn load_local_open_child_blockers(conn: &Connection) -> Option<HashMap<String, Vec<String>>> {
-    let rows = conn
-        .query(
-            "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || ':child-open' as blocker
-             FROM dependencies d
-             JOIN issues i ON d.issue_id = i.id
-             JOIN issues p ON d.depends_on_id = p.id
-             WHERE d.type = 'parent-child'
-               AND p.issue_type = 'epic'
-               AND i.status NOT IN ('closed', 'tombstone')
-               AND (i.is_template = 0 OR i.is_template IS NULL)
-               AND d.depends_on_id NOT LIKE 'external:%'
-               AND d.issue_id NOT LIKE 'external:%'",
-        )
-        .ok()?;
-    let mut blockers_by_parent = HashMap::new();
-    for row in &rows {
-        let Some(parent_id) = row.get(0).and_then(SqliteValue::as_text) else {
-            continue;
-        };
-        let Some(blocker) = row.get(1).and_then(SqliteValue::as_text) else {
-            continue;
-        };
-        if parent_id.is_empty() || blocker.is_empty() {
-            continue;
-        }
-        blockers_by_parent
-            .entry(parent_id.to_string())
-            .or_insert_with(Vec::new)
-            .push(blocker.to_string());
-    }
-    Some(blockers_by_parent)
-}
-
-fn propagate_blocked_parents(
-    blocked: &mut HashMap<String, Vec<String>>,
-    children_by_parent: &HashMap<String, Vec<String>>,
-) {
-    if children_by_parent.is_empty() || blocked.is_empty() {
-        return;
-    }
-
-    let mut queue: Vec<String> = blocked.keys().cloned().collect();
-    let mut seen = HashSet::new();
-    while let Some(parent_id) = queue.pop() {
-        if !seen.insert(parent_id.clone()) {
-            continue;
-        }
-        if let Some(children) = children_by_parent.get(&parent_id) {
-            for child_id in children {
-                let marker = format!("{parent_id}:parent-blocked");
-                let entry = blocked.entry(child_id.clone()).or_default();
-                if entry.contains(&marker) {
-                    continue;
-                }
-                entry.push(marker);
-                queue.push(child_id.clone());
-            }
-        }
-    }
-}
-
-fn normalize_blocker_map(blocked: &mut HashMap<String, Vec<String>>) {
-    blocked.retain(|_, blockers| {
-        blockers.sort();
-        blockers.dedup();
-        !blockers.is_empty()
-    });
 }
 
 fn metadata_value(conn: &Connection, key: &str) -> Option<String> {

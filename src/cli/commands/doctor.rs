@@ -106,6 +106,8 @@ struct PriorJsonlRebuildFailureEvidence {
 }
 
 const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
+const BLOCKED_CACHE_CONTENT_MISMATCH_FINDING: &str =
+    "blocked_issues_cache content differs from direct dependency graph and needs rebuild";
 const JSONL_REBUILD_AUTHORITY_ERROR_PREFIX: &str = "Cannot repair: JSONL authority is unsafe";
 const JSONL_REBUILD_REPEAT_ERROR_PREFIX: &str =
     "Cannot repair: previous JSONL rebuild verification failed";
@@ -321,6 +323,11 @@ fn check_findings(check: &CheckResult) -> Vec<String> {
         .unwrap_or_else(|| check.message.iter().cloned().collect())
 }
 
+fn blocked_cache_rebuild_finding(finding: &str) -> bool {
+    finding.contains(BLOCKED_CACHE_STALE_FINDING)
+        || finding.contains(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING)
+}
+
 fn append_recoverable_anomaly_findings(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
     for finding in check_findings(check) {
         if finding.contains("sqlite_master contains duplicate") {
@@ -349,6 +356,8 @@ fn append_recoverable_anomaly_findings(check: &CheckResult, anomalies: &mut Vec<
             );
         } else if finding.contains(BLOCKED_CACHE_STALE_FINDING) {
             push_anomaly(anomalies, AnomalyClass::BlockedCacheStale);
+        } else if finding.contains(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING) {
+            push_anomaly(anomalies, AnomalyClass::BlockedCacheContentMismatch);
         }
     }
 }
@@ -549,17 +558,33 @@ fn emit_doctor_reliability_audit(
     );
 }
 
+#[cfg(test)]
 fn report_has_blocked_cache_stale_finding(report: &DoctorReport) -> bool {
+    report_has_blocked_cache_finding(report, |message| {
+        message.contains(BLOCKED_CACHE_STALE_FINDING)
+    })
+}
+
+fn report_has_blocked_cache_rebuild_finding(report: &DoctorReport) -> bool {
+    report_has_blocked_cache_finding(report, blocked_cache_rebuild_finding)
+}
+
+fn report_has_blocked_cache_content_mismatch_finding(report: &DoctorReport) -> bool {
+    report_has_blocked_cache_finding(report, |message| {
+        message.contains(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING)
+    })
+}
+
+fn report_has_blocked_cache_finding(
+    report: &DoctorReport,
+    predicate: impl Fn(&str) -> bool + Copy,
+) -> bool {
     report.checks.iter().any(|check| {
         if check.name != "db.recoverable_anomalies" {
             return false;
         }
 
-        if check
-            .message
-            .as_deref()
-            .is_some_and(|message| message.contains(BLOCKED_CACHE_STALE_FINDING))
-        {
+        if check.message.as_deref().is_some_and(predicate) {
             return true;
         }
 
@@ -569,11 +594,9 @@ fn report_has_blocked_cache_stale_finding(report: &DoctorReport) -> bool {
             .and_then(|details| details.get("findings"))
             .and_then(serde_json::Value::as_array)
             .is_some_and(|findings| {
-                findings.iter().any(|finding| {
-                    finding
-                        .as_str()
-                        .is_some_and(|message| message.contains(BLOCKED_CACHE_STALE_FINDING))
-                })
+                findings
+                    .iter()
+                    .any(|finding| finding.as_str().is_some_and(predicate))
             })
     })
 }
@@ -788,11 +811,11 @@ fn report_has_partial_index_warnings(report: &DoctorReport) -> bool {
 
 fn warning_repair_verified(
     report: &DoctorReport,
-    repaired_blocked_cache_stale: bool,
+    repaired_blocked_cache: bool,
     repaired_partial_index_warnings: bool,
 ) -> bool {
     report.ok
-        && (!repaired_blocked_cache_stale || !report_has_blocked_cache_stale_finding(report))
+        && (!repaired_blocked_cache || !report_has_blocked_cache_rebuild_finding(report))
         && (!repaired_partial_index_warnings || !report_has_partial_index_warnings(report))
         && !report_has_warn_level_page_anomaly(report)
 }
@@ -800,7 +823,7 @@ fn warning_repair_verified(
 fn local_repair_message(local_repair: &LocalRepairResult) -> String {
     let mut actions = Vec::new();
     if local_repair.blocked_cache_rebuilt {
-        actions.push("rebuilt the stale blocked cache".to_string());
+        actions.push("rebuilt the blocked cache".to_string());
     }
     if local_repair.indexes_reindexed {
         actions.push("rebuilt all indexes via REINDEX".to_string());
@@ -1447,20 +1470,29 @@ fn repair_recoverable_db_state(
     }
 
     match SqliteStorage::open(db_path) {
-        Ok(storage) => match storage.ensure_blocked_cache_fresh() {
-            Ok(blocked_cache_rebuilt) => {
-                repair.blocked_cache_rebuilt = blocked_cache_rebuilt;
-                repair
+        Ok(mut storage) => {
+            let force_rebuild = report_has_blocked_cache_content_mismatch_finding(report);
+            let rebuild_result = if force_rebuild {
+                storage.rebuild_blocked_cache(true).map(|_| true)
+            } else {
+                storage.ensure_blocked_cache_fresh()
+            };
+
+            match rebuild_result {
+                Ok(blocked_cache_rebuilt) => {
+                    repair.blocked_cache_rebuilt = blocked_cache_rebuilt;
+                    repair
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "Skipping blocked-cache repair; falling back to JSONL rebuild"
+                    );
+                    repair
+                }
             }
-            Err(err) => {
-                tracing::warn!(
-                    path = %db_path.display(),
-                    error = %err,
-                    "Skipping blocked-cache repair; falling back to JSONL rebuild"
-                );
-                repair
-            }
-        },
+        }
         Err(err) => {
             tracing::warn!(
                 path = %db_path.display(),
@@ -1894,13 +1926,13 @@ fn push_recoverable_anomalies_check(checks: &mut Vec<CheckResult>, findings: &[S
         );
     } else if findings
         .iter()
-        .all(|finding| finding == BLOCKED_CACHE_STALE_FINDING)
+        .all(|finding| blocked_cache_rebuild_finding(finding))
     {
         push_check(
             checks,
             "db.recoverable_anomalies",
             CheckStatus::Warn,
-            Some(BLOCKED_CACHE_STALE_FINDING.to_string()),
+            Some(findings[0].clone()),
             Some(serde_json::json!({ "findings": findings })),
         );
     } else {
@@ -1995,6 +2027,10 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
         == Some("stale")
     {
         findings.push(BLOCKED_CACHE_STALE_FINDING.to_string());
+    }
+    let blocked_cache_health = SqliteStorage::blocked_cache_projection_health(conn);
+    if blocked_cache_health.has_mismatch() {
+        findings.push(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING.to_string());
     }
 
     push_recoverable_anomalies_check(checks, &findings);
@@ -3219,15 +3255,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let mut local_repair = LocalRepairResult::default();
 
     if initial.report.ok {
-        let has_blocked_cache_stale = report_has_blocked_cache_stale_finding(&initial.report);
+        let has_blocked_cache_rebuild = report_has_blocked_cache_rebuild_finding(&initial.report);
         let has_partial_index_warnings = report_has_partial_index_warnings(&initial.report);
         let has_warn_page_anomalies = report_has_warn_level_page_anomaly(&initial.report);
 
         // Even when there are no errors, planned deferred cache rebuilds and
         // integrity warnings can be repaired. Run those local repairs when
         // --repair is passed and the warnings are present.
-        if has_blocked_cache_stale || has_partial_index_warnings || has_warn_page_anomalies {
-            local_repair = if has_blocked_cache_stale {
+        if has_blocked_cache_rebuild || has_partial_index_warnings || has_warn_page_anomalies {
+            local_repair = if has_blocked_cache_rebuild {
                 repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report)
             } else {
                 LocalRepairResult::default()
@@ -3244,7 +3280,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let post_warning_repair = collect_doctor_report(&beads_dir, &paths)?;
             let verified = warning_repair_verified(
                 &post_warning_repair.report,
-                has_blocked_cache_stale,
+                has_blocked_cache_rebuild,
                 has_partial_index_warnings,
             );
             let repair_message = repair_outcome_message(
@@ -3317,7 +3353,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     if !local_repair.applied()
-        && (report_has_blocked_cache_stale_finding(&initial.report)
+        && (report_has_blocked_cache_rebuild_finding(&initial.report)
             || report_has_sidecar_anomaly(&initial.report))
     {
         local_repair = repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report);
@@ -4427,6 +4463,100 @@ mod tests {
         let check = find_check(&checks, "db.recoverable_anomalies").expect("check present");
         assert!(matches!(check.status, CheckStatus::Warn));
         assert_eq!(check.message.as_deref(), Some(BLOCKED_CACHE_STALE_FINDING));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_recoverable_anomalies_warns_on_blocked_cache_content_mismatch() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = sample_issue("bd-blocker", "Blocker");
+        let target = sample_issue("bd-target", "Target");
+        storage.create_issue(&blocker, "tester")?;
+        storage.create_issue(&target, "tester")?;
+        storage.add_dependency(&target.id, &blocker.id, "blocks", "tester")?;
+        assert!(storage.ensure_blocked_cache_fresh()?);
+        storage.execute_test_sql(
+            "UPDATE blocked_issues_cache
+             SET blocked_by = '[\"bd-other:open\"]'
+             WHERE issue_id = 'bd-target'",
+        )?;
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_recoverable_anomalies(&conn, &mut checks)?;
+
+        let check = find_check(&checks, "db.recoverable_anomalies").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert_eq!(
+            check.message.as_deref(),
+            Some(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING)
+        );
+        let findings = check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("findings"))
+            .and_then(serde_json::Value::as_array)
+            .expect("findings array");
+        assert!(findings.iter().any(|finding| {
+            finding
+                .as_str()
+                .is_some_and(|message| message == BLOCKED_CACHE_CONTENT_MISMATCH_FINDING)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_repair_recoverable_db_state_rebuilds_blocked_cache_content_mismatch() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = sample_issue("bd-blocker", "Blocker");
+        let target = sample_issue("bd-target", "Target");
+        storage.create_issue(&blocker, "tester")?;
+        storage.create_issue(&target, "tester")?;
+        storage.add_dependency(&target.id, &blocker.id, "blocks", "tester")?;
+        assert!(storage.ensure_blocked_cache_fresh()?);
+        storage.execute_test_sql(
+            "UPDATE blocked_issues_cache
+             SET blocked_by = '[\"bd-other:open\"]'
+             WHERE issue_id = 'bd-target'",
+        )?;
+        drop(storage);
+
+        let report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "db.recoverable_anomalies".to_string(),
+                status: CheckStatus::Warn,
+                message: Some(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING.to_string()),
+                details: Some(serde_json::json!({
+                    "findings": [BLOCKED_CACHE_CONTENT_MISMATCH_FINDING],
+                })),
+            }],
+        };
+
+        let repair = repair_recoverable_db_state(temp.path(), &db_path, &report);
+
+        assert!(repair.blocked_cache_rebuilt);
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let rows = storage.execute_raw_query(
+            "SELECT blocked_by
+             FROM blocked_issues_cache
+             WHERE issue_id = 'bd-target'",
+        )?;
+        let blocked_by = rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("");
+        assert_eq!(blocked_by, "[\"bd-blocker:open\"]");
 
         Ok(())
     }

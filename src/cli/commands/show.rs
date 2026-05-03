@@ -11,11 +11,13 @@ use crate::format::{
 use crate::model::{Dependency, Issue, Priority, Status};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
-use crate::sync::read_issues_from_jsonl;
-use crate::util::id::{IdResolver, ResolverConfig};
+use crate::sync::{path as sync_path, read_issues_from_jsonl};
+use crate::util::id::{IdResolver, ResolverConfig, normalize_id};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as FmtWrite;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Execute the show command.
@@ -449,6 +451,21 @@ fn load_issue_details_from_jsonl(
     jsonl_path: &Path,
     external_db_paths: &HashMap<String, PathBuf>,
 ) -> Result<Vec<IssueDetails>> {
+    if let Some(details_list) =
+        load_exact_issue_details_from_jsonl(target_ids, resolver, jsonl_path, external_db_paths)?
+    {
+        return Ok(details_list);
+    }
+
+    load_issue_details_from_jsonl_materialized(target_ids, resolver, jsonl_path, external_db_paths)
+}
+
+fn load_issue_details_from_jsonl_materialized(
+    target_ids: &[String],
+    resolver: &IdResolver,
+    jsonl_path: &Path,
+    external_db_paths: &HashMap<String, PathBuf>,
+) -> Result<Vec<IssueDetails>> {
     let issues = read_issues_from_jsonl(jsonl_path)?;
     let mut issues_by_id = HashMap::with_capacity(issues.len());
     for issue in issues {
@@ -483,6 +500,227 @@ fn load_issue_details_from_jsonl(
     }
 
     Ok(details_list)
+}
+
+#[derive(Clone)]
+struct JsonlIssueSummary {
+    id: String,
+    title: String,
+    status: Status,
+    priority: Priority,
+    created_at: DateTime<Utc>,
+}
+
+impl JsonlIssueSummary {
+    fn from_issue(issue: &Issue) -> Self {
+        Self {
+            id: issue.id.clone(),
+            title: issue.title.clone(),
+            status: issue.status.clone(),
+            priority: issue.priority,
+            created_at: issue.created_at,
+        }
+    }
+
+    fn dependency_metadata(&self, dep_type: &str) -> IssueWithDependencyMetadata {
+        IssueWithDependencyMetadata {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            status: self.status.clone(),
+            priority: self.priority,
+            dep_type: dep_type.to_string(),
+        }
+    }
+}
+
+type JsonlDependencyDisplayEntry = (IssueWithDependencyMetadata, Priority, DateTime<Utc>);
+
+struct ExactJsonlShowIndex {
+    summaries: HashMap<String, JsonlIssueSummary>,
+    targets: HashMap<String, Issue>,
+    dependents: HashMap<String, Vec<JsonlDependencyDisplayEntry>>,
+}
+
+fn load_exact_issue_details_from_jsonl(
+    target_ids: &[String],
+    resolver: &IdResolver,
+    jsonl_path: &Path,
+    external_db_paths: &HashMap<String, PathBuf>,
+) -> Result<Option<Vec<IssueDetails>>> {
+    let Some(direct_target_ids) = direct_jsonl_target_ids(target_ids, resolver) else {
+        return Ok(None);
+    };
+    let direct_target_set = direct_target_ids.iter().cloned().collect::<HashSet<_>>();
+    let index = scan_exact_jsonl_show_index(jsonl_path, &direct_target_set)?;
+
+    if direct_target_ids
+        .iter()
+        .any(|id| !index.targets.contains_key(id))
+    {
+        return Ok(None);
+    }
+
+    let mut details_list = direct_target_ids
+        .iter()
+        .map(|id| build_issue_details_from_exact_jsonl_index(id, &index))
+        .collect::<Result<Vec<_>>>()?;
+
+    let external_ids = collect_external_dependency_ids(&details_list);
+    if !external_ids.is_empty() {
+        let statuses = SqliteStorage::resolve_external_dependency_statuses_for_ids(
+            &external_ids,
+            external_db_paths,
+        );
+        for details in &mut details_list {
+            apply_external_dependency_metadata(&mut details.dependencies, &statuses);
+            apply_external_dependency_metadata(&mut details.dependents, &statuses);
+        }
+    }
+
+    Ok(Some(details_list))
+}
+
+fn direct_jsonl_target_ids(target_ids: &[String], resolver: &IdResolver) -> Option<Vec<String>> {
+    let mut direct_ids = Vec::with_capacity(target_ids.len());
+    for id_input in target_ids {
+        let trimmed = id_input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let normalized = normalize_id(trimmed);
+        if normalized.contains('-') {
+            direct_ids.push(normalized);
+        } else {
+            direct_ids.push(format!("{}-{normalized}", resolver.default_prefix()));
+        }
+    }
+    Some(direct_ids)
+}
+
+fn scan_exact_jsonl_show_index(
+    jsonl_path: &Path,
+    target_ids: &HashSet<String>,
+) -> Result<ExactJsonlShowIndex> {
+    let file = File::open(jsonl_path)?;
+    sync_path::validate_jsonl_fd_metadata(&file, jsonl_path)?;
+    let file_size = file.metadata().map_or(0, |metadata| metadata.len());
+    let estimated_count = usize::try_from(file_size / 500).unwrap_or(usize::MAX);
+    let mut reader = BufReader::new(file);
+    let mut summaries_by_id = HashMap::with_capacity(estimated_count);
+    let mut target_issues_by_id = HashMap::with_capacity(target_ids.len());
+    let mut dependents_by_target_id: HashMap<String, Vec<JsonlDependencyDisplayEntry>> =
+        HashMap::new();
+    let mut seen_ids = HashSet::with_capacity(estimated_count);
+    let mut line = String::new();
+    let mut line_num = 0;
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            line_num += 1;
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(trimmed).map_err(|error| {
+            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, error))
+        })?;
+        let issue_id = issue.id.clone();
+        if !seen_ids.insert(issue_id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue_id,
+                jsonl_path.display(),
+                line_num + 1
+            )));
+        }
+
+        let summary = JsonlIssueSummary::from_issue(&issue);
+        for dep in &issue.dependencies {
+            if target_ids.contains(&dep.depends_on_id) {
+                dependents_by_target_id
+                    .entry(dep.depends_on_id.clone())
+                    .or_default()
+                    .push((
+                        summary.dependency_metadata(dep.dep_type.as_str()),
+                        summary.priority,
+                        summary.created_at,
+                    ));
+            }
+        }
+
+        if target_ids.contains(&issue_id) {
+            target_issues_by_id.insert(issue_id.clone(), issue);
+        }
+        summaries_by_id.insert(issue_id, summary);
+        line_num += 1;
+    }
+
+    Ok(ExactJsonlShowIndex {
+        summaries: summaries_by_id,
+        targets: target_issues_by_id,
+        dependents: dependents_by_target_id,
+    })
+}
+
+fn build_issue_details_from_exact_jsonl_index(
+    issue_id: &str,
+    index: &ExactJsonlShowIndex,
+) -> Result<IssueDetails> {
+    let issue = index
+        .targets
+        .get(issue_id)
+        .ok_or_else(|| BeadsError::IssueNotFound {
+            id: issue_id.to_string(),
+        })?;
+
+    let mut dependencies = issue
+        .dependencies
+        .iter()
+        .map(|dep| dependency_metadata_from_jsonl_summary(dep, &index.summaries, true))
+        .collect::<Vec<_>>();
+    dependencies.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+
+    let mut dependents = index.dependents.get(issue_id).cloned().unwrap_or_default();
+    dependents.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+
+    let mut issue_without_relations = issue.clone();
+    let labels = issue_without_relations.labels.clone();
+    let comments = issue_without_relations.comments.clone();
+    issue_without_relations.labels.clear();
+    issue_without_relations.dependencies.clear();
+    issue_without_relations.comments.clear();
+
+    Ok(IssueDetails {
+        issue: issue_without_relations,
+        labels,
+        dependencies: dependencies.into_iter().map(|(item, _, _)| item).collect(),
+        dependents: dependents.into_iter().map(|(item, _, _)| item).collect(),
+        comments,
+        events: Vec::new(),
+        parent: issue
+            .dependencies
+            .iter()
+            .rev()
+            .find(|dep| dep.dep_type.as_str() == "parent-child")
+            .map(|dep| dep.depends_on_id.clone()),
+    })
 }
 
 fn build_issue_details_from_jsonl(
@@ -568,6 +806,50 @@ fn dependency_metadata_from_jsonl(
                 priority: target.priority,
                 dep_type: dep.dep_type.as_str().to_string(),
             },
+            target.priority,
+            target.created_at,
+        );
+    }
+
+    if allow_external_placeholder && dep.depends_on_id.starts_with("external:") {
+        return (
+            IssueWithDependencyMetadata {
+                id: dep.depends_on_id.clone(),
+                title: dep
+                    .depends_on_id
+                    .strip_prefix("external:")
+                    .unwrap_or(&dep.depends_on_id)
+                    .to_string(),
+                status: Status::Blocked,
+                priority: Priority::MEDIUM,
+                dep_type: dep.dep_type.as_str().to_string(),
+            },
+            Priority::MEDIUM,
+            dep.created_at,
+        );
+    }
+
+    (
+        IssueWithDependencyMetadata {
+            id: dep.depends_on_id.clone(),
+            title: format!("[missing issue: {}]", dep.depends_on_id),
+            status: Status::Tombstone,
+            priority: Priority::MEDIUM,
+            dep_type: dep.dep_type.as_str().to_string(),
+        },
+        Priority::MEDIUM,
+        dep.created_at,
+    )
+}
+
+fn dependency_metadata_from_jsonl_summary(
+    dep: &Dependency,
+    summaries_by_id: &HashMap<String, JsonlIssueSummary>,
+    allow_external_placeholder: bool,
+) -> JsonlDependencyDisplayEntry {
+    if let Some(target) = summaries_by_id.get(&dep.depends_on_id) {
+        return (
+            target.dependency_metadata(dep.dep_type.as_str()),
             target.priority,
             target.created_at,
         );
@@ -870,7 +1152,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
 mod tests {
     use super::{
         apply_external_dependency_metadata, build_issue_details_from_jsonl, format_issue_details,
-        reorder_details_by_requested_inputs,
+        load_issue_details_from_jsonl, reorder_details_by_requested_inputs,
     };
     use crate::format::{IssueDetails, IssueWithDependencyMetadata};
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
@@ -878,6 +1160,7 @@ mod tests {
     use crate::util::id::{IdResolver, ResolverConfig};
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
+    use std::io::Write;
     use tracing::info;
 
     fn init_logging() {
@@ -1236,6 +1519,67 @@ mod tests {
         assert_eq!(parent_details.dependents[0].dep_type, "parent-child");
         info!(
             "test_build_issue_details_from_jsonl_derives_parent_and_dependents: assertions passed"
+        );
+    }
+
+    #[test]
+    fn test_load_issue_details_from_jsonl_exact_streaming_matches_materialized() {
+        init_logging();
+        info!("test_load_issue_details_from_jsonl_exact_streaming_matches_materialized: starting");
+
+        let mut dependency = make_test_issue("bd-dep01", "Dependency");
+        dependency.priority = Priority::HIGH;
+
+        let mut target = make_test_issue("bd-target", "Target");
+        target.dependencies.push(Dependency {
+            issue_id: target.id.clone(),
+            depends_on_id: dependency.id.clone(),
+            dep_type: DependencyType::Blocks,
+            created_at: target.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+
+        let mut dependent = make_test_issue("bd-dependent", "Dependent");
+        dependent.priority = Priority::CRITICAL;
+        dependent.dependencies.push(Dependency {
+            issue_id: dependent.id.clone(),
+            depends_on_id: target.id.clone(),
+            dep_type: DependencyType::Related,
+            created_at: dependent.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+
+        let issues_by_id = HashMap::from([
+            (dependency.id.clone(), dependency.clone()),
+            (target.id.clone(), target.clone()),
+            (dependent.id.clone(), dependent.clone()),
+        ]);
+        let expected = build_issue_details_from_jsonl(&target, &issues_by_id).unwrap();
+
+        let mut jsonl = tempfile::NamedTempFile::new().unwrap();
+        for issue in [&dependency, &target, &dependent] {
+            writeln!(jsonl, "{}", serde_json::to_string(issue).unwrap()).unwrap();
+        }
+
+        let resolver = IdResolver::new(ResolverConfig::with_prefix("bd"));
+        let actual = load_issue_details_from_jsonl(
+            &[target.id.clone()],
+            &resolver,
+            jsonl.path(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(vec![expected]).unwrap()
+        );
+        info!(
+            "test_load_issue_details_from_jsonl_exact_streaming_matches_materialized: assertions passed"
         );
     }
 

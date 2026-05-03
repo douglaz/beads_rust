@@ -23,10 +23,11 @@ pub use id::{
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 const LAST_TOUCHED_FILE: &str = "last-touched";
+const MAX_LAST_TOUCHED_BYTES: u64 = 4096;
 
 /// Environment variable for overriding the cache directory location.
 ///
@@ -109,12 +110,15 @@ pub fn set_last_touched_id(beads_dir: &Path, id: &str) {
 #[must_use]
 pub fn get_last_touched_id(beads_dir: &Path) -> String {
     let path = last_touched_path(beads_dir);
-    let mut contents = String::new();
+    if fs::metadata(&path).map_or(true, |metadata| metadata.len() > MAX_LAST_TOUCHED_BYTES) {
+        return String::new();
+    }
 
-    if let Ok(mut file) = fs::File::open(path)
-        && file.read_to_string(&mut contents).is_ok()
+    let mut line = String::new();
+    if let Ok(file) = fs::File::open(path)
+        && BufReader::new(file).read_line(&mut line).is_ok()
     {
-        return contents.lines().next().unwrap_or("").trim().to_string();
+        return line.trim().to_string();
     }
 
     String::new()
@@ -244,6 +248,23 @@ mod tests {
         }
 
         assert!(cache_dir.exists(), "parent dir should be created");
+    }
+
+    #[test]
+    fn test_get_last_touched_ignores_oversized_cache_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir(&beads_dir).expect("create .beads");
+        let path = last_touched_path(&beads_dir);
+        fs::write(&path, "bd-abc123\n").expect("write last touched");
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open last touched");
+        file.set_len(MAX_LAST_TOUCHED_BYTES + 1)
+            .expect("extend last touched");
+
+        assert_eq!(get_last_touched_id(&beads_dir), "");
     }
 
     #[test]

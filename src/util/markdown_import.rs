@@ -29,8 +29,12 @@
 use crate::error::{BeadsError, Result};
 use crate::model::DependencyType;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path};
 use std::str::FromStr;
+
+const MAX_MARKDOWN_IMPORT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_MARKDOWN_IMPORT_BYTES_U64: u64 = 10 * 1024 * 1024;
 
 /// A parsed issue from the markdown file.
 #[derive(Debug, Default, Clone)]
@@ -157,11 +161,34 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<ParsedIssue>> {
         return Err(BeadsError::validation("file", "must be a regular file"));
     }
 
-    // Read file content
-    let content = fs::read_to_string(path)
-        .map_err(|e| BeadsError::validation("file", format!("cannot read file: {e}")))?;
+    let content = read_markdown_file_limited(path, &metadata)?;
 
     parse_markdown_content(&content)
+}
+
+fn read_markdown_file_limited(path: &Path, metadata: &fs::Metadata) -> Result<String> {
+    if metadata.len() > MAX_MARKDOWN_IMPORT_BYTES_U64 {
+        return Err(BeadsError::validation(
+            "file",
+            format!("markdown import exceeds maximum size of {MAX_MARKDOWN_IMPORT_BYTES} bytes"),
+        ));
+    }
+
+    let file = fs::File::open(path)
+        .map_err(|e| BeadsError::validation("file", format!("cannot read file: {e}")))?;
+    let mut reader = file.take(MAX_MARKDOWN_IMPORT_BYTES_U64.saturating_add(1));
+    let mut content = String::new();
+    reader
+        .read_to_string(&mut content)
+        .map_err(|e| BeadsError::validation("file", format!("cannot read file: {e}")))?;
+    if content.len() > MAX_MARKDOWN_IMPORT_BYTES {
+        return Err(BeadsError::validation(
+            "file",
+            format!("markdown import exceeds maximum size of {MAX_MARKDOWN_IMPORT_BYTES} bytes"),
+        ));
+    }
+
+    Ok(content)
 }
 
 /// Parse markdown content string into a list of issues.
@@ -181,7 +208,7 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
 
     for line in content.lines() {
         // Check for H2 (new issue)
-        if line.starts_with("## ") && !line.starts_with("### ") {
+        if let Some(stripped) = line.strip_prefix("## ") {
             // Save previous issue
             if let Some(mut issue) = current_issue.take() {
                 apply_section_to_issue(&mut issue, current_section, &section_lines);
@@ -189,7 +216,7 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
             }
 
             // Start new issue
-            let title = line[3..].trim().to_string();
+            let title = stripped.trim().to_string();
             current_issue = Some(ParsedIssue {
                 title,
                 ..Default::default()
@@ -245,13 +272,7 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
 
 /// Apply collected section content to an issue.
 fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[String]) {
-    let content = lines
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string();
+    let content = lines.join("\n").trim().to_string();
 
     if content.is_empty() {
         return;
@@ -709,6 +730,21 @@ This is the actual description.
 
         assert!(
             matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("symlink"))
+        );
+    }
+
+    #[test]
+    fn test_parse_markdown_file_rejects_oversized_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("issues.md");
+        fs::write(&path, "## Imported\n").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_MARKDOWN_IMPORT_BYTES_U64 + 1).unwrap();
+
+        let err = parse_markdown_file(&path).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "file" && reason.contains("maximum size"))
         );
     }
 

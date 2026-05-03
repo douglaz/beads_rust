@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_WRITE_LOCK_TIMEOUT_MS: u64 = 30_000;
 const WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const EXPORT_ISSUE_BATCH_SIZE: usize = 1024;
+const EXPORT_FULL_SCAN_ISSUE_THRESHOLD: usize = 20_000;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
 
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
@@ -1536,8 +1537,80 @@ fn hydrate_export_issue_batch(
         }
     };
 
-    for issue in &mut issues {
-        if let Some(map) = deps_map.as_ref() {
+    populate_export_issue_relations(
+        storage,
+        &mut issues,
+        deps_map.as_ref(),
+        labels_map.as_ref(),
+        comments_map.as_ref(),
+        ctx,
+    )?;
+
+    Ok(issues)
+}
+
+fn hydrate_export_issues_full_scan(
+    storage: &SqliteStorage,
+    ctx: &mut ExportContext,
+) -> Result<Vec<Issue>> {
+    let mut issues = storage.get_all_issues_for_export()?;
+
+    let deps_map = match storage.get_dependency_records_for_export() {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Dependency,
+                "export",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
+    let labels_map = match storage.get_labels_for_export() {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Label,
+                "export",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
+    let comments_map = match storage.get_comments_for_export() {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Comment,
+                "export",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
+
+    populate_export_issue_relations(
+        storage,
+        &mut issues,
+        deps_map.as_ref(),
+        labels_map.as_ref(),
+        comments_map.as_ref(),
+        ctx,
+    )?;
+
+    Ok(issues)
+}
+
+fn populate_export_issue_relations(
+    storage: &SqliteStorage,
+    issues: &mut [Issue],
+    deps_map: Option<&HashMap<String, Vec<Dependency>>>,
+    labels_map: Option<&HashMap<String, Vec<String>>>,
+    comments_map: Option<&HashMap<String, Vec<Comment>>>,
+    ctx: &mut ExportContext,
+) -> Result<()> {
+    for issue in issues {
+        if let Some(map) = deps_map {
             if let Some(deps) = map.get(&issue.id) {
                 issue.dependencies.clone_from(deps);
             }
@@ -1547,7 +1620,7 @@ fn hydrate_export_issue_batch(
             issue.dependencies = deps;
         }
 
-        if let Some(map) = labels_map.as_ref() {
+        if let Some(map) = labels_map {
             if let Some(labels) = map.get(&issue.id) {
                 issue.labels.clone_from(labels);
             }
@@ -1557,7 +1630,7 @@ fn hydrate_export_issue_batch(
             issue.labels = labels;
         }
 
-        if let Some(map) = comments_map.as_ref() {
+        if let Some(map) = comments_map {
             if let Some(comments) = map.get(&issue.id) {
                 issue.comments.clone_from(comments);
             }
@@ -1570,7 +1643,7 @@ fn hydrate_export_issue_batch(
         normalize_issue_for_export(issue);
     }
 
-    Ok(issues)
+    Ok(())
 }
 
 fn write_export_issue_jsonl<W: Write>(
@@ -1787,8 +1860,8 @@ pub fn export_to_jsonl_with_policy(
     let mut issue_hashes = Vec::with_capacity(export_ids.len());
     let mut buffer = Vec::with_capacity(1024);
 
-    for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
-        let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+    if export_ids.len() <= EXPORT_FULL_SCAN_ISSUE_THRESHOLD {
+        let issues = hydrate_export_issues_full_scan(storage, &mut ctx)?;
         for issue in &issues {
             // Skip expired tombstones
             if issue.is_expired_tombstone(config.retention_days) {
@@ -1815,6 +1888,43 @@ pub fn export_to_jsonl_with_policy(
             report.labels_exported += issue.labels.len();
             report.comments_exported += issue.comments.len();
             progress.inc(1);
+        }
+    } else {
+        for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
+            let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+            for issue in &issues {
+                // Skip expired tombstones
+                if issue.is_expired_tombstone(config.retention_days) {
+                    skipped_tombstone_ids.push(issue.id.clone());
+                    progress.inc(1);
+                    continue;
+                }
+
+                if !write_export_issue_jsonl(
+                    &mut writer,
+                    issue,
+                    &mut hasher,
+                    &mut buffer,
+                    &mut ctx,
+                )? {
+                    progress.inc(1);
+                    continue;
+                }
+
+                exported_ids.push(issue.id.clone());
+                issue_hashes.push((
+                    issue.id.clone(),
+                    issue
+                        .content_hash
+                        .clone()
+                        .unwrap_or_else(|| crate::util::content_hash(issue)),
+                ));
+                report.issues_exported += 1;
+                report.dependencies_exported += issue.dependencies.len();
+                report.labels_exported += issue.labels.len();
+                report.comments_exported += issue.comments.len();
+                progress.inc(1);
+            }
         }
     }
 
@@ -1911,8 +2021,8 @@ pub fn export_to_writer_with_policy<W: Write>(
     let mut issue_hashes = Vec::with_capacity(export_ids.len());
     let mut buffer = Vec::with_capacity(1024);
 
-    for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
-        let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+    if export_ids.len() <= EXPORT_FULL_SCAN_ISSUE_THRESHOLD {
+        let issues = hydrate_export_issues_full_scan(storage, &mut ctx)?;
         for issue in &issues {
             if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
                 continue;
@@ -1930,6 +2040,28 @@ pub fn export_to_writer_with_policy<W: Write>(
             report.dependencies_exported += issue.dependencies.len();
             report.labels_exported += issue.labels.len();
             report.comments_exported += issue.comments.len();
+        }
+    } else {
+        for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
+            let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+            for issue in &issues {
+                if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
+                    continue;
+                }
+
+                exported_ids.push(issue.id.clone());
+                issue_hashes.push((
+                    issue.id.clone(),
+                    issue
+                        .content_hash
+                        .clone()
+                        .unwrap_or_else(|| crate::util::content_hash(issue)),
+                ));
+                report.issues_exported += 1;
+                report.dependencies_exported += issue.dependencies.len();
+                report.labels_exported += issue.labels.len();
+                report.comments_exported += issue.comments.len();
+            }
         }
     }
 

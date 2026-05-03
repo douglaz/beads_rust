@@ -963,6 +963,66 @@ fn dep_tree_truncated(depth: usize, max_depth: usize, dependency_count: usize) -
     depth >= max_depth && dependency_count > 0
 }
 
+type DepTreeAdjacency = HashMap<String, Vec<String>>;
+
+fn load_dep_tree_adjacency(
+    storage: &SqliteStorage,
+) -> Result<(DepTreeAdjacency, DepTreeAdjacency)> {
+    let dependency_records = storage.get_all_dependency_records()?;
+    let mut dependencies_by_issue: DepTreeAdjacency =
+        HashMap::with_capacity(dependency_records.len());
+    let mut dependents_by_issue: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (issue_id, dependencies) in dependency_records {
+        let dependency_ids = dependencies_by_issue.entry(issue_id.clone()).or_default();
+        for dependency in dependencies {
+            dependency_ids.push(dependency.depends_on_id.clone());
+            dependents_by_issue
+                .entry(dependency.depends_on_id)
+                .or_default()
+                .push(issue_id.clone());
+        }
+    }
+
+    for dependency_ids in dependencies_by_issue.values_mut() {
+        dependency_ids.sort();
+        dependency_ids.dedup();
+    }
+    for dependent_ids in dependents_by_issue.values_mut() {
+        dependent_ids.sort();
+        dependent_ids.dedup();
+    }
+
+    Ok((dependencies_by_issue, dependents_by_issue))
+}
+
+fn dep_tree_neighbors(
+    direction: DepDirection,
+    issue_id: &str,
+    dependencies_by_issue: &DepTreeAdjacency,
+    dependents_by_issue: &DepTreeAdjacency,
+) -> Vec<String> {
+    match direction {
+        DepDirection::Down => dependencies_by_issue
+            .get(issue_id)
+            .map_or_else(Vec::new, Clone::clone),
+        DepDirection::Up => dependents_by_issue
+            .get(issue_id)
+            .map_or_else(Vec::new, Clone::clone),
+        DepDirection::Both => {
+            let mut neighbors = dependencies_by_issue
+                .get(issue_id)
+                .map_or_else(Vec::new, Clone::clone);
+            if let Some(dependents) = dependents_by_issue.get(issue_id) {
+                neighbors.extend(dependents.iter().cloned());
+            }
+            neighbors.sort();
+            neighbors.dedup();
+            neighbors
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn dep_tree(
     args: &DepTreeArgs,
@@ -994,6 +1054,7 @@ fn dep_tree(
 
     // Optimization: Prefetch all active issue metadata to avoid N+1 queries during traversal
     let metadata_cache = storage.get_active_issues_metadata()?;
+    let (dependencies_by_issue, dependents_by_issue) = load_dep_tree_adjacency(storage)?;
 
     let mut nodes = Vec::new();
 
@@ -1031,18 +1092,12 @@ fn dep_tree(
         let truncated = if item.id.starts_with("external:") {
             false
         } else {
-            dependencies = match args.direction {
-                DepDirection::Down => storage.get_dependencies(&item.id)?,
-                DepDirection::Up => storage.get_dependents(&item.id)?,
-                DepDirection::Both => {
-                    let mut all = storage.get_dependencies(&item.id)?;
-                    let mut up = storage.get_dependents(&item.id)?;
-                    all.append(&mut up);
-                    all.sort();
-                    all.dedup();
-                    all
-                }
-            };
+            dependencies = dep_tree_neighbors(
+                args.direction,
+                &item.id,
+                &dependencies_by_issue,
+                &dependents_by_issue,
+            );
             dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
         };
 
@@ -1627,6 +1682,71 @@ mod tests {
         assert!(dependents.contains(&"bd-002".to_string()));
         assert!(dependents.contains(&"bd-003".to_string()));
         info!("test_get_dependents: assertions passed");
+    }
+
+    #[test]
+    fn test_dep_tree_adjacency_prefetch_matches_direct_queries() {
+        init_test_logging();
+        info!("test_dep_tree_adjacency_prefetch_matches_direct_queries: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        for issue in [
+            make_test_issue("bd-001", "Issue 1"),
+            make_test_issue("bd-002", "Issue 2"),
+            make_test_issue("bd-003", "Issue 3"),
+            make_test_issue("bd-004", "Issue 4"),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        storage
+            .add_dependency("bd-001", "bd-002", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-001", "bd-003", "related", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-004", "bd-001", "blocks", "tester")
+            .unwrap();
+
+        let (dependencies_by_issue, dependents_by_issue) =
+            load_dep_tree_adjacency(&storage).unwrap();
+
+        let mut direct_down = storage.get_dependencies("bd-001").unwrap();
+        direct_down.sort();
+        let down = dep_tree_neighbors(
+            DepDirection::Down,
+            "bd-001",
+            &dependencies_by_issue,
+            &dependents_by_issue,
+        );
+        assert_eq!(down, direct_down);
+
+        let mut direct_up = storage.get_dependents("bd-001").unwrap();
+        direct_up.sort();
+        let up = dep_tree_neighbors(
+            DepDirection::Up,
+            "bd-001",
+            &dependencies_by_issue,
+            &dependents_by_issue,
+        );
+        assert_eq!(up, direct_up);
+
+        let both = dep_tree_neighbors(
+            DepDirection::Both,
+            "bd-001",
+            &dependencies_by_issue,
+            &dependents_by_issue,
+        );
+        assert_eq!(
+            both,
+            vec![
+                "bd-002".to_string(),
+                "bd-003".to_string(),
+                "bd-004".to_string(),
+            ]
+        );
+        info!("test_dep_tree_adjacency_prefetch_matches_direct_queries: assertions passed");
     }
 
     #[test]

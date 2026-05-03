@@ -137,7 +137,7 @@ fn execute_routed(
         let structured_ctx = OutputContext::from_output_format(output_format, quiet, true);
 
         match output_format {
-            crate::cli::OutputFormat::Json => structured_ctx.json_pretty(&details_list),
+            crate::cli::OutputFormat::Json => structured_ctx.json_array(details_list.iter()),
             crate::cli::OutputFormat::Toon => {
                 structured_ctx.toon_with_stats(&details_list, args.stats);
             }
@@ -257,7 +257,7 @@ fn execute_inner(
     }
     match output_format {
         crate::cli::OutputFormat::Json => {
-            ctx.json_pretty(&details_list);
+            ctx.json_array(details_list.iter());
         }
         crate::cli::OutputFormat::Toon => {
             ctx.toon_with_stats(&details_list, args.stats);
@@ -318,7 +318,12 @@ fn reorder_routed_items_by_requested_inputs<T>(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
-            ordered_details[index] = Some(item);
+            let slot = ordered_details.get_mut(index).ok_or_else(|| {
+                BeadsError::internal(format!(
+                    "{context} returned out-of-range issue index {index}"
+                ))
+            })?;
+            *slot = Some(item);
         }
     }
 

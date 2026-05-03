@@ -1209,6 +1209,90 @@ fn e2e_sync_witness_json_is_deterministic_and_read_only() {
 }
 
 #[test]
+fn e2e_sync_witness_reports_base_snapshot_drift() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_base_witness");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let first = run_br(
+        &workspace,
+        ["create", "Base witness issue A"],
+        "create_base_witness_a",
+    );
+    assert!(first.status.success(), "create A failed: {}", first.stderr);
+
+    let first_flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "sync_flush_base_witness_a",
+    );
+    assert!(
+        first_flush.status.success(),
+        "first sync flush failed: {}",
+        first_flush.stderr
+    );
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let base_snapshot_path = workspace.root.join(".beads").join("beads.base.jsonl");
+    fs::copy(&jsonl_path, &base_snapshot_path).expect("seed base witness snapshot");
+
+    let second = run_br(
+        &workspace,
+        ["create", "Base witness issue B"],
+        "create_base_witness_b",
+    );
+    assert!(
+        second.status.success(),
+        "create B failed: {}",
+        second.stderr
+    );
+
+    let second_flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "sync_flush_base_witness_b",
+    );
+    assert!(
+        second_flush.status.success(),
+        "second sync flush failed: {}",
+        second_flush.stderr
+    );
+
+    let witness = run_br(
+        &workspace,
+        ["sync", "--witness", "--witness-chunk-lines", "1", "--json"],
+        "sync_witness_base_compare",
+    );
+    assert!(
+        witness.status.success(),
+        "sync witness failed: {}",
+        witness.stderr
+    );
+    let witness_json: Value =
+        serde_json::from_str(&extract_json_payload(&witness.stdout)).expect("sync witness json");
+
+    assert!(
+        witness_json["base_jsonl_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(".beads/beads.base.jsonl")),
+        "unexpected base witness path: {witness_json}"
+    );
+    let comparison = &witness_json["base_comparison"];
+    assert_eq!(comparison["schema_versions_match"].as_bool(), Some(true));
+    assert_eq!(comparison["chunk_size_lines_match"].as_bool(), Some(true));
+    assert_eq!(comparison["drift_detected"].as_bool(), Some(true));
+    assert_eq!(comparison["base_line_count"].as_u64(), Some(1));
+    assert_eq!(comparison["candidate_line_count"].as_u64(), Some(2));
+    assert_eq!(comparison["unchanged_chunks"].as_u64(), Some(1));
+    assert_eq!(comparison["changed_chunks"].as_u64(), Some(0));
+    assert_eq!(comparison["added_chunks"].as_u64(), Some(1));
+    assert_eq!(comparison["removed_chunks"].as_u64(), Some(0));
+    assert_eq!(comparison["safe_reuse_prefix_chunks"].as_u64(), Some(1));
+    assert_eq!(comparison["first_changed_chunk_index"].as_u64(), Some(1));
+}
+
+#[test]
 fn e2e_version_text() {
     let workspace = BrWorkspace::new();
 

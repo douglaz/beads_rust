@@ -8,7 +8,10 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
-use crate::sync::witness::{JsonlMerkleWitness, build_jsonl_merkle_witness};
+use crate::sync::witness::{
+    JsonlMerkleWitness, JsonlWitnessComparison, build_jsonl_merkle_witness,
+    compare_jsonl_merkle_witnesses,
+};
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
@@ -76,6 +79,10 @@ pub struct SyncStatus {
 pub struct SyncWitnessResult {
     pub jsonl_path: String,
     pub witness: JsonlMerkleWitness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_jsonl_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_comparison: Option<JsonlWitnessComparison>,
 }
 
 #[derive(Debug)]
@@ -884,23 +891,14 @@ fn execute_witness(
         )));
     }
 
-    crate::sync::ensure_no_conflict_markers(jsonl_path)?;
-    let file = File::open(jsonl_path).map_err(|err| {
-        BeadsError::Config(format!(
-            "Failed to open JSONL file for witness {}: {err}",
-            jsonl_path.display()
-        ))
-    })?;
-    let witness = build_jsonl_merkle_witness(BufReader::new(file), args.witness_chunk_lines)
-        .map_err(|err| {
-            BeadsError::Config(format!(
-                "Failed to build JSONL witness for {}: {err}",
-                jsonl_path.display()
-            ))
-        })?;
+    let witness = build_witness_for_path(jsonl_path, args.witness_chunk_lines)?;
+    let (base_jsonl_path, base_comparison) =
+        build_base_witness_comparison(path_policy, args.witness_chunk_lines, &witness)?;
     let result = SyncWitnessResult {
         jsonl_path: jsonl_path.display().to_string(),
         witness,
+        base_jsonl_path,
+        base_comparison,
     };
 
     if !should_render_human_sync_output(ctx, use_json) {
@@ -916,6 +914,43 @@ fn execute_witness(
     Ok(())
 }
 
+fn build_witness_for_path(
+    jsonl_path: &Path,
+    chunk_size_lines: usize,
+) -> Result<JsonlMerkleWitness> {
+    crate::sync::ensure_no_conflict_markers(jsonl_path)?;
+    let file = File::open(jsonl_path).map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to open JSONL file for witness {}: {err}",
+            jsonl_path.display()
+        ))
+    })?;
+    build_jsonl_merkle_witness(BufReader::new(file), chunk_size_lines).map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to build JSONL witness for {}: {err}",
+            jsonl_path.display()
+        ))
+    })
+}
+
+fn build_base_witness_comparison(
+    path_policy: &SyncPathPolicy,
+    chunk_size_lines: usize,
+    current_witness: &JsonlMerkleWitness,
+) -> Result<(Option<String>, Option<JsonlWitnessComparison>)> {
+    let base_jsonl_path = path_policy.beads_dir.join("beads.base.jsonl");
+    if !base_jsonl_path.is_file() {
+        return Ok((None, None));
+    }
+
+    let base_witness = build_witness_for_path(&base_jsonl_path, chunk_size_lines)?;
+    let comparison = compare_jsonl_merkle_witnesses(&base_witness, current_witness);
+    Ok((
+        Some(base_jsonl_path.display().to_string()),
+        Some(comparison),
+    ))
+}
+
 fn render_witness_text(result: &SyncWitnessResult) {
     let witness = &result.witness;
     println!("JSONL Witness:");
@@ -926,6 +961,24 @@ fn render_witness_text(result: &SyncWitnessResult) {
     println!("  Chunk size: {} lines", witness.chunk_size_lines);
     println!("  Chunks: {}", witness.chunks.len());
     println!("  Root hash: {}", witness.root_hash);
+
+    if let Some(comparison) = &result.base_comparison {
+        if let Some(base_path) = &result.base_jsonl_path {
+            println!("  Base path: {base_path}");
+        }
+        println!(
+            "  Base comparison: drift={}, unchanged_chunks={}, changed_chunks={}, added_chunks={}, removed_chunks={}, safe_prefix_chunks={}",
+            comparison.drift_detected,
+            comparison.unchanged_chunks,
+            comparison.changed_chunks,
+            comparison.added_chunks,
+            comparison.removed_chunks,
+            comparison.safe_reuse_prefix_chunks
+        );
+        if let Some(index) = comparison.first_changed_chunk_index {
+            println!("  First changed chunk: {index}");
+        }
+    }
 }
 
 /// Execute the --flush-only (export) operation.

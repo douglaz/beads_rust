@@ -1,7 +1,7 @@
 //! Synthetic scale-up benchmark suite for stress testing with large datasets.
 //!
 //! This module generates synthetic datasets (100k+ issues) by expanding patterns
-//! from real datasets, then exercises list/search/ready/sync operations at scale.
+//! from real datasets, then exercises list/search/ready/graph/sync operations at scale.
 //!
 //! # Usage
 //!
@@ -365,7 +365,7 @@ impl SyntheticDataset {
         fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
 
         // Initialize beads
-        let init_output = Command::new(br_path)
+        let init_output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
             .args(["init"])
             .current_dir(&root)
             .output()?;
@@ -750,7 +750,7 @@ fn run_br_status<const N: usize>(
     workspace: &Path,
     label: &str,
 ) -> std::io::Result<bool> {
-    let output = Command::new(br_path)
+    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
         .args(args)
         .current_dir(workspace)
         .env("NO_COLOR", "1")
@@ -770,7 +770,7 @@ fn run_br_status<const N: usize>(
 }
 
 fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<bool> {
-    let output = Command::new(br_path)
+    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
         .args(["sync", "--status", "--json"])
         .current_dir(workspace)
         .env("NO_COLOR", "1")
@@ -930,6 +930,52 @@ pub struct BenchmarkSummary {
 // Benchmark Runner
 // =============================================================================
 
+const SYNTHETIC_FULL_GRAPH_MAX_ISSUES: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticWorkloadSpec {
+    operation: &'static str,
+    args: Vec<String>,
+}
+
+fn synthetic_graph_workloads(issue_count: usize) -> Vec<SyntheticWorkloadSpec> {
+    let hot_hub = synthetic_issue_id(0);
+    let hot_leaf = synthetic_issue_id(issue_count.saturating_sub(1));
+
+    let mut workloads = vec![
+        SyntheticWorkloadSpec {
+            operation: "graph_hot_hub",
+            args: vec!["graph".to_string(), hot_hub, "--json".to_string()],
+        },
+        SyntheticWorkloadSpec {
+            operation: "dep_tree_hot_leaf",
+            args: vec![
+                "dep".to_string(),
+                "tree".to_string(),
+                hot_leaf,
+                "--direction".to_string(),
+                "down".to_string(),
+                "--max-depth".to_string(),
+                "12".to_string(),
+                "--json".to_string(),
+            ],
+        },
+    ];
+
+    if issue_count <= SYNTHETIC_FULL_GRAPH_MAX_ISSUES {
+        workloads.push(SyntheticWorkloadSpec {
+            operation: "graph_all_components",
+            args: vec![
+                "graph".to_string(),
+                "--all".to_string(),
+                "--json".to_string(),
+            ],
+        });
+    }
+
+    workloads
+}
+
 /// Run a command and capture metrics.
 fn run_operation(
     br_path: &Path,
@@ -939,7 +985,7 @@ fn run_operation(
 ) -> OperationMetrics {
     let start = Instant::now();
 
-    let output = Command::new(br_path)
+    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
         .args(args)
         .current_dir(workspace)
         .env("NO_COLOR", "1")
@@ -1046,6 +1092,11 @@ fn benchmark_synthetic(dataset: &SyntheticDataset, br_path: &Path) -> SyntheticB
         workspace,
         "blocked",
     ));
+
+    for workload in synthetic_graph_workloads(dataset.config.issue_count) {
+        let args: Vec<&str> = workload.args.iter().map(String::as_str).collect();
+        operations.push(run_operation(br_path, &args, workspace, workload.operation));
+    }
 
     // Export operation
     let export_path = dataset.root.join("export.jsonl");
@@ -1500,6 +1551,80 @@ fn test_synthetic_config_distribution_builders() {
     assert_eq!(config.simulated_agent_count, 32);
     assert!((config.claim_density - 0.25).abs() < f64::EPSILON);
     assert!((config.dag_skew - 2.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn synthetic_graph_workloads_cover_skewed_and_wide_profiles() {
+    let workloads = synthetic_graph_workloads(96);
+    let names = workloads
+        .iter()
+        .map(|workload| workload.operation)
+        .collect::<BTreeSet<_>>();
+
+    assert!(names.contains("graph_hot_hub"));
+    assert!(names.contains("dep_tree_hot_leaf"));
+    assert!(names.contains("graph_all_components"));
+
+    let dep_tree = workloads
+        .iter()
+        .find(|workload| workload.operation == "dep_tree_hot_leaf")
+        .expect("leaf dependency-tree workload should exist");
+    assert!(dep_tree.args.windows(2).any(|window| {
+        window.first().is_some_and(|arg| arg == "--max-depth")
+            && window.get(1).is_some_and(|arg| arg == "12")
+    }));
+
+    let million_workloads = synthetic_graph_workloads(ScaleTier::Million.issue_count());
+    assert!(
+        million_workloads
+            .iter()
+            .any(|workload| workload.operation == "graph_hot_hub")
+    );
+    assert!(
+        million_workloads
+            .iter()
+            .any(|workload| workload.operation == "dep_tree_hot_leaf")
+    );
+    assert!(
+        million_workloads
+            .iter()
+            .all(|workload| workload.operation != "graph_all_components")
+    );
+}
+
+#[test]
+fn synthetic_ci_profile_benchmarks_graph_projection_workloads() {
+    let binaries = discover_binaries().expect("Binary discovery failed");
+    let config = SyntheticConfig::ci_profile(101)
+        .with_issue_count(96)
+        .with_dag_skew(2.0);
+    let dataset = SyntheticDataset::generate(config, &binaries.br.path)
+        .expect("generate CI synthetic corpus");
+
+    let benchmark = benchmark_synthetic(&dataset, &binaries.br.path);
+    let operation_names = benchmark
+        .operations
+        .iter()
+        .map(|operation| operation.operation.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for expected in ["graph_hot_hub", "dep_tree_hot_leaf", "graph_all_components"] {
+        assert!(operation_names.contains(expected), "missing {expected}");
+        let operation = benchmark
+            .operations
+            .iter()
+            .find(|operation| operation.operation == expected)
+            .expect("expected operation should be recorded");
+        assert!(
+            operation.success,
+            "{expected} failed: {:?}",
+            operation.error.as_deref()
+        );
+        assert!(
+            operation.output_size_bytes > 0,
+            "{expected} should emit measurable output"
+        );
+    }
 }
 
 #[test]

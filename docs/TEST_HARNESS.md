@@ -192,7 +192,12 @@ surfaces. Each generated workspace writes `synthetic-corpus-manifest.json` with
 the seed, issue count, dependency density, label/comment distributions, simulated
 agent count, claim density, skewed-DAG factor, JSONL hash, file-size report, and
 health results. The manual million profile targets 1,000,000 issues and 10,000
-simulated agents when the host has enough memory and CPU.
+simulated agents when the host has enough memory and CPU. The benchmark operation
+set includes `graph_hot_hub` for wide reverse-dependent graph reads and
+`dep_tree_hot_leaf` for bounded deep dependency-tree reads on the skewed DAG.
+`graph_all_components` is included only for corpora up to 10,000 issues so the
+small profile records full connected-component graph evidence without forcing
+million-issue profiles to materialize a full graph JSON document.
 
 **Contention replay lab (CI smoke and manual 64-worker profile)**
 ```bash

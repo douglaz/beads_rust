@@ -41,7 +41,6 @@ use std::time::{Duration, Instant};
 const DEFAULT_WRITE_LOCK_TIMEOUT_MS: u64 = 30_000;
 const WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const EXPORT_ISSUE_BATCH_SIZE: usize = 256;
-const EXPORT_FULL_SCAN_MIN_ISSUES: usize = 512;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
 
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
@@ -1574,102 +1573,6 @@ fn hydrate_export_issue_batch(
     Ok(issues)
 }
 
-fn hydrate_export_issues_full_scan(
-    storage: &SqliteStorage,
-    ids: &[String],
-    ctx: &mut ExportContext,
-) -> Result<Vec<Issue>> {
-    let export_id_set: HashSet<&str> = ids.iter().map(String::as_str).collect();
-    let mut issues = storage.get_all_issues_for_export()?;
-    issues.retain(|issue| export_id_set.contains(issue.id.as_str()));
-
-    let deps_map = match storage.get_dependency_records_for_export() {
-        Ok(map) => Some(map),
-        Err(err) => {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Dependency,
-                "batch",
-                err.to_string(),
-            ))?;
-            None
-        }
-    };
-    let labels_map = match storage.get_labels_for_export() {
-        Ok(map) => Some(map),
-        Err(err) => {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Label,
-                "batch",
-                err.to_string(),
-            ))?;
-            None
-        }
-    };
-    let comments_map = match storage.get_comments_for_export() {
-        Ok(map) => Some(map),
-        Err(err) => {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Comment,
-                "batch",
-                err.to_string(),
-            ))?;
-            None
-        }
-    };
-
-    for issue in &mut issues {
-        if let Some(map) = deps_map.as_ref() {
-            if let Some(deps) = map.get(&issue.id) {
-                issue.dependencies.clone_from(deps);
-            }
-        } else if ctx.policy != ExportErrorPolicy::RequiredCore
-            && let Ok(deps) = storage.get_dependencies_full(&issue.id)
-        {
-            issue.dependencies = deps;
-        }
-
-        if let Some(map) = labels_map.as_ref() {
-            if let Some(labels) = map.get(&issue.id) {
-                issue.labels.clone_from(labels);
-            }
-        } else if ctx.policy != ExportErrorPolicy::RequiredCore
-            && let Ok(labels) = storage.get_labels(&issue.id)
-        {
-            issue.labels = labels;
-        }
-
-        if let Some(map) = comments_map.as_ref() {
-            if let Some(comments) = map.get(&issue.id) {
-                issue.comments.clone_from(comments);
-            }
-        } else if ctx.policy != ExportErrorPolicy::RequiredCore
-            && let Ok(comments) = storage.get_comments(&issue.id)
-        {
-            issue.comments = comments;
-        }
-
-        normalize_issue_for_export(issue);
-    }
-
-    Ok(issues)
-}
-
-fn hydrate_export_issues(
-    storage: &SqliteStorage,
-    ids: &[String],
-    ctx: &mut ExportContext,
-) -> Result<Vec<Issue>> {
-    if ids.len() >= EXPORT_FULL_SCAN_MIN_ISSUES {
-        return hydrate_export_issues_full_scan(storage, ids, ctx);
-    }
-
-    let mut issues = Vec::with_capacity(ids.len());
-    for id_batch in ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
-        issues.extend(hydrate_export_issue_batch(storage, id_batch, ctx)?);
-    }
-    Ok(issues)
-}
-
 fn write_export_issue_jsonl<W: Write>(
     writer: &mut W,
     issue: &Issue,
@@ -1884,33 +1787,35 @@ pub fn export_to_jsonl_with_policy(
     let mut issue_hashes = Vec::with_capacity(export_ids.len());
     let mut buffer = Vec::with_capacity(1024);
 
-    let issues = hydrate_export_issues(storage, &export_ids, &mut ctx)?;
-    for issue in &issues {
-        // Skip expired tombstones
-        if issue.is_expired_tombstone(config.retention_days) {
-            skipped_tombstone_ids.push(issue.id.clone());
-            progress.inc(1);
-            continue;
-        }
+    for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
+        let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+        for issue in &issues {
+            // Skip expired tombstones
+            if issue.is_expired_tombstone(config.retention_days) {
+                skipped_tombstone_ids.push(issue.id.clone());
+                progress.inc(1);
+                continue;
+            }
 
-        if !write_export_issue_jsonl(&mut writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
-            progress.inc(1);
-            continue;
-        }
+            if !write_export_issue_jsonl(&mut writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
+                progress.inc(1);
+                continue;
+            }
 
-        exported_ids.push(issue.id.clone());
-        issue_hashes.push((
-            issue.id.clone(),
-            issue
-                .content_hash
-                .clone()
-                .unwrap_or_else(|| crate::util::content_hash(issue)),
-        ));
-        report.issues_exported += 1;
-        report.dependencies_exported += issue.dependencies.len();
-        report.labels_exported += issue.labels.len();
-        report.comments_exported += issue.comments.len();
-        progress.inc(1);
+            exported_ids.push(issue.id.clone());
+            issue_hashes.push((
+                issue.id.clone(),
+                issue
+                    .content_hash
+                    .clone()
+                    .unwrap_or_else(|| crate::util::content_hash(issue)),
+            ));
+            report.issues_exported += 1;
+            report.dependencies_exported += issue.dependencies.len();
+            report.labels_exported += issue.labels.len();
+            report.comments_exported += issue.comments.len();
+            progress.inc(1);
+        }
     }
 
     progress.finish_with_message("Export complete");
@@ -2006,24 +1911,26 @@ pub fn export_to_writer_with_policy<W: Write>(
     let mut issue_hashes = Vec::with_capacity(export_ids.len());
     let mut buffer = Vec::with_capacity(1024);
 
-    let issues = hydrate_export_issues(storage, &export_ids, &mut ctx)?;
-    for issue in &issues {
-        if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
-            continue;
-        }
+    for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
+        let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+        for issue in &issues {
+            if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
+                continue;
+            }
 
-        exported_ids.push(issue.id.clone());
-        issue_hashes.push((
-            issue.id.clone(),
-            issue
-                .content_hash
-                .clone()
-                .unwrap_or_else(|| crate::util::content_hash(issue)),
-        ));
-        report.issues_exported += 1;
-        report.dependencies_exported += issue.dependencies.len();
-        report.labels_exported += issue.labels.len();
-        report.comments_exported += issue.comments.len();
+            exported_ids.push(issue.id.clone());
+            issue_hashes.push((
+                issue.id.clone(),
+                issue
+                    .content_hash
+                    .clone()
+                    .unwrap_or_else(|| crate::util::content_hash(issue)),
+            ));
+            report.issues_exported += 1;
+            report.dependencies_exported += issue.dependencies.len();
+            report.labels_exported += issue.labels.len();
+            report.comments_exported += issue.comments.len();
+        }
     }
 
     let content_hash = hex_encode(&hasher.finalize());
@@ -7179,6 +7086,37 @@ mod tests {
         let mut writer = LineFailWriter::new("bd-002");
         let result = export_to_writer_with_policy(&storage, &mut writer, ExportErrorPolicy::Strict);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_export_to_writer_streams_large_issue_set_in_id_order() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue_count = (EXPORT_ISSUE_BATCH_SIZE * 2) + 3;
+
+        for index in (0..issue_count).rev() {
+            let id = format!("bd-{index:04}");
+            let title = format!("Issue {index}");
+            let issue = make_test_issue(&id, &title);
+            storage.create_issue(&issue, "test").unwrap();
+        }
+
+        let mut writer = Vec::new();
+        let (result, report) =
+            export_to_writer_with_policy(&storage, &mut writer, ExportErrorPolicy::Strict).unwrap();
+
+        assert_eq!(result.exported_count, issue_count);
+        assert_eq!(report.issues_exported, issue_count);
+
+        let output = String::from_utf8(writer).unwrap();
+        let ids = output
+            .lines()
+            .map(|line| serde_json::from_str::<Issue>(line).unwrap().id)
+            .collect::<Vec<_>>();
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort();
+
+        assert_eq!(ids.len(), issue_count);
+        assert_eq!(ids, sorted_ids);
     }
 
     #[test]

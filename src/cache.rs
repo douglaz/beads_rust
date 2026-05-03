@@ -386,6 +386,53 @@ where
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct ReplayReport {
+        direct_storage_reads: u64,
+        cache_storage_reads: u64,
+        hits: u64,
+        misses: u64,
+        evictions: u64,
+        ghost_hits: u64,
+        max_weight_seen: usize,
+        final_weight: usize,
+    }
+
+    impl ReplayReport {
+        fn saved_storage_reads(&self) -> u64 {
+            self.direct_storage_reads
+                .saturating_sub(self.cache_storage_reads)
+        }
+
+        const fn candidate_beats_direct_reads(&self) -> bool {
+            self.cache_storage_reads < self.direct_storage_reads
+        }
+    }
+
+    fn replay_accesses(config: S3FifoConfig, accesses: &[usize]) -> ReplayReport {
+        let mut cache = S3FifoCache::with_config(config);
+        let mut max_weight_seen = 0;
+
+        for &key in accesses {
+            if cache.get(&key).is_none() {
+                _ = cache.put(key, key, 1);
+            }
+            max_weight_seen = max_weight_seen.max(cache.current_weight());
+        }
+
+        let stats = cache.stats();
+        ReplayReport {
+            direct_storage_reads: u64::try_from(accesses.len()).unwrap_or(u64::MAX),
+            cache_storage_reads: stats.misses,
+            hits: stats.hits,
+            misses: stats.misses,
+            evictions: stats.evictions,
+            ghost_hits: stats.ghost_hits,
+            max_weight_seen,
+            final_weight: cache.current_weight(),
+        }
+    }
+
     #[test]
     fn disabled_cache_records_misses_without_storing() {
         let mut cache = S3FifoCache::with_config(S3FifoConfig::disabled());
@@ -501,5 +548,62 @@ mod tests {
         assert_eq!(cache.len(), 8);
         assert_eq!(cache.current_weight(), 8);
         assert!(cache.stats().evictions > 0);
+    }
+
+    #[test]
+    fn zipf_like_replay_beats_direct_reads() {
+        let mut accesses = Vec::new();
+        for cold_key in 10..42 {
+            accesses.extend([0; 8]);
+            accesses.extend([1; 4]);
+            accesses.extend([2; 2]);
+            accesses.push(cold_key);
+        }
+
+        let report = replay_accesses(S3FifoConfig::new(4), &accesses);
+
+        assert!(report.candidate_beats_direct_reads());
+        assert!(report.hits > report.misses);
+        assert!(report.saved_storage_reads() > report.direct_storage_reads / 2);
+        assert!(report.max_weight_seen <= 4);
+    }
+
+    #[test]
+    fn bursty_replay_preserves_reused_entries_after_scan_gap() {
+        let mut accesses = vec![42; 6];
+        accesses.extend(100..132);
+        accesses.extend([42; 6]);
+
+        let report = replay_accesses(S3FifoConfig::new(4), &accesses);
+
+        assert!(report.candidate_beats_direct_reads());
+        assert!(report.hits >= 10);
+        assert!(report.evictions > 0);
+        assert!(report.max_weight_seen <= 4);
+    }
+
+    #[test]
+    fn scan_heavy_replay_rejects_candidate_with_evidence() {
+        let accesses: Vec<_> = (0..64).collect();
+
+        let report = replay_accesses(S3FifoConfig::new(8), &accesses);
+
+        assert!(!report.candidate_beats_direct_reads());
+        assert_eq!(report.cache_storage_reads, report.direct_storage_reads);
+        assert_eq!(report.hits, 0);
+        assert!(report.evictions > 0);
+        assert!(report.max_weight_seen <= 8);
+    }
+
+    #[test]
+    fn disabled_replay_matches_direct_reads_without_residency() {
+        let accesses = [0, 1, 0, 2, 0, 3, 0, 4];
+
+        let report = replay_accesses(S3FifoConfig::disabled(), &accesses);
+
+        assert_eq!(report.cache_storage_reads, report.direct_storage_reads);
+        assert_eq!(report.hits, 0);
+        assert_eq!(report.ghost_hits, 0);
+        assert_eq!(report.final_weight, 0);
     }
 }

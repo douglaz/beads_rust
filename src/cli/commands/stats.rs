@@ -388,23 +388,18 @@ fn compute_summary(
         .map(|i| i.id.as_str())
         .collect();
 
-    // Compute blocked-by-blocks in memory to avoid an expensive double LEFT JOIN
-    // in fsqlite. If there are no active issues, no dependency edge can affect
-    // either the blocked count or the ready count.
-    let blocked_by_blocks = if active_issue_ids.is_empty() {
+    // Reuse the storage blocked-ID path for both blocked and ready counts.
+    // It reads the materialized cache when healthy and falls back to direct
+    // graph computation when needed; keep the active filter local so status
+    // accounting remains anchored to the rows already loaded for stats.
+    let dependency_blocked_ids: HashSet<String> = if active_issue_ids.is_empty() {
         HashSet::new()
     } else {
-        let active_issue_id_list = active_issue_ids.iter().copied().collect::<Vec<_>>();
-        let edges = storage.get_blocks_dep_edges_for_issue_ids(&active_issue_id_list)?;
-        let mut blocked = HashSet::new();
-        for (issue_id, depends_on_id) in &edges {
-            if active_issue_ids.contains(depends_on_id.as_str())
-                && active_issue_ids.contains(issue_id.as_str())
-            {
-                blocked.insert(issue_id.clone());
-            }
-        }
-        blocked
+        storage
+            .get_blocked_ids()?
+            .into_iter()
+            .filter(|issue_id| active_issue_ids.contains(issue_id.as_str()))
+            .collect()
     };
 
     for issue in issues {
@@ -442,12 +437,11 @@ fn compute_summary(
 
     // Ready count: status=open (not in_progress), no blockers (full definition).
     let ready = if has_potential_ready_candidates {
-        let all_blocked_ids = storage.get_blocked_ids()?;
         issues
             .iter()
             .filter(|i| {
                 is_potential_ready_candidate(i, now)
-                    && !all_blocked_ids.contains(&i.id)
+                    && !dependency_blocked_ids.contains(&i.id)
                     && external_blockers.is_none_or(|eb| !eb.contains_key(&i.id))
             })
             .count()
@@ -457,7 +451,7 @@ fn compute_summary(
 
     // Blocked count includes both dependency-blocked issues and manual
     // Status::Blocked issues, deduped by ID when both conditions apply.
-    status_blocked_ids.extend(blocked_by_blocks.iter().map(String::as_str));
+    status_blocked_ids.extend(dependency_blocked_ids.iter().map(String::as_str));
     let blocked = status_blocked_ids.len();
 
     // Epics eligible for closure: all children closed

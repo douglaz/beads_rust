@@ -21,6 +21,26 @@ pub struct CreateConfig {
     pub default_priority: Priority,
     pub default_issue_type: IssueType,
     pub actor: String,
+    /// Stable repo identifier stamped onto new issues so cross-repo automation
+    /// has a non-caller-relative anchor instead of a literal `.`. Falls back
+    /// to `None` (storage default) when the beads directory has no usable
+    /// parent name, e.g. `/.beads`.
+    pub source_repo: Option<String>,
+}
+
+/// Derive a stable `source_repo` value from the beads directory path: the
+/// basename of the parent of `.beads/`, normalised. Returns `None` when no
+/// useful name can be extracted, so the caller can let the legacy storage
+/// default take over.
+pub(crate) fn canonical_source_repo(beads_dir: &Path) -> Option<String> {
+    let parent = beads_dir.parent()?;
+    let canonical = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let name = canonical.file_name()?.to_string_lossy().into_owned();
+    if name.is_empty() || name == "." || name == "/" {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 struct NewIdInput<'a> {
@@ -89,6 +109,7 @@ pub fn execute_with_storage(
         default_priority: config::default_priority_from_layer(&layer)?,
         default_issue_type: config::default_issue_type_from_layer(&layer)?,
         actor: config::resolve_actor(&layer),
+        source_repo: canonical_source_repo(&storage_ctx.paths.beads_dir),
     };
 
     let issue =
@@ -321,7 +342,7 @@ pub fn create_issue_impl(
             close_reason: None,
             closed_by_session: None,
             source_system: None,
-            source_repo: None,
+            source_repo: config.source_repo.clone(),
             deleted_at,
             deleted_by: if deleted_at.is_some() {
                 Some(config.actor.clone())
@@ -634,6 +655,7 @@ fn execute_import(
     let default_priority = config::default_priority_from_layer(&layer)?;
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
     let actor = config::resolve_actor(&layer);
+    let import_source_repo = canonical_source_repo(&storage_ctx.paths.beads_dir);
     let now = Utc::now();
     let _json_mode = cli.json.unwrap_or(false);
     let due_at = parse_optional_date(args.due.as_deref())?;
@@ -775,7 +797,7 @@ fn execute_import(
                 close_reason: None,
                 closed_by_session: None,
                 source_system: None,
-                source_repo: None,
+                source_repo: import_source_repo.clone(),
                 deleted_at: import_deleted_at,
                 deleted_by: if import_deleted_at.is_some() {
                     Some(actor.clone())
@@ -1107,6 +1129,7 @@ mod tests {
             default_priority: Priority::MEDIUM,
             default_issue_type: IssueType::Task,
             actor: "test_user".to_string(),
+            source_repo: None,
         }
     }
 

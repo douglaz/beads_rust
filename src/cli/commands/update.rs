@@ -846,10 +846,16 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
     let due_at = optional_date_field(args.due.as_deref())?;
     let defer_until = optional_date_field(args.defer.as_deref())?;
 
-    let closed_at = match &status {
-        Some(Status::Closed) => Some(Some(Utc::now())),
-        Some(_) => Some(None),
-        None => None,
+    if args.session.is_some() && !matches!(status, Some(Status::Closed)) {
+        return Err(BeadsError::validation(
+            "session",
+            "--session can only be used when closing with --status closed",
+        ));
+    }
+    let (closed_at, close_reason, closed_by_session) = match &status {
+        Some(Status::Closed) => (Some(Some(Utc::now())), None, args.session.clone().map(Some)),
+        Some(_) => (Some(None), Some(None), Some(None)),
+        None => (None, None, None),
     };
 
     // Build update struct
@@ -869,8 +875,8 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         defer_until,
         external_ref: optional_string_field(args.external_ref.as_deref()),
         closed_at,
-        close_reason: None,
-        closed_by_session: args.session.clone().map(Some),
+        close_reason,
+        closed_by_session,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -1134,12 +1140,17 @@ mod tests {
         info!("test_build_update_with_status: starting");
         let args = UpdateArgs {
             status: Some("closed".to_string()),
+            session: Some("session-123".to_string()),
             ..Default::default()
         };
         let update = build_update(&args, "test_actor", false).unwrap();
         assert_eq!(update.status, Some(Status::Closed));
         // closed_at should be set
         assert!(update.closed_at.is_some());
+        assert_eq!(
+            update.closed_by_session,
+            Some(Some("session-123".to_string()))
+        );
 
         let args_blocked = UpdateArgs {
             status: Some("blocked".to_string()),
@@ -1147,9 +1158,29 @@ mod tests {
         };
         let update_blocked = build_update(&args_blocked, "test_actor", false).unwrap();
         assert_eq!(update_blocked.status, Some(Status::Blocked));
-        // closed_at should be explicitly cleared for non-terminal statuses
+        // Close metadata should be explicitly cleared for non-terminal statuses.
         assert_eq!(update_blocked.closed_at, Some(None));
+        assert_eq!(update_blocked.close_reason, Some(None));
+        assert_eq!(update_blocked.closed_by_session, Some(None));
         info!("test_build_update_with_status: assertions passed");
+    }
+
+    #[test]
+    fn test_build_update_rejects_session_without_closing() {
+        let args = UpdateArgs {
+            session: Some("session-123".to_string()),
+            ..Default::default()
+        };
+        let err = build_update(&args, "test_actor", false).unwrap_err();
+        assert!(err.to_string().contains("--session can only be used"));
+
+        let args_open = UpdateArgs {
+            status: Some("open".to_string()),
+            session: Some("session-123".to_string()),
+            ..Default::default()
+        };
+        let err = build_update(&args_open, "test_actor", false).unwrap_err();
+        assert!(err.to_string().contains("--session can only be used"));
     }
 
     #[test]

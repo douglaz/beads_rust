@@ -525,6 +525,16 @@ pub enum BatchReportError {
     },
 }
 
+/// Error from planning, executing, or assembling a combined batch harness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "error", content = "detail")]
+pub enum BatchExecutionError {
+    /// The configured batch limits were unusable.
+    BatchLimits(BatchLimitError),
+    /// The executor output did not match the planned batch.
+    Report(BatchReportError),
+}
+
 impl BatchPlan {
     /// Number of accepted envelopes.
     #[must_use]
@@ -764,6 +774,42 @@ pub fn assemble_batch_report(
         family: plan.family,
         responses: responses_by_index.into_values().collect(),
     })
+}
+
+/// Plan one batch, run an injected executor for accepted envelopes, and report.
+///
+/// This is a storage-independent harness for future combiner wiring and tests.
+/// It never executes skipped envelopes; `assemble_batch_report` remains the
+/// single validation point for per-caller output parity.
+///
+/// # Errors
+///
+/// Returns a batch-limit error for invalid limits, or a report error if the
+/// injected executor returns output inconsistent with the accepted envelopes.
+pub fn execute_batch_with<F>(
+    envelopes: &[MutationEnvelope],
+    limits: BatchLimits,
+    now_unix_ms: u64,
+    mut execute: F,
+) -> std::result::Result<BatchReport, BatchExecutionError>
+where
+    F: FnMut(&MutationEnvelope) -> MutationResult,
+{
+    let plan =
+        plan_batch(envelopes, limits, now_unix_ms).map_err(BatchExecutionError::BatchLimits)?;
+    let mut results = Vec::with_capacity(plan.accepted.len());
+    for planned_mutation in &plan.accepted {
+        let envelope = envelopes
+            .get(planned_mutation.index)
+            .ok_or(BatchExecutionError::Report(
+                BatchReportError::PlannedIndexOutOfBounds {
+                    index: planned_mutation.index,
+                    envelope_count: envelopes.len(),
+                },
+            ))?;
+        results.push(execute(envelope));
+    }
+    assemble_batch_report(envelopes, &plan, &results).map_err(BatchExecutionError::Report)
 }
 
 fn envelope_at(
@@ -1754,6 +1800,118 @@ mod tests {
                 "flush failed",
                 CombinedFlushOutcome::FailedAfterCommit,
             )))
+        );
+    }
+
+    #[test]
+    fn batch_execution_harness_runs_only_accepted_envelopes() {
+        let mut invalid = envelope(
+            "invalid",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "invalid"}),
+        );
+        invalid.schema_version = "br.write-combining.v0".to_string();
+        let envelopes = vec![
+            envelope(
+                "request-1",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "first"}),
+            ),
+            invalid,
+            envelope(
+                "request-2",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "second"}),
+            ),
+            envelope(
+                "expired",
+                CompatibleMutation::CreateIssue,
+                NOW_UNIX_MS,
+                json!({"title": "expired"}),
+            ),
+        ];
+        let mut executed_keys = Vec::new();
+
+        let result = execute_batch_with(
+            &envelopes,
+            BatchLimits::default(),
+            NOW_UNIX_MS,
+            |envelope| {
+                executed_keys.push(envelope.idempotency_key.clone());
+                let exit_code = if envelope.idempotency_key == "request-2" {
+                    2
+                } else {
+                    0
+                };
+                MutationResult::new(
+                    envelope.idempotency_key.clone(),
+                    envelope.family,
+                    exit_code,
+                    format!("stdout:{}", envelope.idempotency_key),
+                    format!("stderr:{}", envelope.idempotency_key),
+                    CombinedFlushOutcome::Succeeded,
+                )
+            },
+        );
+        assert!(result.is_ok(), "unexpected execution error: {result:?}");
+        let Ok(report) = result else {
+            return;
+        };
+
+        assert_eq!(executed_keys, vec!["request-1", "request-2"]);
+        assert_eq!(
+            report.outcome_summary(),
+            BatchOutcomeSummary {
+                response_count: 4,
+                applied_count: 2,
+                skipped_count: 2,
+                successful_mutations: 1,
+                failed_mutations: 1,
+                flush_failures: 0,
+                first_failed_index: Some(2),
+                first_flush_failure_index: None,
+            }
+        );
+        assert_eq!(
+            report
+                .responses
+                .iter()
+                .map(|response| response.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn batch_execution_harness_rejects_bad_limits_and_bad_results() {
+        let envelopes = vec![envelope(
+            "request-1",
+            CompatibleMutation::CreateIssue,
+            FUTURE_UNIX_MS,
+            json!({"title": "first"}),
+        )];
+
+        assert_eq!(
+            execute_batch_with(&envelopes, BatchLimits::new(0, 1), NOW_UNIX_MS, |_| {
+                mutation_result("request-1", CompatibleMutation::CreateIssue)
+            }),
+            Err(BatchExecutionError::BatchLimits(
+                BatchLimitError::ZeroMaxEnvelopes
+            ))
+        );
+        assert_eq!(
+            execute_batch_with(&envelopes, BatchLimits::default(), NOW_UNIX_MS, |_| {
+                mutation_result("wrong-key", CompatibleMutation::CreateIssue)
+            }),
+            Err(BatchExecutionError::Report(
+                BatchReportError::MissingResult {
+                    index: 0,
+                    idempotency_key: "request-1".to_string(),
+                }
+            ))
         );
     }
 

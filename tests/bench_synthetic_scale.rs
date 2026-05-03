@@ -73,6 +73,20 @@ fn synthetic_seed_from_env(default_seed: u64) -> u64 {
         .unwrap_or(default_seed)
 }
 
+fn synthetic_evidence_issue_count_from_env(default_count: usize) -> usize {
+    std::env::var("BR_SYNTHETIC_EVIDENCE_ISSUES")
+        .ok()
+        .and_then(|count| count.parse().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(default_count)
+}
+
+fn synthetic_evidence_output_dir() -> PathBuf {
+    std::env::var_os("BR_SYNTHETIC_EVIDENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/benchmark-results"))
+}
+
 /// Scale tier for synthetic datasets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleTier {
@@ -890,6 +904,8 @@ pub struct OperationMetrics {
     pub success: bool,
     /// Output size in bytes
     pub output_size_bytes: usize,
+    /// SHA-256 of stdout for output identity evidence.
+    pub stdout_sha256: Option<String>,
     /// Error message if failed
     pub error: Option<String>,
 }
@@ -899,12 +915,18 @@ pub struct OperationMetrics {
 pub struct SyntheticBenchmark {
     /// Scale tier name
     pub tier: String,
+    /// Dataset configuration used for reproducibility.
+    pub config: SyntheticConfigSnapshot,
     /// Dataset generation metrics
     pub generation: GenerationMetrics,
     /// Operation benchmarks
     pub operations: Vec<OperationMetrics>,
     /// Summary statistics
     pub summary: BenchmarkSummary,
+    /// `br` binary path measured by the benchmark.
+    pub br_binary_path: String,
+    /// Command that can reproduce this benchmark profile.
+    pub reproduction_command: String,
     /// Timestamp
     pub timestamp: String,
 }
@@ -997,6 +1019,11 @@ fn run_operation(
                 success,
                 peak_rss_bytes,
             } = out;
+            let stdout_sha256 = if success {
+                Some(sha256_hex(&stdout))
+            } else {
+                None
+            };
             let error = if success { None } else { Some(stderr) };
 
             OperationMetrics {
@@ -1005,6 +1032,7 @@ fn run_operation(
                 peak_rss_bytes,
                 success,
                 output_size_bytes: stdout.len(),
+                stdout_sha256,
                 error,
             }
         }
@@ -1014,6 +1042,7 @@ fn run_operation(
             peak_rss_bytes: None,
             success: false,
             output_size_bytes: 0,
+            stdout_sha256: None,
             error: Some(e.to_string()),
         },
     }
@@ -1077,6 +1106,10 @@ fn parse_time_max_rss_bytes(stderr: &str) -> Option<u64> {
     })
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
+}
+
 /// Run full benchmark suite on a synthetic dataset.
 fn benchmark_synthetic(dataset: &SyntheticDataset, br_path: &Path) -> SyntheticBenchmark {
     let start = Instant::now();
@@ -1127,16 +1160,12 @@ fn benchmark_synthetic(dataset: &SyntheticDataset, br_path: &Path) -> SyntheticB
     }
 
     // Export operation
-    let export_path = dataset.root.join("export.jsonl");
     operations.push(run_operation(
         br_path,
-        &["export", "--output", export_path.to_str().unwrap()],
+        &["sync", "--flush-only", "--json"],
         workspace,
-        "export",
+        "sync_flush",
     ));
-
-    // Measure export size (captured for future use in metrics)
-    let _export_size = fs::metadata(&export_path).map_or(0, |m| m.len());
 
     // Calculate summary
     let total_duration_ms = start.elapsed().as_millis();
@@ -1194,9 +1223,12 @@ fn benchmark_synthetic(dataset: &SyntheticDataset, br_path: &Path) -> SyntheticB
                 _ => "million",
             }
         ),
+        config: SyntheticConfigSnapshot::from(&dataset.config),
         generation: dataset.metrics.clone(),
         operations,
         summary,
+        br_binary_path: br_path.display().to_string(),
+        reproduction_command: reproduction_command_for(&dataset.config),
         timestamp,
     }
 }
@@ -1280,9 +1312,70 @@ fn write_benchmark_json(
     Ok(())
 }
 
+fn evidence_reproduction_command_for(config: &SyntheticConfig) -> String {
+    format!(
+        "BR_E2E_STRESS=1 BR_SYNTHETIC_SEED={} BR_SYNTHETIC_EVIDENCE_ISSUES={} cargo test --test bench_synthetic_scale stress_synthetic_evidence_profile -- --ignored --nocapture",
+        config.seed, config.issue_count
+    )
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// Bounded evidence profile for streaming-output RSS/latency artifacts.
+/// Env gate: BR_E2E_STRESS=1
+#[test]
+#[ignore = "stress test: BR_E2E_STRESS=1 cargo test --test bench_synthetic_scale stress_synthetic_evidence_profile -- --ignored --nocapture"]
+fn stress_synthetic_evidence_profile() {
+    if !stress_tests_enabled() {
+        eprintln!("Skipping stress test (set BR_E2E_STRESS=1 to enable)");
+        return;
+    }
+
+    let binaries = discover_binaries().expect("Binary discovery failed");
+    let seed = synthetic_seed_from_env(20_260_503);
+    let issue_count = synthetic_evidence_issue_count_from_env(1_024);
+    let config = SyntheticConfig::ci_profile(seed)
+        .with_issue_count(issue_count)
+        .with_label_distribution(32, 1, 4)
+        .with_comment_distribution(0.2, 3)
+        .with_agent_distribution(10_000, 0.08)
+        .with_dag_skew(1.5);
+
+    eprintln!(
+        "Generating bounded synthetic evidence dataset ({} issues, {} simulated agents)...",
+        config.issue_count, config.simulated_agent_count
+    );
+    let dataset = SyntheticDataset::generate(config, &binaries.br.path)
+        .expect("Failed to generate synthetic evidence dataset");
+
+    eprintln!("Running bounded evidence benchmarks...");
+    let mut benchmark = benchmark_synthetic(&dataset, &binaries.br.path);
+    benchmark.tier = "synthetic_evidence".to_string();
+    benchmark.reproduction_command = evidence_reproduction_command_for(&dataset.config);
+    let failed_operations = benchmark
+        .operations
+        .iter()
+        .filter(|operation| !operation.success)
+        .map(|operation| operation.operation.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        failed_operations.is_empty(),
+        "bounded evidence profile should have no failed operations: {failed_operations:?}"
+    );
+    print_benchmark(&benchmark);
+
+    let output_dir = synthetic_evidence_output_dir();
+    fs::create_dir_all(&output_dir).expect("create evidence output dir");
+    let result_path = output_dir.join("synthetic_evidence_latest.json");
+    write_benchmark_json(&[benchmark], &result_path).expect("write evidence benchmark");
+    let manifest_path = output_dir.join("synthetic-corpus-manifest.json");
+    fs::copy(&dataset.manifest_path, &manifest_path).expect("persist corpus manifest");
+
+    println!("Evidence benchmark written to: {}", result_path.display());
+    println!("Corpus manifest written to: {}", manifest_path.display());
+}
 
 /// Small scale synthetic benchmark (10k issues).
 /// Env gate: BR_E2E_STRESS=1
@@ -1636,6 +1729,14 @@ Command being timed: \"br list --json\"\n\
 }
 
 #[test]
+fn sha256_hex_hashes_stdout_for_evidence() {
+    assert_eq!(
+        sha256_hex(b"br evidence\n"),
+        "8dfb2f8fd989532fa7371e6787180e687f541d91995e9a8c27378bc3afbd5406"
+    );
+}
+
+#[test]
 fn synthetic_ci_profile_benchmarks_graph_projection_workloads() {
     let binaries = discover_binaries().expect("Binary discovery failed");
     let config = SyntheticConfig::ci_profile(101)
@@ -1645,6 +1746,26 @@ fn synthetic_ci_profile_benchmarks_graph_projection_workloads() {
         .expect("generate CI synthetic corpus");
 
     let benchmark = benchmark_synthetic(&dataset, &binaries.br.path);
+    let failed_operations = benchmark
+        .operations
+        .iter()
+        .filter(|operation| !operation.success)
+        .map(|operation| operation.operation.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        failed_operations.is_empty(),
+        "synthetic CI profile should have no failed operations: {failed_operations:?}"
+    );
+    assert_eq!(benchmark.config.issue_count, 96);
+    assert_eq!(
+        benchmark.br_binary_path,
+        binaries.br.path.display().to_string()
+    );
+    assert!(
+        benchmark
+            .reproduction_command
+            .contains("BR_SYNTHETIC_SEED=101")
+    );
     let operation_names = benchmark
         .operations
         .iter()
@@ -1666,6 +1787,11 @@ fn synthetic_ci_profile_benchmarks_graph_projection_workloads() {
         assert!(
             operation.output_size_bytes > 0,
             "{expected} should emit measurable output"
+        );
+        assert_eq!(
+            operation.stdout_sha256.as_deref().map(str::len),
+            Some(64),
+            "{expected} should include stdout hash evidence"
         );
     }
 

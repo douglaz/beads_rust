@@ -2187,6 +2187,9 @@ pub enum SortPolicy {
     Oldest,
 }
 
+/// Default worker cap for read-only witness planning on high-core swarm hosts.
+pub const DEFAULT_WITNESS_PARALLELISM: usize = 64;
+
 /// Arguments for the sync command.
 #[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -2237,6 +2240,18 @@ pub struct SyncArgs {
         requires = "witness"
     )]
     pub witness_chunk_lines: usize,
+
+    /// Parallel worker cap for read-only JSONL witness work planning
+    ///
+    /// Only used with --witness and a base snapshot. When omitted, br uses a
+    /// deterministic 64-worker planning cap rather than host-dependent CPU
+    /// detection so robot output remains stable across machines.
+    #[arg(
+        long = "witness-parallelism",
+        value_name = "WORKERS",
+        requires = "witness"
+    )]
+    pub witness_parallelism: Option<usize>,
 
     /// Override safety guards (use with caution!)
     ///

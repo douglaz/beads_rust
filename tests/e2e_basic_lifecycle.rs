@@ -1232,6 +1232,24 @@ fn assert_base_witness_reuse_plan(witness_json: &Value) {
     assert_eq!(actions[1]["action"].as_str(), Some("read_added"));
     assert!(actions[1]["base_index"].is_null());
     assert_eq!(actions[1]["candidate_index"].as_u64(), Some(1));
+
+    let work_plan = &witness_json["base_parallel_work_plan"];
+    assert_eq!(work_plan["max_parallelism"].as_u64(), Some(1));
+    assert_eq!(work_plan["total_batches"].as_u64(), Some(2));
+    assert_eq!(work_plan["candidate_output_batches"].as_u64(), Some(2));
+    assert_eq!(work_plan["metadata_only_drop_batches"].as_u64(), Some(0));
+    assert_eq!(work_plan["deterministic_batch_order"].as_bool(), Some(true));
+    let batches = work_plan["batches"].as_array().expect("work batches");
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0]["kind"].as_str(), Some("candidate_output"));
+    assert_eq!(batches[0]["candidate_start_index"].as_u64(), Some(0));
+    assert_eq!(batches[0]["candidate_end_index"].as_u64(), Some(1));
+    assert_eq!(batches[0]["action_count"].as_u64(), Some(1));
+    assert_eq!(batches[0]["actions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(batches[1]["kind"].as_str(), Some("candidate_output"));
+    assert_eq!(batches[1]["candidate_start_index"].as_u64(), Some(1));
+    assert_eq!(batches[1]["candidate_end_index"].as_u64(), Some(2));
+    assert_eq!(batches[1]["action_count"].as_u64(), Some(1));
 }
 
 #[test]
@@ -1293,7 +1311,15 @@ fn e2e_sync_witness_reports_base_snapshot_drift() {
 
     let witness = run_br(
         &workspace,
-        ["sync", "--witness", "--witness-chunk-lines", "1", "--json"],
+        [
+            "sync",
+            "--witness",
+            "--witness-chunk-lines",
+            "1",
+            "--witness-parallelism",
+            "1",
+            "--json",
+        ],
         "sync_witness_base_compare",
     );
     assert!(

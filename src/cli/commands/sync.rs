@@ -3,14 +3,15 @@
 //! Provides explicit JSONL sync actions without git operations.
 //! Supports `--flush-only` (export) and `--import-only` (import).
 
-use crate::cli::SyncArgs;
+use crate::cli::{DEFAULT_WITNESS_PARALLELISM, SyncArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::witness::{
-    JsonlMerkleWitness, JsonlWitnessComparison, JsonlWitnessReusePlan, build_jsonl_merkle_witness,
-    compare_jsonl_merkle_witnesses, plan_jsonl_witness_reuse,
+    JsonlMerkleWitness, JsonlWitnessComparison, JsonlWitnessParallelWorkPlan,
+    JsonlWitnessReusePlan, build_jsonl_merkle_witness, compare_jsonl_merkle_witnesses,
+    plan_jsonl_witness_parallel_work, plan_jsonl_witness_reuse,
 };
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
@@ -85,6 +86,15 @@ pub struct SyncWitnessResult {
     pub base_comparison: Option<JsonlWitnessComparison>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_reuse_plan: Option<JsonlWitnessReusePlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_parallel_work_plan: Option<JsonlWitnessParallelWorkPlan>,
+}
+
+struct BaseWitnessArtifacts {
+    jsonl_path: Option<String>,
+    comparison: Option<JsonlWitnessComparison>,
+    reuse_plan: Option<JsonlWitnessReusePlan>,
+    parallel_work_plan: Option<JsonlWitnessParallelWorkPlan>,
 }
 
 #[derive(Debug)]
@@ -245,6 +255,13 @@ fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         return Err(BeadsError::Validation {
             field: "witness_chunk_lines".to_string(),
             reason: "--witness-chunk-lines must be greater than zero".to_string(),
+        });
+    }
+
+    if args.witness_parallelism == Some(0) {
+        return Err(BeadsError::Validation {
+            field: "witness_parallelism".to_string(),
+            reason: "--witness-parallelism must be greater than zero".to_string(),
         });
     }
 
@@ -894,14 +911,19 @@ fn execute_witness(
     }
 
     let witness = build_witness_for_path(jsonl_path, args.witness_chunk_lines)?;
-    let (base_jsonl_path, base_comparison, base_reuse_plan) =
-        build_base_witness_artifacts(path_policy, args.witness_chunk_lines, &witness)?;
+    let base_artifacts = build_base_witness_artifacts(
+        path_policy,
+        args.witness_chunk_lines,
+        effective_witness_parallelism(args),
+        &witness,
+    )?;
     let result = SyncWitnessResult {
         jsonl_path: jsonl_path.display().to_string(),
         witness,
-        base_jsonl_path,
-        base_comparison,
-        base_reuse_plan,
+        base_jsonl_path: base_artifacts.jsonl_path,
+        base_comparison: base_artifacts.comparison,
+        base_reuse_plan: base_artifacts.reuse_plan,
+        base_parallel_work_plan: base_artifacts.parallel_work_plan,
     };
 
     if !should_render_human_sync_output(ctx, use_json) {
@@ -915,6 +937,11 @@ fn execute_witness(
     }
 
     Ok(())
+}
+
+fn effective_witness_parallelism(args: &SyncArgs) -> usize {
+    args.witness_parallelism
+        .unwrap_or(DEFAULT_WITNESS_PARALLELISM)
 }
 
 fn build_witness_for_path(
@@ -939,25 +966,31 @@ fn build_witness_for_path(
 fn build_base_witness_artifacts(
     path_policy: &SyncPathPolicy,
     chunk_size_lines: usize,
+    max_parallelism: usize,
     current_witness: &JsonlMerkleWitness,
-) -> Result<(
-    Option<String>,
-    Option<JsonlWitnessComparison>,
-    Option<JsonlWitnessReusePlan>,
-)> {
+) -> Result<BaseWitnessArtifacts> {
     let base_jsonl_path = path_policy.beads_dir.join("beads.base.jsonl");
     if !base_jsonl_path.is_file() {
-        return Ok((None, None, None));
+        return Ok(BaseWitnessArtifacts {
+            jsonl_path: None,
+            comparison: None,
+            reuse_plan: None,
+            parallel_work_plan: None,
+        });
     }
 
     let base_witness = build_witness_for_path(&base_jsonl_path, chunk_size_lines)?;
     let comparison = compare_jsonl_merkle_witnesses(&base_witness, current_witness);
     let reuse_plan = plan_jsonl_witness_reuse(&base_witness, current_witness);
-    Ok((
-        Some(base_jsonl_path.display().to_string()),
-        Some(comparison),
-        Some(reuse_plan),
-    ))
+    let parallel_work_plan = plan_jsonl_witness_parallel_work(&reuse_plan, max_parallelism)
+        .map_err(|err| BeadsError::Config(format!("Failed to plan JSONL witness work: {err}")))?;
+
+    Ok(BaseWitnessArtifacts {
+        jsonl_path: Some(base_jsonl_path.display().to_string()),
+        comparison: Some(comparison),
+        reuse_plan: Some(reuse_plan),
+        parallel_work_plan: Some(parallel_work_plan),
+    })
 }
 
 fn render_witness_text(result: &SyncWitnessResult) {
@@ -991,6 +1024,12 @@ fn render_witness_text(result: &SyncWitnessResult) {
 
     if let Some(plan) = &result.base_reuse_plan {
         println!("  Reuse plan actions: {}", plan.actions.len());
+    }
+    if let Some(plan) = &result.base_parallel_work_plan {
+        println!(
+            "  Parallel work batches: {} (max_parallelism={})",
+            plan.total_batches, plan.max_parallelism
+        );
     }
 }
 
@@ -2501,6 +2540,19 @@ mod tests {
         };
 
         let err = validate_sync_mode_args(&args).expect_err("zero witness chunk size should fail");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rejects_zero_witness_parallelism() {
+        let args = SyncArgs {
+            witness: true,
+            witness_chunk_lines: 2,
+            witness_parallelism: Some(0),
+            ..SyncArgs::default()
+        };
+
+        let err = validate_sync_mode_args(&args).expect_err("zero witness parallelism should fail");
         assert!(matches!(err, BeadsError::Validation { .. }));
     }
 

@@ -10,7 +10,7 @@ use fastmcp_rust::{
     McpContext, McpError, McpErrorCode, McpResult, Resource, ResourceContent, ResourceHandler,
     ResourceTemplate,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::error::StructuredError;
 use crate::model::{Event, Issue, Status};
@@ -20,6 +20,36 @@ use super::{BeadsState, to_mcp};
 
 fn read_project_config(storage: &SqliteStorage) -> McpResult<HashMap<String, String>> {
     storage.get_all_config().map_err(to_mcp)
+}
+
+fn resource_json(uri: &str, value: &Value) -> Vec<ResourceContent> {
+    vec![ResourceContent {
+        uri: uri.to_string(),
+        mime_type: Some("application/json".into()),
+        text: Some(value.to_string()),
+        blob: None,
+    }]
+}
+
+fn cached_resource_json<F>(
+    state: &BeadsState,
+    uri: &str,
+    key: String,
+    build: F,
+) -> McpResult<Vec<ResourceContent>>
+where
+    F: FnOnce(&SqliteStorage) -> McpResult<Value>,
+{
+    if let Some(value) = state.cached_read_json(&key) {
+        return Ok(resource_json(uri, &value));
+    }
+
+    let before = state.capture_read_snapshot_witness();
+    let storage = state.open_read_storage().map_err(to_mcp)?;
+    let value = build(&storage)?;
+    state.store_read_json_snapshot(key, before, &value);
+
+    Ok(resource_json(uri, &value))
 }
 
 /// Build a structured "issue not found" error with fuzzy suggestions,
@@ -83,24 +113,22 @@ impl ResourceHandler for ProjectInfoResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
+        cached_resource_json(
+            &self.0,
+            "beads://project/info",
+            "resource:project_info".to_string(),
+            |storage| {
+                let config = read_project_config(storage)?;
+                let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
 
-        let config = read_project_config(&storage)?;
-        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
-
-        let info = json!({
-            "beads_dir": self.0.beads_dir.display().to_string(),
-            "issue_prefix": prefix,
-            "actor": self.0.actor,
-            "config": config,
-        });
-
-        Ok(vec![ResourceContent {
-            uri: "beads://project/info".into(),
-            mime_type: Some("application/json".into()),
-            text: Some(info.to_string()),
-            blob: None,
-        }])
+                Ok(json!({
+                    "beads_dir": self.0.beads_dir.display().to_string(),
+                    "issue_prefix": prefix,
+                    "actor": self.0.actor,
+                    "config": config,
+                }))
+            },
+        )
     }
 }
 
@@ -113,6 +141,50 @@ impl IssueResource {
     pub fn new(state: Arc<BeadsState>) -> Self {
         Self(state)
     }
+}
+
+fn issue_resource_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
+    let maybe_details = storage
+        .get_issue_details(id, true, true, 20)
+        .map_err(to_mcp)?;
+    let Some(details) = maybe_details else {
+        return Err(issue_not_found_resource(storage, id)?);
+    };
+
+    let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("labels".into(), json!(details.labels));
+        obj.insert("comments".into(), json!(details.comments));
+        obj.insert(
+            "dependencies".into(),
+            json!(
+                details
+                    .dependencies
+                    .iter()
+                    .map(|d| {
+                        json!({"id": d.id, "title": d.title, "status": d.status, "dep_type": d.dep_type})
+                    })
+                    .collect::<Vec<_>>()
+            ),
+        );
+        obj.insert(
+            "dependents".into(),
+            json!(
+                details
+                    .dependents
+                    .iter()
+                    .map(|d| {
+                        json!({"id": d.id, "title": d.title, "status": d.status, "dep_type": d.dep_type})
+                    })
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if let Some(parent) = &details.parent {
+            obj.insert("parent".into(), json!(parent));
+        }
+    }
+
+    Ok(result)
 }
 
 impl ResourceHandler for IssueResource {
@@ -160,42 +232,9 @@ impl ResourceHandler for IssueResource {
             McpError::invalid_params("'id' parameter is required in the URI template")
         })?;
 
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
-
-        let maybe_details = storage
-            .get_issue_details(id, true, true, 20)
-            .map_err(to_mcp)?;
-        let Some(details) = maybe_details else {
-            return Err(issue_not_found_resource(&storage, id)?);
-        };
-
-        let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
-        if let Some(obj) = result.as_object_mut() {
-            obj.insert("labels".into(), json!(details.labels));
-            obj.insert("comments".into(), json!(details.comments));
-            obj.insert(
-                "dependencies".into(),
-                json!(details.dependencies.iter().map(|d| {
-                    json!({"id": d.id, "title": d.title, "status": d.status, "dep_type": d.dep_type})
-                }).collect::<Vec<_>>()),
-            );
-            obj.insert(
-                "dependents".into(),
-                json!(details.dependents.iter().map(|d| {
-                    json!({"id": d.id, "title": d.title, "status": d.status, "dep_type": d.dep_type})
-                }).collect::<Vec<_>>()),
-            );
-            if let Some(parent) = &details.parent {
-                obj.insert("parent".into(), json!(parent));
-            }
-        }
-
-        Ok(vec![ResourceContent {
-            uri: uri.to_string(),
-            mime_type: Some("application/json".into()),
-            text: Some(result.to_string()),
-            blob: None,
-        }])
+        cached_resource_json(&self.0, uri, format!("resource:issue:{id}"), |storage| {
+            issue_resource_json(storage, id)
+        })
     }
 }
 
@@ -340,21 +379,20 @@ impl ResourceHandler for LabelsResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
-        let labels = storage.get_unique_labels_with_counts().map_err(to_mcp)?;
+        cached_resource_json(
+            &self.0,
+            "beads://labels",
+            "resource:labels".to_string(),
+            |storage| {
+                let labels = storage.get_unique_labels_with_counts().map_err(to_mcp)?;
 
-        let result = json!({
-            "labels": labels.iter().map(|(name, count)| {
-                json!({"name": name, "count": count})
-            }).collect::<Vec<_>>(),
-        });
-
-        Ok(vec![ResourceContent {
-            uri: "beads://labels".into(),
-            mime_type: Some("application/json".into()),
-            text: Some(result.to_string()),
-            blob: None,
-        }])
+                Ok(json!({
+                    "labels": labels.iter().map(|(name, count)| {
+                        json!({"name": name, "count": count})
+                    }).collect::<Vec<_>>(),
+                }))
+            },
+        )
     }
 }
 
@@ -389,29 +427,28 @@ impl ResourceHandler for ReadyIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
-        let ready = storage
-            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
-            .map_err(to_mcp)?;
+        cached_resource_json(
+            &self.0,
+            "beads://issues/ready",
+            "resource:issues_ready".to_string(),
+            |storage| {
+                let ready = storage
+                    .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
+                    .map_err(to_mcp)?;
 
-        let result = json!({
-            "count": ready.len(),
-            "issues": ready.iter().map(|issue| {
-                json!({
-                    "id": issue.id,
-                    "title": issue.title,
-                    "priority": issue.priority,
-                    "type": issue.issue_type,
-                })
-            }).collect::<Vec<_>>(),
-        });
-
-        Ok(vec![ResourceContent {
-            uri: "beads://issues/ready".into(),
-            mime_type: Some("application/json".into()),
-            text: Some(result.to_string()),
-            blob: None,
-        }])
+                Ok(json!({
+                    "count": ready.len(),
+                    "issues": ready.iter().map(|issue| {
+                        json!({
+                            "id": issue.id,
+                            "title": issue.title,
+                            "priority": issue.priority,
+                            "type": issue.issue_type,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))
+            },
+        )
     }
 }
 
@@ -446,26 +483,25 @@ impl ResourceHandler for BlockedIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
-        let blocked = storage.get_blocked_issues().map_err(to_mcp)?;
+        cached_resource_json(
+            &self.0,
+            "beads://issues/blocked",
+            "resource:issues_blocked".to_string(),
+            |storage| {
+                let blocked = storage.get_blocked_issues().map_err(to_mcp)?;
 
-        let result = json!({
-            "count": blocked.len(),
-            "issues": blocked.iter().map(|(issue, blockers)| {
-                json!({
-                    "id": issue.id,
-                    "title": issue.title,
-                    "blocked_by": blockers,
-                })
-            }).collect::<Vec<_>>(),
-        });
-
-        Ok(vec![ResourceContent {
-            uri: "beads://issues/blocked".into(),
-            mime_type: Some("application/json".into()),
-            text: Some(result.to_string()),
-            blob: None,
-        }])
+                Ok(json!({
+                    "count": blocked.len(),
+                    "issues": blocked.iter().map(|(issue, blockers)| {
+                        json!({
+                            "id": issue.id,
+                            "title": issue.title,
+                            "blocked_by": blockers,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))
+            },
+        )
     }
 }
 
@@ -500,34 +536,33 @@ impl ResourceHandler for InProgressResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
-        let filters = ListFilters {
-            statuses: Some(vec![Status::InProgress]),
-            include_closed: false,
-            limit: Some(50),
-            ..ListFilters::default()
-        };
-        let issues = storage.list_issues(&filters).map_err(to_mcp)?;
+        cached_resource_json(
+            &self.0,
+            "beads://issues/in_progress",
+            "resource:issues_in_progress".to_string(),
+            |storage| {
+                let filters = ListFilters {
+                    statuses: Some(vec![Status::InProgress]),
+                    include_closed: false,
+                    limit: Some(50),
+                    ..ListFilters::default()
+                };
+                let issues = storage.list_issues(&filters).map_err(to_mcp)?;
 
-        let result = json!({
-            "count": issues.len(),
-            "issues": issues.iter().map(|issue| {
-                json!({
-                    "id": issue.id,
-                    "title": issue.title,
-                    "priority": issue.priority,
-                    "type": issue.issue_type,
-                    "assignee": issue.assignee,
-                })
-            }).collect::<Vec<_>>(),
-        });
-
-        Ok(vec![ResourceContent {
-            uri: "beads://issues/in_progress".into(),
-            mime_type: Some("application/json".into()),
-            text: Some(result.to_string()),
-            blob: None,
-        }])
+                Ok(json!({
+                    "count": issues.len(),
+                    "issues": issues.iter().map(|issue| {
+                        json!({
+                            "id": issue.id,
+                            "title": issue.title,
+                            "priority": issue.priority,
+                            "type": issue.issue_type,
+                            "assignee": issue.assignee,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))
+            },
+        )
     }
 }
 
@@ -562,29 +597,28 @@ impl ResourceHandler for EventsResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
-        let events = storage.get_all_events(50).map_err(to_mcp)?;
+        cached_resource_json(
+            &self.0,
+            "beads://events/recent",
+            "resource:events_recent".to_string(),
+            |storage| {
+                let events = storage.get_all_events(50).map_err(to_mcp)?;
 
-        let result = json!({
-            "count": events.len(),
-            "events": events.iter().map(|e: &Event| {
-                json!({
-                    "issue_id": e.issue_id,
-                    "event_type": e.event_type,
-                    "actor": e.actor,
-                    "old_value": e.old_value,
-                    "new_value": e.new_value,
-                    "created_at": e.created_at,
-                })
-            }).collect::<Vec<_>>(),
-        });
-
-        Ok(vec![ResourceContent {
-            uri: "beads://events/recent".into(),
-            mime_type: Some("application/json".into()),
-            text: Some(result.to_string()),
-            blob: None,
-        }])
+                Ok(json!({
+                    "count": events.len(),
+                    "events": events.iter().map(|e: &Event| {
+                        json!({
+                            "issue_id": e.issue_id,
+                            "event_type": e.event_type,
+                            "actor": e.actor,
+                            "old_value": e.old_value,
+                            "new_value": e.new_value,
+                            "created_at": e.created_at,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))
+            },
+        )
     }
 }
 
@@ -618,34 +652,33 @@ impl ResourceHandler for DeferredIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
-        let filters = ListFilters {
-            statuses: Some(vec![Status::Deferred]),
-            include_deferred: true,
-            limit: Some(50),
-            ..ListFilters::default()
-        };
-        let issues = storage.list_issues(&filters).map_err(to_mcp)?;
+        cached_resource_json(
+            &self.0,
+            "beads://issues/deferred",
+            "resource:issues_deferred".to_string(),
+            |storage| {
+                let filters = ListFilters {
+                    statuses: Some(vec![Status::Deferred]),
+                    include_deferred: true,
+                    limit: Some(50),
+                    ..ListFilters::default()
+                };
+                let issues = storage.list_issues(&filters).map_err(to_mcp)?;
 
-        let result = json!({
-            "count": issues.len(),
-            "issues": issues.iter().map(|issue| {
-                json!({
-                    "id": issue.id,
-                    "title": issue.title,
-                    "priority": issue.priority,
-                    "type": issue.issue_type,
-                    "defer_until": issue.defer_until,
-                })
-            }).collect::<Vec<_>>(),
-        });
-
-        Ok(vec![ResourceContent {
-            uri: "beads://issues/deferred".into(),
-            mime_type: Some("application/json".into()),
-            text: Some(result.to_string()),
-            blob: None,
-        }])
+                Ok(json!({
+                    "count": issues.len(),
+                    "issues": issues.iter().map(|issue| {
+                        json!({
+                            "id": issue.id,
+                            "title": issue.title,
+                            "priority": issue.priority,
+                            "type": issue.issue_type,
+                            "defer_until": issue.defer_until,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))
+            },
+        )
     }
 }
 
@@ -806,15 +839,12 @@ impl ResourceHandler for GraphHealthResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
-        let health = compute_graph_health(&storage)?;
-
-        Ok(vec![ResourceContent {
-            uri: "beads://graph/health".into(),
-            mime_type: Some("application/json".into()),
-            text: Some(health.to_string()),
-            blob: None,
-        }])
+        cached_resource_json(
+            &self.0,
+            "beads://graph/health",
+            "resource:graph_health".to_string(),
+            compute_graph_health,
+        )
     }
 }
 
@@ -905,22 +935,124 @@ impl ResourceHandler for BottlenecksResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let storage = self.0.open_read_storage().map_err(to_mcp)?;
-        let bottlenecks = compute_bottlenecks(&storage)?;
-
-        Ok(vec![ResourceContent {
-            uri: "beads://issues/bottlenecks".into(),
-            mime_type: Some("application/json".into()),
-            text: Some(bottlenecks.to_string()),
-            blob: None,
-        }])
+        cached_resource_json(
+            &self.0,
+            "beads://issues/bottlenecks",
+            "resource:issues_bottlenecks".to_string(),
+            compute_bottlenecks,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{issue_not_found_resource, read_project_config};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use fastmcp_rust::{Cx, McpContext, ResourceContent, ResourceHandler};
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::{
+        IssueResource, ReadyIssuesResource, issue_not_found_resource, issue_resource_json,
+        read_project_config,
+    };
+    use crate::mcp::{BeadsState, McpReadSnapshotCache};
+    use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
+
+    fn mcp_resource_state(temp: &TempDir, read_snapshot: bool) -> Arc<BeadsState> {
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let db_path = beads_dir.join("beads.db");
+        SqliteStorage::open(&db_path).expect("initialize storage");
+        Arc::new(BeadsState {
+            db_path,
+            beads_dir: beads_dir.clone(),
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            write_lock_timeout_ms: Some(25),
+            allow_external_jsonl: false,
+            actor: "mcp-resource-test".to_string(),
+            issue_prefix: Some("br".to_string()),
+            read_snapshot_cache: read_snapshot
+                .then(|| std::sync::Mutex::new(McpReadSnapshotCache::default())),
+        })
+    }
+
+    fn insert_resource_issue(state: &BeadsState, id: &str, title: &str) {
+        let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let now = Utc::now();
+        let issue = Issue {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: now,
+            updated_at: now,
+            ..Issue::default()
+        };
+        storage
+            .create_issue(&issue, "mcp-resource-test")
+            .expect("create issue");
+    }
+
+    fn resource_text_json(contents: &[ResourceContent]) -> Value {
+        let [content] = contents else {
+            return json!({"unexpected_resource_count": contents.len()});
+        };
+        let Some(text) = content.text.as_deref() else {
+            return json!({"missing_text": true});
+        };
+        serde_json::from_str(text)
+            .unwrap_or_else(|err| json!({"parse_error": err.to_string(), "text": text}))
+    }
+
+    #[test]
+    fn ready_resource_snapshot_matches_direct_json_and_invalidates() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, true);
+        insert_resource_issue(&state, "br-ready-resource-1", "ready resource first issue");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let resource = ReadyIssuesResource::new(Arc::clone(&state));
+
+        let first_content = resource.read(&ctx).expect("read ready resource");
+        let first = resource_text_json(&first_content);
+        assert_eq!(first["count"].as_u64(), Some(1));
+
+        insert_resource_issue(&state, "br-ready-resource-2", "ready resource second issue");
+        fs::write(&state.jsonl_path, "{\"id\":\"br-ready-resource-2\"}\n")
+            .expect("update jsonl witness");
+
+        let second_content = resource
+            .read(&ctx)
+            .expect("read ready resource after witness mismatch");
+        let second = resource_text_json(&second_content);
+        assert_eq!(second["count"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn issue_resource_snapshot_matches_direct_json() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, true);
+        insert_resource_issue(&state, "br-resource-issue", "resource issue details");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let resource = IssueResource::new(Arc::clone(&state));
+        let params = HashMap::from([("id".to_string(), "br-resource-issue".to_string())]);
+
+        let content = resource
+            .read_with_uri(&ctx, "beads://issues/br-resource-issue", &params)
+            .expect("read issue resource");
+        let cached = resource_text_json(&content);
+        let direct = {
+            let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+            issue_resource_json(&storage, "br-resource-issue").expect("direct issue resource")
+        };
+
+        assert_eq!(cached, direct);
+    }
 
     #[test]
     fn issue_not_found_resource_surfaces_id_scan_failure() {

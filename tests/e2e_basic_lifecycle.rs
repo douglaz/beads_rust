@@ -1208,6 +1208,32 @@ fn e2e_sync_witness_json_is_deterministic_and_read_only() {
     assert_eq!(status_after_json["dirty_count"].as_u64(), Some(0));
 }
 
+fn assert_base_witness_reuse_plan(witness_json: &Value) {
+    let reuse_plan = &witness_json["base_reuse_plan"];
+    assert_eq!(
+        reuse_plan["comparison"]["safe_reuse_prefix_chunks"].as_u64(),
+        Some(1)
+    );
+    let schedule = &reuse_plan["schedule"];
+    assert_eq!(schedule["candidate_output_actions"].as_u64(), Some(2));
+    assert_eq!(schedule["metadata_only_drop_actions"].as_u64(), Some(0));
+    assert_eq!(schedule["reusable_actions"].as_u64(), Some(1));
+    assert_eq!(schedule["read_added_actions"].as_u64(), Some(1));
+    assert_eq!(schedule["max_parallel_candidate_actions"].as_u64(), Some(2));
+    assert_eq!(
+        schedule["deterministic_candidate_order"].as_bool(),
+        Some(true)
+    );
+    let actions = reuse_plan["actions"].as_array().expect("reuse actions");
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0]["action"].as_str(), Some("reuse_unchanged"));
+    assert_eq!(actions[0]["base_index"].as_u64(), Some(0));
+    assert_eq!(actions[0]["candidate_index"].as_u64(), Some(0));
+    assert_eq!(actions[1]["action"].as_str(), Some("read_added"));
+    assert!(actions[1]["base_index"].is_null());
+    assert_eq!(actions[1]["candidate_index"].as_u64(), Some(1));
+}
+
 #[test]
 fn e2e_sync_witness_reports_base_snapshot_drift() {
     let workspace = BrWorkspace::new();
@@ -1296,20 +1322,7 @@ fn e2e_sync_witness_reports_base_snapshot_drift() {
     assert_eq!(comparison["removed_chunks"].as_u64(), Some(0));
     assert_eq!(comparison["safe_reuse_prefix_chunks"].as_u64(), Some(1));
     assert_eq!(comparison["first_changed_chunk_index"].as_u64(), Some(1));
-
-    let reuse_plan = &witness_json["base_reuse_plan"];
-    assert_eq!(
-        reuse_plan["comparison"]["safe_reuse_prefix_chunks"].as_u64(),
-        Some(1)
-    );
-    let actions = reuse_plan["actions"].as_array().expect("reuse actions");
-    assert_eq!(actions.len(), 2);
-    assert_eq!(actions[0]["action"].as_str(), Some("reuse_unchanged"));
-    assert_eq!(actions[0]["base_index"].as_u64(), Some(0));
-    assert_eq!(actions[0]["candidate_index"].as_u64(), Some(0));
-    assert_eq!(actions[1]["action"].as_str(), Some("read_added"));
-    assert!(actions[1]["base_index"].is_null());
-    assert_eq!(actions[1]["candidate_index"].as_u64(), Some(1));
+    assert_base_witness_reuse_plan(&witness_json);
 }
 
 #[test]

@@ -73,7 +73,27 @@ pub struct JsonlWitnessComparison {
 #[must_use = "reuse plans identify which chunks can be copied or rebuilt"]
 pub struct JsonlWitnessReusePlan {
     pub comparison: JsonlWitnessComparison,
+    pub schedule: JsonlWitnessReuseSchedule,
     pub actions: Vec<JsonlChunkReuseStep>,
+}
+
+/// Scheduling summary derived from a candidate-ordered JSONL reuse plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonlWitnessReuseSchedule {
+    pub total_actions: usize,
+    pub candidate_output_actions: usize,
+    pub metadata_only_drop_actions: usize,
+    pub reusable_actions: usize,
+    pub rebuild_actions: usize,
+    pub read_added_actions: usize,
+    pub candidate_output_line_count: usize,
+    pub candidate_output_byte_count: u64,
+    pub reusable_byte_count: u64,
+    pub rebuild_byte_count: u64,
+    pub read_added_byte_count: u64,
+    pub dropped_byte_count: u64,
+    pub max_parallel_candidate_actions: usize,
+    pub deterministic_candidate_order: bool,
 }
 
 /// One chunk action in a JSONL witness reuse plan.
@@ -225,8 +245,10 @@ pub fn plan_jsonl_witness_reuse(
         ));
     }
 
+    let schedule = build_reuse_schedule(&actions);
     JsonlWitnessReusePlan {
         comparison,
+        schedule,
         actions,
     }
 }
@@ -372,6 +394,86 @@ fn base_chunk_step(
         line_count: chunk.line_count,
         byte_count: chunk.byte_count,
     }
+}
+
+fn build_reuse_schedule(actions: &[JsonlChunkReuseStep]) -> JsonlWitnessReuseSchedule {
+    let mut schedule = JsonlWitnessReuseSchedule {
+        total_actions: actions.len(),
+        candidate_output_actions: 0,
+        metadata_only_drop_actions: 0,
+        reusable_actions: 0,
+        rebuild_actions: 0,
+        read_added_actions: 0,
+        candidate_output_line_count: 0,
+        candidate_output_byte_count: 0,
+        reusable_byte_count: 0,
+        rebuild_byte_count: 0,
+        read_added_byte_count: 0,
+        dropped_byte_count: 0,
+        max_parallel_candidate_actions: 0,
+        deterministic_candidate_order: candidate_actions_are_deterministically_ordered(actions),
+    };
+
+    for step in actions {
+        match step.action {
+            JsonlChunkReuseAction::ReuseUnchanged => {
+                schedule.reusable_actions += 1;
+                schedule.reusable_byte_count =
+                    schedule.reusable_byte_count.saturating_add(step.byte_count);
+                record_candidate_output(&mut schedule, step);
+            }
+            JsonlChunkReuseAction::RebuildCandidate => {
+                schedule.rebuild_actions += 1;
+                schedule.rebuild_byte_count =
+                    schedule.rebuild_byte_count.saturating_add(step.byte_count);
+                record_candidate_output(&mut schedule, step);
+            }
+            JsonlChunkReuseAction::ReadAdded => {
+                schedule.read_added_actions += 1;
+                schedule.read_added_byte_count = schedule
+                    .read_added_byte_count
+                    .saturating_add(step.byte_count);
+                record_candidate_output(&mut schedule, step);
+            }
+            JsonlChunkReuseAction::DropRemoved => {
+                schedule.metadata_only_drop_actions += 1;
+                schedule.dropped_byte_count =
+                    schedule.dropped_byte_count.saturating_add(step.byte_count);
+            }
+        }
+    }
+
+    schedule.max_parallel_candidate_actions = schedule.candidate_output_actions;
+    schedule
+}
+
+fn record_candidate_output(schedule: &mut JsonlWitnessReuseSchedule, step: &JsonlChunkReuseStep) {
+    schedule.candidate_output_actions += 1;
+    schedule.candidate_output_line_count = schedule
+        .candidate_output_line_count
+        .saturating_add(step.line_count);
+    schedule.candidate_output_byte_count = schedule
+        .candidate_output_byte_count
+        .saturating_add(step.byte_count);
+}
+
+fn candidate_actions_are_deterministically_ordered(actions: &[JsonlChunkReuseStep]) -> bool {
+    let mut expected_candidate_index = 0;
+    let mut drops_started = false;
+
+    for step in actions {
+        match step.candidate_index {
+            Some(candidate_index)
+                if !drops_started && candidate_index == expected_candidate_index =>
+            {
+                expected_candidate_index += 1;
+            }
+            Some(_) => return false,
+            None => drops_started = true,
+        }
+    }
+
+    true
 }
 
 fn sum_chunk_bytes(chunks: &[JsonlChunkWitness]) -> u64 {
@@ -735,6 +837,34 @@ mod tests {
         assert_eq!(plan.actions[1].candidate_index, Some(1));
         assert_eq!(plan.actions[2].base_index, None);
         assert_eq!(plan.actions[2].candidate_index, Some(2));
+        assert_eq!(plan.schedule.total_actions, 3);
+        assert_eq!(plan.schedule.candidate_output_actions, 3);
+        assert_eq!(plan.schedule.metadata_only_drop_actions, 0);
+        assert_eq!(plan.schedule.reusable_actions, 1);
+        assert_eq!(plan.schedule.rebuild_actions, 1);
+        assert_eq!(plan.schedule.read_added_actions, 1);
+        assert_eq!(plan.schedule.max_parallel_candidate_actions, 3);
+        assert!(plan.schedule.deterministic_candidate_order);
+        assert_eq!(
+            plan.schedule.candidate_output_line_count,
+            candidate.line_count
+        );
+        assert_eq!(
+            plan.schedule.candidate_output_byte_count,
+            candidate.byte_count
+        );
+        assert_eq!(
+            plan.schedule.reusable_byte_count,
+            candidate.chunks[0].byte_count
+        );
+        assert_eq!(
+            plan.schedule.rebuild_byte_count,
+            candidate.chunks[1].byte_count
+        );
+        assert_eq!(
+            plan.schedule.read_added_byte_count,
+            candidate.chunks[2].byte_count
+        );
     }
 
     #[test]
@@ -757,6 +887,14 @@ mod tests {
         assert_eq!(plan.actions[1].base_index, Some(1));
         assert_eq!(plan.actions[1].candidate_index, None);
         assert_eq!(plan.actions[2].base_index, Some(2));
+        assert_eq!(plan.schedule.candidate_output_actions, 1);
+        assert_eq!(plan.schedule.metadata_only_drop_actions, 2);
+        assert_eq!(plan.schedule.max_parallel_candidate_actions, 1);
+        assert_eq!(
+            plan.schedule.dropped_byte_count,
+            base.chunks[1].byte_count + base.chunks[2].byte_count
+        );
+        assert!(plan.schedule.deterministic_candidate_order);
     }
 
     #[test]

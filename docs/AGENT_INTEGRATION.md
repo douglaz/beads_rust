@@ -15,6 +15,7 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 - [MCP Server](#mcp-server)
 - [Robot Mode Flags](#robot-mode-flags)
 - [Degraded Coordination Without Agent Mail](#degraded-coordination-without-agent-mail)
+- [Swarm-Scale Tuning](#swarm-scale-tuning)
 - [Agent-Specific Configuration](#agent-specific-configuration)
 - [Best Practices](#best-practices)
 
@@ -593,6 +594,16 @@ br create "New issue" --silent
 br close br-123 --quiet --json
 # Outputs JSON, no status messages
 ```
+
+---
+
+## Swarm-Scale Tuning
+
+For 256GB+ RAM and 64+ core agent hosts, see
+[Swarm-Scale Tuning](SWARM_SCALE_TUNING.md). It covers conservative defaults,
+high-core build hygiene, `.write.lock` timeout profiles, Agent Mail reservation
+patterns, MCP serve topology, performance evidence collection, and rollback
+rules for future snapshot/cache/controller features.
 
 ---
 

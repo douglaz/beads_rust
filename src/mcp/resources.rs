@@ -3,7 +3,7 @@
 //! Resources provide read-only discovery endpoints that agents can inspect
 //! before calling tools.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use fastmcp_rust::{
@@ -692,7 +692,7 @@ fn longest_chain_from(
     node: &str,
     edges: &HashMap<String, Vec<String>>,
     cache: &mut HashMap<String, usize>,
-    visiting: &mut std::collections::HashSet<String>,
+    visiting: &mut HashSet<String>,
 ) -> usize {
     if let Some(&cached) = cache.get(node) {
         return cached;
@@ -711,6 +711,47 @@ fn longest_chain_from(
     visiting.remove(node);
     cache.insert(node.to_string(), depth);
     depth
+}
+
+fn graph_has_cycle(edges: &HashMap<String, Vec<String>>) -> bool {
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+
+    for start in edges.keys().map(String::as_str) {
+        if visited.contains(start) {
+            continue;
+        }
+
+        visiting.insert(start);
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, child_idx)) = stack.pop() {
+            let Some(children) = edges.get(node) else {
+                visiting.remove(node);
+                visited.insert(node);
+                continue;
+            };
+
+            if child_idx >= children.len() {
+                visiting.remove(node);
+                visited.insert(node);
+                continue;
+            }
+
+            stack.push((node, child_idx + 1));
+            let child = children[child_idx].as_str();
+            if visited.contains(child) {
+                continue;
+            }
+            if visiting.contains(child) {
+                return true;
+            }
+
+            visiting.insert(child);
+            stack.push((child, 0));
+        }
+    }
+
+    false
 }
 
 /// Compute graph health metrics from the dependency edges.
@@ -749,7 +790,7 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
 
     // Longest chain depth
     let mut depth_cache: HashMap<String, usize> = HashMap::new();
-    let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut visiting: HashSet<String> = HashSet::new();
     let max_chain_depth = open_ids
         .iter()
         .map(|id| longest_chain_from(id, &adj, &mut depth_cache, &mut visiting))
@@ -773,15 +814,7 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
     };
     let stale_issues = storage.list_issues(&stale_filters).map_err(to_mcp)?;
 
-    // Cycle check — look for any self-referential paths in open edges
-    let has_cycles = !storage.get_blocked_ids().map_err(to_mcp)?.is_empty()
-        && open_edges.iter().any(|(from, to)| {
-            // Simple heuristic: check if any blocked issue forms a cycle
-            // Full cycle detection would require DFS, but would_create_cycle
-            // is per-pair. We use the presence of mutual edges as a proxy.
-            adj.get(to.as_str())
-                .is_some_and(|targets| targets.iter().any(|t| t == from))
-        });
+    let has_cycles = graph_has_cycle(&adj);
 
     Ok(json!({
         "open_issue_count": node_count,
@@ -805,7 +838,7 @@ fn compute_graph_health(storage: &SqliteStorage) -> McpResult<serde_json::Value>
             "Shallow — good parallelization potential"
         },
         "high_fan_out_issues": high_fan_out,
-        "mutual_dependency_detected": has_cycles,
+        "cycle_detected": has_cycles,
         "stale_issue_count": stale_issues.len(),
         "stale_threshold_days": 30,
     }))
@@ -956,8 +989,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        IssueResource, ReadyIssuesResource, issue_not_found_resource, issue_resource_json,
-        read_project_config,
+        IssueResource, ReadyIssuesResource, graph_has_cycle, issue_not_found_resource,
+        issue_resource_json, read_project_config,
     };
     use crate::mcp::{BeadsState, McpReadSnapshotCache};
     use crate::model::{Issue, IssueType, Priority, Status};
@@ -1008,6 +1041,18 @@ mod tests {
         };
         serde_json::from_str(text)
             .unwrap_or_else(|err| json!({"parse_error": err.to_string(), "text": text}))
+    }
+
+    fn edge_map(edges: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        edges
+            .iter()
+            .map(|(from, targets)| {
+                (
+                    (*from).to_string(),
+                    targets.iter().map(|target| (*target).to_string()).collect(),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -1084,5 +1129,27 @@ mod tests {
             err.to_string().contains("config") || err.to_string().contains("no such table"),
             "unexpected MCP error: {err}"
         );
+    }
+
+    #[test]
+    fn graph_has_cycle_detects_three_node_cycle() {
+        let edges = edge_map(&[
+            ("br-a", &["br-b"]),
+            ("br-b", &["br-c"]),
+            ("br-c", &["br-a"]),
+        ]);
+
+        assert!(graph_has_cycle(&edges));
+    }
+
+    #[test]
+    fn graph_has_cycle_ignores_acyclic_graph() {
+        let edges = edge_map(&[
+            ("br-a", &["br-b", "br-c"]),
+            ("br-b", &["br-d"]),
+            ("br-c", &[]),
+        ]);
+
+        assert!(!graph_has_cycle(&edges));
     }
 }

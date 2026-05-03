@@ -964,6 +964,9 @@ fn dep_tree_truncated(depth: usize, max_depth: usize, dependency_count: usize) -
 }
 
 type DepTreeAdjacency = HashMap<String, Vec<String>>;
+type DepTreeMetadataCache = HashMap<String, (String, i32, String)>;
+
+const LOCAL_DEP_TREE_NODE_LIMIT: usize = 256;
 
 fn load_dep_tree_adjacency(
     storage: &SqliteStorage,
@@ -1023,43 +1026,96 @@ fn dep_tree_neighbors(
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn dep_tree(
-    args: &DepTreeArgs,
+fn dep_tree_neighbors_from_storage(
     storage: &SqliteStorage,
-    resolver: &IdResolver,
-    external_db_paths: &HashMap<String, PathBuf>,
-    _json: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
-    let root_id = resolve_issue_id(storage, resolver, &args.issue)?;
-    let root_issue = storage
-        .get_issue(&root_id)?
-        .ok_or_else(|| BeadsError::IssueNotFound {
-            id: root_id.clone(),
-        })?;
+    direction: DepDirection,
+    issue_id: &str,
+) -> Result<Vec<String>> {
+    let mut neighbors = match direction {
+        DepDirection::Down => storage.get_dependencies(issue_id)?,
+        DepDirection::Up => storage.get_dependents(issue_id)?,
+        DepDirection::Both => {
+            let mut neighbors = storage.get_dependencies(issue_id)?;
+            neighbors.extend(storage.get_dependents(issue_id)?);
+            neighbors
+        }
+    };
+    neighbors.sort();
+    neighbors.dedup();
+    Ok(neighbors)
+}
 
-    // Helper struct for BFS
-    #[allow(clippy::items_after_statements)]
-    struct QueueItem {
-        id: String,
-        depth: usize,
-        parent_id: Option<String>,
-        parent_key: Option<String>,
-        path: Vec<String>,
+fn dep_tree_metadata_for_node(
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &crate::model::Issue,
+    node_id: &str,
+    external_statuses: &HashMap<String, bool>,
+    metadata_cache: &mut DepTreeMetadataCache,
+) -> Result<(String, i32, String)> {
+    if let Some(metadata) = metadata_cache.get(node_id) {
+        return Ok(metadata.clone());
     }
 
-    let external_statuses =
-        storage.resolve_external_dependency_statuses(external_db_paths, false)?;
+    let metadata =
+        resolve_dep_tree_node_metadata(storage, root_id, root_issue, node_id, external_statuses)?;
+    metadata_cache.insert(node_id.to_string(), metadata.clone());
+    Ok(metadata)
+}
 
-    // Optimization: Prefetch all active issue metadata to avoid N+1 queries during traversal
-    let metadata_cache = storage.get_active_issues_metadata()?;
+fn hydrate_dep_tree_metadata_for_ids(
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &crate::model::Issue,
+    issue_ids: &[String],
+    external_statuses: &HashMap<String, bool>,
+    metadata_cache: &mut DepTreeMetadataCache,
+) -> Result<()> {
+    for issue_id in issue_ids {
+        dep_tree_metadata_for_node(
+            storage,
+            root_id,
+            root_issue,
+            issue_id,
+            external_statuses,
+            metadata_cache,
+        )?;
+    }
+    Ok(())
+}
+
+struct DepTreeQueueItem {
+    id: String,
+    depth: usize,
+    parent_id: Option<String>,
+    parent_key: Option<String>,
+    path: Vec<String>,
+}
+
+fn dep_tree_root_metadata(root_issue: &crate::model::Issue) -> (String, i32, String) {
+    (
+        root_issue.title.clone(),
+        root_issue.priority.0,
+        root_issue.status.as_str().to_string(),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_dep_tree_nodes_global(
+    args: &DepTreeArgs,
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &crate::model::Issue,
+    external_statuses: &HashMap<String, bool>,
+) -> Result<Vec<TreeNode>> {
+    let mut metadata_cache = storage.get_active_issues_metadata()?;
+    metadata_cache.insert(root_id.to_string(), dep_tree_root_metadata(root_issue));
     let (dependencies_by_issue, dependents_by_issue) = load_dep_tree_adjacency(storage)?;
 
     let mut nodes = Vec::new();
 
-    let mut queue = vec![QueueItem {
-        id: root_id.clone(),
+    let mut queue = vec![DepTreeQueueItem {
+        id: root_id.to_string(),
         depth: 0,
         parent_id: None,
         parent_key: None,
@@ -1076,17 +1132,14 @@ fn dep_tree(
         let node_key = format!("n{next_node_key}");
         next_node_key += 1;
 
-        let (title, priority, status) = if let Some(meta) = metadata_cache.get(&item.id) {
-            meta.clone()
-        } else {
-            resolve_dep_tree_node_metadata(
-                storage,
-                &root_id,
-                &root_issue,
-                &item.id,
-                &external_statuses,
-            )?
-        };
+        let (title, priority, status) = dep_tree_metadata_for_node(
+            storage,
+            root_id,
+            root_issue,
+            &item.id,
+            external_statuses,
+            &mut metadata_cache,
+        )?;
 
         let mut dependencies = Vec::new();
         let truncated = if item.id.starts_with("external:") {
@@ -1122,7 +1175,7 @@ fn dep_tree(
             // Push in reverse order so first sorted item pops first.
             for dep_id in dependencies.into_iter().rev() {
                 // No global visited check here
-                queue.push(QueueItem {
+                queue.push(DepTreeQueueItem {
                     id: dep_id,
                     depth: item.depth + 1,
                     parent_id: Some(item.id.clone()),
@@ -1132,6 +1185,135 @@ fn dep_tree(
             }
         }
     }
+
+    Ok(nodes)
+}
+
+#[allow(clippy::too_many_lines)]
+fn try_build_dep_tree_nodes_local(
+    args: &DepTreeArgs,
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &crate::model::Issue,
+    external_statuses: &HashMap<String, bool>,
+) -> Result<Option<Vec<TreeNode>>> {
+    let mut metadata_cache = DepTreeMetadataCache::new();
+    metadata_cache.insert(root_id.to_string(), dep_tree_root_metadata(root_issue));
+
+    let mut nodes = Vec::new();
+    let mut queue = vec![DepTreeQueueItem {
+        id: root_id.to_string(),
+        depth: 0,
+        parent_id: None,
+        parent_key: None,
+        path: Vec::new(),
+    }];
+    let mut next_node_key = 0usize;
+
+    while let Some(item) = queue.pop() {
+        if nodes.len() >= LOCAL_DEP_TREE_NODE_LIMIT {
+            return Ok(None);
+        }
+
+        if item.path.contains(&item.id) {
+            continue;
+        }
+
+        let node_key = format!("n{next_node_key}");
+        next_node_key += 1;
+
+        let (title, priority, status) = dep_tree_metadata_for_node(
+            storage,
+            root_id,
+            root_issue,
+            &item.id,
+            external_statuses,
+            &mut metadata_cache,
+        )?;
+
+        let mut dependencies = Vec::new();
+        let truncated = if item.id.starts_with("external:") {
+            false
+        } else {
+            dependencies = dep_tree_neighbors_from_storage(storage, args.direction, &item.id)?;
+            dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
+        };
+
+        nodes.push(TreeNode {
+            node_key: node_key.clone(),
+            id: item.id.clone(),
+            title,
+            depth: item.depth,
+            parent_id: item.parent_id.clone(),
+            parent_key: item.parent_key.clone(),
+            priority,
+            status,
+            truncated,
+        });
+
+        if item.depth < args.max_depth && !item.id.starts_with("external:") {
+            if nodes.len().saturating_add(dependencies.len()) > LOCAL_DEP_TREE_NODE_LIMIT {
+                return Ok(None);
+            }
+
+            let mut new_path = item.path.clone();
+            new_path.push(item.id.clone());
+
+            hydrate_dep_tree_metadata_for_ids(
+                storage,
+                root_id,
+                root_issue,
+                &dependencies,
+                external_statuses,
+                &mut metadata_cache,
+            )?;
+            sort_dep_tree_siblings(&mut dependencies, &metadata_cache);
+
+            for dep_id in dependencies.into_iter().rev() {
+                queue.push(DepTreeQueueItem {
+                    id: dep_id,
+                    depth: item.depth + 1,
+                    parent_id: Some(item.id.clone()),
+                    parent_key: Some(node_key.clone()),
+                    path: new_path.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(Some(nodes))
+}
+
+#[allow(clippy::too_many_lines)]
+fn dep_tree(
+    args: &DepTreeArgs,
+    storage: &SqliteStorage,
+    resolver: &IdResolver,
+    external_db_paths: &HashMap<String, PathBuf>,
+    _json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let root_id = resolve_issue_id(storage, resolver, &args.issue)?;
+    let root_issue = storage
+        .get_issue(&root_id)?
+        .ok_or_else(|| BeadsError::IssueNotFound {
+            id: root_id.clone(),
+        })?;
+
+    let external_statuses =
+        storage.resolve_external_dependency_statuses(external_db_paths, false)?;
+    let nodes = match try_build_dep_tree_nodes_local(
+        args,
+        storage,
+        &root_id,
+        &root_issue,
+        &external_statuses,
+    )? {
+        Some(nodes) => nodes,
+        None => {
+            build_dep_tree_nodes_global(args, storage, &root_id, &root_issue, &external_statuses)?
+        }
+    };
 
     if ctx.is_json() || ctx.is_toon() {
         if ctx.is_toon() {
@@ -1747,6 +1929,124 @@ mod tests {
             ]
         );
         info!("test_dep_tree_adjacency_prefetch_matches_direct_queries: assertions passed");
+    }
+
+    fn dep_tree_test_args(issue: &str, direction: DepDirection, max_depth: usize) -> DepTreeArgs {
+        DepTreeArgs {
+            issue: issue.to_string(),
+            direction,
+            max_depth,
+            format: "text".to_string(),
+        }
+    }
+
+    type TreeNodeProjection = (
+        String,
+        String,
+        String,
+        usize,
+        Option<String>,
+        Option<String>,
+        i32,
+        String,
+        bool,
+    );
+
+    fn tree_node_projection(nodes: &[TreeNode]) -> Vec<TreeNodeProjection> {
+        nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.node_key.clone(),
+                    node.id.clone(),
+                    node.title.clone(),
+                    node.depth,
+                    node.parent_id.clone(),
+                    node.parent_key.clone(),
+                    node.priority,
+                    node.status.clone(),
+                    node.truncated,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_dep_tree_local_traversal_matches_global_nodes() {
+        init_test_logging();
+        info!("test_dep_tree_local_traversal_matches_global_nodes: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        for issue in [
+            make_test_issue("bd-001", "Issue 1"),
+            make_test_issue("bd-002", "Issue 2"),
+            make_test_issue("bd-003", "Issue 3"),
+            make_test_issue("bd-004", "Issue 4"),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        storage
+            .add_dependency("bd-001", "bd-002", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-001", "bd-003", "related", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-004", "bd-001", "blocks", "tester")
+            .unwrap();
+
+        let args = dep_tree_test_args("bd-001", DepDirection::Both, 2);
+        let root_issue = storage.get_issue("bd-001").unwrap().unwrap();
+        let external_statuses = HashMap::new();
+        let local = try_build_dep_tree_nodes_local(
+            &args,
+            &storage,
+            "bd-001",
+            &root_issue,
+            &external_statuses,
+        )
+        .unwrap()
+        .expect("small tree should use local traversal");
+        let global =
+            build_dep_tree_nodes_global(&args, &storage, "bd-001", &root_issue, &external_statuses)
+                .unwrap();
+
+        assert_eq!(tree_node_projection(&local), tree_node_projection(&global));
+        info!("test_dep_tree_local_traversal_matches_global_nodes: assertions passed");
+    }
+
+    #[test]
+    fn test_dep_tree_local_traversal_falls_back_for_wide_roots() {
+        init_test_logging();
+        info!("test_dep_tree_local_traversal_falls_back_for_wide_roots: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let root = make_test_issue("bd-root", "Root");
+        storage.create_issue(&root, "tester").unwrap();
+        for index in 0..LOCAL_DEP_TREE_NODE_LIMIT {
+            let child_id = format!("bd-child-{index:03}");
+            let child = make_test_issue(&child_id, &format!("Child {index:03}"));
+            storage.create_issue(&child, "tester").unwrap();
+            storage
+                .add_dependency("bd-root", &child_id, "blocks", "tester")
+                .unwrap();
+        }
+
+        let args = dep_tree_test_args("bd-root", DepDirection::Down, 10);
+        let root_issue = storage.get_issue("bd-root").unwrap().unwrap();
+        let external_statuses = HashMap::new();
+        let local = try_build_dep_tree_nodes_local(
+            &args,
+            &storage,
+            "bd-root",
+            &root_issue,
+            &external_statuses,
+        )
+        .unwrap();
+
+        assert!(local.is_none());
+        info!("test_dep_tree_local_traversal_falls_back_for_wide_roots: assertions passed");
     }
 
     #[test]

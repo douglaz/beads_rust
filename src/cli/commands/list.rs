@@ -15,10 +15,11 @@ use crate::format::{
     format_issue_pretty_with, terminal_width,
 };
 use crate::model::{IssueType, Priority, Status};
-use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
+use crate::output::{IssueTable, IssueTableColumns, JsonArrayPageMeta, OutputContext, OutputMode};
 use crate::storage::ListFilters;
+use crate::storage::sqlite::ListRelationMetadata;
 use chrono::Utc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 
 /// Execute the list command.
@@ -184,45 +185,6 @@ fn execute_inner(
             let ctx = OutputContext::from_output_format(output_format, quiet, true);
             let use_full_relation_scan =
                 should_use_full_relation_scan(args, client_filters, user_limit, user_offset);
-            let issues_with_counts: Vec<IssueWithCounts> = if use_full_relation_scan {
-                let mut relation_metadata = storage.get_all_list_relation_metadata()?;
-                issues
-                    .into_iter()
-                    .map(|mut issue| {
-                        let metadata = relation_metadata.remove(&issue.id).unwrap_or_default();
-                        issue.labels = metadata.labels;
-
-                        IssueWithCounts {
-                            issue,
-                            dependency_count: metadata.dependency_count,
-                            dependent_count: metadata.dependent_count,
-                        }
-                    })
-                    .collect()
-            } else {
-                let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-                let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
-                let (dependency_counts, dependent_counts) =
-                    storage.count_relation_counts_for_issues(&issue_ids)?;
-
-                issues
-                    .into_iter()
-                    .map(|mut issue| {
-                        if let Some(labels) = labels_map.remove(&issue.id) {
-                            issue.labels = labels;
-                        }
-
-                        let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
-                        let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
-
-                        IssueWithCounts {
-                            issue,
-                            dependency_count,
-                            dependent_count,
-                        }
-                    })
-                    .collect()
-            };
 
             let has_more = if user_limit == 0 {
                 false
@@ -230,8 +192,7 @@ fn execute_inner(
                 json_total > user_offset.saturating_add(user_limit)
             };
 
-            let page = ListPage {
-                issues: issues_with_counts,
+            let page_meta = JsonArrayPageMeta {
                 total: json_total,
                 limit: user_limit,
                 offset: user_offset,
@@ -239,9 +200,24 @@ fn execute_inner(
             };
 
             if matches!(output_format, OutputFormat::Toon) {
+                let issues_with_counts =
+                    collect_issues_with_counts(storage, issues, use_full_relation_scan)?;
+                let page = ListPage {
+                    issues: issues_with_counts,
+                    total: page_meta.total,
+                    limit: page_meta.limit,
+                    offset: page_meta.offset,
+                    has_more: page_meta.has_more,
+                };
                 ctx.toon_with_stats(&page, args.stats);
             } else {
-                ctx.json_pretty(&page);
+                stream_issues_with_counts(
+                    &ctx,
+                    storage,
+                    issues,
+                    use_full_relation_scan,
+                    page_meta,
+                )?;
             }
         }
         OutputFormat::Csv => {
@@ -310,6 +286,120 @@ fn execute_inner(
     }
 
     Ok(())
+}
+
+fn collect_issues_with_counts(
+    storage: &crate::storage::SqliteStorage,
+    issues: Vec<crate::model::Issue>,
+    use_full_relation_scan: bool,
+) -> Result<Vec<IssueWithCounts>> {
+    if use_full_relation_scan {
+        let mut relation_metadata = storage.get_all_list_relation_metadata()?;
+        Ok(issues
+            .into_iter()
+            .map(|issue| issue_with_full_relation_metadata(issue, &mut relation_metadata))
+            .collect())
+    } else {
+        let (mut labels_map, dependency_counts, dependent_counts) =
+            load_relation_metadata_for_issues(storage, &issues)?;
+        Ok(issues
+            .into_iter()
+            .map(|issue| {
+                issue_with_batched_relation_metadata(
+                    issue,
+                    &mut labels_map,
+                    &dependency_counts,
+                    &dependent_counts,
+                )
+            })
+            .collect())
+    }
+}
+
+fn stream_issues_with_counts(
+    ctx: &OutputContext,
+    storage: &crate::storage::SqliteStorage,
+    issues: Vec<crate::model::Issue>,
+    use_full_relation_scan: bool,
+    page_meta: JsonArrayPageMeta,
+) -> Result<()> {
+    if use_full_relation_scan {
+        let mut relation_metadata = storage.get_all_list_relation_metadata()?;
+        ctx.json_array_page(
+            "issues",
+            issues
+                .into_iter()
+                .map(|issue| issue_with_full_relation_metadata(issue, &mut relation_metadata)),
+            page_meta,
+        );
+    } else {
+        let (mut labels_map, dependency_counts, dependent_counts) =
+            load_relation_metadata_for_issues(storage, &issues)?;
+        ctx.json_array_page(
+            "issues",
+            issues.into_iter().map(|issue| {
+                issue_with_batched_relation_metadata(
+                    issue,
+                    &mut labels_map,
+                    &dependency_counts,
+                    &dependent_counts,
+                )
+            }),
+            page_meta,
+        );
+    }
+    Ok(())
+}
+
+type BatchedRelationMetadata = (
+    HashMap<String, Vec<String>>,
+    HashMap<String, usize>,
+    HashMap<String, usize>,
+);
+
+fn load_relation_metadata_for_issues(
+    storage: &crate::storage::SqliteStorage,
+    issues: &[crate::model::Issue],
+) -> Result<BatchedRelationMetadata> {
+    let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let labels_map = storage.get_labels_for_issues(&issue_ids)?;
+    let (dependency_counts, dependent_counts) =
+        storage.count_relation_counts_for_issues(&issue_ids)?;
+    Ok((labels_map, dependency_counts, dependent_counts))
+}
+
+fn issue_with_full_relation_metadata(
+    mut issue: crate::model::Issue,
+    relation_metadata: &mut HashMap<String, ListRelationMetadata>,
+) -> IssueWithCounts {
+    let metadata = relation_metadata.remove(&issue.id).unwrap_or_default();
+    issue.labels = metadata.labels;
+
+    IssueWithCounts {
+        issue,
+        dependency_count: metadata.dependency_count,
+        dependent_count: metadata.dependent_count,
+    }
+}
+
+fn issue_with_batched_relation_metadata(
+    mut issue: crate::model::Issue,
+    labels_map: &mut HashMap<String, Vec<String>>,
+    dependency_counts: &HashMap<String, usize>,
+    dependent_counts: &HashMap<String, usize>,
+) -> IssueWithCounts {
+    if let Some(labels) = labels_map.remove(&issue.id) {
+        issue.labels = labels;
+    }
+
+    let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
+    let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
+
+    IssueWithCounts {
+        issue,
+        dependency_count,
+        dependent_count,
+    }
 }
 
 /// Convert CLI args to storage filter.

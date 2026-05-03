@@ -82,6 +82,48 @@ where
     writer.write_all(b"]").map_err(serde_json::Error::io)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JsonArrayPageMeta {
+    pub(crate) total: usize,
+    pub(crate) limit: usize,
+    pub(crate) offset: usize,
+    pub(crate) has_more: bool,
+}
+
+fn write_json_array_page_to_writer<I, T, W>(
+    writer: &mut W,
+    array_field: &str,
+    values: I,
+    meta: JsonArrayPageMeta,
+) -> serde_json::Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Serialize,
+    W: Write,
+{
+    writer.write_all(b"{").map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut *writer, array_field)?;
+    writer.write_all(b":").map_err(serde_json::Error::io)?;
+    write_json_array_to_writer(writer, values)?;
+    writer
+        .write_all(b",\"total\":")
+        .map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut *writer, &meta.total)?;
+    writer
+        .write_all(b",\"limit\":")
+        .map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut *writer, &meta.limit)?;
+    writer
+        .write_all(b",\"offset\":")
+        .map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut *writer, &meta.offset)?;
+    writer
+        .write_all(b",\"has_more\":")
+        .map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut *writer, &meta.has_more)?;
+    writer.write_all(b"}").map_err(serde_json::Error::io)
+}
+
 #[must_use]
 fn toon_encode_options() -> EncodeOptions {
     EncodeOptions {
@@ -403,6 +445,26 @@ impl OutputContext {
             let stdout = io::stdout();
             let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
             if let Err(err) = write_json_array_to_writer(&mut out, values) {
+                self.report_serialization_error("JSON", &err);
+                return;
+            }
+            let _ = out.write_all(b"\n");
+        }
+    }
+
+    pub(crate) fn json_array_page<I, T>(
+        &self,
+        array_field: &str,
+        values: I,
+        meta: JsonArrayPageMeta,
+    ) where
+        I: IntoIterator<Item = T>,
+        T: serde::Serialize,
+    {
+        if self.is_json() {
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
+            if let Err(err) = write_json_array_page_to_writer(&mut out, array_field, values, meta) {
                 self.report_serialization_error("JSON", &err);
                 return;
             }
@@ -797,6 +859,57 @@ mod tests {
             .expect("streaming empty JSON array serialization failed");
 
         assert_eq!(streamed, b"[]");
+    }
+
+    #[test]
+    fn write_json_array_page_to_writer_matches_materialized_page_output() {
+        #[derive(Serialize)]
+        struct Row {
+            id: &'static str,
+            priority: u8,
+        }
+
+        #[derive(Serialize)]
+        struct Page<'a> {
+            issues: &'a [Row],
+            total: usize,
+            limit: usize,
+            offset: usize,
+            has_more: bool,
+        }
+
+        let rows = vec![
+            Row {
+                id: "beads_rust-alpha",
+                priority: 0,
+            },
+            Row {
+                id: "beads_rust-beta",
+                priority: 1,
+            },
+        ];
+        let meta = JsonArrayPageMeta {
+            total: 5,
+            limit: 2,
+            offset: 1,
+            has_more: true,
+        };
+        let mut streamed = Vec::new();
+
+        write_json_array_page_to_writer(&mut streamed, "issues", rows.iter(), meta)
+            .expect("streaming JSON page serialization failed");
+
+        let materialized = Page {
+            issues: &rows,
+            total: meta.total,
+            limit: meta.limit,
+            offset: meta.offset,
+            has_more: meta.has_more,
+        };
+        assert_eq!(
+            streamed,
+            serde_json::to_vec(&materialized).expect("materialized JSON page serialization failed")
+        );
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub mod health;
 pub mod logging;
 pub mod model;
 pub mod output;
+pub mod policy;
 pub mod shutdown;
 pub mod storage;
 pub mod sync;

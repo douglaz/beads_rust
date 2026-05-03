@@ -1109,6 +1109,106 @@ fn e2e_sync_status_json() {
 }
 
 #[test]
+fn e2e_sync_witness_json_is_deterministic_and_read_only() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let first = run_br(&workspace, ["create", "Witness issue A"], "create_a");
+    assert!(first.status.success(), "create A failed: {}", first.stderr);
+
+    let second = run_br(&workspace, ["create", "Witness issue B"], "create_b");
+    assert!(
+        second.status.success(),
+        "create B failed: {}",
+        second.stderr
+    );
+
+    let flush = run_br(&workspace, ["sync", "--flush-only", "--json"], "sync_flush");
+    assert!(
+        flush.status.success(),
+        "sync flush failed: {}",
+        flush.stderr
+    );
+
+    let status_before = run_br(
+        &workspace,
+        ["sync", "--status", "--json"],
+        "status_before_witness",
+    );
+    assert!(
+        status_before.status.success(),
+        "pre-witness status failed: {}",
+        status_before.stderr
+    );
+    let status_before_json: Value =
+        serde_json::from_str(&extract_json_payload(&status_before.stdout))
+            .expect("pre-witness status json");
+    assert_eq!(status_before_json["dirty_count"].as_u64(), Some(0));
+
+    let witness = run_br(
+        &workspace,
+        ["sync", "--witness", "--witness-chunk-lines", "1", "--json"],
+        "sync_witness",
+    );
+    assert!(
+        witness.status.success(),
+        "sync witness failed: {}",
+        witness.stderr
+    );
+    let witness_json: Value =
+        serde_json::from_str(&extract_json_payload(&witness.stdout)).expect("sync witness json");
+
+    assert!(
+        witness_json["jsonl_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(".beads/issues.jsonl")),
+        "unexpected witness path: {witness_json}"
+    );
+    let witness_body = &witness_json["witness"];
+    assert_eq!(witness_body["schema_version"], "br.jsonl-witness.v1");
+    assert_eq!(witness_body["chunk_size_lines"].as_u64(), Some(1));
+    assert_eq!(witness_body["line_count"].as_u64(), Some(2));
+    assert!(witness_body["byte_count"].as_u64().is_some_and(|n| n > 0));
+    assert_eq!(witness_body["root_hash"].as_str().map(str::len), Some(64));
+    assert_eq!(witness_body["chunks"].as_array().map(Vec::len), Some(2));
+
+    let witness_again = run_br(
+        &workspace,
+        ["sync", "--witness", "--witness-chunk-lines", "1", "--json"],
+        "sync_witness_again",
+    );
+    assert!(
+        witness_again.status.success(),
+        "second sync witness failed: {}",
+        witness_again.stderr
+    );
+    let witness_again_json: Value =
+        serde_json::from_str(&extract_json_payload(&witness_again.stdout))
+            .expect("second sync witness json");
+    assert_eq!(
+        witness_body["root_hash"],
+        witness_again_json["witness"]["root_hash"]
+    );
+
+    let status_after = run_br(
+        &workspace,
+        ["sync", "--status", "--json"],
+        "status_after_witness",
+    );
+    assert!(
+        status_after.status.success(),
+        "post-witness status failed: {}",
+        status_after.stderr
+    );
+    let status_after_json: Value =
+        serde_json::from_str(&extract_json_payload(&status_after.stdout))
+            .expect("post-witness status json");
+    assert_eq!(status_after_json["dirty_count"].as_u64(), Some(0));
+}
+
+#[test]
 fn e2e_version_text() {
     let workspace = BrWorkspace::new();
 

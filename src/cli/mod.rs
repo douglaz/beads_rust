@@ -882,6 +882,7 @@ MODES (one required unless --status):
   --import-only   Import JSONL into database (validates first)
   --merge         Three-way merge .beads/beads.base.jsonl + DB + JSONL
   --status        Show sync status (read-only)
+  --witness       Emit deterministic JSONL chunk witness (read-only)
 
 SAFETY GUARDS:
   Export guards (bypassed with --force):
@@ -914,7 +915,8 @@ EXAMPLES:
   br sync --merge --force-db     Keep local DB conflicts
   br sync --merge --force-jsonl  Keep JSONL conflicts
   br sync --rebuild              Import + remove DB entries not in JSONL
-  br sync --status               Show current sync status")]
+  br sync --status               Show current sync status
+  br sync --witness --json       Emit JSONL chunk witness")]
     Sync(SyncArgs),
 
     /// Undefer issues (make ready again)
@@ -2216,6 +2218,25 @@ pub struct SyncArgs {
     /// Displays hash comparison and freshness info without modifications.
     #[arg(long)]
     pub status: bool,
+
+    /// Emit deterministic JSONL chunk witness (read-only)
+    ///
+    /// Reads the resolved issues.jsonl bytes and emits chunk/root hashes
+    /// without opening or mutating the SQLite database.
+    #[arg(long)]
+    pub witness: bool,
+
+    /// Lines per JSONL witness chunk
+    ///
+    /// Only used with --witness. Larger chunks reduce witness size; smaller
+    /// chunks improve unchanged-chunk localization for parallel sync planning.
+    #[arg(
+        long = "witness-chunk-lines",
+        default_value_t = 1024,
+        value_name = "LINES",
+        requires = "witness"
+    )]
+    pub witness_chunk_lines: usize,
 
     /// Override safety guards (use with caution!)
     ///

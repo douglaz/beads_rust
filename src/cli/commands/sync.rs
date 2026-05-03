@@ -8,6 +8,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
+use crate::sync::witness::{JsonlMerkleWitness, build_jsonl_merkle_witness};
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
@@ -24,7 +25,7 @@ use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::IsTerminal;
+use std::io::{BufReader, IsTerminal};
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -70,6 +71,13 @@ pub struct SyncStatus {
     pub db_newer: bool,
 }
 
+/// JSONL witness command output.
+#[derive(Debug, Serialize)]
+pub struct SyncWitnessResult {
+    pub jsonl_path: String,
+    pub witness: JsonlMerkleWitness,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // Fields may be used in future sync enhancements
 struct SyncPathPolicy {
@@ -90,6 +98,7 @@ struct SyncStartupState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncOperation {
     Status,
+    Witness,
     Flush,
     Merge,
     Import,
@@ -116,6 +125,11 @@ pub fn execute(
 ) -> Result<()> {
     validate_sync_mode_args(args)?;
 
+    if args.witness {
+        let (_, _, path_policy) = resolve_sync_startup_paths(args, cli)?;
+        return execute_witness(&path_policy, args, ctx.is_json() || args.robot, ctx);
+    }
+
     let mut startup = prepare_sync_startup(args, cli, startup_write_lock_held)?;
 
     maybe_delegate_rebuild(args, &mut startup.open_result)?;
@@ -140,23 +154,7 @@ fn prepare_sync_startup(
     cli: &config::CliOverrides,
     startup_write_lock_held: bool,
 ) -> Result<SyncStartupState> {
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
-    let allow_external_jsonl = args.allow_external_jsonl
-        || config::implicit_external_jsonl_allowed(
-            &startup.paths.beads_dir,
-            &startup.paths.db_path,
-            &startup.paths.jsonl_path,
-        );
-    let path_policy =
-        validate_sync_paths(&beads_dir, &startup.paths.jsonl_path, allow_external_jsonl)?;
-    debug!(
-        jsonl_path = %path_policy.jsonl_path.display(),
-        manifest_path = %path_policy.manifest_path.display(),
-        external_jsonl = path_policy.is_external,
-        allow_external_jsonl = path_policy.allow_external_jsonl,
-        "Resolved sync path policy"
-    );
+    let (beads_dir, startup, path_policy) = resolve_sync_startup_paths(args, cli)?;
 
     let open_result = if startup_write_lock_held {
         config::open_storage_with_startup_config_under_write_lock(
@@ -175,12 +173,37 @@ fn prepare_sync_startup(
     })
 }
 
+fn resolve_sync_startup_paths(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+) -> Result<(PathBuf, config::StartupConfig, SyncPathPolicy)> {
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
+    let allow_external_jsonl = args.allow_external_jsonl
+        || config::implicit_external_jsonl_allowed(
+            &startup.paths.beads_dir,
+            &startup.paths.db_path,
+            &startup.paths.jsonl_path,
+        );
+    let path_policy =
+        validate_sync_paths(&beads_dir, &startup.paths.jsonl_path, allow_external_jsonl)?;
+    debug!(
+        jsonl_path = %path_policy.jsonl_path.display(),
+        manifest_path = %path_policy.manifest_path.display(),
+        external_jsonl = path_policy.is_external,
+        allow_external_jsonl = path_policy.allow_external_jsonl,
+        "Resolved sync path policy"
+    );
+
+    Ok((beads_dir, startup, path_policy))
+}
+
 /// For `--rename-prefix` imports, defer any implicit JSONL recovery until the
 /// explicit import path below so the command's import semantics (ID rewrites and
 /// duplicate external_ref cleanup) are applied in the same invocation instead
 /// of being skipped by open-time recovery.
 fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
-    !args.status && !args.flush_only && !args.merge && args.rename_prefix
+    !args.status && !args.witness && !args.flush_only && !args.merge && args.rename_prefix
 }
 
 /// Reject argument combinations that must fail BEFORE opening storage or
@@ -189,12 +212,30 @@ fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
 /// touched the DB family — otherwise the validation message arrives after
 /// `recover_database_from_jsonl` has already moved the existing DB aside.
 fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
-    let mode_count = u8::from(args.flush_only) + u8::from(args.import_only) + u8::from(args.merge);
+    let mode_count = u8::from(args.flush_only)
+        + u8::from(args.import_only)
+        + u8::from(args.merge)
+        + u8::from(args.witness);
     if mode_count > 1 {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
-            reason: "Must specify exactly one of --flush-only, --import-only, or --merge"
-                .to_string(),
+            reason:
+                "Must specify exactly one of --flush-only, --import-only, --merge, or --witness"
+                    .to_string(),
+        });
+    }
+
+    if args.status && args.witness {
+        return Err(BeadsError::Validation {
+            field: "mode".to_string(),
+            reason: "--status cannot be combined with --witness".to_string(),
+        });
+    }
+
+    if args.witness && args.witness_chunk_lines == 0 {
+        return Err(BeadsError::Validation {
+            field: "witness_chunk_lines".to_string(),
+            reason: "--witness-chunk-lines must be greater than zero".to_string(),
         });
     }
 
@@ -363,6 +404,7 @@ fn dispatch_sync_subcommand(
         SyncOperation::Status => {
             execute_status(&open_result.storage, path_policy, options.use_json, ctx)
         }
+        SyncOperation::Witness => execute_witness(path_policy, args, options.use_json, ctx),
         SyncOperation::Flush => execute_flush(
             &mut open_result.storage,
             beads_dir,
@@ -417,7 +459,9 @@ fn sync_dispatch_options(
 }
 
 fn sync_operation(args: &SyncArgs) -> SyncOperation {
-    if args.status {
+    if args.witness {
+        SyncOperation::Witness
+    } else if args.status {
         SyncOperation::Status
     } else if args.flush_only {
         SyncOperation::Flush
@@ -823,6 +867,65 @@ fn render_status_rich(status: &SyncStatus, ctx: &OutputContext) {
         .title(Text::new("Sync Status"))
         .box_style(theme.box_style);
     ctx.render(&panel);
+}
+
+/// Execute the --witness operation.
+fn execute_witness(
+    path_policy: &SyncPathPolicy,
+    args: &SyncArgs,
+    use_json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let jsonl_path = &path_policy.jsonl_path;
+    if !jsonl_path.is_file() {
+        return Err(BeadsError::Config(format!(
+            "JSONL file not found: {}",
+            jsonl_path.display()
+        )));
+    }
+
+    crate::sync::ensure_no_conflict_markers(jsonl_path)?;
+    let file = File::open(jsonl_path).map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to open JSONL file for witness {}: {err}",
+            jsonl_path.display()
+        ))
+    })?;
+    let witness = build_jsonl_merkle_witness(BufReader::new(file), args.witness_chunk_lines)
+        .map_err(|err| {
+            BeadsError::Config(format!(
+                "Failed to build JSONL witness for {}: {err}",
+                jsonl_path.display()
+            ))
+        })?;
+    let result = SyncWitnessResult {
+        jsonl_path: jsonl_path.display().to_string(),
+        witness,
+    };
+
+    if !should_render_human_sync_output(ctx, use_json) {
+        return Ok(());
+    }
+
+    if use_json {
+        ctx.json_pretty(&result);
+    } else {
+        render_witness_text(&result);
+    }
+
+    Ok(())
+}
+
+fn render_witness_text(result: &SyncWitnessResult) {
+    let witness = &result.witness;
+    println!("JSONL Witness:");
+    println!("  Path: {}", result.jsonl_path);
+    println!("  Schema: {}", witness.schema_version);
+    println!("  Lines: {}", witness.line_count);
+    println!("  Bytes: {}", witness.byte_count);
+    println!("  Chunk size: {} lines", witness.chunk_size_lines);
+    println!("  Chunks: {}", witness.chunks.len());
+    println!("  Root hash: {}", witness.root_hash);
 }
 
 /// Execute the --flush-only (export) operation.
@@ -2286,6 +2389,53 @@ mod tests {
         assert!(should_render_human_sync_output(&quiet_ctx, true));
         assert!(should_render_human_sync_output(&plain_ctx, false));
         assert!(should_render_human_sync_output(&plain_ctx, true));
+    }
+
+    #[test]
+    fn sync_operation_witness_is_explicit_read_only_mode() {
+        let args = SyncArgs {
+            witness: true,
+            witness_chunk_lines: 2,
+            ..SyncArgs::default()
+        };
+
+        assert_eq!(sync_operation(&args), SyncOperation::Witness);
+        assert!(!should_defer_jsonl_recovery(&args));
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rejects_witness_mode_conflicts() {
+        let status_conflict = SyncArgs {
+            status: true,
+            witness: true,
+            witness_chunk_lines: 2,
+            ..SyncArgs::default()
+        };
+        let err = validate_sync_mode_args(&status_conflict)
+            .expect_err("status and witness should conflict");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+
+        let merge_conflict = SyncArgs {
+            merge: true,
+            witness: true,
+            witness_chunk_lines: 2,
+            ..SyncArgs::default()
+        };
+        let err = validate_sync_mode_args(&merge_conflict)
+            .expect_err("merge and witness should conflict");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rejects_zero_witness_chunk_lines() {
+        let args = SyncArgs {
+            witness: true,
+            witness_chunk_lines: 0,
+            ..SyncArgs::default()
+        };
+
+        let err = validate_sync_mode_args(&args).expect_err("zero witness chunk size should fail");
+        assert!(matches!(err, BeadsError::Validation { .. }));
     }
 
     #[test]

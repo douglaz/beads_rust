@@ -2984,6 +2984,90 @@ impl SqliteStorage {
         Ok(issues)
     }
 
+    /// List lint command issues without hydrating fields lint never inspects.
+    ///
+    /// This is intentionally narrow and falls back to `list_issues` if the
+    /// filter shape expands beyond what `br lint` currently uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_lint_issues_for_command_output(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
+        let unsupported_filter = filters
+            .labels
+            .as_ref()
+            .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .labels_or
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .priorities
+                .as_ref()
+                .is_some_and(|priorities| !priorities.is_empty())
+            || filters.assignee.is_some()
+            || filters.unassigned
+            || filters.title_contains.is_some()
+            || filters.updated_before.is_some()
+            || filters.updated_after.is_some()
+            || filters.limit.is_some()
+            || filters.offset.is_some()
+            || filters.sort.is_some()
+            || filters.reverse;
+        if unsupported_filter {
+            return self.list_issues(filters);
+        }
+
+        let mut sql = String::from(
+            "SELECT id, title, description, status, issue_type, created_at, updated_at
+             FROM issues WHERE 1=1",
+        );
+        let mut params = Vec::new();
+
+        if let Some(ref statuses) = filters.statuses
+            && !statuses.is_empty()
+        {
+            let placeholders: Vec<String> = statuses.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND status IN ({}) ", placeholders.join(","));
+            for status in statuses {
+                params.push(SqliteValue::from(status.as_str()));
+            }
+        }
+
+        if let Some(ref types) = filters.types
+            && !types.is_empty()
+        {
+            let placeholders: Vec<String> = types.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND issue_type IN ({}) ", placeholders.join(","));
+            for issue_type in types {
+                params.push(SqliteValue::from(issue_type.as_str()));
+            }
+        }
+
+        if !filters.include_closed {
+            if filters.include_deferred {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            } else {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
+            }
+        } else if filters.statuses.as_ref().is_none_or(Vec::is_empty) {
+            sql.push_str(" AND status != 'tombstone'");
+        }
+
+        if !filters.include_templates {
+            sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        }
+
+        sql.push_str(" ORDER BY priority ASC, created_at DESC, id ASC");
+
+        let rows = self.conn.query_with_params(&sql, &params)?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::lint_command_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
     /// Get lean issue rows for stats computation without hydrating large text fields.
     ///
     /// # Errors
@@ -8131,6 +8215,63 @@ impl SqliteStorage {
             created_at: parse_datetime_value(row.get(6))?,
             created_by: None,
             updated_at: parse_datetime_value(row.get(7))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
+    fn lint_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: get_non_empty_str(2),
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: parse_status(row.get(3).and_then(SqliteValue::as_text)),
+            priority: Priority::default(),
+            issue_type: parse_issue_type(row.get(4).and_then(SqliteValue::as_text)),
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: parse_datetime_value(row.get(5))?,
+            created_by: None,
+            updated_at: parse_datetime_value(row.get(6))?,
             closed_at: None,
             close_reason: None,
             closed_by_session: None,

@@ -21,9 +21,12 @@
 use crate::error::{BeadsError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use tracing::{debug, trace, warn};
+
+const MAX_REDIRECT_BYTES: usize = 4096;
+const MAX_REDIRECT_BYTES_U64: u64 = 4096;
 
 /// A route entry from routes.jsonl.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,7 +183,7 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let content = fs::read_to_string(&redirect_path)?;
+    let content = read_redirect_file_limited(&redirect_path)?;
     let target = content.trim();
 
     if target.is_empty() {
@@ -204,6 +207,28 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
     );
 
     Ok(Some(resolved))
+}
+
+fn read_redirect_file_limited(redirect_path: &Path) -> Result<String> {
+    if fs::metadata(redirect_path)?.len() > MAX_REDIRECT_BYTES_U64 {
+        return Err(BeadsError::Config(format!(
+            "Redirect file exceeds maximum size of {MAX_REDIRECT_BYTES} bytes: {}",
+            redirect_path.display()
+        )));
+    }
+
+    let file = File::open(redirect_path)?;
+    let mut reader = file.take(MAX_REDIRECT_BYTES_U64.saturating_add(1));
+    let mut content = String::new();
+    reader.read_to_string(&mut content)?;
+    if content.len() > MAX_REDIRECT_BYTES {
+        return Err(BeadsError::Config(format!(
+            "Redirect file exceeds maximum size of {MAX_REDIRECT_BYTES} bytes: {}",
+            redirect_path.display()
+        )));
+    }
+
+    Ok(content)
 }
 
 /// Follow redirects until we reach a terminal beads directory.
@@ -516,6 +541,27 @@ mod tests {
 
         let result = read_redirect(&beads_dir).unwrap().unwrap();
         assert_eq!(result, beads_dir);
+    }
+
+    #[test]
+    fn read_redirect_rejects_oversized_file() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let redirect_path = beads_dir.join("redirect");
+        fs::write(&redirect_path, ".").unwrap();
+        File::options()
+            .write(true)
+            .open(&redirect_path)
+            .unwrap()
+            .set_len(MAX_REDIRECT_BYTES_U64 + 1)
+            .unwrap();
+
+        let err = read_redirect(&beads_dir).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("maximum size")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

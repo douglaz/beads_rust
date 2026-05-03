@@ -8245,6 +8245,66 @@ fn parse_external_dependency(dep_id: &str) -> Option<(String, String)> {
     Some((project, capability))
 }
 
+fn cycle_endpoint(value: Option<&SqliteValue>) -> String {
+    value
+        .and_then(SqliteValue::as_text)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn reverse_cycle_graph(graph: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
+    let mut reverse_graph: BTreeMap<String, Vec<String>> = graph
+        .keys()
+        .map(|node| (node.clone(), Vec::new()))
+        .collect();
+
+    for (from, neighbors) in graph {
+        for to in neighbors {
+            reverse_graph
+                .entry(to.clone())
+                .or_default()
+                .push(from.clone());
+        }
+    }
+
+    for neighbors in reverse_graph.values_mut() {
+        neighbors.sort();
+        neighbors.dedup();
+    }
+
+    reverse_graph
+}
+
+fn find_cycle_graph_path(
+    graph: &BTreeMap<String, Vec<String>>,
+    start: &str,
+    target: &str,
+    component: &HashSet<&str>,
+) -> Option<Vec<String>> {
+    let mut visited = HashSet::new();
+    let mut stack = vec![(start.to_string(), vec![start.to_string()])];
+
+    while let Some((node, path)) = stack.pop() {
+        if node == target {
+            return Some(path);
+        }
+        if !visited.insert(node.clone()) {
+            continue;
+        }
+        if let Some(neighbors) = graph.get(&node) {
+            for neighbor in neighbors.iter().rev() {
+                if component.contains(neighbor.as_str()) && !visited.contains(neighbor) {
+                    let mut next_path = path.clone();
+                    next_path.push(neighbor.clone());
+                    stack.push((neighbor.clone(), next_path));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn query_external_project_capabilities(
     db_path: &Path,
     capabilities: &HashSet<String>,
@@ -8858,32 +8918,27 @@ impl SqliteStorage {
 
     /// Detect all cycles in the dependency graph.
     ///
-    /// Returns a list of cycles, where each cycle is a vector of issue IDs.
-    /// Uses an iterative DFS to avoid stack overflow on deep graphs.
+    /// Returns deterministic cycle witnesses, where each cycle is a vector of
+    /// issue IDs ending with its starting ID. The implementation finds strongly
+    /// connected components first, then emits one witness per cyclic component.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     pub fn detect_all_cycles(&self) -> Result<Vec<Vec<String>>> {
-        use std::collections::{HashMap, HashSet};
+        let graph = self.load_dependency_cycle_graph()?;
+        Ok(Self::cycle_witnesses_from_graph(&graph))
+    }
 
-        // Get all dependencies, respecting parent-child direction (parent depends on child)
-        let mut graph: HashMap<String, Vec<String>> = HashMap::new();
-
+    fn load_dependency_cycle_graph(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let rows1 = self.conn.query(
             "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'",
         )?;
         for row in &rows1 {
-            let from = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
-            let to = row
-                .get(1)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
+            let from = cycle_endpoint(row.get(0));
+            let to = cycle_endpoint(row.get(1));
+            graph.entry(to.clone()).or_default();
             graph.entry(from).or_default().push(to);
         }
 
@@ -8891,53 +8946,131 @@ impl SqliteStorage {
             "SELECT depends_on_id, issue_id FROM dependencies WHERE type = 'parent-child'",
         )?;
         for row in &rows2 {
-            let from = row
-                .get(0)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
-            let to = row
-                .get(1)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
+            let from = cycle_endpoint(row.get(0));
+            let to = cycle_endpoint(row.get(1));
+            graph.entry(to.clone()).or_default();
             graph.entry(from).or_default().push(to);
         }
 
-        let mut unique_cycles = HashSet::new();
-        let mut keys: Vec<_> = graph.keys().cloned().collect();
-        keys.sort();
+        for neighbors in graph.values_mut() {
+            neighbors.sort();
+            neighbors.dedup();
+        }
 
-        // Enforce a sensible depth cap to prevent exponential blowup on dense/corrupted graphs
-        let max_depth = DEPENDENCY_TRAVERSAL_MAX_DEPTH.min(20);
+        Ok(graph)
+    }
 
-        for start_node in keys {
-            let mut stack = vec![(start_node.clone(), vec![start_node.clone()])];
+    fn cycle_witnesses_from_graph(graph: &BTreeMap<String, Vec<String>>) -> Vec<Vec<String>> {
+        let components = Self::strongly_connected_components(graph);
+        let mut cycles = Vec::new();
 
-            while let Some((u, path)) = stack.pop() {
-                if path.len() > max_depth {
+        for component in components {
+            if component.len() == 1 {
+                let node = &component[0];
+                if graph
+                    .get(node)
+                    .is_some_and(|neighbors| neighbors.binary_search(node).is_ok())
+                {
+                    cycles.push(vec![node.clone(), node.clone()]);
+                }
+                continue;
+            }
+
+            if let Some(cycle) = Self::cycle_witness_for_component(graph, &component) {
+                cycles.push(cycle);
+            }
+        }
+
+        cycles.sort();
+        cycles
+    }
+
+    fn strongly_connected_components(graph: &BTreeMap<String, Vec<String>>) -> Vec<Vec<String>> {
+        let mut visited = HashSet::new();
+        let mut finish_order = Vec::with_capacity(graph.len());
+
+        for node in graph.keys() {
+            if visited.contains(node) {
+                continue;
+            }
+            Self::push_cycle_graph_finish_order(graph, node, &mut visited, &mut finish_order);
+        }
+
+        let reverse_graph = reverse_cycle_graph(graph);
+        let mut assigned = HashSet::new();
+        let mut components = Vec::new();
+
+        for node in finish_order.iter().rev() {
+            if assigned.contains(node) {
+                continue;
+            }
+
+            let mut component = Vec::new();
+            let mut stack = vec![node.clone()];
+            while let Some(current) = stack.pop() {
+                if !assigned.insert(current.clone()) {
                     continue;
                 }
-                if let Some(neighbors) = graph.get(&u) {
-                    for v in neighbors {
-                        // Only consider cycles where start_node is the strictly minimum node
-                        if v == &start_node {
-                            let mut cycle = path.clone();
-                            cycle.push(v.clone());
-                            unique_cycles.insert(cycle);
-                        } else if v > &start_node && !path.contains(v) {
-                            let mut new_path = path.clone();
-                            new_path.push(v.clone());
-                            stack.push((v.clone(), new_path));
+                component.push(current.clone());
+                if let Some(neighbors) = reverse_graph.get(&current) {
+                    for neighbor in neighbors.iter().rev() {
+                        if !assigned.contains(neighbor) {
+                            stack.push(neighbor.clone());
                         }
                     }
                 }
             }
+            component.sort();
+            components.push(component);
         }
 
-        let mut cycles: Vec<_> = unique_cycles.into_iter().collect();
-        cycles.sort();
-        Ok(cycles)
+        components.sort();
+        components
+    }
+
+    fn push_cycle_graph_finish_order(
+        graph: &BTreeMap<String, Vec<String>>,
+        start: &str,
+        visited: &mut HashSet<String>,
+        finish_order: &mut Vec<String>,
+    ) {
+        let mut stack = vec![(start.to_string(), false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                finish_order.push(node);
+                continue;
+            }
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+
+            stack.push((node.clone(), true));
+            if let Some(neighbors) = graph.get(&node) {
+                for neighbor in neighbors.iter().rev() {
+                    if !visited.contains(neighbor) {
+                        stack.push((neighbor.clone(), false));
+                    }
+                }
+            }
+        }
+    }
+
+    fn cycle_witness_for_component(
+        graph: &BTreeMap<String, Vec<String>>,
+        component: &[String],
+    ) -> Option<Vec<String>> {
+        let start = component.first()?;
+        let component_set: HashSet<_> = component.iter().map(String::as_str).collect();
+        for neighbor in graph.get(start)?.iter().filter(|neighbor| {
+            neighbor.as_str() != start.as_str() && component_set.contains(neighbor.as_str())
+        }) {
+            if let Some(mut path) = find_cycle_graph_path(graph, neighbor, start, &component_set) {
+                let mut cycle = vec![start.clone()];
+                cycle.append(&mut path);
+                return Some(cycle);
+            }
+        }
+        None
     }
 
     // ===== Import Helper Methods =====

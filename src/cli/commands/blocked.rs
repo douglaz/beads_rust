@@ -259,10 +259,12 @@ fn output_structured_blocked(
     ctx: &OutputContext,
     blocked_issues: &[BlockedIssue],
 ) {
-    let output = blocked_issue_outputs(blocked_issues);
     match output_format {
-        OutputFormat::Json => ctx.json_pretty(&output),
-        OutputFormat::Toon => ctx.toon_with_stats(&output, args.stats),
+        OutputFormat::Json => ctx.json_array(blocked_issues.iter().map(blocked_issue_output)),
+        OutputFormat::Toon => {
+            let output = blocked_issue_outputs(blocked_issues);
+            ctx.toon_with_stats(&output, args.stats);
+        }
         OutputFormat::Text | OutputFormat::Csv => {}
     }
 }
@@ -633,6 +635,23 @@ mod tests {
         assert!(args.label.is_empty());
         assert!(!args.robot);
         info!("test_blocked_args_defaults: assertions passed");
+    }
+
+    #[test]
+    fn test_blocked_issue_output_iterator_matches_materialized_outputs() {
+        let issues = vec![
+            make_blocked_issue("a", "P0", 0, 1),
+            make_blocked_issue("b", "P1", 1, 2),
+        ];
+
+        let streamed: Vec<BlockedIssueOutput> = issues.iter().map(blocked_issue_output).collect();
+        let materialized = blocked_issue_outputs(&issues);
+
+        let streamed_json =
+            serde_json::to_vec(&streamed).expect("serialize streamed blocked output");
+        let materialized_json =
+            serde_json::to_vec(&materialized).expect("serialize materialized blocked output");
+        assert_eq!(streamed_json, materialized_json);
     }
 
     #[test]

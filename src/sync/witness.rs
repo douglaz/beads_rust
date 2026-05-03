@@ -40,6 +40,34 @@ pub struct JsonlChunkWitness {
     pub last_line_hash: Option<String>,
 }
 
+/// Drift summary between two JSONL Merkle witnesses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use = "comparison summaries identify which chunks can be reused safely"]
+pub struct JsonlWitnessComparison {
+    pub schema_versions_match: bool,
+    pub chunk_size_lines_match: bool,
+    pub root_hashes_match: bool,
+    pub drift_detected: bool,
+    pub base_line_count: usize,
+    pub candidate_line_count: usize,
+    pub base_byte_count: u64,
+    pub candidate_byte_count: u64,
+    pub base_chunk_count: usize,
+    pub candidate_chunk_count: usize,
+    pub comparable_chunk_count: usize,
+    pub unchanged_chunks: usize,
+    pub changed_chunks: usize,
+    pub added_chunks: usize,
+    pub removed_chunks: usize,
+    pub unchanged_byte_count: u64,
+    pub changed_base_byte_count: u64,
+    pub changed_candidate_byte_count: u64,
+    pub added_byte_count: u64,
+    pub removed_byte_count: u64,
+    pub safe_reuse_prefix_chunks: usize,
+    pub first_changed_chunk_index: Option<usize>,
+}
+
 /// Build a deterministic witness over exact JSONL bytes read from `reader`.
 ///
 /// Lines are counted by `BufRead::read_until(b'\n')`, so newline bytes are part
@@ -95,6 +123,122 @@ pub fn build_jsonl_merkle_witness<R: BufRead>(
         root_hash,
         chunks,
     })
+}
+
+/// Compare two JSONL witnesses and conservatively identify reusable chunks.
+///
+/// Chunks are considered reusable only when schema, chunk sizing, chunk index,
+/// line range, byte count, and chunk hash all match. This intentionally treats
+/// shifted chunks as changed so an incremental sync planner cannot hide drift
+/// behind a coincidental hash match.
+pub fn compare_jsonl_merkle_witnesses(
+    base: &JsonlMerkleWitness,
+    candidate: &JsonlMerkleWitness,
+) -> JsonlWitnessComparison {
+    let schema_versions_match = base.schema_version == candidate.schema_version;
+    let chunk_size_lines_match = base.chunk_size_lines == candidate.chunk_size_lines;
+    let root_hashes_match = base.root_hash == candidate.root_hash;
+    let witnesses_are_comparable = schema_versions_match && chunk_size_lines_match;
+
+    let mut unchanged_chunks = 0;
+    let mut changed_chunks = 0;
+    let mut unchanged_byte_count = 0;
+    let mut changed_base_byte_count = 0;
+    let mut changed_candidate_byte_count = 0;
+    let mut safe_reuse_prefix_chunks = 0;
+    let mut first_changed_chunk_index = None;
+
+    let comparable_chunk_count = if witnesses_are_comparable {
+        let comparable_chunk_count = base.chunks.len().min(candidate.chunks.len());
+        let mut prefix_is_reusable = true;
+
+        for (index, (base_chunk, candidate_chunk)) in
+            base.chunks.iter().zip(&candidate.chunks).enumerate()
+        {
+            if chunks_match_for_reuse(base_chunk, candidate_chunk) {
+                unchanged_chunks += 1;
+                unchanged_byte_count += candidate_chunk.byte_count;
+                if prefix_is_reusable {
+                    safe_reuse_prefix_chunks += 1;
+                }
+            } else {
+                changed_chunks += 1;
+                changed_base_byte_count += base_chunk.byte_count;
+                changed_candidate_byte_count += candidate_chunk.byte_count;
+                prefix_is_reusable = false;
+                first_changed_chunk_index.get_or_insert(index);
+            }
+        }
+
+        comparable_chunk_count
+    } else {
+        0
+    };
+
+    let (added_chunks, removed_chunks, added_byte_count, removed_byte_count) =
+        if witnesses_are_comparable {
+            (
+                candidate.chunks.len().saturating_sub(base.chunks.len()),
+                base.chunks.len().saturating_sub(candidate.chunks.len()),
+                sum_chunk_bytes(
+                    candidate
+                        .chunks
+                        .get(comparable_chunk_count..)
+                        .unwrap_or(&[]),
+                ),
+                sum_chunk_bytes(base.chunks.get(comparable_chunk_count..).unwrap_or(&[])),
+            )
+        } else {
+            (
+                candidate.chunks.len(),
+                base.chunks.len(),
+                sum_chunk_bytes(&candidate.chunks),
+                sum_chunk_bytes(&base.chunks),
+            )
+        };
+
+    if first_changed_chunk_index.is_none()
+        && (!witnesses_are_comparable || added_chunks > 0 || removed_chunks > 0)
+    {
+        first_changed_chunk_index = Some(comparable_chunk_count);
+    }
+
+    JsonlWitnessComparison {
+        schema_versions_match,
+        chunk_size_lines_match,
+        root_hashes_match,
+        drift_detected: !(witnesses_are_comparable && root_hashes_match),
+        base_line_count: base.line_count,
+        candidate_line_count: candidate.line_count,
+        base_byte_count: base.byte_count,
+        candidate_byte_count: candidate.byte_count,
+        base_chunk_count: base.chunks.len(),
+        candidate_chunk_count: candidate.chunks.len(),
+        comparable_chunk_count,
+        unchanged_chunks,
+        changed_chunks,
+        added_chunks,
+        removed_chunks,
+        unchanged_byte_count,
+        changed_base_byte_count,
+        changed_candidate_byte_count,
+        added_byte_count,
+        removed_byte_count,
+        safe_reuse_prefix_chunks,
+        first_changed_chunk_index,
+    }
+}
+
+fn chunks_match_for_reuse(base: &JsonlChunkWitness, candidate: &JsonlChunkWitness) -> bool {
+    base.index == candidate.index
+        && base.start_line == candidate.start_line
+        && base.line_count == candidate.line_count
+        && base.byte_count == candidate.byte_count
+        && base.hash == candidate.hash
+}
+
+fn sum_chunk_bytes(chunks: &[JsonlChunkWitness]) -> u64 {
+    chunks.iter().map(|chunk| chunk.byte_count).sum()
 }
 
 struct ChunkBuilder {
@@ -239,6 +383,10 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn witness(input: &[u8], chunk_size_lines: usize) -> JsonlMerkleWitness {
+        build_jsonl_merkle_witness(Cursor::new(input), chunk_size_lines).unwrap()
+    }
+
     #[test]
     fn builds_deterministic_chunk_witnesses() {
         let input = b"{\"id\":\"a\"}\n{\"id\":\"b\"}\n{\"id\":\"c\"}\n";
@@ -319,5 +467,89 @@ mod tests {
         assert_eq!(first.byte_count, 0);
         assert!(first.chunks.is_empty());
         assert!(!first.root_hash.is_empty());
+    }
+
+    #[test]
+    fn comparison_reports_identical_witnesses_as_reusable() {
+        let base = witness(b"a\nb\nc\n", 2);
+        let candidate = witness(b"a\nb\nc\n", 2);
+
+        let comparison = compare_jsonl_merkle_witnesses(&base, &candidate);
+
+        assert!(comparison.schema_versions_match);
+        assert!(comparison.chunk_size_lines_match);
+        assert!(comparison.root_hashes_match);
+        assert!(!comparison.drift_detected);
+        assert_eq!(comparison.comparable_chunk_count, 2);
+        assert_eq!(comparison.unchanged_chunks, 2);
+        assert_eq!(comparison.changed_chunks, 0);
+        assert_eq!(comparison.added_chunks, 0);
+        assert_eq!(comparison.removed_chunks, 0);
+        assert_eq!(comparison.unchanged_byte_count, candidate.byte_count);
+        assert_eq!(comparison.safe_reuse_prefix_chunks, 2);
+        assert_eq!(comparison.first_changed_chunk_index, None);
+    }
+
+    #[test]
+    fn comparison_localizes_changed_chunk() {
+        let base = witness(b"a\nb\nc\n", 1);
+        let candidate = witness(b"a\nB\nc\n", 1);
+
+        let comparison = compare_jsonl_merkle_witnesses(&base, &candidate);
+
+        assert!(comparison.drift_detected);
+        assert!(!comparison.root_hashes_match);
+        assert_eq!(comparison.comparable_chunk_count, 3);
+        assert_eq!(comparison.unchanged_chunks, 2);
+        assert_eq!(comparison.changed_chunks, 1);
+        assert_eq!(comparison.added_chunks, 0);
+        assert_eq!(comparison.removed_chunks, 0);
+        assert_eq!(comparison.safe_reuse_prefix_chunks, 1);
+        assert_eq!(comparison.first_changed_chunk_index, Some(1));
+        assert_eq!(
+            comparison.changed_base_byte_count,
+            base.chunks[1].byte_count
+        );
+        assert_eq!(
+            comparison.changed_candidate_byte_count,
+            candidate.chunks[1].byte_count
+        );
+    }
+
+    #[test]
+    fn comparison_reports_tail_appends_without_marking_prefix_changed() {
+        let base = witness(b"a\nb\n", 1);
+        let candidate = witness(b"a\nb\nc\n", 1);
+
+        let comparison = compare_jsonl_merkle_witnesses(&base, &candidate);
+
+        assert!(comparison.drift_detected);
+        assert_eq!(comparison.comparable_chunk_count, 2);
+        assert_eq!(comparison.unchanged_chunks, 2);
+        assert_eq!(comparison.changed_chunks, 0);
+        assert_eq!(comparison.added_chunks, 1);
+        assert_eq!(comparison.removed_chunks, 0);
+        assert_eq!(comparison.added_byte_count, candidate.chunks[2].byte_count);
+        assert_eq!(comparison.removed_byte_count, 0);
+        assert_eq!(comparison.safe_reuse_prefix_chunks, 2);
+        assert_eq!(comparison.first_changed_chunk_index, Some(2));
+    }
+
+    #[test]
+    fn comparison_rejects_incompatible_chunk_sizes_for_reuse() {
+        let base = witness(b"a\nb\nc\n", 1);
+        let candidate = witness(b"a\nb\nc\n", 2);
+
+        let comparison = compare_jsonl_merkle_witnesses(&base, &candidate);
+
+        assert!(comparison.drift_detected);
+        assert!(!comparison.chunk_size_lines_match);
+        assert_eq!(comparison.comparable_chunk_count, 0);
+        assert_eq!(comparison.unchanged_chunks, 0);
+        assert_eq!(comparison.changed_chunks, 0);
+        assert_eq!(comparison.added_chunks, candidate.chunks.len());
+        assert_eq!(comparison.removed_chunks, base.chunks.len());
+        assert_eq!(comparison.safe_reuse_prefix_chunks, 0);
+        assert_eq!(comparison.first_changed_chunk_index, Some(0));
     }
 }

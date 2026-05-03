@@ -189,9 +189,7 @@ fn execute_inner(
     }
     match output_format {
         OutputFormat::Json => {
-            let ready_output: Vec<ReadyIssue> =
-                ready_issues.into_iter().map(ReadyIssue::from).collect();
-            early_ctx.json_pretty(&ready_output);
+            early_ctx.json_array(ready_issues.into_iter().map(ReadyIssue::from));
         }
         OutputFormat::Toon => {
             let ready_output: Vec<ReadyIssue> =

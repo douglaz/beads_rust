@@ -63,6 +63,25 @@ impl Write for CountingWriter {
     }
 }
 
+fn write_json_array_to_writer<I, T, W>(writer: &mut W, values: I) -> serde_json::Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Serialize,
+    W: Write,
+{
+    writer.write_all(b"[").map_err(serde_json::Error::io)?;
+    let mut first = true;
+    for value in values {
+        if first {
+            first = false;
+        } else {
+            writer.write_all(b",").map_err(serde_json::Error::io)?;
+        }
+        serde_json::to_writer(&mut *writer, &value)?;
+    }
+    writer.write_all(b"]").map_err(serde_json::Error::io)
+}
+
 #[must_use]
 fn toon_encode_options() -> EncodeOptions {
     EncodeOptions {
@@ -368,6 +387,22 @@ impl OutputContext {
             let stdout = io::stdout();
             let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
             if let Err(err) = serde_json::to_writer(&mut out, value) {
+                self.report_serialization_error("JSON", &err);
+                return;
+            }
+            let _ = out.write_all(b"\n");
+        }
+    }
+
+    pub fn json_array<I, T>(&self, values: I)
+    where
+        I: IntoIterator<Item = T>,
+        T: serde::Serialize,
+    {
+        if self.is_json() {
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY, stdout.lock());
+            if let Err(err) = write_json_array_to_writer(&mut out, values) {
                 self.report_serialization_error("JSON", &err);
                 return;
             }
@@ -723,6 +758,45 @@ mod tests {
                     .len()
             )
         );
+    }
+
+    #[test]
+    fn write_json_array_to_writer_matches_materialized_vec_output() {
+        #[derive(Serialize)]
+        struct Row {
+            id: &'static str,
+            priority: u8,
+        }
+
+        let rows = vec![
+            Row {
+                id: "beads_rust-alpha",
+                priority: 0,
+            },
+            Row {
+                id: "beads_rust-beta",
+                priority: 1,
+            },
+        ];
+        let mut streamed = Vec::new();
+
+        write_json_array_to_writer(&mut streamed, rows.iter())
+            .expect("streaming JSON array serialization failed");
+
+        assert_eq!(
+            streamed,
+            serde_json::to_vec(&rows).expect("materialized JSON serialization failed")
+        );
+    }
+
+    #[test]
+    fn write_json_array_to_writer_emits_empty_array() {
+        let mut streamed = Vec::new();
+
+        write_json_array_to_writer(&mut streamed, std::iter::empty::<serde_json::Value>())
+            .expect("streaming empty JSON array serialization failed");
+
+        assert_eq!(streamed, b"[]");
     }
 
     #[test]

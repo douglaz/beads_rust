@@ -9,6 +9,7 @@
 
 pub mod history;
 pub mod path;
+pub mod witness;
 
 pub use path::{
     ALLOWED_EXACT_NAMES, ALLOWED_EXTENSIONS, PathValidation, is_sync_path_allowed,

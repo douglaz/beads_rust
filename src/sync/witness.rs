@@ -1,0 +1,323 @@
+//! Deterministic JSONL chunk witnesses for sync pipelines.
+//!
+//! This module is intentionally pure: it reads JSONL bytes and produces a
+//! stable witness without touching files, paths, storage, or git state. The
+//! serial import/export path can keep its existing behavior while future
+//! parallel sync work uses these witnesses to prove unchanged chunks.
+
+use crate::util::hex_encode;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::{self, BufRead};
+
+/// Schema marker for JSONL Merkle witnesses.
+pub const JSONL_WITNESS_SCHEMA_VERSION: &str = "br.jsonl-witness.v1";
+
+const ROOT_DOMAIN: &[u8] = b"br:jsonl-witness:root:v1\0";
+const CHUNK_DOMAIN: &[u8] = b"br:jsonl-witness:chunk:v1\0";
+const FIELD_SEPARATOR: &[u8] = b"\0";
+
+/// Merkle-style witness for an exact JSONL byte stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonlMerkleWitness {
+    pub schema_version: String,
+    pub chunk_size_lines: usize,
+    pub line_count: usize,
+    pub byte_count: u64,
+    pub root_hash: String,
+    pub chunks: Vec<JsonlChunkWitness>,
+}
+
+/// Witness metadata for one contiguous JSONL line chunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonlChunkWitness {
+    pub index: usize,
+    pub start_line: usize,
+    pub line_count: usize,
+    pub byte_count: u64,
+    pub hash: String,
+    pub first_line_hash: Option<String>,
+    pub last_line_hash: Option<String>,
+}
+
+/// Build a deterministic witness over exact JSONL bytes read from `reader`.
+///
+/// Lines are counted by `BufRead::read_until(b'\n')`, so newline bytes are part
+/// of the line hash when present and the final non-newline-terminated line is
+/// still counted.
+pub fn build_jsonl_merkle_witness<R: BufRead>(
+    mut reader: R,
+    chunk_size_lines: usize,
+) -> io::Result<JsonlMerkleWitness> {
+    if chunk_size_lines == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chunk_size_lines must be greater than zero",
+        ));
+    }
+
+    let mut chunks = Vec::new();
+    let mut line_count = 0_usize;
+    let mut byte_count = 0_u64;
+    let mut chunk_builder = ChunkBuilder::new(0, 0)?;
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        if chunk_builder.line_count == chunk_size_lines {
+            chunks.push(chunk_builder.finish());
+            chunk_builder = ChunkBuilder::new(chunks.len(), line_count)?;
+        }
+
+        line_count = line_count
+            .checked_add(1)
+            .ok_or_else(|| io_invalid_data("JSONL line count overflowed usize"))?;
+        byte_count = checked_add_bytes(byte_count, bytes_read, "JSONL byte count")?;
+        chunk_builder.push_line(&line, bytes_read)?;
+    }
+
+    if chunk_builder.line_count > 0 {
+        chunks.push(chunk_builder.finish());
+    }
+
+    let root_hash = compute_root_hash(chunk_size_lines, line_count, byte_count, &chunks)?;
+
+    Ok(JsonlMerkleWitness {
+        schema_version: JSONL_WITNESS_SCHEMA_VERSION.to_string(),
+        chunk_size_lines,
+        line_count,
+        byte_count,
+        root_hash,
+        chunks,
+    })
+}
+
+struct ChunkBuilder {
+    index: usize,
+    start_line: usize,
+    line_count: usize,
+    byte_count: u64,
+    hasher: Sha256,
+    first_line_hash: Option<String>,
+    last_line_hash: Option<String>,
+}
+
+impl ChunkBuilder {
+    fn new(index: usize, start_line: usize) -> io::Result<Self> {
+        let mut hasher = Sha256::new();
+        hasher.update(CHUNK_DOMAIN);
+        hasher.update(index_to_bytes(index)?);
+        hasher.update(index_to_bytes(start_line)?);
+
+        Ok(Self {
+            index,
+            start_line,
+            line_count: 0,
+            byte_count: 0,
+            hasher,
+            first_line_hash: None,
+            last_line_hash: None,
+        })
+    }
+
+    fn push_line(&mut self, line: &[u8], bytes_read: usize) -> io::Result<()> {
+        let line_hash = sha256_hex(line);
+
+        if self.first_line_hash.is_none() {
+            self.first_line_hash = Some(line_hash.clone());
+        }
+        self.last_line_hash = Some(line_hash);
+
+        self.hasher.update(index_to_bytes(self.line_count)?);
+        self.hasher.update(length_to_bytes(bytes_read)?);
+        self.hasher.update(line);
+        self.line_count = self
+            .line_count
+            .checked_add(1)
+            .ok_or_else(|| io_invalid_data("chunk line count overflowed usize"))?;
+        self.byte_count = checked_add_bytes(self.byte_count, bytes_read, "chunk byte count")?;
+        Ok(())
+    }
+
+    fn finish(self) -> JsonlChunkWitness {
+        let hash = hex_encode(&self.hasher.finalize());
+
+        JsonlChunkWitness {
+            index: self.index,
+            start_line: self.start_line,
+            line_count: self.line_count,
+            byte_count: self.byte_count,
+            hash,
+            first_line_hash: self.first_line_hash,
+            last_line_hash: self.last_line_hash,
+        }
+    }
+}
+
+fn compute_root_hash(
+    chunk_size_lines: usize,
+    line_count: usize,
+    byte_count: u64,
+    chunks: &[JsonlChunkWitness],
+) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(ROOT_DOMAIN);
+    hash_field(&mut hasher, JSONL_WITNESS_SCHEMA_VERSION.as_bytes())?;
+    hasher.update(index_to_bytes(chunk_size_lines)?);
+    hasher.update(index_to_bytes(line_count)?);
+    hasher.update(byte_count.to_le_bytes());
+    hasher.update(index_to_bytes(chunks.len())?);
+
+    for chunk in chunks {
+        hasher.update(index_to_bytes(chunk.index)?);
+        hasher.update(index_to_bytes(chunk.start_line)?);
+        hasher.update(index_to_bytes(chunk.line_count)?);
+        hasher.update(chunk.byte_count.to_le_bytes());
+        hash_field(&mut hasher, chunk.hash.as_bytes())?;
+        hash_optional_field(&mut hasher, chunk.first_line_hash.as_deref())?;
+        hash_optional_field(&mut hasher, chunk.last_line_hash.as_deref())?;
+    }
+
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn hash_field(hasher: &mut Sha256, bytes: &[u8]) -> io::Result<()> {
+    hasher.update(length_to_bytes(bytes.len())?);
+    hasher.update(FIELD_SEPARATOR);
+    hasher.update(bytes);
+    hasher.update(FIELD_SEPARATOR);
+    Ok(())
+}
+
+fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) -> io::Result<()> {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hash_field(hasher, value.as_bytes())?;
+        }
+        None => hasher.update([0]),
+    }
+    Ok(())
+}
+
+fn checked_add_bytes(total: u64, delta: usize, label: &'static str) -> io::Result<u64> {
+    let delta = length_to_u64(delta)?;
+    total
+        .checked_add(delta)
+        .ok_or_else(|| io_invalid_data(format!("{label} overflowed u64")))
+}
+
+fn index_to_bytes(value: usize) -> io::Result<[u8; 8]> {
+    length_to_bytes(value)
+}
+
+fn length_to_bytes(value: usize) -> io::Result<[u8; 8]> {
+    Ok(length_to_u64(value)?.to_le_bytes())
+}
+
+fn length_to_u64(value: usize) -> io::Result<u64> {
+    u64::try_from(value).map_err(|_| io_invalid_data("length exceeded u64"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_encode(&hasher.finalize())
+}
+
+fn io_invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn builds_deterministic_chunk_witnesses() {
+        let input = b"{\"id\":\"a\"}\n{\"id\":\"b\"}\n{\"id\":\"c\"}\n";
+
+        let first = build_jsonl_merkle_witness(Cursor::new(input), 2).unwrap();
+        let second = build_jsonl_merkle_witness(Cursor::new(input), 2).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.schema_version, JSONL_WITNESS_SCHEMA_VERSION);
+        assert_eq!(first.chunk_size_lines, 2);
+        assert_eq!(first.line_count, 3);
+        assert_eq!(first.byte_count, u64::try_from(input.len()).unwrap());
+        assert_eq!(first.chunks.len(), 2);
+        assert_eq!(first.chunks[0].index, 0);
+        assert_eq!(first.chunks[0].start_line, 0);
+        assert_eq!(first.chunks[0].line_count, 2);
+        assert_eq!(first.chunks[1].index, 1);
+        assert_eq!(first.chunks[1].start_line, 2);
+        assert_eq!(first.chunks[1].line_count, 1);
+        assert_eq!(
+            first.chunks[0].first_line_hash.as_deref(),
+            Some(sha256_hex(b"{\"id\":\"a\"}\n").as_str())
+        );
+        assert_eq!(
+            first.chunks[1].last_line_hash.as_deref(),
+            Some(sha256_hex(b"{\"id\":\"c\"}\n").as_str())
+        );
+    }
+
+    #[test]
+    fn root_changes_when_a_byte_changes() {
+        let original = build_jsonl_merkle_witness(Cursor::new(b"{\"id\":\"a\"}\n"), 2).unwrap();
+        let changed = build_jsonl_merkle_witness(Cursor::new(b"{\"id\":\"b\"}\n"), 2).unwrap();
+
+        assert_ne!(original.root_hash, changed.root_hash);
+        assert_ne!(original.chunks[0].hash, changed.chunks[0].hash);
+    }
+
+    #[test]
+    fn root_changes_when_line_order_changes() {
+        let first = build_jsonl_merkle_witness(Cursor::new(b"a\nb\n"), 2).unwrap();
+        let second = build_jsonl_merkle_witness(Cursor::new(b"b\na\n"), 2).unwrap();
+
+        assert_ne!(first.root_hash, second.root_hash);
+    }
+
+    #[test]
+    fn final_line_without_newline_is_counted_and_hashed() {
+        let witness = build_jsonl_merkle_witness(Cursor::new(b"a\nb"), 1).unwrap();
+
+        assert_eq!(witness.line_count, 2);
+        assert_eq!(witness.byte_count, 3);
+        assert_eq!(witness.chunks.len(), 2);
+        assert_eq!(
+            witness.chunks[1].first_line_hash.as_deref(),
+            Some(sha256_hex(b"b").as_str())
+        );
+        assert_eq!(
+            witness.chunks[1].last_line_hash.as_deref(),
+            Some(sha256_hex(b"b").as_str())
+        );
+    }
+
+    #[test]
+    fn zero_chunk_size_is_rejected() {
+        let err = build_jsonl_merkle_witness(Cursor::new(b"a\n"), 0).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn empty_input_has_stable_empty_root() {
+        let first = build_jsonl_merkle_witness(Cursor::new(Vec::new()), 2).unwrap();
+        let second = build_jsonl_merkle_witness(Cursor::new(Vec::new()), 2).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.line_count, 0);
+        assert_eq!(first.byte_count, 0);
+        assert!(first.chunks.is_empty());
+        assert!(!first.root_hash.is_empty());
+    }
+}

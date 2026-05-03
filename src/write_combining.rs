@@ -303,6 +303,11 @@ pub enum BatchSkipReason {
     InvalidEnvelope(EnvelopeValidationError),
     /// The caller deadline has already elapsed.
     Expired,
+    /// A prior accepted envelope in this batch has the same idempotency key.
+    DuplicateIdempotencyKey {
+        /// Duplicated caller idempotency key.
+        idempotency_key: String,
+    },
     /// The batch accepted the maximum number of envelopes.
     QueueFull,
     /// Accepting this envelope would exceed the argument-byte budget.
@@ -490,6 +495,7 @@ pub fn plan_batch(
     limits.validate()?;
 
     let mut plan = BatchPlan::default();
+    let mut accepted_idempotency_keys = BTreeSet::new();
     let mut boundary_seen = false;
 
     for (index, envelope) in envelopes.iter().enumerate() {
@@ -507,6 +513,16 @@ pub fn plan_batch(
 
         if envelope.deadline_unix_ms <= now_unix_ms {
             plan.skipped.push(skipped(index, BatchSkipReason::Expired));
+            continue;
+        }
+
+        if accepted_idempotency_keys.contains(envelope.idempotency_key.as_str()) {
+            plan.skipped.push(skipped(
+                index,
+                BatchSkipReason::DuplicateIdempotencyKey {
+                    idempotency_key: envelope.idempotency_key.clone(),
+                },
+            ));
             continue;
         }
 
@@ -569,6 +585,7 @@ pub fn plan_batch(
         }
 
         plan.family.get_or_insert(envelope.family);
+        accepted_idempotency_keys.insert(envelope.idempotency_key.as_str());
         plan.used_argument_bytes = next_bytes;
         plan.accepted.push(PlannedMutation {
             index,
@@ -1323,6 +1340,50 @@ mod tests {
                 ),
                 &BatchSkipReason::Expired
             ]
+        );
+    }
+
+    #[test]
+    fn batch_rejects_duplicate_idempotency_without_blocking_later_valid() {
+        let envelopes = vec![
+            envelope(
+                "request-1",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "first"}),
+            ),
+            envelope(
+                "request-1",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "duplicate"}),
+            ),
+            envelope(
+                "request-2",
+                CompatibleMutation::CreateIssue,
+                FUTURE_UNIX_MS,
+                json!({"title": "second"}),
+            ),
+        ];
+
+        let plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+
+        assert_eq!(plan.accepted_count(), 2);
+        assert_eq!(
+            plan.accepted
+                .iter()
+                .map(|mutation| mutation.index)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            plan.skipped
+                .iter()
+                .map(|skipped| &skipped.reason)
+                .collect::<Vec<_>>(),
+            vec![&BatchSkipReason::DuplicateIdempotencyKey {
+                idempotency_key: "request-1".to_string(),
+            }]
         );
     }
 

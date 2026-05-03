@@ -9,8 +9,8 @@ use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::witness::{
-    JsonlMerkleWitness, JsonlWitnessComparison, build_jsonl_merkle_witness,
-    compare_jsonl_merkle_witnesses,
+    JsonlMerkleWitness, JsonlWitnessComparison, JsonlWitnessReusePlan, build_jsonl_merkle_witness,
+    compare_jsonl_merkle_witnesses, plan_jsonl_witness_reuse,
 };
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
@@ -83,6 +83,8 @@ pub struct SyncWitnessResult {
     pub base_jsonl_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_comparison: Option<JsonlWitnessComparison>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_reuse_plan: Option<JsonlWitnessReusePlan>,
 }
 
 #[derive(Debug)]
@@ -892,13 +894,14 @@ fn execute_witness(
     }
 
     let witness = build_witness_for_path(jsonl_path, args.witness_chunk_lines)?;
-    let (base_jsonl_path, base_comparison) =
-        build_base_witness_comparison(path_policy, args.witness_chunk_lines, &witness)?;
+    let (base_jsonl_path, base_comparison, base_reuse_plan) =
+        build_base_witness_artifacts(path_policy, args.witness_chunk_lines, &witness)?;
     let result = SyncWitnessResult {
         jsonl_path: jsonl_path.display().to_string(),
         witness,
         base_jsonl_path,
         base_comparison,
+        base_reuse_plan,
     };
 
     if !should_render_human_sync_output(ctx, use_json) {
@@ -933,21 +936,27 @@ fn build_witness_for_path(
     })
 }
 
-fn build_base_witness_comparison(
+fn build_base_witness_artifacts(
     path_policy: &SyncPathPolicy,
     chunk_size_lines: usize,
     current_witness: &JsonlMerkleWitness,
-) -> Result<(Option<String>, Option<JsonlWitnessComparison>)> {
+) -> Result<(
+    Option<String>,
+    Option<JsonlWitnessComparison>,
+    Option<JsonlWitnessReusePlan>,
+)> {
     let base_jsonl_path = path_policy.beads_dir.join("beads.base.jsonl");
     if !base_jsonl_path.is_file() {
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
 
     let base_witness = build_witness_for_path(&base_jsonl_path, chunk_size_lines)?;
     let comparison = compare_jsonl_merkle_witnesses(&base_witness, current_witness);
+    let reuse_plan = plan_jsonl_witness_reuse(&base_witness, current_witness);
     Ok((
         Some(base_jsonl_path.display().to_string()),
         Some(comparison),
+        Some(reuse_plan),
     ))
 }
 
@@ -978,6 +987,10 @@ fn render_witness_text(result: &SyncWitnessResult) {
         if let Some(index) = comparison.first_changed_chunk_index {
             println!("  First changed chunk: {index}");
         }
+    }
+
+    if let Some(plan) = &result.base_reuse_plan {
+        println!("  Reuse plan actions: {}", plan.actions.len());
     }
 }
 

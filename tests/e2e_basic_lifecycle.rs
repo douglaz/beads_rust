@@ -1233,10 +1233,6 @@ fn e2e_sync_witness_reports_base_snapshot_drift() {
         first_flush.stderr
     );
 
-    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
-    let base_snapshot_path = workspace.root.join(".beads").join("beads.base.jsonl");
-    fs::copy(&jsonl_path, &base_snapshot_path).expect("seed base witness snapshot");
-
     let second = run_br(
         &workspace,
         ["create", "Base witness issue B"],
@@ -1258,6 +1254,16 @@ fn e2e_sync_witness_reports_base_snapshot_drift() {
         "second sync flush failed: {}",
         second_flush.stderr
     );
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let base_snapshot_path = workspace.root.join(".beads").join("beads.base.jsonl");
+    let current_jsonl = fs::read_to_string(&jsonl_path).expect("read current jsonl");
+    let first_candidate_line = current_jsonl
+        .lines()
+        .next()
+        .expect("candidate jsonl should contain at least one issue");
+    fs::write(&base_snapshot_path, format!("{first_candidate_line}\n"))
+        .expect("seed base witness snapshot");
 
     let witness = run_br(
         &workspace,
@@ -1290,6 +1296,20 @@ fn e2e_sync_witness_reports_base_snapshot_drift() {
     assert_eq!(comparison["removed_chunks"].as_u64(), Some(0));
     assert_eq!(comparison["safe_reuse_prefix_chunks"].as_u64(), Some(1));
     assert_eq!(comparison["first_changed_chunk_index"].as_u64(), Some(1));
+
+    let reuse_plan = &witness_json["base_reuse_plan"];
+    assert_eq!(
+        reuse_plan["comparison"]["safe_reuse_prefix_chunks"].as_u64(),
+        Some(1)
+    );
+    let actions = reuse_plan["actions"].as_array().expect("reuse actions");
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0]["action"].as_str(), Some("reuse_unchanged"));
+    assert_eq!(actions[0]["base_index"].as_u64(), Some(0));
+    assert_eq!(actions[0]["candidate_index"].as_u64(), Some(0));
+    assert_eq!(actions[1]["action"].as_str(), Some("read_added"));
+    assert!(actions[1]["base_index"].is_null());
+    assert_eq!(actions[1]["candidate_index"].as_u64(), Some(1));
 }
 
 #[test]

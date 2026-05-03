@@ -72,7 +72,7 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
     filters.sort = Some("updated_at".to_string());
     filters.reverse = true; // updated_at default is DESC, so reverse gets ASC
 
-    let stale = storage.list_issues(&filters)?;
+    let stale = storage.list_stale_issues_for_command_output(&filters)?;
 
     // Output based on mode
     if matches!(ctx.mode(), OutputMode::Quiet) {

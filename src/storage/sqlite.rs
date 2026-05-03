@@ -2886,6 +2886,104 @@ impl SqliteStorage {
         Ok(issues)
     }
 
+    /// List stale command issues without hydrating fields stale output never renders.
+    ///
+    /// This is intentionally narrow and falls back to `list_issues` if the
+    /// filter shape expands beyond what `br stale` currently uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_stale_issues_for_command_output(
+        &self,
+        filters: &ListFilters,
+    ) -> Result<Vec<Issue>> {
+        let unsupported_filter = filters
+            .labels
+            .as_ref()
+            .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .labels_or
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .types
+                .as_ref()
+                .is_some_and(|types| !types.is_empty())
+            || filters
+                .priorities
+                .as_ref()
+                .is_some_and(|priorities| !priorities.is_empty())
+            || filters.assignee.is_some()
+            || filters.unassigned
+            || filters.title_contains.is_some()
+            || filters.updated_after.is_some()
+            || filters.sort.as_deref() != Some("updated_at")
+            || !filters.reverse;
+        if unsupported_filter {
+            return self.list_issues(filters);
+        }
+
+        let mut sql = String::from(
+            "SELECT id, title, status, priority, issue_type, assignee, created_at, updated_at
+             FROM issues WHERE 1=1",
+        );
+        let mut params = Vec::new();
+
+        if let Some(ref statuses) = filters.statuses
+            && !statuses.is_empty()
+        {
+            let placeholders: Vec<String> = statuses.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(sql, " AND status IN ({}) ", placeholders.join(","));
+            for status in statuses {
+                params.push(SqliteValue::from(status.as_str()));
+            }
+        }
+
+        if !filters.include_closed {
+            if filters.include_deferred {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            } else {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
+            }
+        } else if filters.statuses.as_ref().is_none_or(Vec::is_empty) {
+            sql.push_str(" AND status != 'tombstone'");
+        }
+
+        if !filters.include_templates {
+            sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        }
+
+        if let Some(updated_before) = filters.updated_before {
+            sql.push_str(" AND updated_at <= ?");
+            params.push(SqliteValue::from(updated_before.to_rfc3339()));
+        }
+
+        sql.push_str(" ORDER BY updated_at ASC, id ASC");
+
+        match (filters.limit, filters.offset) {
+            (Some(limit), offset) if limit > 0 => {
+                let _ = write!(sql, " LIMIT {limit}");
+                if let Some(offset) = offset
+                    && offset > 0
+                {
+                    let _ = write!(sql, " OFFSET {offset}");
+                }
+            }
+            (_, Some(offset)) if offset > 0 => {
+                let _ = write!(sql, " LIMIT -1 OFFSET {offset}");
+            }
+            _ => {}
+        }
+
+        let rows = self.conn.query_with_params(&sql, &params)?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::stale_command_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
     /// Get lean issue rows for stats computation without hydrating large text fields.
     ///
     /// # Errors
@@ -7996,6 +8094,69 @@ impl SqliteStorage {
         })
     }
 
+    fn stale_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: parse_status(row.get(2).and_then(SqliteValue::as_text)),
+            priority: Priority(get_opt_i32(3).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(4).and_then(SqliteValue::as_text)),
+            assignee: get_non_empty_str(5),
+            owner: None,
+            estimated_minutes: None,
+            created_at: parse_datetime_value(row.get(6))?,
+            created_by: None,
+            updated_at: parse_datetime_value(row.get(7))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
     fn stats_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
@@ -9900,7 +10061,7 @@ impl SqliteStorage {
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
-    use crate::format::{BlockedIssueOutput, ReadyIssue};
+    use crate::format::{BlockedIssueOutput, ReadyIssue, StaleIssue};
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
     use std::fs;
@@ -12864,6 +13025,80 @@ mod tests {
             .into_iter()
             .map(blocked_issue_output_for_test)
             .collect();
+
+        assert_eq!(
+            serde_json::to_value(projected).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_list_stale_issues_for_command_output_matches_full_stale_output() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 10, 12, 0, 0).unwrap();
+        let old_at = now - chrono::Duration::days(45);
+        let fresh_at = now - chrono::Duration::days(1);
+
+        let mut stale_issue = make_issue(
+            "bd-stale-detailed",
+            "Detailed stale issue",
+            Status::Open,
+            1,
+            Some("alice"),
+            old_at,
+            None,
+        );
+        stale_issue.description = Some("Should not be loaded".to_string());
+        stale_issue.design = Some("unused design".repeat(512));
+        stale_issue.acceptance_criteria = Some("unused ac".repeat(512));
+        stale_issue.notes = Some("unused notes".repeat(512));
+        stale_issue.owner = Some("owner".to_string());
+        stale_issue.created_by = Some("creator".to_string());
+        stale_issue.source_repo = Some("repo".to_string());
+        stale_issue.sender = Some("cli".to_string());
+
+        let fresh_issue = make_issue(
+            "bd-fresh",
+            "Fresh issue",
+            Status::Open,
+            2,
+            Some("bob"),
+            fresh_at,
+            None,
+        );
+
+        storage.create_issue(&stale_issue, "tester").unwrap();
+        storage.create_issue(&fresh_issue, "tester").unwrap();
+
+        let filters = ListFilters {
+            include_deferred: true,
+            updated_before: Some(now - chrono::Duration::days(30)),
+            sort: Some("updated_at".to_string()),
+            reverse: true,
+            ..ListFilters::default()
+        };
+
+        let full: Vec<_> = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(StaleIssue::from)
+            .collect();
+        let projected_raw = storage
+            .list_stale_issues_for_command_output(&filters)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-stale-detailed")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.source_repo.is_none());
+        assert!(projected_issue.sender.is_none());
+
+        let projected: Vec<_> = projected_raw.into_iter().map(StaleIssue::from).collect();
 
         assert_eq!(
             serde_json::to_value(projected).unwrap(),

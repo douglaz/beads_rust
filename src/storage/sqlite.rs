@@ -6787,6 +6787,81 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Fetch reverse-dependency edges for a bounded set of blocking roots.
+    ///
+    /// Returns a map from `depends_on_id` → `Vec<IssueWithDependencyMetadata>`.
+    /// Unlike [`Self::prefetch_blocking_dependents`], this keeps focused graph
+    /// traversals from hydrating the entire workspace dependency graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocking_dependents_for_issue_ids(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, Vec<IssueWithDependencyMetadata>>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut map: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT d.depends_on_id, d.issue_id, i.title, i.status, i.priority, d.type
+                 FROM dependencies d
+                 LEFT JOIN issues i ON d.issue_id = i.id
+                 WHERE d.depends_on_id IN ({})
+                   AND d.type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child')
+                 ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.issue_id ASC",
+                placeholders.join(",")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect();
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let Some(depends_on_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(issue_id) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let dep_type = row
+                    .get(5)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("blocks")
+                    .to_string();
+                let title = row.get(2).and_then(SqliteValue::as_text);
+                let status = row.get(3).and_then(SqliteValue::as_text);
+                let priority = row.get(4).and_then(SqliteValue::as_integer);
+
+                let meta = match (title, status, priority) {
+                    (Some(title), Some(status), Some(priority)) => IssueWithDependencyMetadata {
+                        id: issue_id.to_string(),
+                        title: title.to_string(),
+                        status: parse_status(Some(status)),
+                        priority: Priority(i32::try_from(priority).unwrap_or(2)),
+                        dep_type,
+                    },
+                    _ => IssueWithDependencyMetadata {
+                        id: issue_id.to_string(),
+                        title: format!("[missing issue: {issue_id}]"),
+                        status: Status::Tombstone,
+                        priority: Priority::MEDIUM,
+                        dep_type,
+                    },
+                };
+
+                map.entry(depends_on_id.to_string()).or_default().push(meta);
+            }
+        }
+
+        Ok(map)
+    }
+
     /// Count dependencies and dependents for multiple issues with one round-trip per chunk.
     ///
     /// # Errors

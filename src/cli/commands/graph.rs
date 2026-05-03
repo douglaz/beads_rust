@@ -11,7 +11,7 @@ use super::{
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{format_status_label, sanitize_terminal_inline};
+use crate::format::{IssueWithDependencyMetadata, format_status_label, sanitize_terminal_inline};
 use crate::model::{Issue, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -22,6 +22,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use tracing::debug;
 use unicode_width::UnicodeWidthStr;
+
+const GRAPH_DEPENDENTS_BATCH_SIZE: usize = 400;
 
 /// JSON output for a single node in the graph.
 #[derive(Debug, Clone, Serialize)]
@@ -548,7 +550,7 @@ fn collect_single_graph(
     let mut queued_nodes: HashSet<String> = HashSet::new();
 
     let metadata_cache = storage.get_active_issues_metadata()?;
-    let dependents_cache = storage.prefetch_blocking_dependents()?;
+    let mut dependents_cache: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
 
     let mut stack: Vec<String> = vec![root_id.to_string()];
     queued_nodes.insert(root_id.to_string());
@@ -565,6 +567,11 @@ fn collect_single_graph(
         if !expanded_nodes.insert(current_id.clone()) {
             continue;
         }
+
+        let mut frontier_batch = Vec::with_capacity(stack.len().saturating_add(1));
+        frontier_batch.push(current_id.clone());
+        frontier_batch.extend(stack.iter().rev().cloned());
+        cache_graph_dependents(storage, &mut dependents_cache, &frontier_batch)?;
 
         let mut dependents: Vec<_> = dependents_cache
             .get(&current_id)
@@ -614,6 +621,38 @@ fn collect_single_graph(
         issues_by_id,
         edges,
     })
+}
+
+fn cache_graph_dependents(
+    storage: &SqliteStorage,
+    dependents_cache: &mut HashMap<String, Vec<IssueWithDependencyMetadata>>,
+    issue_ids: &[String],
+) -> Result<()> {
+    let mut missing_ids = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for issue_id in issue_ids {
+        if dependents_cache.contains_key(issue_id.as_str()) || !seen_ids.insert(issue_id.as_str()) {
+            continue;
+        }
+        missing_ids.push(issue_id.clone());
+        if missing_ids.len() == GRAPH_DEPENDENTS_BATCH_SIZE {
+            break;
+        }
+    }
+
+    if missing_ids.is_empty() {
+        return Ok(());
+    }
+
+    let fetched = storage.get_blocking_dependents_for_issue_ids(&missing_ids)?;
+    for issue_id in &missing_ids {
+        dependents_cache.insert(
+            issue_id.clone(),
+            fetched.get(issue_id).cloned().unwrap_or_default(),
+        );
+    }
+
+    Ok(())
 }
 
 fn build_graph_nodes(
@@ -1843,6 +1882,67 @@ mod tests {
                 "bd-b".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_cache_graph_dependents_batches_frontier_roots() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = chrono::Utc::now();
+
+        for (id, title, priority) in [
+            ("bd-root", "Root", 1),
+            ("bd-a", "A", 1),
+            ("bd-b", "B", 2),
+            ("bd-c", "C", 3),
+        ] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: title.to_string(),
+                status: Status::Open,
+                priority: crate::model::Priority(priority),
+                issue_type: crate::model::IssueType::Task,
+                created_at: t1,
+                updated_at: t1,
+                ..Default::default()
+            };
+            storage.create_issue(&issue, "test").unwrap();
+        }
+
+        let created_at = t1.to_rfc3339();
+        storage
+            .execute_test_sql(&format!(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-a', 'bd-root', 'blocks', '{created_at}', 'test');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-b', 'bd-root', 'blocks', '{created_at}', 'test');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-c', 'bd-a', 'blocks', '{created_at}', 'test');"
+            ))
+            .unwrap();
+
+        let mut cache = HashMap::new();
+        cache_graph_dependents(
+            &storage,
+            &mut cache,
+            &["bd-root".to_string(), "bd-a".to_string()],
+        )
+        .unwrap();
+
+        let root_dependents: Vec<_> = cache.get("bd-root").map_or_else(Vec::new, |dependents| {
+            dependents
+                .iter()
+                .map(|dependent| dependent.id.as_str())
+                .collect()
+        });
+        assert_eq!(root_dependents, vec!["bd-a", "bd-b"]);
+
+        let a_dependents: Vec<_> = cache.get("bd-a").map_or_else(Vec::new, |dependents| {
+            dependents
+                .iter()
+                .map(|dependent| dependent.id.as_str())
+                .collect()
+        });
+        assert_eq!(a_dependents, vec!["bd-c"]);
     }
 
     #[test]

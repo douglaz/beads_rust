@@ -150,7 +150,7 @@ fn execute_inner(
         statuses: Some(vec![Status::Open, Status::InProgress]),
         ..Default::default()
     };
-    let issues = storage.list_issues(&filters)?;
+    let issues = storage.list_orphan_candidate_issues_for_command_output(&filters)?;
     if issues.is_empty() {
         output_empty(render_mode, ctx)?;
         return Ok(());

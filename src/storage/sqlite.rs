@@ -3122,11 +3122,73 @@ impl SqliteStorage {
              FROM issues
              WHERE status IN ('open', 'in_progress')
                AND (is_template = 0 OR is_template IS NULL)
-             ORDER BY priority ASC, created_at DESC, id ASC",
+             ORDER BY COALESCE(priority, 2) ASC, created_at DESC, id ASC",
         )?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::orphan_candidate_issue_from_row(row)?);
+            issues.push(Self::command_summary_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
+    /// List graph command issues without hydrating fields graph rendering never inspects.
+    ///
+    /// This is intentionally narrow and falls back to `list_issues` if the
+    /// filter shape expands beyond what `br graph --all` currently uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_graph_issues_for_command_output(
+        &self,
+        filters: &ListFilters,
+    ) -> Result<Vec<Issue>> {
+        let unsupported_filter = filters
+            .statuses
+            .as_ref()
+            .is_some_and(|statuses| !statuses.is_empty())
+            || filters
+                .labels
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .labels_or
+                .as_ref()
+                .is_some_and(|labels| !labels.is_empty())
+            || filters
+                .types
+                .as_ref()
+                .is_some_and(|types| !types.is_empty())
+            || filters
+                .priorities
+                .as_ref()
+                .is_some_and(|priorities| !priorities.is_empty())
+            || filters.assignee.is_some()
+            || filters.unassigned
+            || filters.include_closed
+            || !filters.include_deferred
+            || filters.include_templates
+            || filters.title_contains.is_some()
+            || filters.updated_before.is_some()
+            || filters.updated_after.is_some()
+            || filters.limit.is_some()
+            || filters.offset.is_some()
+            || filters.sort.is_some()
+            || filters.reverse;
+        if unsupported_filter {
+            return self.list_issues(filters);
+        }
+
+        let rows = self.conn.query(
+            "SELECT id, title, status, priority, issue_type, created_at, updated_at
+             FROM issues
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND (is_template = 0 OR is_template IS NULL)
+             ORDER BY COALESCE(priority, 2) ASC, created_at DESC, id ASC",
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::command_summary_issue_from_row(row)?);
         }
         Ok(issues)
     }
@@ -8361,7 +8423,7 @@ impl SqliteStorage {
         })
     }
 
-    fn orphan_candidate_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn command_summary_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -13428,6 +13490,83 @@ mod tests {
         let projected_issue = projected_raw
             .iter()
             .find(|issue| issue.id == "bd-orphan-open")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.owner.is_none());
+        assert!(projected_issue.sender.is_none());
+
+        let projected = projected_raw
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+
+        assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_list_graph_issues_for_command_output_matches_full_graph_fields() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 12, 12, 0, 0).unwrap();
+
+        let mut open_issue = make_issue(
+            "bd-graph-open",
+            "Open graph node",
+            Status::Open,
+            1,
+            None,
+            now,
+            None,
+        );
+        open_issue.description = Some("Should not be loaded".to_string());
+        open_issue.design = Some("unused design".repeat(512));
+        open_issue.acceptance_criteria = Some("unused ac".repeat(512));
+        open_issue.notes = Some("unused notes".repeat(512));
+        open_issue.owner = Some("owner".to_string());
+        open_issue.sender = Some("cli".to_string());
+
+        let deferred_issue = make_issue(
+            "bd-graph-deferred",
+            "Deferred graph node",
+            Status::Deferred,
+            2,
+            None,
+            now - chrono::Duration::minutes(1),
+            None,
+        );
+        let mut closed_issue = make_issue(
+            "bd-graph-closed",
+            "Closed non-node",
+            Status::Closed,
+            3,
+            None,
+            now - chrono::Duration::minutes(2),
+            None,
+        );
+        closed_issue.closed_at = Some(now);
+
+        storage.create_issue(&open_issue, "tester").unwrap();
+        storage.create_issue(&deferred_issue, "tester").unwrap();
+        storage.create_issue(&closed_issue, "tester").unwrap();
+
+        let filters = ListFilters {
+            include_deferred: true,
+            ..ListFilters::default()
+        };
+        let full = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+        let projected_raw = storage
+            .list_graph_issues_for_command_output(&filters)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-graph-open")
             .unwrap();
         assert!(projected_issue.description.is_none());
         assert!(projected_issue.design.is_none());

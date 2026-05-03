@@ -270,7 +270,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
         ..Default::default()
     };
 
-    let issues = storage.list_issues(&filters)?;
+    let issues = storage.list_graph_issues_for_command_output(&filters)?;
     debug!(count = issues.len(), "Found issues for graph");
 
     if issues.is_empty() {

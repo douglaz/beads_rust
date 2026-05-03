@@ -1,6 +1,6 @@
 use crate::cli::{CountArgs, CountBy};
 use crate::config;
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::Status;
 use crate::output::OutputContext;
@@ -85,19 +85,7 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
     filters.include_templates = args.include_templates;
     filters.title_contains.clone_from(&args.title_contains);
 
-    let by = args.by.or(if args.by_status {
-        Some(CountBy::Status)
-    } else if args.by_priority {
-        Some(CountBy::Priority)
-    } else if args.by_type {
-        Some(CountBy::Type)
-    } else if args.by_assignee {
-        Some(CountBy::Assignee)
-    } else if args.by_label {
-        Some(CountBy::Label)
-    } else {
-        None
-    });
+    let by = resolve_count_grouping(args)?;
 
     match by {
         None => {
@@ -142,6 +130,45 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
     }
 
     Ok(())
+}
+
+fn resolve_count_grouping(args: &CountArgs) -> Result<Option<CountBy>> {
+    let mut selected = Vec::with_capacity(6);
+
+    if let Some(by) = args.by {
+        selected.push(("--by", by));
+    }
+    if args.by_status {
+        selected.push(("--by-status", CountBy::Status));
+    }
+    if args.by_priority {
+        selected.push(("--by-priority", CountBy::Priority));
+    }
+    if args.by_type {
+        selected.push(("--by-type", CountBy::Type));
+    }
+    if args.by_assignee {
+        selected.push(("--by-assignee", CountBy::Assignee));
+    }
+    if args.by_label {
+        selected.push(("--by-label", CountBy::Label));
+    }
+
+    if selected.len() > 1 {
+        let mut flags = String::new();
+        for (index, (flag, _)) in selected.iter().enumerate() {
+            if index > 0 {
+                flags.push_str(", ");
+            }
+            flags.push_str(flag);
+        }
+        return Err(BeadsError::Validation {
+            field: "by".to_string(),
+            reason: format!("only one count grouping selector can be specified; got {flags}"),
+        });
+    }
+
+    Ok(selected.first().map(|(_, by)| *by))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -511,6 +538,25 @@ mod tests {
         crate::logging::init_test_logging();
     }
 
+    fn count_args() -> CountArgs {
+        CountArgs {
+            by: None,
+            by_status: false,
+            by_priority: false,
+            by_type: false,
+            by_assignee: false,
+            by_label: false,
+            status: vec![],
+            types: vec![],
+            priority: vec![],
+            assignee: None,
+            unassigned: false,
+            include_closed: false,
+            include_templates: false,
+            title_contains: None,
+        }
+    }
+
     fn make_issue(id: &str, status: Status, priority: Priority, issue_type: IssueType) -> Issue {
         Issue {
             id: id.to_string(),
@@ -752,5 +798,46 @@ mod tests {
 
         info!("test_parse_count_filters_trim_delimited_whitespace: assertions passed");
         Ok(())
+    }
+
+    #[test]
+    fn test_resolve_count_grouping_selects_single_selector() -> Result<()> {
+        init_logging();
+        info!("test_resolve_count_grouping_selects_single_selector: starting");
+
+        let args = count_args();
+        assert_eq!(resolve_count_grouping(&args)?, None);
+
+        let mut args = count_args();
+        args.by = Some(CountBy::Priority);
+        assert_eq!(resolve_count_grouping(&args)?, Some(CountBy::Priority));
+
+        let mut args = count_args();
+        args.by_assignee = true;
+        assert_eq!(resolve_count_grouping(&args)?, Some(CountBy::Assignee));
+
+        info!("test_resolve_count_grouping_selects_single_selector: assertions passed");
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_count_grouping_rejects_conflicting_selectors() {
+        init_logging();
+        info!("test_resolve_count_grouping_rejects_conflicting_selectors: starting");
+
+        let mut args = count_args();
+        args.by = Some(CountBy::Status);
+        args.by_label = true;
+
+        let err = resolve_count_grouping(&args).expect_err("conflicting selectors should fail");
+        assert!(matches!(
+            err,
+            BeadsError::Validation { ref field, ref reason }
+                if field == "by"
+                    && reason.contains("--by")
+                    && reason.contains("--by-label")
+        ));
+
+        info!("test_resolve_count_grouping_rejects_conflicting_selectors: assertions passed");
     }
 }

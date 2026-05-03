@@ -3029,21 +3029,34 @@ impl SqliteStorage {
             || filters.title_contains.is_some()
             || filters.updated_before.is_some()
             || filters.updated_after.is_some()
-            || filters.limit.is_some_and(|limit| limit != 0)
-            || filters.offset.is_some_and(|offset| offset != 0)
             || filters.sort.is_some()
             || filters.reverse;
         if unsupported_filter {
             return self.list_issues(filters);
         }
 
-        let rows = self.conn.query(
+        let mut sql = String::from(
             "SELECT id, title, status, priority, issue_type, created_at, updated_at
              FROM issues
              WHERE status NOT IN ('closed', 'tombstone')
                AND (is_template = 0 OR is_template IS NULL)
              ORDER BY COALESCE(priority, 2) ASC, created_at DESC, id ASC",
-        )?;
+        );
+        match (filters.limit, filters.offset) {
+            (Some(limit), offset) if limit > 0 => {
+                let _ = write!(sql, " LIMIT {limit}");
+                if let Some(offset) = offset
+                    && offset > 0
+                {
+                    let _ = write!(sql, " OFFSET {offset}");
+                }
+            }
+            (_, Some(offset)) if offset > 0 => {
+                let _ = write!(sql, " LIMIT -1 OFFSET {offset}");
+            }
+            _ => {}
+        }
+        let rows = self.conn.query(&sql)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             issues.push(Self::command_summary_issue_from_row(row)?);
@@ -14239,6 +14252,90 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_list_text_issues_for_command_output_supports_limit_offset() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 13, 12, 0, 0).unwrap();
+
+        let mut oldest_high = make_issue(
+            "bd-list-high-old",
+            "High old",
+            Status::Open,
+            1,
+            None,
+            now - chrono::Duration::minutes(2),
+            None,
+        );
+        oldest_high.description = Some("Should not be loaded".repeat(256));
+        let newest_high = make_issue(
+            "bd-list-high-new",
+            "High new",
+            Status::Open,
+            1,
+            None,
+            now,
+            None,
+        );
+        let normal = make_issue(
+            "bd-list-normal",
+            "Normal",
+            Status::Open,
+            2,
+            None,
+            now - chrono::Duration::minutes(1),
+            None,
+        );
+
+        storage.create_issue(&oldest_high, "tester").unwrap();
+        storage.create_issue(&newest_high, "tester").unwrap();
+        storage.create_issue(&normal, "tester").unwrap();
+
+        let filters = ListFilters {
+            include_deferred: true,
+            limit: Some(2),
+            offset: Some(1),
+            ..ListFilters::default()
+        };
+        let full = storage
+            .list_issues(&filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+        let projected_raw = storage
+            .list_text_issues_for_command_output(&filters)
+            .unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-list-high-old")
+            .unwrap();
+        assert!(projected_issue.description.is_none());
+
+        let projected = projected_raw
+            .into_iter()
+            .map(|issue| (issue.id, issue.title, issue.status, issue.priority))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            projected,
+            vec![
+                (
+                    "bd-list-high-old".to_string(),
+                    "High old".to_string(),
+                    Status::Open,
+                    Priority(1),
+                ),
+                (
+                    "bd-list-normal".to_string(),
+                    "Normal".to_string(),
+                    Status::Open,
+                    Priority(2),
+                ),
+            ]
+        );
         assert_eq!(projected, full);
     }
 

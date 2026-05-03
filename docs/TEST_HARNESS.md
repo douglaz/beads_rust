@@ -177,12 +177,22 @@ the `perf-evidence-manifest.json`, timing samples, placeholder syscall/IO/RSS
 slots, golden stdout/stderr checksums, an isomorphism note, and an enforcing
 self-baseline comparison.
 
-**Synthetic scale (10k–250k issues)**
+**Synthetic scale (CI profile, 10k–250k issues, and manual million-agent profile)**
 ```bash
+ cargo test --test bench_synthetic_scale synthetic_ci_profile -- --nocapture
 BR_E2E_STRESS=1 cargo test --test bench_synthetic_scale -- --nocapture --ignored
+BR_E2E_STRESS=1 BR_SYNTHETIC_MILLION=1 BR_SYNTHETIC_SEED=42 \
+  cargo test --test bench_synthetic_scale stress_synthetic_million -- --nocapture --ignored
 ```
 Outputs: `target/benchmark-results/synthetic_*_latest.json`,
-`target/benchmark-results/synthetic_all_<timestamp>.json`
+`target/benchmark-results/synthetic_all_<timestamp>.json`. The generator streams
+deterministic JSONL directly, then validates the corpus through real
+`br sync --import-only`, `br doctor --json`, and `br sync --status --json`
+surfaces. Each generated workspace writes `synthetic-corpus-manifest.json` with
+the seed, issue count, dependency density, label/comment distributions, simulated
+agent count, claim density, skewed-DAG factor, JSONL hash, file-size report, and
+health results. The manual million profile targets 1,000,000 issues and 10,000
+simulated agents when the host has enough memory and CPU.
 
 **Real datasets**
 ```bash

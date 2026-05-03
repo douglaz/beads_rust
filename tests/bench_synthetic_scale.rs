@@ -35,13 +35,18 @@
 
 mod common;
 
+use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
+use beads_rust::util::hex_encode;
+use chrono::Utc;
 use common::binary_discovery::discover_binaries;
 use common::dataset_registry::KnownDataset;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -56,6 +61,18 @@ fn stress_tests_enabled() -> bool {
     std::env::var("BR_E2E_STRESS").is_ok()
 }
 
+/// Check if the manual million-issue profile is enabled.
+fn million_profile_enabled() -> bool {
+    std::env::var("BR_SYNTHETIC_MILLION").is_ok()
+}
+
+fn synthetic_seed_from_env(default_seed: u64) -> u64 {
+    std::env::var("BR_SYNTHETIC_SEED")
+        .ok()
+        .and_then(|seed| seed.parse().ok())
+        .unwrap_or(default_seed)
+}
+
 /// Scale tier for synthetic datasets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleTier {
@@ -67,6 +84,8 @@ pub enum ScaleTier {
     Large,
     /// 250,000 issues - extreme stress test
     XLarge,
+    /// 1,000,000 issues - manual 256GB+/64-core profile
+    Million,
 }
 
 impl ScaleTier {
@@ -77,6 +96,7 @@ impl ScaleTier {
             Self::Medium => 50_000,
             Self::Large => 100_000,
             Self::XLarge => 250_000,
+            Self::Million => 1_000_000,
         }
     }
 
@@ -87,6 +107,7 @@ impl ScaleTier {
             Self::Medium => "medium_50k",
             Self::Large => "large_100k",
             Self::XLarge => "xlarge_250k",
+            Self::Million => "million_1m",
         }
     }
 
@@ -97,6 +118,7 @@ impl ScaleTier {
             Self::Small => 0.3,
             Self::Medium | Self::Large => 0.5,
             Self::XLarge => 0.7,
+            Self::Million => 0.9,
         }
     }
 }
@@ -116,6 +138,22 @@ pub struct SyntheticConfig {
     pub seed: u64,
     /// Base dataset to expand (for realistic patterns)
     pub base_dataset: Option<KnownDataset>,
+    /// Number of label names in the synthetic label pool.
+    pub label_pool_size: usize,
+    /// Minimum labels assigned per issue.
+    pub min_labels_per_issue: usize,
+    /// Maximum labels assigned per issue.
+    pub max_labels_per_issue: usize,
+    /// Probability that an issue receives comments.
+    pub comment_density: f64,
+    /// Maximum comments per commented issue.
+    pub max_comments_per_issue: usize,
+    /// Simulated agent identities available for claims and comments.
+    pub simulated_agent_count: usize,
+    /// Probability that an issue is claimed by a simulated agent.
+    pub claim_density: f64,
+    /// Bias dependencies toward low-numbered hub issues for skewed DAG profiles.
+    pub dag_skew: f64,
 }
 
 impl SyntheticConfig {
@@ -126,12 +164,103 @@ impl SyntheticConfig {
             dependency_density: tier.dependency_density(),
             seed: 42, // Reproducible by default
             base_dataset: Some(KnownDataset::BeadsRust),
+            label_pool_size: 64,
+            min_labels_per_issue: 0,
+            max_labels_per_issue: 4,
+            comment_density: 0.15,
+            max_comments_per_issue: 3,
+            simulated_agent_count: 10_000,
+            claim_density: 0.05,
+            dag_skew: 1.25,
+        }
+    }
+
+    #[must_use]
+    pub const fn ci_profile(seed: u64) -> Self {
+        Self {
+            issue_count: 256,
+            dependency_density: 0.4,
+            seed,
+            base_dataset: None,
+            label_pool_size: 12,
+            min_labels_per_issue: 0,
+            max_labels_per_issue: 3,
+            comment_density: 0.25,
+            max_comments_per_issue: 2,
+            simulated_agent_count: 16,
+            claim_density: 0.2,
+            dag_skew: 0.8,
+        }
+    }
+
+    #[must_use]
+    pub const fn million_agent_profile(seed: u64) -> Self {
+        Self {
+            issue_count: ScaleTier::Million.issue_count(),
+            dependency_density: ScaleTier::Million.dependency_density(),
+            seed,
+            base_dataset: Some(KnownDataset::BeadsRust),
+            label_pool_size: 512,
+            min_labels_per_issue: 1,
+            max_labels_per_issue: 6,
+            comment_density: 0.2,
+            max_comments_per_issue: 4,
+            simulated_agent_count: 10_000,
+            claim_density: 0.08,
+            dag_skew: 1.8,
         }
     }
 
     #[must_use]
     pub const fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_issue_count(mut self, issue_count: usize) -> Self {
+        self.issue_count = issue_count;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_label_distribution(
+        mut self,
+        label_pool_size: usize,
+        min_labels_per_issue: usize,
+        max_labels_per_issue: usize,
+    ) -> Self {
+        self.label_pool_size = label_pool_size;
+        self.min_labels_per_issue = min_labels_per_issue;
+        self.max_labels_per_issue = max_labels_per_issue;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_comment_distribution(
+        mut self,
+        comment_density: f64,
+        max_comments_per_issue: usize,
+    ) -> Self {
+        self.comment_density = comment_density;
+        self.max_comments_per_issue = max_comments_per_issue;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_agent_distribution(
+        mut self,
+        simulated_agent_count: usize,
+        claim_density: f64,
+    ) -> Self {
+        self.simulated_agent_count = simulated_agent_count;
+        self.claim_density = claim_density;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_dag_skew(mut self, dag_skew: f64) -> Self {
+        self.dag_skew = dag_skew;
         self
     }
 }
@@ -143,12 +272,69 @@ pub struct GenerationMetrics {
     pub issue_count: usize,
     /// Actual dependency count generated
     pub dependency_count: usize,
+    /// Total labels assigned across all issues.
+    pub label_assignment_count: usize,
+    /// Total comments generated across all issues.
+    pub comment_count: usize,
+    /// Number of simulated agent identities in the corpus.
+    pub simulated_agent_count: usize,
+    /// Number of claimed issues assigned to simulated agents.
+    pub claim_count: usize,
     /// Generation duration
     pub generation_ms: u128,
     /// JSONL file size in bytes
     pub jsonl_size_bytes: u64,
+    /// Byte count predicted by the generator while streaming JSONL.
+    pub expected_jsonl_size_bytes: u64,
     /// DB file size after rebuild
     pub db_size_bytes: u64,
+    /// SHA-256 hash of generated issues.jsonl.
+    pub content_hash: String,
+    /// Health checks recorded after import/rebuild.
+    pub health: GenerationHealth,
+}
+
+/// Health evidence for a generated corpus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationHealth {
+    /// Every JSONL line parsed as an Issue.
+    pub jsonl_valid: bool,
+    /// Number of valid JSONL issue records.
+    pub jsonl_issue_count: usize,
+    /// `br sync --import-only --json` succeeded.
+    pub sync_import_ok: bool,
+    /// `br doctor --json` succeeded after import.
+    pub doctor_ok: bool,
+    /// `br sync --status --json` reported no dirty DB/JSONL divergence.
+    pub sync_status_clean: bool,
+}
+
+/// Reproducibility manifest for a generated synthetic corpus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyntheticCorpusManifest {
+    pub schema_version: String,
+    pub generator: String,
+    pub generated_at: String,
+    pub config: SyntheticConfigSnapshot,
+    pub metrics: GenerationMetrics,
+    pub reproduction_command: String,
+}
+
+/// Serializable subset of SyntheticConfig.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyntheticConfigSnapshot {
+    pub issue_count: usize,
+    pub dependency_density: f64,
+    pub seed: u64,
+    pub base_dataset: Option<String>,
+    pub label_pool_size: usize,
+    pub min_labels_per_issue: usize,
+    pub max_labels_per_issue: usize,
+    pub comment_density: f64,
+    pub max_comments_per_issue: usize,
+    pub simulated_agent_count: usize,
+    pub claim_density: f64,
+    pub dag_skew: f64,
 }
 
 /// A generated synthetic dataset in an isolated workspace.
@@ -156,6 +342,7 @@ pub struct SyntheticDataset {
     pub temp_dir: TempDir,
     pub root: PathBuf,
     pub beads_dir: PathBuf,
+    pub manifest_path: PathBuf,
     pub config: SyntheticConfig,
     pub metrics: GenerationMetrics,
 }
@@ -171,6 +358,7 @@ impl SyntheticDataset {
         let temp_dir = TempDir::new()?;
         let root = temp_dir.path().to_path_buf();
         let beads_dir = root.join(".beads");
+        let manifest_path = root.join("synthetic-corpus-manifest.json");
 
         // Create minimal git scaffold
         fs::create_dir_all(root.join(".git"))?;
@@ -189,140 +377,57 @@ impl SyntheticDataset {
             )));
         }
 
-        // Generate synthetic issues
-        let mut rng = StdRng::seed_from_u64(config.seed);
-        let mut dependency_count = 0;
-
-        // Pre-compute issue IDs for dependency references (unused but kept for reference)
-        let _issue_ids: Vec<String> = (0..config.issue_count)
-            .map(|i| format!("synth-{i:08x}"))
-            .collect();
-
-        // Generate issues via br CLI (batch creates)
-        let batch_size = 1000; // Create in batches to avoid command-line limits
-        let mut created_count = 0;
-
-        for batch_start in (0..config.issue_count).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(config.issue_count);
-
-            for i in batch_start..batch_end {
-                let issue_type = match rng.random_range(0..10) {
-                    0..=5 => "task",
-                    6..=8 => "bug",
-                    _ => "feature",
-                };
-
-                let priority = rng.random_range(0..=4);
-                let title = generate_title(&mut rng, i);
-
-                let create_output = Command::new(br_path)
-                    .args([
-                        "create",
-                        "--title",
-                        &title,
-                        "--type",
-                        issue_type,
-                        "--priority",
-                        &priority.to_string(),
-                    ])
-                    .current_dir(&root)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()?;
-
-                if !create_output.status.success() {
-                    eprintln!(
-                        "Warning: create failed for issue {i}: {}",
-                        String::from_utf8_lossy(&create_output.stderr)
-                    );
-                    continue;
-                }
-
-                created_count += 1;
-
-                // Progress indicator
-                if created_count % 5000 == 0 {
-                    eprintln!(
-                        "  Generated {created_count}/{} issues...",
-                        config.issue_count
-                    );
-                }
-            }
-        }
-
-        // Add dependencies (in a second pass to ensure all issues exist)
-        if config.dependency_density > 0.0 {
-            eprintln!("  Adding dependencies...");
-
-            // Get list of actual issue IDs
-            let list_output = Command::new(br_path)
-                .args(["list", "--json"])
-                .current_dir(&root)
-                .output()?;
-
-            if list_output.status.success() {
-                let actual_ids: Vec<String> = String::from_utf8_lossy(&list_output.stdout)
-                    .lines()
-                    .filter_map(|line| {
-                        serde_json::from_str::<serde_json::Value>(line)
-                            .ok()
-                            .and_then(|v| v["id"].as_str().map(String::from))
-                    })
-                    .collect();
-
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let target_deps =
-                    (actual_ids.len() as f64 * config.dependency_density).round() as usize;
-                let mut added_deps = 0;
-
-                for _ in 0..target_deps {
-                    if actual_ids.len() < 2 {
-                        break;
-                    }
-
-                    let from_idx = rng.random_range(1..actual_ids.len());
-                    let to_idx = rng.random_range(0..from_idx); // Dependency on earlier issue
-
-                    let dep_output = Command::new(br_path)
-                        .args(["dep", "add", &actual_ids[from_idx], &actual_ids[to_idx]])
-                        .current_dir(&root)
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .output()?;
-
-                    if dep_output.status.success() {
-                        added_deps += 1;
-                        dependency_count += 1;
-                    }
-
-                    if added_deps % 1000 == 0 && added_deps > 0 {
-                        eprintln!("  Added {added_deps}/{target_deps} dependencies...");
-                    }
-                }
-            }
-        }
+        let generated = write_synthetic_jsonl(&config, &beads_dir.join("issues.jsonl"))?;
+        let sync_import_ok = run_br_status(
+            br_path,
+            ["sync", "--import-only", "--json"],
+            &root,
+            "br sync --import-only",
+        )?;
+        let doctor_ok = run_br_status(br_path, ["doctor", "--json"], &root, "br doctor")?;
+        let sync_status_clean = sync_status_is_clean(br_path, &root)?;
+        let jsonl_health = validate_generated_jsonl(&beads_dir.join("issues.jsonl"))?;
 
         let generation_ms = start.elapsed().as_millis();
-
-        // Measure file sizes
-        let jsonl_path = beads_dir.join("issues.jsonl");
         let db_path = beads_dir.join("beads.db");
-
-        let jsonl_size_bytes = fs::metadata(&jsonl_path).map_or(0, |m| m.len());
         let db_size_bytes = fs::metadata(&db_path).map_or(0, |m| m.len());
 
         let metrics = GenerationMetrics {
-            issue_count: created_count,
-            dependency_count,
+            issue_count: generated.issue_count,
+            dependency_count: generated.dependency_count,
+            label_assignment_count: generated.label_assignment_count,
+            comment_count: generated.comment_count,
+            simulated_agent_count: config.simulated_agent_count,
+            claim_count: generated.claim_count,
             generation_ms,
-            jsonl_size_bytes,
+            jsonl_size_bytes: generated.jsonl_size_bytes,
+            expected_jsonl_size_bytes: generated.expected_jsonl_size_bytes,
             db_size_bytes,
+            content_hash: generated.content_hash,
+            health: GenerationHealth {
+                jsonl_valid: jsonl_health.valid,
+                jsonl_issue_count: jsonl_health.issue_count,
+                sync_import_ok,
+                doctor_ok,
+                sync_status_clean,
+            },
         };
+
+        let manifest = SyntheticCorpusManifest {
+            schema_version: "br.synthetic-corpus.v1".to_string(),
+            generator: "bench_synthetic_scale::write_synthetic_jsonl".to_string(),
+            generated_at: Utc::now().to_rfc3339(),
+            config: SyntheticConfigSnapshot::from(&config),
+            metrics: metrics.clone(),
+            reproduction_command: reproduction_command_for(&config),
+        };
+        write_json_pretty(&manifest_path, &manifest)?;
 
         Ok(Self {
             temp_dir,
             root,
             beads_dir,
+            manifest_path,
             config,
             metrics,
         })
@@ -332,6 +437,395 @@ impl SyntheticDataset {
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
         &self.root
+    }
+}
+
+impl From<&SyntheticConfig> for SyntheticConfigSnapshot {
+    fn from(config: &SyntheticConfig) -> Self {
+        Self {
+            issue_count: config.issue_count,
+            dependency_density: config.dependency_density,
+            seed: config.seed,
+            base_dataset: config
+                .base_dataset
+                .map(|dataset| dataset.name().to_string()),
+            label_pool_size: config.label_pool_size,
+            min_labels_per_issue: config.min_labels_per_issue,
+            max_labels_per_issue: config.max_labels_per_issue,
+            comment_density: config.comment_density,
+            max_comments_per_issue: config.max_comments_per_issue,
+            simulated_agent_count: config.simulated_agent_count,
+            claim_density: config.claim_density,
+            dag_skew: config.dag_skew,
+        }
+    }
+}
+
+struct GeneratedCorpusStats {
+    issue_count: usize,
+    dependency_count: usize,
+    label_assignment_count: usize,
+    comment_count: usize,
+    claim_count: usize,
+    jsonl_size_bytes: u64,
+    expected_jsonl_size_bytes: u64,
+    content_hash: String,
+}
+
+struct JsonlHealth {
+    valid: bool,
+    issue_count: usize,
+}
+
+fn write_synthetic_jsonl(
+    config: &SyntheticConfig,
+    jsonl_path: &Path,
+) -> std::io::Result<GeneratedCorpusStats> {
+    let file = File::create(jsonl_path)?;
+    let mut writer = BufWriter::new(file);
+    let mut hasher = Sha256::new();
+    let mut rng = StdRng::seed_from_u64(config.seed);
+
+    let mut stats = GeneratedCorpusStats {
+        issue_count: 0,
+        dependency_count: 0,
+        label_assignment_count: 0,
+        comment_count: 0,
+        claim_count: 0,
+        jsonl_size_bytes: 0,
+        expected_jsonl_size_bytes: 0,
+        content_hash: String::new(),
+    };
+
+    for index in 0..config.issue_count {
+        let issue = generate_synthetic_issue(config, &mut rng, index, &mut stats);
+        let line = serde_json::to_vec(&issue)?;
+        writer.write_all(&line)?;
+        writer.write_all(b"\n")?;
+        hasher.update(&line);
+        hasher.update(b"\n");
+        stats.expected_jsonl_size_bytes = stats
+            .expected_jsonl_size_bytes
+            .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
+            .saturating_add(1);
+        stats.issue_count += 1;
+
+        if stats.issue_count.is_multiple_of(100_000) {
+            eprintln!(
+                "  Streamed {}/{} synthetic issues...",
+                stats.issue_count, config.issue_count
+            );
+        }
+    }
+    writer.flush()?;
+
+    stats.jsonl_size_bytes = fs::metadata(jsonl_path).map_or(0, |metadata| metadata.len());
+    stats.content_hash = hex_encode(&hasher.finalize());
+    Ok(stats)
+}
+
+fn generate_synthetic_issue(
+    config: &SyntheticConfig,
+    rng: &mut StdRng,
+    index: usize,
+    stats: &mut GeneratedCorpusStats,
+) -> Issue {
+    let id = synthetic_issue_id(index);
+    let created_at = synthetic_timestamp(index);
+    let labels = generate_labels(config, rng);
+    let dependencies = generate_dependencies(config, rng, index, &id, created_at);
+    let comments = generate_comments(config, rng, index, &id, created_at, stats.comment_count);
+    let assignee = choose_claimed_agent(config, rng);
+
+    stats.dependency_count += dependencies.len();
+    stats.label_assignment_count += labels.len();
+    stats.comment_count += comments.len();
+    if assignee.is_some() {
+        stats.claim_count += 1;
+    }
+
+    Issue {
+        id,
+        title: generate_title(rng, index),
+        description: Some(format!(
+            "Synthetic scale corpus issue {index}; seed={}; agents={}; generated for br large-workspace benchmarking.",
+            config.seed, config.simulated_agent_count
+        )),
+        status: if assignee.is_some() {
+            Status::InProgress
+        } else {
+            Status::Open
+        },
+        priority: Priority(rng.random_range(0..=4)),
+        issue_type: synthetic_issue_type(rng),
+        assignee,
+        created_at,
+        created_by: Some(synthetic_agent_name(
+            config.seed,
+            index % effective_agent_count(config),
+        )),
+        updated_at: created_at,
+        source_repo: Some("synthetic-swarm-corpus".to_string()),
+        compaction_level: Some(0),
+        original_size: Some(0),
+        labels,
+        dependencies,
+        comments,
+        ..Issue::default()
+    }
+}
+
+fn synthetic_issue_id(index: usize) -> String {
+    format!("synth-{index:08x}")
+}
+
+fn synthetic_timestamp(index: usize) -> chrono::DateTime<Utc> {
+    let base = chrono::DateTime::<Utc>::UNIX_EPOCH;
+    base + chrono::Duration::seconds(usize_to_i64(index % 86_400))
+}
+
+fn synthetic_issue_type(rng: &mut StdRng) -> IssueType {
+    match rng.random_range(0..10) {
+        0..=5 => IssueType::Task,
+        6..=7 => IssueType::Bug,
+        8 => IssueType::Feature,
+        _ => IssueType::Chore,
+    }
+}
+
+fn effective_agent_count(config: &SyntheticConfig) -> usize {
+    config.simulated_agent_count.max(1)
+}
+
+fn synthetic_agent_name(seed: u64, index: usize) -> String {
+    format!("agent-{seed:016x}-{index:05}")
+}
+
+fn choose_claimed_agent(config: &SyntheticConfig, rng: &mut StdRng) -> Option<String> {
+    if config.claim_density <= 0.0 {
+        return None;
+    }
+    if rng.random_range(0.0..1.0) >= config.claim_density.min(1.0) {
+        return None;
+    }
+    Some(synthetic_agent_name(
+        config.seed,
+        rng.random_range(0..effective_agent_count(config)),
+    ))
+}
+
+fn generate_labels(config: &SyntheticConfig, rng: &mut StdRng) -> Vec<String> {
+    if config.label_pool_size == 0 || config.max_labels_per_issue == 0 {
+        return Vec::new();
+    }
+
+    let min = config.min_labels_per_issue.min(config.max_labels_per_issue);
+    let max = config.max_labels_per_issue.max(min);
+    let label_count = rng.random_range(min..=max).min(config.label_pool_size);
+    let mut labels = BTreeSet::new();
+
+    while labels.len() < label_count {
+        labels.insert(format!(
+            "label-{:03}",
+            rng.random_range(0..config.label_pool_size)
+        ));
+    }
+
+    labels.into_iter().collect()
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn generate_dependencies(
+    config: &SyntheticConfig,
+    rng: &mut StdRng,
+    index: usize,
+    issue_id: &str,
+    created_at: chrono::DateTime<Utc>,
+) -> Vec<Dependency> {
+    if index == 0 || config.dependency_density <= 0.0 {
+        return Vec::new();
+    }
+
+    let guaranteed = config.dependency_density.floor() as usize;
+    let fractional = config.dependency_density.fract();
+    let dep_count = guaranteed + usize::from(rng.random_range(0.0..1.0) < fractional);
+    let dep_count = dep_count.min(index);
+    let mut targets = BTreeSet::new();
+
+    while targets.len() < dep_count {
+        targets.insert(skewed_dependency_target(config, rng, index));
+    }
+
+    targets
+        .into_iter()
+        .map(|target| Dependency {
+            issue_id: issue_id.to_string(),
+            depends_on_id: synthetic_issue_id(target),
+            dep_type: DependencyType::Blocks,
+            created_at,
+            created_by: Some("synthetic-corpus-generator".to_string()),
+            metadata: Some(format!(
+                "{{\"seed\":{},\"dag_skew\":{}}}",
+                config.seed, config.dag_skew
+            )),
+            thread_id: None,
+        })
+        .collect()
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn skewed_dependency_target(
+    config: &SyntheticConfig,
+    rng: &mut StdRng,
+    upper_bound: usize,
+) -> usize {
+    if upper_bound <= 1 {
+        return 0;
+    }
+
+    let skew = config.dag_skew.max(0.0);
+    let sample = rng.random_range(0.0..1.0_f64).powf(1.0 + skew);
+    ((sample * upper_bound as f64).floor() as usize).min(upper_bound - 1)
+}
+
+fn generate_comments(
+    config: &SyntheticConfig,
+    rng: &mut StdRng,
+    index: usize,
+    issue_id: &str,
+    created_at: chrono::DateTime<Utc>,
+    next_comment_id: usize,
+) -> Vec<Comment> {
+    if config.comment_density <= 0.0 || config.max_comments_per_issue == 0 {
+        return Vec::new();
+    }
+    if rng.random_range(0.0..1.0) >= config.comment_density.min(1.0) {
+        return Vec::new();
+    }
+
+    let comment_count = rng.random_range(1..=config.max_comments_per_issue);
+    (0..comment_count)
+        .map(|offset| Comment {
+            id: usize_to_i64(next_comment_id + offset + 1),
+            issue_id: issue_id.to_string(),
+            author: synthetic_agent_name(
+                config.seed,
+                rng.random_range(0..effective_agent_count(config)),
+            ),
+            body: format!(
+                "Synthetic agent note {offset} for issue {index}; seed={}; reproducible benchmark corpus.",
+                config.seed
+            ),
+            created_at: created_at + chrono::Duration::seconds(usize_to_i64(offset + 1)),
+        })
+        .collect()
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn validate_generated_jsonl(jsonl_path: &Path) -> std::io::Result<JsonlHealth> {
+    let content = fs::read_to_string(jsonl_path)?;
+    let mut issue_count = 0;
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        serde_json::from_str::<Issue>(line).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("generated JSONL issue line is invalid: {err}"),
+            )
+        })?;
+        issue_count += 1;
+    }
+
+    Ok(JsonlHealth {
+        valid: true,
+        issue_count,
+    })
+}
+
+fn run_br_status<const N: usize>(
+    br_path: &Path,
+    args: [&str; N],
+    workspace: &Path,
+    label: &str,
+) -> std::io::Result<bool> {
+    let output = Command::new(br_path)
+        .args(args)
+        .current_dir(workspace)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    Err(std::io::Error::other(format!(
+        "{label} failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )))
+}
+
+fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<bool> {
+    let output = Command::new(br_path)
+        .args(["sync", "--status", "--json"])
+        .current_dir(workspace)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "br sync --status failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid br sync --status JSON: {err}"),
+        )
+    })?;
+
+    Ok(value
+        .get("dirty_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX)
+        == 0
+        && !value
+            .get("jsonl_newer")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+        && !value
+            .get("db_newer")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true))
+}
+
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let file = File::create(path)?;
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, value)?;
+    Ok(())
+}
+
+fn reproduction_command_for(config: &SyntheticConfig) -> String {
+    if config.issue_count >= ScaleTier::Million.issue_count() {
+        format!(
+            "BR_E2E_STRESS=1 BR_SYNTHETIC_MILLION=1 BR_SYNTHETIC_SEED={} cargo test --test bench_synthetic_scale stress_synthetic_million -- --ignored --nocapture",
+            config.seed
+        )
+    } else {
+        format!(
+            "BR_E2E_STRESS=1 BR_SYNTHETIC_SEED={} cargo test --test bench_synthetic_scale -- --ignored --nocapture",
+            config.seed
+        )
     }
 }
 
@@ -617,7 +1111,8 @@ fn benchmark_synthetic(dataset: &SyntheticDataset, br_path: &Path) -> SyntheticB
                 n if n <= 10_000 => "small",
                 n if n <= 50_000 => "medium",
                 n if n <= 100_000 => "large",
-                _ => "xlarge",
+                n if n < 1_000_000 => "xlarge",
+                _ => "million",
             }
         ),
         generation: dataset.metrics.clone(),
@@ -639,13 +1134,25 @@ fn print_benchmark(benchmark: &SyntheticBenchmark) {
     // Generation metrics
     let generation = &benchmark.generation;
     println!(
-        "Dataset: {} issues, {} dependencies ({:.1} KB JSONL, {:.1} KB DB)",
+        "Dataset: {} issues, {} dependencies, {} labels, {} comments, {} claims across {} agents ({:.1} KB JSONL, {:.1} KB DB)",
         generation.issue_count,
         generation.dependency_count,
+        generation.label_assignment_count,
+        generation.comment_count,
+        generation.claim_count,
+        generation.simulated_agent_count,
         generation.jsonl_size_bytes as f64 / 1024.0,
         generation.db_size_bytes as f64 / 1024.0
     );
     println!("Generation time: {}ms", generation.generation_ms);
+    println!("JSONL hash: {}", generation.content_hash);
+    println!(
+        "Health: jsonl_valid={} sync_import_ok={} doctor_ok={} sync_status_clean={}",
+        generation.health.jsonl_valid,
+        generation.health.sync_import_ok,
+        generation.health.doctor_ok,
+        generation.health.sync_status_clean
+    );
     println!("{dash}");
 
     // Operations
@@ -834,6 +1341,44 @@ fn stress_synthetic_xlarge() {
     println!("Results written to: {}", output_path.display());
 }
 
+/// Manual million-issue synthetic benchmark with 10,000 simulated agents.
+/// Env gate: BR_E2E_STRESS=1 BR_SYNTHETIC_MILLION=1
+#[test]
+#[ignore = "manual stress test: BR_E2E_STRESS=1 BR_SYNTHETIC_MILLION=1 cargo test --test bench_synthetic_scale stress_synthetic_million -- --ignored --nocapture"]
+fn stress_synthetic_million() {
+    if !stress_tests_enabled() || !million_profile_enabled() {
+        eprintln!(
+            "Skipping million-issue stress test (set BR_E2E_STRESS=1 BR_SYNTHETIC_MILLION=1)"
+        );
+        return;
+    }
+
+    let binaries = discover_binaries().expect("Binary discovery failed");
+    let seed = synthetic_seed_from_env(42);
+
+    println!("\n=== Synthetic Scale-Up Benchmark: Million (1M / 10K agents) ===\n");
+
+    let config = SyntheticConfig::million_agent_profile(seed);
+    eprintln!(
+        "Generating synthetic dataset ({} issues, {} simulated agents)...",
+        config.issue_count, config.simulated_agent_count
+    );
+
+    let dataset = SyntheticDataset::generate(config, &binaries.br.path)
+        .expect("Failed to generate synthetic million-agent dataset");
+
+    eprintln!("Running benchmarks...");
+    let benchmark = benchmark_synthetic(&dataset, &binaries.br.path);
+    print_benchmark(&benchmark);
+
+    let output_dir = PathBuf::from("target/benchmark-results");
+    fs::create_dir_all(&output_dir).expect("create output dir");
+    let output_path = output_dir.join("synthetic_million_latest.json");
+    write_benchmark_json(&[benchmark], &output_path).expect("write results");
+    println!("Results written to: {}", output_path.display());
+    println!("Manifest written to: {}", dataset.manifest_path.display());
+}
+
 /// Run all synthetic benchmarks in sequence.
 /// Env gate: BR_E2E_STRESS=1
 #[test]
@@ -918,9 +1463,11 @@ fn test_scale_tier_properties() {
     assert_eq!(ScaleTier::Medium.issue_count(), 50_000);
     assert_eq!(ScaleTier::Large.issue_count(), 100_000);
     assert_eq!(ScaleTier::XLarge.issue_count(), 250_000);
+    assert_eq!(ScaleTier::Million.issue_count(), 1_000_000);
 
     assert_eq!(ScaleTier::Small.name(), "small_10k");
     assert_eq!(ScaleTier::Large.name(), "large_100k");
+    assert_eq!(ScaleTier::Million.name(), "million_1m");
 }
 
 /// Unit test for title generation.
@@ -932,4 +1479,65 @@ fn test_generate_title() {
     // Should have format "Prefix subject (#123)"
     assert!(title.contains("#123"));
     assert!(title.len() > 10);
+}
+
+#[test]
+fn test_synthetic_config_distribution_builders() {
+    let config = SyntheticConfig::ci_profile(7)
+        .with_issue_count(64)
+        .with_label_distribution(8, 1, 2)
+        .with_comment_distribution(0.5, 3)
+        .with_agent_distribution(32, 0.25)
+        .with_dag_skew(2.0);
+
+    assert_eq!(config.issue_count, 64);
+    assert_eq!(config.seed, 7);
+    assert_eq!(config.label_pool_size, 8);
+    assert_eq!(config.min_labels_per_issue, 1);
+    assert_eq!(config.max_labels_per_issue, 2);
+    assert!((config.comment_density - 0.5).abs() < f64::EPSILON);
+    assert_eq!(config.max_comments_per_issue, 3);
+    assert_eq!(config.simulated_agent_count, 32);
+    assert!((config.claim_density - 0.25).abs() < f64::EPSILON);
+    assert!((config.dag_skew - 2.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn synthetic_ci_profile_generates_valid_reproducible_manifest() {
+    let binaries = discover_binaries().expect("Binary discovery failed");
+    let config = SyntheticConfig::ci_profile(99).with_issue_count(96);
+
+    let first = SyntheticDataset::generate(config.clone(), &binaries.br.path)
+        .expect("generate first CI synthetic corpus");
+    let second =
+        SyntheticDataset::generate(config, &binaries.br.path).expect("generate second CI corpus");
+
+    assert_eq!(first.metrics.issue_count, 96);
+    assert_eq!(first.metrics.health.jsonl_issue_count, 96);
+    assert_eq!(first.metrics.content_hash, second.metrics.content_hash);
+    assert_eq!(
+        first.metrics.expected_jsonl_size_bytes,
+        first.metrics.jsonl_size_bytes
+    );
+    assert!(first.metrics.health.jsonl_valid);
+    assert!(first.metrics.health.sync_import_ok);
+    assert!(first.metrics.health.doctor_ok);
+    assert!(first.metrics.health.sync_status_clean);
+    assert!(first.metrics.dependency_count > 0);
+    assert!(first.metrics.label_assignment_count > 0);
+    assert!(first.metrics.comment_count > 0);
+    assert!(first.metrics.claim_count > 0);
+    assert_eq!(first.metrics.simulated_agent_count, 16);
+
+    let manifest = fs::read_to_string(&first.manifest_path).expect("read corpus manifest");
+    let manifest: SyntheticCorpusManifest =
+        serde_json::from_str(&manifest).expect("parse corpus manifest");
+    assert_eq!(manifest.schema_version, "br.synthetic-corpus.v1");
+    assert_eq!(manifest.config.seed, 99);
+    assert_eq!(manifest.metrics.content_hash, first.metrics.content_hash);
+    assert!(
+        manifest
+            .reproduction_command
+            .contains("BR_SYNTHETIC_SEED=99")
+    );
 }

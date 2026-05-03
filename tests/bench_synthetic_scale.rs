@@ -985,31 +985,26 @@ fn run_operation(
 ) -> OperationMetrics {
     let start = Instant::now();
 
-    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
-        .args(args)
-        .current_dir(workspace)
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+    let output = run_measured_br_command(br_path, args, workspace);
 
     let duration = start.elapsed();
 
     match output {
         Ok(out) => {
-            let success = out.status.success();
-            let error = if success {
-                None
-            } else {
-                Some(String::from_utf8_lossy(&out.stderr).to_string())
-            };
+            let MeasuredCommandOutput {
+                stdout,
+                stderr,
+                success,
+                peak_rss_bytes,
+            } = out;
+            let error = if success { None } else { Some(stderr) };
 
             OperationMetrics {
                 operation: operation.to_string(),
                 duration_ms: duration.as_millis(),
-                peak_rss_bytes: get_peak_rss_bytes(),
+                peak_rss_bytes,
                 success,
-                output_size_bytes: out.stdout.len(),
+                output_size_bytes: stdout.len(),
                 error,
             }
         }
@@ -1024,29 +1019,62 @@ fn run_operation(
     }
 }
 
-/// Get peak RSS from /proc/self/status on Linux.
-fn get_peak_rss_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(status) = fs::read_to_string("/proc/self/status") {
-            for line in status.lines() {
-                if line.starts_with("VmHWM:") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2
-                        && let Ok(kb) = parts[1].parse::<u64>()
-                    {
-                        return Some(kb * 1024);
-                    }
-                }
-            }
-        }
-        None
+struct MeasuredCommandOutput {
+    stdout: Vec<u8>,
+    stderr: String,
+    success: bool,
+    peak_rss_bytes: Option<u64>,
+}
+
+fn run_measured_br_command(
+    br_path: &Path,
+    args: &[&str],
+    workspace: &Path,
+) -> std::io::Result<MeasuredCommandOutput> {
+    if Path::new("/usr/bin/time").is_file() {
+        let output = Command::new("/usr/bin/time") // ubs:ignore - benchmark harness intentionally invokes GNU time for child RSS
+            .arg("-v")
+            .arg(br_path)
+            .args(args)
+            .current_dir(workspace)
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Ok(MeasuredCommandOutput {
+            stdout: output.stdout,
+            peak_rss_bytes: parse_time_max_rss_bytes(&stderr),
+            stderr,
+            success: output.status.success(),
+        });
     }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+        .args(args)
+        .current_dir(workspace)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    Ok(MeasuredCommandOutput {
+        stdout: output.stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        success: output.status.success(),
+        peak_rss_bytes: None,
+    })
+}
+
+fn parse_time_max_rss_bytes(stderr: &str) -> Option<u64> {
+    stderr.lines().find_map(|line| {
+        let kb = line
+            .trim_start()
+            .strip_prefix("Maximum resident set size (kbytes):")?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some(kb.saturating_mul(1024))
+    })
 }
 
 /// Run full benchmark suite on a synthetic dataset.
@@ -1208,17 +1236,21 @@ fn print_benchmark(benchmark: &SyntheticBenchmark) {
 
     // Operations
     println!(
-        "{:<20} {:>12} {:>12} {:>10}",
-        "Operation", "Duration(ms)", "Output(KB)", "Status"
+        "{:<20} {:>12} {:>12} {:>12} {:>10}",
+        "Operation", "Duration(ms)", "Output(KB)", "RSS(MB)", "Status"
     );
     println!("{dash}");
 
     for op in &benchmark.operations {
         let status = if op.success { "OK" } else { "FAIL" };
         let output_kb = op.output_size_bytes as f64 / 1024.0;
+        let rss_mb = op.peak_rss_bytes.map_or_else(
+            || "n/a".to_string(),
+            |bytes| format!("{:.1}", bytes as f64 / (1024.0 * 1024.0)),
+        );
         println!(
-            "{:<20} {:>12} {:>12.1} {:>10}",
-            op.operation, op.duration_ms, output_kb, status
+            "{:<20} {:>12} {:>12.1} {:>12} {:>10}",
+            op.operation, op.duration_ms, output_kb, rss_mb, status
         );
     }
 
@@ -1593,6 +1625,17 @@ fn synthetic_graph_workloads_cover_skewed_and_wide_profiles() {
 }
 
 #[test]
+fn parse_time_max_rss_bytes_reads_gnu_time_output() {
+    let stderr = "\
+Command being timed: \"br list --json\"\n\
+\tUser time (seconds): 0.03\n\
+\tMaximum resident set size (kbytes): 12345\n\
+\tExit status: 0\n";
+
+    assert_eq!(parse_time_max_rss_bytes(stderr), Some(12_641_280));
+}
+
+#[test]
 fn synthetic_ci_profile_benchmarks_graph_projection_workloads() {
     let binaries = discover_binaries().expect("Binary discovery failed");
     let config = SyntheticConfig::ci_profile(101)
@@ -1623,6 +1666,19 @@ fn synthetic_ci_profile_benchmarks_graph_projection_workloads() {
         assert!(
             operation.output_size_bytes > 0,
             "{expected} should emit measurable output"
+        );
+    }
+
+    if Path::new("/usr/bin/time").is_file() {
+        let missing_rss = benchmark
+            .operations
+            .iter()
+            .filter(|operation| operation.success && operation.peak_rss_bytes.is_none())
+            .map(|operation| operation.operation.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            missing_rss.is_empty(),
+            "GNU time should provide child-process RSS for every successful operation; missing: {missing_rss:?}"
         );
     }
 }

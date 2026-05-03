@@ -184,7 +184,14 @@ fn execute_list_with_storage_ctx(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
 
-    list_comments_by_id(issue_input, &storage_ctx.storage, &resolver, json, ctx, wrap)?;
+    list_comments_by_id(
+        issue_input,
+        &storage_ctx.storage,
+        &resolver,
+        json,
+        ctx,
+        wrap,
+    )?;
     Ok(true)
 }
 

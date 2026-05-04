@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_AUDIT_STDIN_BYTES: usize = 10 * 1024 * 1024;
+const MAX_AUDIT_STDIN_BYTES_U64: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -321,11 +323,7 @@ fn record_entry(
     let use_stdin = args.stdin;
 
     let mut entry = if use_stdin {
-        let mut input = String::new();
-        // Limit stdin to 10MB to prevent OOM
-        io::stdin()
-            .take(10 * 1024 * 1024)
-            .read_to_string(&mut input)?;
+        let input = read_audit_stdin_limited(io::stdin())?;
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Err(BeadsError::validation(
@@ -441,6 +439,22 @@ fn label_entry(
     }
 
     Ok(())
+}
+
+fn read_audit_stdin_limited<R: Read>(reader: R) -> Result<String> {
+    let mut reader = reader.take(MAX_AUDIT_STDIN_BYTES_U64.saturating_add(1));
+    let mut input = Vec::new();
+    reader.read_to_end(&mut input)?;
+    if input.len() > MAX_AUDIT_STDIN_BYTES {
+        return Err(BeadsError::validation(
+            "stdin",
+            format!("stdin input exceeds maximum size of {MAX_AUDIT_STDIN_BYTES} bytes"),
+        ));
+    }
+
+    String::from_utf8(input).map_err(|e| {
+        BeadsError::validation("stdin", format!("stdin input must be valid UTF-8: {e}"))
+    })
 }
 
 fn clean_opt(value: Option<&str>) -> Option<String> {
@@ -843,6 +857,29 @@ mod tests {
         assert_eq!(json["id"], "int-2b3c4d5e");
         assert_eq!(json["parent_id"], "int-aaaa1111");
         assert_eq!(json["label"], "good");
+    }
+
+    #[test]
+    fn test_read_audit_stdin_limited_checks_size_before_utf8_decode() {
+        let mut payload = vec![b'a'; MAX_AUDIT_STDIN_BYTES];
+        payload.push(0xc3);
+
+        let err = read_audit_stdin_limited(std::io::Cursor::new(payload)).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "stdin" && reason.contains("maximum size")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_audit_stdin_limited_rejects_invalid_utf8() {
+        let err = read_audit_stdin_limited(std::io::Cursor::new([0xff])).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Validation { field, reason } if field == "stdin" && reason.contains("valid UTF-8")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

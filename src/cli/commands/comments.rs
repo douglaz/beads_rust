@@ -418,15 +418,17 @@ fn read_limited_string<R: Read>(reader: &mut R, byte_limit: usize, field: &str) 
         .checked_add(1)
         .and_then(|limit| u64::try_from(limit).ok())
         .unwrap_or(u64::MAX);
-    let mut buffer = String::new();
-    reader.take(max_bytes).read_to_string(&mut buffer)?;
+    let mut buffer = Vec::new();
+    reader.take(max_bytes).read_to_end(&mut buffer)?;
     if buffer.len() > byte_limit {
         return Err(BeadsError::validation(
             field,
             format!("{field} input exceeds maximum size of {byte_limit} bytes"),
         ));
     }
-    Ok(buffer)
+    String::from_utf8(buffer).map_err(|err| {
+        BeadsError::validation(field, format!("{field} input must be valid UTF-8: {err}"))
+    })
 }
 
 fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
@@ -679,6 +681,38 @@ mod tests {
         let err = read_limited_string(&mut reader, 32, "text").expect_err("oversized stdin");
         assert!(matches!(err, BeadsError::Validation { .. }));
         info!("test_read_limited_string_rejects_oversized_input: assertions passed");
+    }
+
+    #[test]
+    fn test_read_limited_string_checks_size_before_utf8_decode() {
+        init_test_logging();
+        info!("test_read_limited_string_checks_size_before_utf8_decode: starting");
+        let payload = "aaaaé";
+        let mut reader = payload.as_bytes();
+        let err = read_limited_string(&mut reader, 4, "text")
+            .expect_err("oversized input should be reported before UTF-8 decoding");
+        assert!(
+            matches!(&err, BeadsError::Validation { field, reason }
+                if field == "text" && reason.contains("exceeds maximum size")),
+            "unexpected error: {err:?}"
+        );
+        info!("test_read_limited_string_checks_size_before_utf8_decode: assertions passed");
+    }
+
+    #[test]
+    fn test_read_limited_string_rejects_invalid_utf8() {
+        init_test_logging();
+        info!("test_read_limited_string_rejects_invalid_utf8: starting");
+        let payload = [0xff];
+        let mut reader = payload.as_slice();
+        let err = read_limited_string(&mut reader, 4, "text")
+            .expect_err("invalid UTF-8 input should be rejected");
+        assert!(
+            matches!(&err, BeadsError::Validation { field, reason }
+                if field == "text" && reason.contains("valid UTF-8")),
+            "unexpected error: {err:?}"
+        );
+        info!("test_read_limited_string_rejects_invalid_utf8: assertions passed");
     }
 
     #[test]

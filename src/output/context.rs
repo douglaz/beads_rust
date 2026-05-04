@@ -8,7 +8,7 @@ use rich_rust::renderables::Renderable;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use toon_rust::options::KeyFoldingMode;
 use toon_rust::{EncodeOptions, JsonValue, StringOrNumberOrBoolOrNull, encode_lines};
 
@@ -42,6 +42,43 @@ pub enum OutputMode {
 }
 
 const JSON_OUTPUT_BUFFER_CAPACITY: usize = 128 * 1024;
+
+#[derive(Debug, Clone)]
+struct OutputSerializationFailure {
+    message: String,
+    io_kind: Option<io::ErrorKind>,
+}
+
+static OUTPUT_SERIALIZATION_FAILURE: Mutex<Option<OutputSerializationFailure>> = Mutex::new(None);
+
+fn record_output_serialization_failure(format: &str, err: &serde_json::Error) {
+    if is_broken_pipe_serialization_error(err) {
+        return;
+    }
+
+    let failure = OutputSerializationFailure {
+        message: format!("failed to serialize {format} output: {err}"),
+        io_kind: err.io_error_kind(),
+    };
+    if let Ok(mut recorded) = OUTPUT_SERIALIZATION_FAILURE.lock()
+        && recorded.is_none()
+    {
+        *recorded = Some(failure);
+    }
+}
+
+pub fn take_output_serialization_failure() -> Option<crate::BeadsError> {
+    let Ok(mut recorded) = OUTPUT_SERIALIZATION_FAILURE.lock() else {
+        return Some(crate::BeadsError::Io(io::Error::other(
+            "output serialization failure tracker was poisoned",
+        )));
+    };
+    let failure = recorded.take()?;
+    Some(match failure.io_kind {
+        Some(kind) => crate::BeadsError::Io(io::Error::new(kind, failure.message)),
+        None => crate::BeadsError::Json(serde_json::Error::io(io::Error::other(failure.message))),
+    })
+}
 
 #[derive(Default)]
 struct CountingWriter {
@@ -775,6 +812,7 @@ impl OutputContext {
     }
 
     fn report_serialization_error(&self, format: &str, err: &serde_json::Error) {
+        record_output_serialization_failure(format, err);
         if !self.is_quiet() && !is_broken_pipe_serialization_error(err) {
             eprintln!("Error: failed to serialize {format} output: {err}");
         }

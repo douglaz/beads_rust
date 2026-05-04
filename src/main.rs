@@ -592,6 +592,10 @@ fn main() {
             );
         }
     }
+
+    if let Some(err) = beads_rust::output::take_output_serialization_failure() {
+        std::process::exit(err.exit_code());
+    }
 }
 
 struct StartupContext {

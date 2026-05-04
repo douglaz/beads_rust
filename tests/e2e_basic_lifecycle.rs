@@ -11,6 +11,7 @@ use common::isolated_workspace_failure_fixture;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command as StdCommand, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -191,6 +192,24 @@ fn assert_issue_description(workspace: &BrWorkspace, issue_id: &str, expected: &
     assert_eq!(issues[0]["description"].as_str(), Some(expected));
 }
 
+fn clear_br_env_for_std_command(cmd: &mut StdCommand) {
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key.starts_with("BD_")
+            || key.starts_with("BEADS_")
+            || matches!(
+                key.as_ref(),
+                "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                    | "BR_OUTPUT_FORMAT"
+                    | "TOON_DEFAULT_FORMAT"
+                    | "TOON_STATS"
+            )
+        {
+            cmd.env_remove(key.as_ref());
+        }
+    }
+}
+
 #[test]
 fn e2e_basic_lifecycle() {
     let _log = common::test_log("e2e_basic_lifecycle");
@@ -263,6 +282,50 @@ fn e2e_basic_lifecycle() {
     ];
     let close = run_br(&workspace, close_args, "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn json_stdout_write_failure_exits_with_io_error() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_stdout_failure");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "stdout failure probe"],
+        "create_stdout_failure",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let dev_full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("br"));
+    cmd.current_dir(&workspace.root);
+    cmd.args(["list", "--json", "--no-auto-import", "--no-auto-flush"]);
+    clear_br_env_for_std_command(&mut cmd);
+    cmd.env("NO_COLOR", "1");
+    cmd.env("RUST_LOG", "beads_rust=debug");
+    cmd.env("RUST_BACKTRACE", "1");
+    cmd.env("HOME", &workspace.root);
+    cmd.stdout(Stdio::from(dev_full));
+    cmd.stderr(Stdio::piped());
+
+    let output = cmd.output().expect("run br with /dev/full stdout");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(8),
+        "stdout write failure should exit as I/O error; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("failed to serialize JSON output"),
+        "stderr should report the output serialization failure: {stderr}"
+    );
 }
 
 #[test]

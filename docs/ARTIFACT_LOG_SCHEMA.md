@@ -224,6 +224,117 @@ Policy modes:
   commands.
 - `enforcing`: a baseline manifest path and passing comparison are required.
 
+### 6. NUMA Read-Command Profile (manifest.json + env.json)
+
+Manual high-core profiling bundles use `manifest.json` and `env.json` when the
+goal is not a before/after optimization gate, but an evidence map for future
+read-command work. These bundles are intended for 64+ core / high-RAM hosts and
+must make CPU placement explicit.
+
+`env.json` records the host, binary, and corpus:
+
+```json
+{
+  "schema_version": "br.numa-profile-env.v1",
+  "generated_at": "2026-05-04T22:00:00Z",
+  "git": {
+    "revision": "git-revision",
+    "runtime_code_dirty": false
+  },
+  "host": {
+    "kernel": "Linux 6.x x86_64 GNU/Linux",
+    "cpu_model": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+    "logical_cpus": 128,
+    "cores_per_socket": 64,
+    "threads_per_core": 2,
+    "sockets": 1,
+    "numa_nodes": 1,
+    "memory_total_bytes": 536069881856,
+    "memory_available_bytes": 462368509952
+  },
+  "binary": {
+    "path": "/data/tmp/.../release/br",
+    "version": "br 0.2.5",
+    "sha256": "64-char-sha256",
+    "build_profile": "release --no-default-features"
+  },
+  "workspace": {
+    "path": "/data/tmp/br-large-profile",
+    "issue_count": 12000,
+    "jsonl_sha256": "64-char-sha256",
+    "storage_path": ".beads/beads.db"
+  },
+  "captured_files": {
+    "lscpu_text": "env/lscpu.txt",
+    "lscpu_json": "env/lscpu.json",
+    "numactl_hardware": "env/numactl-hardware.txt",
+    "memory": "env/free-bytes.txt"
+  }
+}
+```
+
+`manifest.json` records the command matrix, placement modes, and evidence
+decomposition:
+
+```json
+{
+  "schema_version": "br.numa-read-command-profile.v1",
+  "generated_at": "2026-05-04T22:00:00Z",
+  "bead": "beads_rust-72yf.39",
+  "purpose": "High-core/NUMA-aware read-command evidence bundle.",
+  "environment_path": "env.json",
+  "profile_modes": [
+    {
+      "name": "default_scheduler",
+      "timing_summary_path": "timing/default-summary.json",
+      "raw_hyperfine_path": "timing/hyperfine-default.json"
+    },
+    {
+      "name": "pinned_cpu0",
+      "timing_summary_path": "timing/pinned-cpu0-summary.json",
+      "raw_hyperfine_path": "timing/hyperfine-pinned-cpu0.json"
+    },
+    {
+      "name": "cross_numa",
+      "status": "unavailable_on_pilot_host",
+      "reason": "numactl reported one NUMA node"
+    }
+  ],
+  "commands": [
+    {
+      "label": "list_json_limit100",
+      "args": ["list", "--json", "--limit", "100"],
+      "stdout_path": "commands/list_json_limit100.json",
+      "stderr_path": "commands/list_json_limit100.stderr",
+      "syscall_summary_path": "syscalls/list_json_limit100.strace.txt"
+    }
+  ],
+  "golden": {
+    "checksums_path": "golden/command-output-sha256.txt"
+  },
+  "decomposition": {
+    "queueing_lock": "lock-wait or contention evidence path",
+    "service_cpu": "timing user/system split and pinned/default delta",
+    "io_page_reads": "strace pread64/open/stat counters",
+    "serialization_output": "stdout byte counts and golden outputs"
+  },
+  "notes_path": "notes.md"
+}
+```
+
+Required command labels for the standard read profile are:
+
+- `list_json_limit100`
+- `ready_json_limit100`
+- `scheduler_json_candidate100`
+- `search_agent_json_limit100`
+- `stats_no_activity_json`
+- `label_list_all_json`
+
+Cross-NUMA mode is required on hosts where `numactl --hardware` reports two or
+more nodes. Single-node hosts must keep the `cross_numa` profile entry with
+`status: "unavailable_on_pilot_host"` and preserve the raw `numactl` output.
+
 ## Directory Structure
 
 ```
@@ -257,6 +368,17 @@ target/perf-artifacts/
     ├── io/
     ├── rss/
     └── raw/
+
+tests/artifacts/perf/
+└── <numa-read-command-profile>/
+    ├── manifest.json
+    ├── env.json
+    ├── env/
+    ├── commands/
+    ├── golden/
+    ├── timing/
+    ├── syscalls/
+    └── raw/
 ```
 
 ## Validation Rules
@@ -281,6 +403,10 @@ target/perf-artifacts/
     lowercase SHA-256 hex digests
 12. **Timing order**: Performance evidence timing must satisfy
     `min <= p50 <= p95 <= p99 <= max`
+13. **NUMA profile coverage**: NUMA read-command profiles must include the six
+    standard command labels, default-scheduler timing, pinned-core timing,
+    syscall summaries, golden stdout/stderr checksums, and a cross-NUMA profile
+    entry that is either populated or explicitly marked unavailable.
 
 ### Cross-Platform Normalization
 

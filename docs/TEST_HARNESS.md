@@ -212,6 +212,65 @@ hashes, and replay seed. Replay creates a fresh workspace from only the trace
 plan and reports the first divergent worker/event if exit codes or created
 issue effects differ.
 
+**NUMA/high-core read-command profile (manual 64+ core evidence)**
+```bash
+export BR_NUMA_PROFILE_DIR=tests/artifacts/perf/beads-perf-<timestamp>-numa-read-command-profile
+export BR_NUMA_PROFILE_WORKSPACE=/data/tmp/br-large-read-profile
+export BR_NUMA_PROFILE_BINARY=/data/tmp/br-release/release/br
+
+mkdir -p "$BR_NUMA_PROFILE_DIR"/{env,commands,golden,timing,syscalls,raw}
+lscpu > "$BR_NUMA_PROFILE_DIR/env/lscpu.txt"
+lscpu --json > "$BR_NUMA_PROFILE_DIR/env/lscpu.json"
+numactl --hardware > "$BR_NUMA_PROFILE_DIR/env/numactl-hardware.txt"
+free -b > "$BR_NUMA_PROFILE_DIR/env/free-bytes.txt"
+
+hyperfine --warmup 2 --runs 10 \
+  --export-json "$BR_NUMA_PROFILE_DIR/timing/hyperfine-default.json" \
+  --command-name list_json_limit100 \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush list --json --limit 100" \
+  --command-name ready_json_limit100 \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush ready --json --limit 100" \
+  --command-name scheduler_json_candidate100 \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush scheduler --json --candidate-limit 100" \
+  --command-name search_agent_json_limit100 \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush search agent --json --limit 100" \
+  --command-name stats_no_activity_json \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush stats --no-activity --json" \
+  --command-name label_list_all_json \
+    "NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush label list-all --json"
+```
+Run the same matrix pinned to one logical CPU:
+
+```bash
+hyperfine --warmup 2 --runs 10 \
+  --export-json "$BR_NUMA_PROFILE_DIR/timing/hyperfine-pinned-cpu0.json" \
+  --command-name list_json_limit100_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush list --json --limit 100" \
+  --command-name ready_json_limit100_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush ready --json --limit 100" \
+  --command-name scheduler_json_candidate100_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush scheduler --json --candidate-limit 100" \
+  --command-name search_agent_json_limit100_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush search agent --json --limit 100" \
+  --command-name stats_no_activity_json_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush stats --no-activity --json" \
+  --command-name label_list_all_json_cpu0 \
+    "taskset -c 0 env NO_COLOR=1 $BR_NUMA_PROFILE_BINARY --no-auto-import --no-auto-flush label list-all --json"
+```
+On hosts where `numactl --hardware` reports at least two nodes, also run a
+cross-node matrix such as `numactl --cpunodebind=0 --membind=1 ...` and the
+reverse binding. On single-node hosts, keep a `cross_numa` entry in
+`manifest.json` with `status: "unavailable_on_pilot_host"` and preserve the raw
+`numactl` output.
+
+For each command, capture one `strace -qq -c -o ...` summary and one golden
+stdout/stderr pair. The profile bundle must include `env.json`, `manifest.json`,
+command stdout/stderr files, `golden/command-output-sha256.txt`, raw hyperfine
+samples, p50/p95/p99 summaries, syscall summaries, and `notes.md` with the tail
+decomposition across queueing/lock, service CPU, IO/page reads, and
+serialization/output. See `docs/ARTIFACT_LOG_SCHEMA.md` for
+`br.numa-read-command-profile.v1`.
+
 **Real datasets**
 ```bash
 cargo test --test bench_real_datasets -- --nocapture --ignored

@@ -1416,12 +1416,12 @@ impl CreateIssueTool {
 }
 
 fn create_issue_result_json(
-    id: String,
-    title: String,
+    id: &str,
+    title: &str,
     priority: Priority,
-    issue_type: IssueType,
-    parent_id: Option<String>,
-    coercions: Vec<String>,
+    issue_type: &IssueType,
+    parent_id: Option<&str>,
+    coercions: &[String],
 ) -> Value {
     let mut result = json!({
         "id": id,
@@ -1529,7 +1529,12 @@ fn create_issue_json(
     }
 
     Ok(create_issue_result_json(
-        id, title, priority, issue_type, parent_id, coercions,
+        &id,
+        &title,
+        priority,
+        &issue_type,
+        parent_id.as_deref(),
+        &coercions,
     ))
 }
 

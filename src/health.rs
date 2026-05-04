@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const ORPHANED_LOCK_FILE_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
+const CONFLICT_MARKER_PREFIX_LEN: usize = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WorkspaceHealth {
@@ -410,18 +411,8 @@ pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClas
         anomalies.push(AnomalyClass::TruncatedWal);
     }
 
-    if jsonl_path.is_file()
-        && let Ok(content) = std::fs::read_to_string(jsonl_path)
-    {
-        let has_conflict_markers = content.lines().any(|line| {
-            line.starts_with("<<<<<<<")
-                || line.starts_with(">>>>>>>")
-                || line.starts_with("=======")
-                || line.starts_with("|||||||")
-        });
-        if has_conflict_markers {
-            anomalies.push(AnomalyClass::JsonlConflictMarkers);
-        }
+    if jsonl_path.is_file() && jsonl_has_conflict_markers(jsonl_path) {
+        anomalies.push(AnomalyClass::JsonlConflictMarkers);
     }
 
     let journal_path = sqlite_sidecar_path(db_path, "-journal");
@@ -438,6 +429,55 @@ pub fn classify_file_state(db_path: &Path, jsonl_path: &Path) -> Vec<AnomalyClas
     }
 
     anomalies
+}
+
+fn jsonl_has_conflict_markers(path: &Path) -> bool {
+    use std::io::BufRead as _;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut prefix = [0_u8; CONFLICT_MARKER_PREFIX_LEN];
+    let mut prefix_len = 0_usize;
+    let mut reading_prefix = true;
+
+    loop {
+        let buffer = match reader.fill_buf() {
+            Ok([]) => return false,
+            Ok(buffer) => buffer,
+            Err(_) => return false,
+        };
+
+        let mut consumed = 0;
+        for &byte in buffer {
+            consumed += 1;
+
+            if reading_prefix && byte != b'\n' {
+                if prefix_len < CONFLICT_MARKER_PREFIX_LEN {
+                    prefix[prefix_len] = byte;
+                    prefix_len += 1;
+                }
+                if prefix_len == CONFLICT_MARKER_PREFIX_LEN {
+                    if is_jsonl_conflict_marker_prefix(&prefix) {
+                        return true;
+                    }
+                    reading_prefix = false;
+                }
+            }
+
+            if byte == b'\n' {
+                prefix_len = 0;
+                reading_prefix = true;
+            }
+        }
+
+        reader.consume(consumed);
+    }
+}
+
+fn is_jsonl_conflict_marker_prefix(prefix: &[u8; CONFLICT_MARKER_PREFIX_LEN]) -> bool {
+    prefix == b"<<<<<<<" || prefix == b">>>>>>>" || prefix == b"=======" || prefix == b"|||||||"
 }
 
 fn is_orphaned_lock_file(lock_path: &Path, now: SystemTime) -> bool {
@@ -551,6 +591,23 @@ mod tests {
             anomalies
                 .iter()
                 .any(|a| matches!(a, AnomalyClass::JsonlConflictMarkers))
+        );
+    }
+
+    #[test]
+    fn conflict_markers_are_detected_in_non_utf8_jsonl() {
+        let (_dir, db_path, jsonl_path) = setup_workspace();
+        let mut f = std::fs::File::create(&db_path).unwrap();
+        f.write_all(b"SQLite format 3\0").unwrap();
+        f.write_all(&[0u8; 100]).unwrap();
+        std::fs::write(&jsonl_path, b"{\"id\":\"a\"}\n\xff\n<<<<<<< HEAD\n").unwrap();
+
+        let anomalies = classify_file_state(&db_path, &jsonl_path);
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| matches!(a, AnomalyClass::JsonlConflictMarkers)),
+            "non-UTF-8 bytes must not hide merge conflict markers: {anomalies:?}"
         );
     }
 

@@ -4470,8 +4470,11 @@ fn process_import_action(
 ) -> Result<()> {
     match action {
         CollisionAction::Insert => {
-            insert_new_import_issue(storage, issue)?;
-            sync_issue_relations(storage, issue)?;
+            if insert_new_import_issue(storage, issue)? {
+                storage.insert_new_issue_relations_for_import(issue)?;
+            } else {
+                sync_issue_relations(storage, issue)?;
+            }
             result.imported_count += 1;
             result.created_count += 1;
             record_imported_relation_counts(result, issue);
@@ -4504,9 +4507,9 @@ fn process_import_action(
     Ok(())
 }
 
-fn insert_new_import_issue(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
+fn insert_new_import_issue(storage: &SqliteStorage, issue: &Issue) -> Result<bool> {
     match storage.insert_new_issue_for_import(issue) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(true),
         Err(BeadsError::Database(
             fsqlite_error::FrankenError::PrimaryKeyViolation
             | fsqlite_error::FrankenError::UniqueViolation { .. },
@@ -4516,7 +4519,7 @@ fn insert_new_import_issue(storage: &SqliteStorage, issue: &Issue) -> Result<()>
                 "Import insert found a concurrent key collision; falling back to upsert"
             );
             storage.upsert_issue_for_import(issue)?;
-            Ok(())
+            Ok(false)
         }
         Err(error) => Err(error),
     }

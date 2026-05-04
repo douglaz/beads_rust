@@ -262,7 +262,6 @@ const EXPORT_HASH_CHUNK_SIZE: usize = 32;
 // the delete batched/full-table, but re-insert rows individually.
 const BLOCKED_CACHE_DELETE_CHUNK_SIZE: usize = 400;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
-const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
 const BLOCKS_DEP_EDGE_FILTER_LIMIT: usize = 400;
 const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
 const DEPENDENCY_TRAVERSAL_MAX_DEPTH: usize = 500;
@@ -10453,37 +10452,31 @@ impl SqliteStorage {
             &[SqliteValue::from(issue_id)],
         )?;
 
+        self.insert_labels_for_import(issue_id, labels)
+    }
+
+    fn insert_labels_for_import(&self, issue_id: &str, labels: &[String]) -> Result<()> {
         if labels.is_empty() {
             return Ok(());
         }
 
         // Add new labels
-        let mut seen_labels = HashSet::new();
-        let mut unique_labels = Vec::new();
-        for label in labels {
-            if seen_labels.insert(label.as_str()) {
-                unique_labels.push(label);
-            }
-        }
+        let unique_labels = unique_label_refs(labels);
 
         if unique_labels.is_empty() {
             return Ok(());
         }
 
-        for chunk in unique_labels.chunks(IMPORT_LABEL_CHUNK_SIZE) {
-            let placeholders: Vec<String> = chunk.iter().map(|_| "(?, ?)".to_string()).collect();
-            let sql = format!(
-                "INSERT INTO labels (issue_id, label) VALUES {}",
-                placeholders.join(", ")
-            );
-
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            for label in chunk {
-                params.push(SqliteValue::from(issue_id));
-                params.push(SqliteValue::from(label.as_str()));
-            }
-
-            self.conn.execute_with_params(&sql, &params)?;
+        // Keep label inserts single-row: fsqlite can mis-handle multi-values
+        // inserts with repeated issue_id bindings on this primary key.
+        for label in unique_labels {
+            self.conn.execute_with_params(
+                "INSERT OR IGNORE INTO labels (issue_id, label) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(label.as_str()),
+                ],
+            )?;
         }
 
         Ok(())
@@ -10505,6 +10498,14 @@ impl SqliteStorage {
             &[SqliteValue::from(issue_id)],
         )?;
 
+        self.insert_dependencies_for_import(issue_id, dependencies)
+    }
+
+    fn insert_dependencies_for_import(
+        &self,
+        issue_id: &str,
+        dependencies: &[crate::model::Dependency],
+    ) -> Result<()> {
         if dependencies.is_empty() {
             return Ok(());
         }
@@ -10574,6 +10575,30 @@ impl SqliteStorage {
             &[SqliteValue::from(issue_id)],
         )?;
 
+        self.insert_comments_for_import(issue_id, comments)
+    }
+
+    /// Insert relation rows for an issue that was just created during import.
+    ///
+    /// The caller must only use this after a successful new issue insert. Update
+    /// and upsert paths must keep using the `sync_*_for_import` methods so stale
+    /// relation rows are removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any relation insert fails.
+    pub(crate) fn insert_new_issue_relations_for_import(&self, issue: &Issue) -> Result<()> {
+        self.insert_labels_for_import(&issue.id, &issue.labels)?;
+        self.insert_dependencies_for_import(&issue.id, &issue.dependencies)?;
+        self.insert_comments_for_import(&issue.id, &issue.comments)?;
+        Ok(())
+    }
+
+    fn insert_comments_for_import(
+        &self,
+        issue_id: &str,
+        comments: &[crate::model::Comment],
+    ) -> Result<()> {
         if comments.is_empty() {
             return Ok(());
         }
@@ -13114,6 +13139,67 @@ mod tests {
                 BeadsError::Database(db_error) if is_import_comment_id_collision(db_error)
             ),
             "duplicate same-issue import comment IDs must remain invalid: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_insert_new_issue_relations_for_import_skips_relation_deletes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let parent = make_issue("bd-parent", "Parent", Status::Open, 2, None, t1, None);
+        let other = make_issue("bd-other", "Other", Status::Open, 2, None, t1, None);
+        let mut imported = make_issue("bd-new", "New import", Status::Open, 2, None, t1, None);
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&other, "tester").unwrap();
+        storage.insert_new_issue_for_import(&imported).unwrap();
+
+        let existing_comment = storage
+            .add_comment("bd-other", "bob", "Existing owner")
+            .unwrap();
+        imported.labels = vec!["sync".to_string(), "perf".to_string(), "sync".to_string()];
+        imported.dependencies = vec![crate::model::Dependency {
+            issue_id: imported.id.clone(),
+            depends_on_id: parent.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+        imported.comments = vec![crate::model::Comment {
+            id: existing_comment.id,
+            issue_id: imported.id.clone(),
+            author: "alice".to_string(),
+            body: "Imported comment".to_string(),
+            created_at: t1 + chrono::Duration::minutes(5),
+        }];
+
+        storage
+            .insert_new_issue_relations_for_import(&imported)
+            .unwrap();
+
+        assert_eq!(
+            storage.get_labels(&imported.id).unwrap(),
+            vec!["perf", "sync"]
+        );
+        let dependency_count = storage
+            .execute_raw_query("SELECT COUNT(*) FROM dependencies WHERE issue_id = 'bd-new'")
+            .unwrap()
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(dependency_count, 1);
+
+        let imported_comments = storage.get_comments(&imported.id).unwrap();
+        assert_eq!(imported_comments.len(), 1);
+        assert_eq!(imported_comments[0].body, "Imported comment");
+        assert_ne!(imported_comments[0].id, existing_comment.id);
+
+        assert_eq!(
+            storage.get_comments(&other.id).unwrap(),
+            vec![existing_comment]
         );
     }
 

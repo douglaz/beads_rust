@@ -15,7 +15,6 @@ const DISABLE_FAST_OPEN_ENV: (&str, &str) = ("BR_DISABLE_READ_ONLY_FAST_OPEN", "
 
 struct SeededWorkspace {
     workspace: BrWorkspace,
-    epic_id: String,
     blocker_id: String,
     blocked_id: String,
 }
@@ -151,7 +150,6 @@ fn seed_workspace() -> SeededWorkspace {
 
     SeededWorkspace {
         workspace,
-        epic_id,
         blocker_id,
         blocked_id,
     }
@@ -458,10 +456,10 @@ fn cli_read_only_fast_open_matrix_bypasses_held_write_lock() {
 
     let blocked_conservative = run_command(
         &seed.workspace,
-        &MatrixCommand {
-            label: "list_json_locked_conservative",
-            args: strings(["--lock-timeout", "50", "list", "--json", "--limit", "1"]),
-        },
+        &exact_command(
+            "list_json_locked_conservative",
+            strings(["--lock-timeout", "50", "list", "--json", "--limit", "1"]),
+        ),
         true,
     );
     assert!(

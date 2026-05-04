@@ -4253,6 +4253,10 @@ impl SqliteStorage {
             "status NOT IN ('closed', 'tombstone', 'deferred')"
         };
         let needle = query.to_ascii_lowercase();
+        if !self.search_default_visible_has_match(status_filter, &needle)? {
+            return Ok(Vec::new());
+        }
+
         let mut issues = self.search_default_visible_priority_window(
             status_filter,
             &needle,
@@ -4277,6 +4281,25 @@ impl SqliteStorage {
         }
 
         Ok(issues)
+    }
+
+    fn search_default_visible_has_match(&self, status_filter: &str, needle: &str) -> Result<bool> {
+        let sql = format!(
+            "SELECT 1 FROM issues
+             WHERE {status_filter}
+               AND (is_template = 0 OR is_template IS NULL)
+               AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)
+             LIMIT 1"
+        );
+        let rows = self.conn.query_with_params(
+            &sql,
+            &[
+                SqliteValue::from(needle),
+                SqliteValue::from(needle),
+                SqliteValue::from(needle),
+            ],
+        )?;
+        Ok(!rows.is_empty())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -17614,6 +17637,12 @@ mod tests {
             fast_ids,
             vec!["bd-search-deferred", "bd-search-p0-new", "bd-search-p0-old",]
         );
+
+        let fast_no_match = storage.search_issues("absent", &fast_filters).unwrap();
+        let generic_no_match = storage.search_issues("absent", &generic_filters).unwrap();
+
+        assert_eq!(fast_no_match, generic_no_match);
+        assert!(fast_no_match.is_empty());
     }
 
     #[test]

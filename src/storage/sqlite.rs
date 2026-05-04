@@ -2863,34 +2863,18 @@ impl SqliteStorage {
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
-        let label_filters_can_use_uncorrelated_in =
-            filters.statuses.as_ref().is_none_or(Vec::is_empty)
-                && filters.types.as_ref().is_none_or(Vec::is_empty)
-                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
-                && filters.assignee.is_none()
-                && filters.title_contains.is_none()
-                && filters.updated_before.is_none()
-                && filters.updated_after.is_none();
-        let label_candidate_ids = if label_filters_can_use_uncorrelated_in {
+        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
+        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
+        let label_candidate_ids = if labels_and.is_empty() && labels_or.is_empty() {
             None
         } else {
-            self.label_filter_candidate_ids(
-                filters.labels.as_deref().unwrap_or(&[]),
-                filters.labels_or.as_deref().unwrap_or(&[]),
-            )?
+            self.label_filter_candidate_ids(labels_and, labels_or)?
         };
         if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
         }
         sql.push_str(" FROM issues WHERE 1=1");
-        if label_filters_can_use_uncorrelated_in {
-            append_label_membership_filters(
-                &mut sql,
-                &mut params,
-                filters.labels.as_deref().unwrap_or(&[]),
-                filters.labels_or.as_deref().unwrap_or(&[]),
-            );
-        } else if let Some(ref issue_ids) = label_candidate_ids {
+        if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
 
@@ -3556,10 +3540,16 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn count_issues_with_filters(&self, filters: &ListFilters) -> Result<usize> {
+        if let Some(label) = default_visible_single_label_count_filter(filters) {
+            return self.count_default_visible_single_label(filters.include_deferred, label);
+        }
+
         let mut sql = String::from("SELECT COUNT(*)");
 
         let mut params: Vec<SqliteValue> = Vec::new();
 
+        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
+        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
         let label_filters_can_use_uncorrelated_in =
             filters.statuses.as_ref().is_none_or(Vec::is_empty)
                 && filters.types.as_ref().is_none_or(Vec::is_empty)
@@ -3571,22 +3561,14 @@ impl SqliteStorage {
         let label_candidate_ids = if label_filters_can_use_uncorrelated_in {
             None
         } else {
-            self.label_filter_candidate_ids(
-                filters.labels.as_deref().unwrap_or(&[]),
-                filters.labels_or.as_deref().unwrap_or(&[]),
-            )?
+            self.label_filter_candidate_ids(labels_and, labels_or)?
         };
         if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
             return Ok(0);
         }
         sql.push_str(" FROM issues WHERE 1=1");
         if label_filters_can_use_uncorrelated_in {
-            append_label_membership_filters(
-                &mut sql,
-                &mut params,
-                filters.labels.as_deref().unwrap_or(&[]),
-                filters.labels_or.as_deref().unwrap_or(&[]),
-            );
+            append_label_membership_filters(&mut sql, &mut params, labels_and, labels_or);
         } else if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
         }
@@ -3663,6 +3645,49 @@ impl SqliteStorage {
         let row = self.conn.query_row_with_params(&sql, &params)?;
         let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
         Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    fn count_default_visible_single_label(
+        &self,
+        include_deferred: bool,
+        label: &str,
+    ) -> Result<usize> {
+        let status_filter = if include_deferred {
+            "status NOT IN ('closed', 'tombstone')"
+        } else {
+            "status NOT IN ('closed', 'tombstone', 'deferred')"
+        };
+        let issue_rows = self.conn.query(&format!(
+            "SELECT id
+             FROM issues
+             WHERE {status_filter}
+               AND (is_template = 0 OR is_template IS NULL)"
+        ))?;
+        if issue_rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut visible_ids = HashSet::with_capacity(issue_rows.len());
+        for row in &issue_rows {
+            let issue_id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            if !issue_id.is_empty() {
+                visible_ids.insert(issue_id);
+            }
+        }
+
+        let label_rows = self.conn.query_with_params(
+            "SELECT issue_id FROM labels WHERE label = ?",
+            &[SqliteValue::from(label)],
+        )?;
+        Ok(label_rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text))
+            .filter(|issue_id| visible_ids.contains(*issue_id))
+            .count())
     }
 
     /// Count default-visible issues grouped by status.
@@ -9376,6 +9401,28 @@ fn default_visible_limited_page_limit(filters: &ListFilters) -> Option<usize> {
         && filters.updated_after.is_none();
 
     is_default_visible.then_some(limit)
+}
+
+fn default_visible_single_label_count_filter(filters: &ListFilters) -> Option<&str> {
+    let labels = filters.labels.as_deref()?;
+    let unique_labels = unique_label_refs(labels);
+    let [label] = unique_labels.as_slice() else {
+        return None;
+    };
+
+    let is_default_visible = filters.statuses.as_ref().is_none_or(Vec::is_empty)
+        && filters.types.as_ref().is_none_or(Vec::is_empty)
+        && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+        && filters.assignee.is_none()
+        && !filters.unassigned
+        && !filters.include_closed
+        && !filters.include_templates
+        && filters.title_contains.is_none()
+        && filters.labels_or.as_ref().is_none_or(Vec::is_empty)
+        && filters.updated_before.is_none()
+        && filters.updated_after.is_none();
+
+    is_default_visible.then_some(label.as_str())
 }
 
 fn sort_list_default(issues: &mut [Issue]) {
@@ -17319,6 +17366,61 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, "bd-l5");
         assert_eq!(storage.count_issues_with_filters(&filters).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_list_issues_materialized_label_candidates_match_filtered_fallback() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        for id in ["bd-lj1", "bd-lj2", "bd-lj3", "bd-lj4"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        for (issue_id, labels) in [
+            ("bd-lj1", ["export", "lane-00", "swarm"].as_slice()),
+            ("bd-lj2", ["export", "lane-01"].as_slice()),
+            ("bd-lj3", ["lane-00", "swarm"].as_slice()),
+            ("bd-lj4", ["export", "swarm"].as_slice()),
+        ] {
+            for label in labels {
+                storage.add_label(issue_id, label, "tester").unwrap();
+            }
+        }
+
+        let fast_filters = ListFilters {
+            labels: Some(vec!["export".to_string()]),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let fallback_filters = ListFilters {
+            types: Some(vec![IssueType::Task]),
+            ..fast_filters.clone()
+        };
+
+        let fast_ids: Vec<_> = storage
+            .list_issues(&fast_filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+        let fallback_ids: Vec<_> = storage
+            .list_issues(&fallback_filters)
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+
+        assert_eq!(fast_ids, vec!["bd-lj1", "bd-lj2"]);
+        assert_eq!(fast_ids, fallback_ids);
+        assert_eq!(
+            storage.count_issues_with_filters(&fast_filters).unwrap(),
+            storage
+                .count_issues_with_filters(&fallback_filters)
+                .unwrap()
+        );
+        assert_eq!(storage.count_issues_with_filters(&fast_filters).unwrap(), 3);
     }
 
     #[test]

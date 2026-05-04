@@ -39,6 +39,7 @@ const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 /// desynchronization. This is critical for multi-agent concurrent access.
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 0;
 const SQLITE_VAR_LIMIT: usize = 900;
+const REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES: usize = 8_192;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ListRelationMetadata {
@@ -2873,6 +2874,14 @@ impl SqliteStorage {
         if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
         }
+        if self.redundant_default_visible_single_label_filter(
+            filters,
+            label_candidate_ids.as_deref(),
+        )? {
+            let mut filters_without_redundant_label = filters.clone();
+            filters_without_redundant_label.labels = None;
+            return self.list_issues(&filters_without_redundant_label);
+        }
         sql.push_str(" FROM issues WHERE 1=1");
         if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
@@ -3690,6 +3699,49 @@ impl SqliteStorage {
             .count())
     }
 
+    fn single_label_covers_default_visible_issues(
+        &self,
+        include_deferred: bool,
+        label: &str,
+    ) -> Result<bool> {
+        let total = self.count_default_visible_issues(include_deferred)?;
+        let labeled = self.count_default_visible_single_label(include_deferred, label)?;
+        Ok(labeled == total)
+    }
+
+    fn count_default_visible_issues(&self, include_deferred: bool) -> Result<usize> {
+        let status_filter = if include_deferred {
+            "status NOT IN ('closed', 'tombstone')"
+        } else {
+            "status NOT IN ('closed', 'tombstone', 'deferred')"
+        };
+        let row = self.conn.query_row(&format!(
+            "SELECT COUNT(*)
+             FROM issues
+             WHERE {status_filter}
+               AND (is_template = 0 OR is_template IS NULL)"
+        ))?;
+        let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    fn redundant_default_visible_single_label_filter(
+        &self,
+        filters: &ListFilters,
+        label_candidate_ids: Option<&[String]>,
+    ) -> Result<bool> {
+        let Some(label) = default_visible_single_label_count_filter(filters) else {
+            return Ok(false);
+        };
+        let Some(issue_ids) = label_candidate_ids else {
+            return Ok(false);
+        };
+        if issue_ids.len() < REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES {
+            return Ok(false);
+        }
+        self.single_label_covers_default_visible_issues(filters.include_deferred, label)
+    }
+
     /// Count default-visible issues grouped by status.
     ///
     /// # Errors
@@ -4024,6 +4076,18 @@ impl SqliteStorage {
         };
         if label_candidate_ids.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
+        }
+        if self.redundant_default_visible_single_label_filter(
+            filters,
+            label_candidate_ids.as_deref(),
+        )? {
+            let mut filters_without_redundant_label = filters.clone();
+            filters_without_redundant_label.labels = None;
+            return self.search_issues_with_projection(
+                trimmed,
+                &filters_without_redundant_label,
+                projection,
+            );
         }
         if let Some(ref issue_ids) = label_candidate_ids {
             append_issue_id_membership_filter(&mut sql, &mut params, issue_ids);
@@ -11132,6 +11196,10 @@ mod tests {
         )
     }
 
+    fn issue_ids(issues: Vec<Issue>) -> Vec<String> {
+        issues.into_iter().map(|issue| issue.id).collect()
+    }
+
     fn ready_summary_projection_fixture() -> SqliteStorage {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
@@ -16932,6 +17000,114 @@ mod tests {
                 ..ListFilters::default()
             })
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_redundant_single_label_fast_path_preserves_list_and_search_results() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        let mut visible_a = make_issue(
+            "bd-s-cover-a",
+            "needle global alpha",
+            Status::Open,
+            1,
+            None,
+            t1,
+            None,
+        );
+        visible_a.labels = vec!["global".to_string()];
+        let mut visible_b = make_issue(
+            "bd-s-cover-b",
+            "needle global beta",
+            Status::Open,
+            2,
+            None,
+            t1 + chrono::Duration::minutes(1),
+            None,
+        );
+        visible_b.labels = vec!["global".to_string()];
+        let deferred_unlabeled = make_issue(
+            "bd-s-cover-c",
+            "needle deferred",
+            Status::Deferred,
+            0,
+            None,
+            t1 + chrono::Duration::minutes(2),
+            None,
+        );
+
+        for issue in [visible_a, visible_b, deferred_unlabeled] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        assert!(
+            storage
+                .single_label_covers_default_visible_issues(false, "global")
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .single_label_covers_default_visible_issues(true, "global")
+                .unwrap()
+        );
+
+        let no_label_filters = ListFilters::default();
+        let global_label_filters = ListFilters {
+            labels: Some(vec!["global".to_string()]),
+            ..ListFilters::default()
+        };
+
+        let broad_candidate_ids =
+            vec!["bd-s-cover-a".to_string(); REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES];
+        assert!(
+            storage
+                .redundant_default_visible_single_label_filter(
+                    &global_label_filters,
+                    Some(&broad_candidate_ids),
+                )
+                .unwrap()
+        );
+        let narrow_candidate_ids =
+            vec!["bd-s-cover-a".to_string(); REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES - 1];
+        assert!(
+            !storage
+                .redundant_default_visible_single_label_filter(
+                    &global_label_filters,
+                    Some(&narrow_candidate_ids),
+                )
+                .unwrap()
+        );
+
+        let no_label_list_ids = issue_ids(storage.list_issues(&no_label_filters).unwrap());
+        let global_label_list_ids = issue_ids(storage.list_issues(&global_label_filters).unwrap());
+        assert_eq!(global_label_list_ids, no_label_list_ids);
+
+        let no_label_search_ids =
+            issue_ids(storage.search_issues("needle", &no_label_filters).unwrap());
+        let global_label_search_ids = issue_ids(
+            storage
+                .search_issues("needle", &global_label_filters)
+                .unwrap(),
+        );
+        assert_eq!(global_label_search_ids, no_label_search_ids);
+
+        let include_deferred_global_label_ids = issue_ids(
+            storage
+                .search_issues(
+                    "needle",
+                    &ListFilters {
+                        include_deferred: true,
+                        labels: Some(vec!["global".to_string()]),
+                        ..ListFilters::default()
+                    },
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            include_deferred_global_label_ids,
+            vec!["bd-s-cover-a", "bd-s-cover-b"]
         );
     }
 

@@ -3813,9 +3813,6 @@ fn normalize_issue(issue: &mut Issue) {
         }
     }
 
-    // Recompute content hash
-    issue.content_hash = Some(content_hash(issue));
-
     // Wisp detection: if ID contains "-wisp-", mark as ephemeral
     if issue.id.contains("-wisp-") {
         issue.ephemeral = true;
@@ -3847,6 +3844,10 @@ fn normalize_issue(issue: &mut Issue) {
     if issue.updated_at < issue.created_at {
         issue.updated_at = issue.created_at;
     }
+
+    // Recompute after all import repairs so the stored row hash matches the
+    // canonical issue state used by collision detection and export hashes.
+    issue.content_hash = Some(content_hash(issue));
 }
 
 #[derive(Debug)]
@@ -6444,6 +6445,18 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_issue_hashes_trimmed_external_ref() {
+        let mut issue = make_test_issue("bd-001", "Test");
+        issue.external_ref = Some("  ext-123  ".to_string());
+
+        normalize_issue(&mut issue);
+
+        let expected_hash = crate::util::content_hash(&issue);
+        assert_eq!(issue.external_ref.as_deref(), Some("ext-123"));
+        assert_eq!(issue.content_hash.as_deref(), Some(expected_hash.as_str()));
+    }
+
+    #[test]
     fn test_normalize_issue_remaps_legacy_done_to_closed() {
         // Go-beads "done" survives round-tripping as Status::Custom; ensure
         // import normalization promotes it to the canonical Closed variant
@@ -6734,6 +6747,27 @@ mod tests {
         assert_eq!(result.updated_count, 0);
         assert_eq!(result.skipped_count, 0);
         assert!(storage.get_issue("test-new").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_import_stores_content_hash_after_external_ref_trim() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let mut new_issue = make_test_issue("test-ext", "External ref trim");
+        new_issue.external_ref = Some("  ext-123  ".to_string());
+        let json = serde_json::to_string(&new_issue).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let config = ImportConfig::default();
+        let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
+
+        assert_eq!(result.imported_count, 1);
+        let stored = storage.get_issue("test-ext").unwrap().unwrap();
+        let expected_hash = crate::util::content_hash(&stored);
+        assert_eq!(stored.external_ref.as_deref(), Some("ext-123"));
+        assert_eq!(stored.content_hash.as_deref(), Some(expected_hash.as_str()));
     }
 
     #[test]

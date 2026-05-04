@@ -9,7 +9,7 @@ use crate::util::hex_encode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    io::{self, BufRead},
+    io::{self, BufRead, Read, Seek, SeekFrom, Write},
     sync::mpsc,
     thread,
 };
@@ -79,6 +79,63 @@ pub struct JsonlWitnessReusePlan {
     pub comparison: JsonlWitnessComparison,
     pub schedule: JsonlWitnessReuseSchedule,
     pub actions: Vec<JsonlChunkReuseStep>,
+}
+
+/// Proof summary from replaying a JSONL witness reuse plan into candidate bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use = "materialization summaries prove how many chunks were reused or rebuilt"]
+pub struct JsonlWitnessReuseMaterialization {
+    pub reused_chunks: usize,
+    pub rebuilt_chunks: usize,
+    pub read_added_chunks: usize,
+    pub dropped_chunks: usize,
+    pub output_byte_count: u64,
+    pub reused_byte_count: u64,
+    pub rebuilt_byte_count: u64,
+    pub read_added_byte_count: u64,
+    pub dropped_byte_count: u64,
+}
+
+impl JsonlWitnessReuseMaterialization {
+    fn record_reused(&mut self, byte_count: u64) -> io::Result<()> {
+        self.reused_chunks += 1;
+        self.reused_byte_count =
+            checked_add_u64(self.reused_byte_count, byte_count, "reused byte count")?;
+        self.record_output_bytes(byte_count)
+    }
+
+    fn record_rebuilt(&mut self, byte_count: u64) -> io::Result<()> {
+        self.rebuilt_chunks += 1;
+        self.rebuilt_byte_count =
+            checked_add_u64(self.rebuilt_byte_count, byte_count, "rebuilt byte count")?;
+        self.record_output_bytes(byte_count)
+    }
+
+    fn record_read_added(&mut self, byte_count: u64) -> io::Result<()> {
+        self.read_added_chunks += 1;
+        self.read_added_byte_count = checked_add_u64(
+            self.read_added_byte_count,
+            byte_count,
+            "read-added byte count",
+        )?;
+        self.record_output_bytes(byte_count)
+    }
+
+    fn record_dropped(&mut self, byte_count: u64) -> io::Result<()> {
+        self.dropped_chunks += 1;
+        self.dropped_byte_count =
+            checked_add_u64(self.dropped_byte_count, byte_count, "dropped byte count")?;
+        Ok(())
+    }
+
+    fn record_output_bytes(&mut self, byte_count: u64) -> io::Result<()> {
+        self.output_byte_count = checked_add_u64(
+            self.output_byte_count,
+            byte_count,
+            "materialized output byte count",
+        )?;
+        Ok(())
+    }
 }
 
 /// Bounded work plan for executing a witness reuse plan with parallel workers.
@@ -397,6 +454,122 @@ pub fn plan_jsonl_witness_parallel_work(
     })
 }
 
+/// Replay a witness reuse plan into exact candidate JSONL bytes.
+///
+/// Unchanged chunks are copied from `base_reader`; changed and added candidate
+/// chunks are copied from `candidate_reader`; removed base chunks are counted as
+/// metadata-only drops. The inputs are seek-based so the planner can prove a
+/// future parallel executor without buffering the full JSONL stream.
+///
+/// Returns [`io::ErrorKind::InvalidData`] when the plan does not match the two
+/// witnesses, when candidate-output actions are not in deterministic candidate
+/// order, or when a reuse action tries to copy a chunk whose witness metadata no
+/// longer matches.
+pub fn materialize_jsonl_witness_reuse_plan<RB, RC, W>(
+    base_reader: &mut RB,
+    candidate_reader: &mut RC,
+    writer: &mut W,
+    base_witness: &JsonlMerkleWitness,
+    candidate_witness: &JsonlMerkleWitness,
+    plan: &JsonlWitnessReusePlan,
+) -> io::Result<JsonlWitnessReuseMaterialization>
+where
+    RB: Read + Seek,
+    RC: Read + Seek,
+    W: Write,
+{
+    validate_reuse_materialization_inputs(base_witness, candidate_witness, plan)?;
+
+    let base_offsets = chunk_start_offsets(base_witness, "base")?;
+    let candidate_offsets = chunk_start_offsets(candidate_witness, "candidate")?;
+    let mut materialization = JsonlWitnessReuseMaterialization::default();
+
+    for step in &plan.actions {
+        match step.action {
+            JsonlChunkReuseAction::ReuseUnchanged => {
+                let base_index = required_chunk_index(step.base_index, "reuse base_index")?;
+                let candidate_index =
+                    required_chunk_index(step.candidate_index, "reuse candidate_index")?;
+                let base_chunk = witness_chunk(&base_witness.chunks, base_index, "base")?;
+                let candidate_chunk =
+                    witness_chunk(&candidate_witness.chunks, candidate_index, "candidate")?;
+                validate_step_matches_chunk(step, candidate_chunk, "candidate")?;
+                if !chunks_match_for_reuse(base_chunk, candidate_chunk) {
+                    return Err(io_invalid_data(
+                        "reuse step no longer matches base and candidate chunk witnesses",
+                    ));
+                }
+                let copied = copy_witness_chunk(
+                    base_reader,
+                    &base_offsets,
+                    &base_witness.chunks,
+                    base_index,
+                    writer,
+                    "base",
+                )?;
+                materialization.record_reused(copied)?;
+            }
+            JsonlChunkReuseAction::RebuildCandidate => {
+                let candidate_index =
+                    required_chunk_index(step.candidate_index, "rebuild candidate_index")?;
+                let candidate_chunk =
+                    witness_chunk(&candidate_witness.chunks, candidate_index, "candidate")?;
+                validate_step_matches_chunk(step, candidate_chunk, "candidate")?;
+                let copied = copy_witness_chunk(
+                    candidate_reader,
+                    &candidate_offsets,
+                    &candidate_witness.chunks,
+                    candidate_index,
+                    writer,
+                    "candidate",
+                )?;
+                materialization.record_rebuilt(copied)?;
+            }
+            JsonlChunkReuseAction::ReadAdded => {
+                let candidate_index =
+                    required_chunk_index(step.candidate_index, "read-added candidate_index")?;
+                if step.base_index.is_some() {
+                    return Err(io_invalid_data(
+                        "read-added step unexpectedly referenced a base chunk",
+                    ));
+                }
+                let candidate_chunk =
+                    witness_chunk(&candidate_witness.chunks, candidate_index, "candidate")?;
+                validate_step_matches_chunk(step, candidate_chunk, "candidate")?;
+                let copied = copy_witness_chunk(
+                    candidate_reader,
+                    &candidate_offsets,
+                    &candidate_witness.chunks,
+                    candidate_index,
+                    writer,
+                    "candidate",
+                )?;
+                materialization.record_read_added(copied)?;
+            }
+            JsonlChunkReuseAction::DropRemoved => {
+                let base_index = required_chunk_index(step.base_index, "drop base_index")?;
+                if step.candidate_index.is_some() {
+                    return Err(io_invalid_data(
+                        "drop step unexpectedly referenced a candidate chunk",
+                    ));
+                }
+                let base_chunk = witness_chunk(&base_witness.chunks, base_index, "base")?;
+                validate_step_matches_chunk(step, base_chunk, "base")?;
+                materialization.record_dropped(step.byte_count)?;
+            }
+        }
+    }
+
+    if materialization.output_byte_count != candidate_witness.byte_count {
+        return Err(io_invalid_data(format!(
+            "materialized output byte count {} did not match candidate witness byte count {}",
+            materialization.output_byte_count, candidate_witness.byte_count
+        )));
+    }
+
+    Ok(materialization)
+}
+
 /// Compare two JSONL witnesses and conservatively identify reusable chunks.
 ///
 /// Chunks are considered reusable only when schema, chunk sizing, chunk index,
@@ -507,6 +680,136 @@ fn chunks_match_for_reuse(base: &JsonlChunkWitness, candidate: &JsonlChunkWitnes
         && base.line_count == candidate.line_count
         && base.byte_count == candidate.byte_count
         && base.hash == candidate.hash
+}
+
+fn validate_reuse_materialization_inputs(
+    base_witness: &JsonlMerkleWitness,
+    candidate_witness: &JsonlMerkleWitness,
+    plan: &JsonlWitnessReusePlan,
+) -> io::Result<()> {
+    validate_chunk_sequence(base_witness)?;
+    validate_chunk_sequence(candidate_witness)?;
+
+    let expected_comparison = compare_jsonl_merkle_witnesses(base_witness, candidate_witness);
+    if plan.comparison != expected_comparison {
+        return Err(io_invalid_data(
+            "reuse plan comparison did not match supplied witnesses",
+        ));
+    }
+
+    let expected_schedule = build_reuse_schedule(&plan.actions);
+    if plan.schedule != expected_schedule {
+        return Err(io_invalid_data(
+            "reuse plan schedule did not match supplied actions",
+        ));
+    }
+
+    if !candidate_actions_are_deterministically_ordered(&plan.actions) {
+        return Err(io_invalid_data(
+            "reuse plan candidate-output actions were not in deterministic candidate order",
+        ));
+    }
+
+    if plan.schedule.candidate_output_actions != candidate_witness.chunks.len() {
+        return Err(io_invalid_data(format!(
+            "reuse plan had {} candidate-output actions for {} candidate chunks",
+            plan.schedule.candidate_output_actions,
+            candidate_witness.chunks.len()
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_chunk_sequence(witness: &JsonlMerkleWitness) -> io::Result<()> {
+    for (expected_index, chunk) in witness.chunks.iter().enumerate() {
+        if chunk.index != expected_index {
+            return Err(io_invalid_data(
+                "witness chunks were not stored in ascending chunk-index order",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn chunk_start_offsets(witness: &JsonlMerkleWitness, label: &'static str) -> io::Result<Vec<u64>> {
+    let mut offsets = Vec::with_capacity(witness.chunks.len());
+    let mut next_offset = 0;
+
+    for chunk in &witness.chunks {
+        offsets.push(next_offset);
+        next_offset = checked_add_u64(next_offset, chunk.byte_count, "witness chunk offset")?;
+    }
+
+    if next_offset != witness.byte_count {
+        return Err(io_invalid_data(format!(
+            "{label} witness chunk byte counts summed to {next_offset}, expected {}",
+            witness.byte_count
+        )));
+    }
+
+    Ok(offsets)
+}
+
+fn required_chunk_index(index: Option<usize>, label: &'static str) -> io::Result<usize> {
+    index.ok_or_else(|| io_invalid_data(format!("reuse plan step was missing {label}")))
+}
+
+fn witness_chunk<'a>(
+    chunks: &'a [JsonlChunkWitness],
+    index: usize,
+    label: &'static str,
+) -> io::Result<&'a JsonlChunkWitness> {
+    chunks.get(index).ok_or_else(|| {
+        io_invalid_data(format!(
+            "{label} witness chunk index {index} was out of range"
+        ))
+    })
+}
+
+fn validate_step_matches_chunk(
+    step: &JsonlChunkReuseStep,
+    chunk: &JsonlChunkWitness,
+    label: &'static str,
+) -> io::Result<()> {
+    if step.start_line != chunk.start_line
+        || step.line_count != chunk.line_count
+        || step.byte_count != chunk.byte_count
+    {
+        return Err(io_invalid_data(format!(
+            "reuse plan step metadata did not match {label} witness chunk {}",
+            chunk.index
+        )));
+    }
+    Ok(())
+}
+
+fn copy_witness_chunk<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    offsets: &[u64],
+    chunks: &[JsonlChunkWitness],
+    index: usize,
+    writer: &mut W,
+    label: &'static str,
+) -> io::Result<u64> {
+    let chunk = witness_chunk(chunks, index, label)?;
+    let offset = offsets.get(index).ok_or_else(|| {
+        io_invalid_data(format!("{label} witness chunk offset {index} was missing"))
+    })?;
+
+    reader.seek(SeekFrom::Start(*offset))?;
+    let mut limited = reader.take(chunk.byte_count);
+    let copied = io::copy(&mut limited, writer)?;
+    if copied != chunk.byte_count {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "{label} JSONL ended while copying chunk {index}: copied {copied} of {} bytes",
+                chunk.byte_count
+            ),
+        ));
+    }
+    Ok(copied)
 }
 
 fn candidate_chunk_step(
@@ -1018,6 +1321,10 @@ fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) -> io::Result<(
 
 fn checked_add_bytes(total: u64, delta: usize, label: &'static str) -> io::Result<u64> {
     let delta = length_to_u64(delta)?;
+    checked_add_u64(total, delta, label)
+}
+
+fn checked_add_u64(total: u64, delta: u64, label: &'static str) -> io::Result<u64> {
     total
         .checked_add(delta)
         .ok_or_else(|| io_invalid_data(format!("{label} overflowed u64")))
@@ -1052,6 +1359,27 @@ mod tests {
 
     fn witness(input: &[u8], chunk_size_lines: usize) -> JsonlMerkleWitness {
         build_jsonl_merkle_witness(Cursor::new(input), chunk_size_lines).unwrap()
+    }
+
+    fn materialize_plan(
+        base_input: &[u8],
+        candidate_input: &[u8],
+        base: &JsonlMerkleWitness,
+        candidate: &JsonlMerkleWitness,
+        plan: &JsonlWitnessReusePlan,
+    ) -> io::Result<(JsonlWitnessReuseMaterialization, Vec<u8>)> {
+        let mut base_reader = Cursor::new(base_input);
+        let mut candidate_reader = Cursor::new(candidate_input);
+        let mut output = Vec::new();
+        let summary = materialize_jsonl_witness_reuse_plan(
+            &mut base_reader,
+            &mut candidate_reader,
+            &mut output,
+            base,
+            candidate,
+            plan,
+        )?;
+        Ok((summary, output))
     }
 
     #[test]
@@ -1375,6 +1703,92 @@ mod tests {
         assert_eq!(plan.actions[0].candidate_index, Some(0));
         assert_eq!(plan.actions[2].base_index, Some(0));
         assert_eq!(plan.comparison.comparable_chunk_count, 0);
+    }
+
+    #[test]
+    fn reuse_materialization_reconstructs_candidate_bytes_from_mixed_actions() {
+        let base_input: &[u8] = b"a\nb\nc\n";
+        let candidate_input: &[u8] = b"a\nB\nc\nd\n";
+        let base = witness(base_input, 1);
+        let candidate = witness(candidate_input, 1);
+        let plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let (summary, output) =
+            materialize_plan(base_input, candidate_input, &base, &candidate, &plan).unwrap();
+
+        assert_eq!(output, candidate_input);
+        assert_eq!(summary.reused_chunks, 2);
+        assert_eq!(summary.rebuilt_chunks, 1);
+        assert_eq!(summary.read_added_chunks, 1);
+        assert_eq!(summary.dropped_chunks, 0);
+        assert_eq!(summary.output_byte_count, candidate.byte_count);
+        assert_eq!(
+            summary.reused_byte_count,
+            candidate.chunks[0].byte_count + candidate.chunks[2].byte_count
+        );
+        assert_eq!(summary.rebuilt_byte_count, candidate.chunks[1].byte_count);
+        assert_eq!(
+            summary.read_added_byte_count,
+            candidate.chunks[3].byte_count
+        );
+    }
+
+    #[test]
+    fn reuse_materialization_counts_removed_base_chunks_without_emitting_them() {
+        let base_input: &[u8] = b"a\nb\nc\n";
+        let candidate_input: &[u8] = b"a\n";
+        let base = witness(base_input, 1);
+        let candidate = witness(candidate_input, 1);
+        let plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let (summary, output) =
+            materialize_plan(base_input, candidate_input, &base, &candidate, &plan).unwrap();
+
+        assert_eq!(output, candidate_input);
+        assert_eq!(summary.reused_chunks, 1);
+        assert_eq!(summary.dropped_chunks, 2);
+        assert_eq!(summary.output_byte_count, candidate.byte_count);
+        assert_eq!(
+            summary.dropped_byte_count,
+            base.chunks[1].byte_count + base.chunks[2].byte_count
+        );
+    }
+
+    #[test]
+    fn reuse_materialization_rebuilds_candidate_when_chunk_sizes_differ() {
+        let base_input: &[u8] = b"a\nb\nc\n";
+        let candidate_input: &[u8] = b"a\nb\nc\n";
+        let base = witness(base_input, 1);
+        let candidate = witness(candidate_input, 2);
+        let plan = plan_jsonl_witness_reuse(&base, &candidate);
+
+        let (summary, output) =
+            materialize_plan(base_input, candidate_input, &base, &candidate, &plan).unwrap();
+
+        assert_eq!(output, candidate_input);
+        assert_eq!(summary.reused_chunks, 0);
+        assert_eq!(summary.rebuilt_chunks, candidate.chunks.len());
+        assert_eq!(summary.dropped_chunks, base.chunks.len());
+        assert_eq!(summary.output_byte_count, candidate.byte_count);
+    }
+
+    #[test]
+    fn reuse_materialization_rejects_tampered_reuse_action() {
+        let base_input: &[u8] = b"a\n";
+        let candidate_input: &[u8] = b"A\n";
+        let base = witness(base_input, 1);
+        let candidate = witness(candidate_input, 1);
+        let mut plan = plan_jsonl_witness_reuse(&base, &candidate);
+        for step in &mut plan.actions {
+            step.action = JsonlChunkReuseAction::ReuseUnchanged;
+        }
+        plan.schedule = build_reuse_schedule(&plan.actions);
+
+        let err =
+            materialize_plan(base_input, candidate_input, &base, &candidate, &plan).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("no longer matches"));
     }
 
     #[test]

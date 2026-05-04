@@ -4291,7 +4291,7 @@ fn stream_import_actions_in_tx(
             export_hash_ids.insert(export_id.clone());
             export_hash_batch.push((export_id, export_hash));
             if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
-                storage.set_export_hashes_in_tx(&export_hash_batch)?;
+                storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
                 export_hash_batch.clear();
             }
         } else {
@@ -4303,7 +4303,7 @@ fn stream_import_actions_in_tx(
     })?;
 
     if !export_hash_batch.is_empty() {
-        storage.set_export_hashes_in_tx(&export_hash_batch)?;
+        storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
     }
     tx_result.export_hashes_recorded = export_hash_ids.len();
     if uncertified_local_wins > 0 {

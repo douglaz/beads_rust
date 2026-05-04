@@ -1390,6 +1390,41 @@ impl SqliteStorage {
         Ok(count)
     }
 
+    /// Insert export hashes after the caller has already cleared the table.
+    ///
+    /// Import starts by deleting all export hashes, so it does not need the
+    /// general setter's per-row delete safety path for existing rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn insert_export_hashes_after_clear_in_tx(
+        &self,
+        exports: &[(String, String)],
+    ) -> Result<usize> {
+        let unique_exports = Self::dedupe_export_hash_batch(exports);
+        if unique_exports.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut count = 0;
+
+        for (issue_id, content_hash) in &unique_exports {
+            self.conn.execute_with_params(
+                "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(now.as_str()),
+                ],
+            )?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
     /// Set only export hashes whose content changed, using the caller's active transaction.
     ///
     /// # Errors
@@ -15355,6 +15390,51 @@ mod tests {
 
         let (content_hash, _) = storage.get_export_hash("bd-hash-1").unwrap().unwrap();
         assert_eq!(content_hash, "hash-new");
+    }
+
+    #[test]
+    fn test_insert_export_hashes_after_clear_skips_stale_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        for issue_id in ["bd-hash-1", "bd-hash-2"] {
+            let issue = make_issue(issue_id, "Hash target", Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .set_export_hashes(&[
+                ("bd-hash-1".to_string(), "stale-a".to_string()),
+                ("bd-hash-2".to_string(), "stale-b".to_string()),
+            ])
+            .unwrap();
+
+        let inserted = storage
+            .with_write_transaction(|storage| {
+                storage.clear_all_export_hashes_in_tx()?;
+                storage.insert_export_hashes_after_clear_in_tx(&[
+                    ("bd-hash-1".to_string(), "fresh-a".to_string()),
+                    ("bd-hash-1".to_string(), "fresh-a-final".to_string()),
+                    ("bd-hash-2".to_string(), "fresh-b".to_string()),
+                ])
+            })
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            storage.get_export_hash("bd-hash-1").unwrap().unwrap().0,
+            "fresh-a-final"
+        );
+        assert_eq!(
+            storage.get_export_hash("bd-hash-2").unwrap().unwrap().0,
+            "fresh-b"
+        );
+        let row_count = storage
+            .execute_raw_query("SELECT COUNT(*) FROM export_hashes")
+            .unwrap()
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(row_count, 2);
     }
 
     #[test]

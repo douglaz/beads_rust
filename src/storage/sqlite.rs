@@ -10544,54 +10544,97 @@ impl SqliteStorage {
         }
 
         for comment in comments {
-            let created_at = comment.created_at.to_rfc3339();
-            let colliding_issue_id = if comment.id > 0 {
-                self.conn
-                    .query_with_params(
-                        "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
-                        &[SqliteValue::from(comment.id)],
-                    )?
-                    .into_iter()
-                    .next()
-                    .and_then(|row| {
-                        row.get(0)
-                            .and_then(SqliteValue::as_text)
-                            .map(str::to_string)
-                    })
-            } else {
-                None
-            };
-
-            if colliding_issue_id
-                .as_deref()
-                .is_some_and(|existing_issue_id| existing_issue_id != issue_id)
-                || comment.id <= 0
-            {
-                self.conn.execute_with_params(
-                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
-                    &[
-                        SqliteValue::from(issue_id),
-                        SqliteValue::from(comment.author.as_str()),
-                        SqliteValue::from(comment.body.as_str()),
-                        SqliteValue::from(created_at.as_str()),
-                    ],
-                )?;
-            } else {
-                self.conn.execute_with_params(
-                    "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
-                    &[
-                        SqliteValue::from(comment.id),
-                        SqliteValue::from(issue_id),
-                        SqliteValue::from(comment.author.as_str()),
-                        SqliteValue::from(comment.body.as_str()),
-                        SqliteValue::from(created_at.as_str()),
-                    ],
-                )?;
-            }
+            self.insert_comment_for_import(issue_id, comment)?;
         }
 
         Ok(())
     }
+
+    fn insert_comment_for_import(&self, issue_id: &str, comment: &Comment) -> Result<()> {
+        let created_at = comment.created_at.to_rfc3339();
+        if comment.id <= 0 {
+            return self.insert_import_comment_without_id(issue_id, comment, &created_at);
+        }
+
+        match self.insert_import_comment_with_id(issue_id, comment, &created_at) {
+            Ok(()) => Ok(()),
+            Err(BeadsError::Database(error)) if is_import_comment_id_collision(&error) => {
+                match self.import_comment_id_owner(comment.id)? {
+                    Some(owner_issue_id) if owner_issue_id != issue_id => {
+                        self.insert_import_comment_without_id(issue_id, comment, &created_at)
+                    }
+                    _ => Err(BeadsError::Database(error)),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn insert_import_comment_without_id(
+        &self,
+        issue_id: &str,
+        comment: &Comment,
+        created_at: &str,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(comment.author.as_str()),
+                SqliteValue::from(comment.body.as_str()),
+                SqliteValue::from(created_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_import_comment_with_id(
+        &self,
+        issue_id: &str,
+        comment: &Comment,
+        created_at: &str,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
+            &[
+                SqliteValue::from(comment.id),
+                SqliteValue::from(issue_id),
+                SqliteValue::from(comment.author.as_str()),
+                SqliteValue::from(comment.body.as_str()),
+                SqliteValue::from(created_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn import_comment_id_owner(&self, comment_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_with_params(
+                "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
+                &[SqliteValue::from(comment_id)],
+            )?
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            }))
+    }
+}
+
+fn is_import_comment_id_collision(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::PrimaryKeyViolation | FrankenError::UniqueViolation { .. }
+    ) || matches!(
+        error,
+        FrankenError::Internal(message)
+            if message.contains("VDBE halted with code 19")
+                && (message.contains("PRIMARY KEY constraint failed")
+                    || message.contains("UNIQUE constraint failed"))
+    )
 }
 
 /// Implement the `DependencyStore` trait for `SqliteStorage`.
@@ -12994,6 +13037,49 @@ mod tests {
 
         let comments_b = storage.get_comments("bd-c-import-b").unwrap();
         assert_eq!(comments_b, vec![existing_comment]);
+    }
+
+    #[test]
+    fn test_sync_comments_for_import_rejects_duplicate_comment_ids_for_same_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-c-import-dup",
+            "Duplicate import comments",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let first = crate::model::Comment {
+            id: 42,
+            issue_id: issue.id.clone(),
+            author: "alice".to_string(),
+            body: "first imported comment".to_string(),
+            created_at: t1,
+        };
+        let second = crate::model::Comment {
+            id: 42,
+            issue_id: issue.id.clone(),
+            author: "alice".to_string(),
+            body: "duplicate imported comment".to_string(),
+            created_at: t1 + chrono::Duration::minutes(1),
+        };
+
+        let error = storage
+            .sync_comments_for_import(&issue.id, &[first, second])
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                BeadsError::Database(db_error) if is_import_comment_id_collision(db_error)
+            ),
+            "duplicate same-issue import comment IDs must remain invalid: {error:?}"
+        );
     }
 
     #[test]

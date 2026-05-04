@@ -85,6 +85,7 @@ const PLACEHOLDER_EXACT: &[&str] = &[
 ];
 
 const SHOW_ISSUE_BATCH_MAX: usize = 100;
+const UPDATE_ISSUE_BATCH_MAX: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Placeholder detection
@@ -1273,12 +1274,16 @@ fn show_issue_batch_error_item(id: &str, err: McpError) -> Value {
     json!({
         "id": id,
         "ok": false,
-        "error": {
-            "code": i32::from(err.code),
-            "kind": format!("{:?}", err.code),
-            "message": err.message,
-            "data": err.data.unwrap_or(Value::Null),
-        }
+        "error": mcp_error_json(err),
+    })
+}
+
+fn mcp_error_json(err: McpError) -> Value {
+    json!({
+        "code": i32::from(err.code),
+        "kind": format!("{:?}", err.code),
+        "message": err.message,
+        "data": err.data.unwrap_or(Value::Null),
     })
 }
 
@@ -1609,7 +1614,187 @@ impl UpdateIssueTool {
     }
 }
 
+fn update_issue_result_json(issue: &Issue, coercions: &[String]) -> Value {
+    let mut result = json!({
+        "id": &issue.id,
+        "title": &issue.title,
+        "status": &issue.status,
+        "priority": &issue.priority,
+        "updated_at": &issue.updated_at,
+    });
+
+    if !coercions.is_empty() {
+        result["coercions"] = json!(coercions);
+        result["warnings"] = result["coercions"].clone();
+    }
+
+    result
+}
+
+fn apply_update_issue_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    args: &Value,
+) -> McpResult<Value> {
+    let id = required_str_arg(args, "id")?;
+
+    let (updates, coercions) = parse_update_fields(&id, args)?;
+    let labels_to_add = optional_label_array_arg(args, "labels_add")?;
+    let labels_to_remove = optional_label_array_arg(args, "labels_remove")?;
+    let comment = optional_str_arg(args, "comment")?;
+
+    if let Some(comment) = comment.as_deref()
+        && !comment.is_empty()
+    {
+        validate_mcp_comment(&id, &state.actor, comment)?;
+    }
+
+    // Validate ID exists before attempting update (placeholder + existence check).
+    require_valid_issue(storage, &id)?;
+
+    let has_field_updates = UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
+    let has_side_effects = !labels_to_add.is_empty()
+        || !labels_to_remove.is_empty()
+        || comment.as_deref().is_some_and(|s| !s.is_empty());
+
+    let issue = if has_field_updates {
+        storage
+            .update_issue(&id, &updates, &state.actor)
+            .map_err(beads_to_mcp)?
+    } else if has_side_effects {
+        match storage
+            .get_issue_details(&id, false, false, 0)
+            .map_err(beads_to_mcp)?
+        {
+            Some(details) => details.issue,
+            None => return Err(issue_not_found_err(storage, &id)?),
+        }
+    } else {
+        return Err(McpError::with_data(
+            McpErrorCode::ToolExecutionError,
+            "No changes specified",
+            json!({
+                "error_type": "NOTHING_TO_DO",
+                "recoverable": true,
+                "hint": "Provide at least one field to update, a label operation, or a comment",
+                "suggested_tool_calls": [
+                    {"tool": "show_issue", "arguments": {"id": id}}
+                ]
+            }),
+        ));
+    };
+
+    // Handle label mutations.
+    for label in &labels_to_add {
+        storage
+            .add_label(&id, label, &state.actor)
+            .map_err(beads_to_mcp)?;
+    }
+    for label in &labels_to_remove {
+        storage
+            .remove_label(&id, label, &state.actor)
+            .map_err(beads_to_mcp)?;
+    }
+
+    // Add comment if provided.
+    if let Some(comment) = comment.as_deref()
+        && !comment.is_empty()
+    {
+        storage
+            .add_comment(&id, &state.actor, comment)
+            .map_err(beads_to_mcp)?;
+    }
+
+    Ok(update_issue_result_json(&issue, &coercions))
+}
+
+fn update_issue_batch_items(args: &Value) -> McpResult<Option<Vec<Value>>> {
+    if args.get("id").is_some() && args.get("updates").is_some() {
+        return Err(McpError::invalid_params(
+            "Provide either 'id' for a single update or 'updates' for a batch, not both",
+        ));
+    }
+
+    let Some(value) = args.get("updates") else {
+        return Ok(None);
+    };
+
+    let items = value.as_array().ok_or_else(|| {
+        McpError::invalid_params(format!(
+            "'updates' must be an array of objects, got {value}"
+        ))
+    })?;
+    if items.is_empty() {
+        return Err(McpError::invalid_params(
+            "'updates' must include at least one update item",
+        ));
+    }
+    if items.len() > UPDATE_ISSUE_BATCH_MAX {
+        return Err(McpError::invalid_params(format!(
+            "'updates' supports at most {UPDATE_ISSUE_BATCH_MAX} update items per call, got {}",
+            items.len()
+        )));
+    }
+    for (idx, item) in items.iter().enumerate() {
+        if !item.is_object() {
+            return Err(McpError::invalid_params(format!(
+                "'updates[{idx}]' must be an object, got {item}"
+            )));
+        }
+    }
+
+    Ok(Some(items.clone()))
+}
+
+fn update_issue_batch_error_item(index: usize, args: &Value, err: McpError) -> Value {
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .map_or(Value::Null, |id| json!(id));
+    json!({
+        "index": index,
+        "id": id,
+        "ok": false,
+        "error": mcp_error_json(err),
+    })
+}
+
+fn update_issue_batch_json(
+    storage: &mut SqliteStorage,
+    state: &BeadsState,
+    items: &[Value],
+) -> Value {
+    let mut ok_count = 0_u64;
+    let results = items
+        .iter()
+        .enumerate()
+        .map(
+            |(index, item)| match apply_update_issue_json(storage, state, item) {
+                Ok(result) => {
+                    ok_count += 1;
+                    json!({
+                        "index": index,
+                        "id": result["id"].clone(),
+                        "ok": true,
+                        "result": result,
+                    })
+                }
+                Err(err) => update_issue_batch_error_item(index, item, err),
+            },
+        )
+        .collect::<Vec<_>>();
+    let count = u64::try_from(items.len()).unwrap_or(u64::MAX);
+
+    json!({
+        "items": results,
+        "count": count,
+        "ok_count": ok_count,
+        "error_count": count.saturating_sub(ok_count),
+    })
+}
+
 impl ToolHandler for UpdateIssueTool {
+    #[allow(clippy::too_many_lines)]
     fn definition(&self) -> Tool {
         Tool {
             name: "update_issue".into(),
@@ -1618,9 +1803,10 @@ impl ToolHandler for UpdateIssueTool {
                  Discovery: Get IDs from list_issues. See beads://schema for valid values.\n\
                  When to use: Changing status, priority, assignee, adding comments.\n\
                  NOT for: Closing issues — use close_issue for proper close tracking.\n\
-                 Do: Provide only the fields you want to change.\n\
+                 Do: Provide only the fields you want to change, or pass updates[] for a per-item batch envelope.\n\
                  Don't: Set status to 'closed' — you'll be redirected to close_issue.\n\
                  Inputs auto-corrected: 'wip' → in_progress, 'urgent' → critical, etc.\n\
+                 Batch semantics: updates[] uses one write lock/storage open/auto-flush and returns {items,count,ok_count,error_count}; each item has ok:true with the legacy result or ok:false with a structured error.\n\
                  Idempotency: Safe to retry with the same values."
                     .into(),
             ),
@@ -1688,9 +1874,23 @@ impl ToolHandler for UpdateIssueTool {
                     "comment": {
                         "type": "string",
                         "description": "Add a comment to the issue (appended after field updates)"
+                    },
+                    "updates": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": UPDATE_ISSUE_BATCH_MAX,
+                        "description": "Batch of update objects using the same fields as a single update item: id plus optional title, description, status, priority, type, assignee, owner, due_at, defer_until, estimated_minutes, external_ref, labels_add, labels_remove, and comment. Returns {items,count,ok_count,error_count}; each item is either {index,id,ok:true,result} using the legacy single-update result shape, or {index,id,ok:false,error}. Partial failures do not fail the whole batch.",
+                        "items": {
+                            "type": "object",
+                            "required": ["id"],
+                            "additionalProperties": true
+                        }
                     }
                 },
-                "required": ["id"],
+                "oneOf": [
+                    {"required": ["id"]},
+                    {"required": ["updates"]}
+                ],
                 "additionalProperties": false
             }),
             output_schema: None,
@@ -1707,98 +1907,16 @@ impl ToolHandler for UpdateIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
-        let id = required_str_arg(&args, "id")?;
-
-        let (updates, coercions) = parse_update_fields(&id, &args)?;
-        let labels_to_add = optional_label_array_arg(&args, "labels_add")?;
-        let labels_to_remove = optional_label_array_arg(&args, "labels_remove")?;
-        let comment = optional_str_arg(&args, "comment")?;
-
-        if let Some(comment) = comment.as_deref()
-            && !comment.is_empty()
-        {
-            validate_mcp_comment(&id, &self.0.actor, comment)?;
+        if let Some(items) = update_issue_batch_items(&args)? {
+            let result = self
+                .0
+                .with_mutation(|storage| Ok(update_issue_batch_json(storage, &self.0, &items)))?;
+            return Ok(vec![Content::text(result.to_string())]);
         }
 
-        let issue = self.0.with_mutation(|storage| {
-            // Validate ID exists before attempting update (placeholder + existence check)
-            require_valid_issue(storage, &id)?;
-
-            let has_field_updates = UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
-            let has_side_effects = !labels_to_add.is_empty()
-                || !labels_to_remove.is_empty()
-                || comment.as_deref().is_some_and(|s| !s.is_empty());
-
-            let issue = if has_field_updates {
-                storage
-                    .update_issue(&id, &updates, &self.0.actor)
-                    .map_err(beads_to_mcp)?
-            } else if has_side_effects {
-                match storage
-                    .get_issue_details(&id, false, false, 0)
-                    .map_err(beads_to_mcp)?
-                {
-                    Some(details) => details.issue,
-                    None => return Err(issue_not_found_err(storage, &id)?),
-                }
-            } else {
-                return Err(McpError::with_data(
-                    McpErrorCode::ToolExecutionError,
-                    "No changes specified",
-                    json!({
-                        "error_type": "NOTHING_TO_DO",
-                        "recoverable": true,
-                        "hint": "Provide at least one field to update, a label operation, or a comment",
-                        "suggested_tool_calls": [
-                            {"tool": "show_issue", "arguments": {"id": id}}
-                        ]
-                    }),
-                ));
-            };
-
-            // Handle label mutations
-            for label in &labels_to_add {
-                storage
-                    .add_label(&id, label, &self.0.actor)
-                    .map_err(beads_to_mcp)?;
-            }
-            for label in &labels_to_remove {
-                storage
-                    .remove_label(&id, label, &self.0.actor)
-                    .map_err(beads_to_mcp)?;
-            }
-
-            // Add comment if provided
-            if let Some(comment) = comment.as_deref()
-                && !comment.is_empty()
-            {
-                storage
-                    .add_comment(&id, &self.0.actor, comment)
-                    .map_err(beads_to_mcp)?;
-            }
-
-            Ok(issue)
-        })?;
-
-        let mut warnings: Vec<String> = Vec::new();
-        warnings.extend(coercions.clone());
-
-        let mut result = json!({
-            "id": issue.id,
-            "title": issue.title,
-            "status": issue.status,
-            "priority": issue.priority,
-            "updated_at": issue.updated_at,
-        });
-
-        if !coercions.is_empty() {
-            result["coercions"] = json!(coercions);
-        }
-
-        if !warnings.is_empty() {
-            result["warnings"] = json!(warnings);
-        }
-
+        let result = self
+            .0
+            .with_mutation(|storage| apply_update_issue_json(storage, &self.0, &args))?;
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -2398,6 +2516,12 @@ mod tests {
             .unwrap_or_else(|err| json!({"parse_error": err.to_string(), "text": text}))
     }
 
+    fn assert_batch_counts(batch: &serde_json::Value, count: u64, ok: u64, errors: u64) {
+        assert_eq!(batch["count"].as_u64(), Some(count));
+        assert_eq!(batch["ok_count"].as_u64(), Some(ok));
+        assert_eq!(batch["error_count"].as_u64(), Some(errors));
+    }
+
     #[test]
     fn project_overview_snapshot_matches_direct_json_and_invalidates() {
         let temp = TempDir::new().expect("tempdir");
@@ -2599,6 +2723,173 @@ mod tests {
         );
     }
 
+    #[test]
+    fn update_issue_legacy_single_result_shape_is_unchanged() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-update-single", "single update original");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = UpdateIssueTool::new(Arc::clone(&state));
+
+        let content = tool
+            .call(
+                &ctx,
+                json!({
+                    "id": "br-mcp-update-single",
+                    "title": "single update changed",
+                }),
+            )
+            .expect("single update");
+        let result = content_json(&content);
+
+        assert_eq!(result["id"].as_str(), Some("br-mcp-update-single"));
+        assert_eq!(result["title"].as_str(), Some("single update changed"));
+        assert!(result.get("items").is_none());
+        assert!(result.get("count").is_none());
+    }
+
+    #[test]
+    fn update_issue_batch_returns_ordered_items_partial_errors_and_flushes() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-update-batch-1", "batch first original");
+        insert_test_issue(&state, "br-mcp-update-batch-2", "batch second original");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = UpdateIssueTool::new(Arc::clone(&state));
+
+        let content = tool
+            .call(
+                &ctx,
+                json!({
+                    "updates": [
+                        {"id": "br-mcp-update-batch-1", "title": "batch first changed"},
+                        {"id": "missing-id", "title": "missing should fail"},
+                        {"id": "YOUR_ID", "title": "placeholder should fail"},
+                        {
+                            "id": "br-mcp-update-batch-2",
+                            "status": "wip",
+                            "labels_add": ["team:batch"],
+                            "comment": "batch comment"
+                        }
+                    ]
+                }),
+            )
+            .expect("batch update");
+        let batch = content_json(&content);
+
+        assert_batch_counts(&batch, 4, 2, 2);
+        assert_eq!(batch["items"][0]["index"].as_u64(), Some(0));
+        assert_eq!(batch["items"][0]["ok"].as_bool(), Some(true));
+        assert_eq!(
+            batch["items"][0]["result"]["title"].as_str(),
+            Some("batch first changed")
+        );
+        assert_eq!(
+            batch["items"][1]["error"]["data"]["error_type"].as_str(),
+            Some("ISSUE_NOT_FOUND")
+        );
+        assert_eq!(
+            batch["items"][2]["error"]["data"]["error_type"].as_str(),
+            Some("PLACEHOLDER_DETECTED")
+        );
+        assert_eq!(
+            batch["items"][3]["result"]["status"].as_str(),
+            Some("in_progress")
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let first = storage
+            .get_issue("br-mcp-update-batch-1")
+            .expect("get first issue")
+            .expect("first issue exists");
+        let second = storage
+            .get_issue("br-mcp-update-batch-2")
+            .expect("get second issue")
+            .expect("second issue exists");
+        assert_eq!(first.title, "batch first changed");
+        assert_eq!(second.status, Status::InProgress);
+        assert_eq!(
+            storage.get_labels("br-mcp-update-batch-2").expect("labels"),
+            vec!["team:batch".to_string()]
+        );
+        let comments = storage
+            .get_comments("br-mcp-update-batch-2")
+            .expect("comments");
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].author, "mcp-test");
+        assert_eq!(comments[0].body, "batch comment");
+
+        let jsonl = fs::read_to_string(&state.jsonl_path).expect("read auto-flushed jsonl");
+        assert!(jsonl.contains("batch first changed"));
+        assert!(jsonl.contains("batch comment"));
+    }
+
+    #[test]
+    fn update_issue_batch_rejects_ambiguous_single_and_batch_args() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = UpdateIssueTool::new(state);
+
+        let err = tool
+            .call(
+                &ctx,
+                json!({
+                    "id": "br-one",
+                    "updates": [{"id": "br-two", "title": "two"}]
+                }),
+            )
+            .expect_err("id and updates together should fail");
+
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+        assert!(err.message.contains("either 'id'"));
+    }
+
+    #[test]
+    fn update_issue_batch_rejects_invalid_comment_before_item_field_mutation() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-update-invalid-comment", "comment original");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = UpdateIssueTool::new(Arc::clone(&state));
+
+        let content = tool
+            .call(
+                &ctx,
+                json!({
+                    "updates": [{
+                        "id": "br-mcp-update-invalid-comment",
+                        "title": "should not mutate",
+                        "comment": "x".repeat(51_201)
+                    }]
+                }),
+            )
+            .expect("batch update should return per-item error");
+        let batch = content_json(&content);
+
+        assert_batch_counts(&batch, 1, 0, 1);
+        assert_eq!(batch["items"][0]["ok"].as_bool(), Some(false));
+        assert!(
+            batch["items"][0]["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("content") && message.contains("50KB"))
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let issue = storage
+            .get_issue("br-mcp-update-invalid-comment")
+            .expect("get issue")
+            .expect("issue exists");
+        assert_eq!(issue.title, "comment original");
+        assert!(
+            storage
+                .get_comments("br-mcp-update-invalid-comment")
+                .expect("comments")
+                .is_empty(),
+            "invalid batch comment must not be inserted"
+        );
+    }
+
     fn time_repeated_json_reads<F>(
         iterations: u32,
         mut read: F,
@@ -2763,6 +3054,86 @@ mod tests {
                 "speedup": repeated_single.0.as_nanos() as f64
                     / batch.0.as_nanos().max(1) as f64,
                 "equality": "batch envelope matches repeated single-item issue JSON",
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "perf probe for MCP update_issue batch evidence"]
+    fn mcp_update_issue_batch_perf_probe() {
+        let ids = (0..25)
+            .map(|index| format!("br-mcp-update-batch-perf-{index:04}"))
+            .collect::<Vec<_>>();
+        let iterations = 5_u32;
+
+        let repeated_temp = TempDir::new().expect("repeated tempdir");
+        let repeated_state = mcp_test_state(&repeated_temp);
+        for id in &ids {
+            insert_test_issue(&repeated_state, id, &format!("Repeated update issue {id}"));
+        }
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let repeated_tool = UpdateIssueTool::new(Arc::clone(&repeated_state));
+        let repeated_started = Instant::now();
+        for round in 0..iterations {
+            for id in &ids {
+                repeated_tool
+                    .call(
+                        &ctx,
+                        json!({
+                            "id": id,
+                            "title": format!("repeated round {round} {id}")
+                        }),
+                    )
+                    .expect("single update");
+            }
+        }
+        let repeated = repeated_started.elapsed();
+
+        let batch_temp = TempDir::new().expect("batch tempdir");
+        let batch_state = mcp_test_state(&batch_temp);
+        for id in &ids {
+            insert_test_issue(&batch_state, id, &format!("Batch update issue {id}"));
+        }
+        let batch_tool = UpdateIssueTool::new(Arc::clone(&batch_state));
+        let batch_started = Instant::now();
+        let mut last_batch = serde_json::Value::Null;
+        for round in 0..iterations {
+            let updates = ids
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "title": format!("batch round {round} {id}")
+                    })
+                })
+                .collect::<Vec<_>>();
+            let content = batch_tool
+                .call(&ctx, json!({"updates": updates}))
+                .expect("batch update");
+            last_batch = content_json(&content);
+            assert_batch_counts(&last_batch, ids.len() as u64, ids.len() as u64, 0);
+        }
+        let batch = batch_started.elapsed();
+
+        let storage = SqliteStorage::open(&batch_state.db_path).expect("open batch storage");
+        for id in &ids {
+            let issue = storage
+                .get_issue(id)
+                .expect("get issue")
+                .expect("issue exists");
+            assert!(issue.title.starts_with("batch round 4 "));
+        }
+
+        println!(
+            "{}",
+            json!({
+                "issues": ids.len(),
+                "iterations": iterations,
+                "repeated_single_total_ns": repeated.as_nanos(),
+                "batch_total_ns": batch.as_nanos(),
+                "speedup": repeated.as_nanos() as f64 / batch.as_nanos().max(1) as f64,
+                "last_batch_ok_count": last_batch["ok_count"],
+                "equality": "batch updates verified by final storage state and per-item ok counts",
             })
         );
     }

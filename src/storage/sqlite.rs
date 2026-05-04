@@ -4351,6 +4351,17 @@ impl SqliteStorage {
         high_bucket_filters.priorities = Some(priorities);
         high_bucket_filters.limit = Some(limit);
 
+        if exclude_blocked_in_sql {
+            let issues = self.query_ready_issue_candidates_with_projection(
+                &high_bucket_filters,
+                ReadySortPolicy::Oldest,
+                true,
+                true,
+                projection,
+            )?;
+            return Ok((issues.len() >= limit).then_some(issues));
+        }
+
         let mut summary_issues = self.query_ready_issue_candidates_with_projection(
             &high_bucket_filters,
             ReadySortPolicy::Oldest,
@@ -14052,6 +14063,48 @@ mod tests {
 
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, "bd-ready-window-blocker");
+    }
+
+    #[test]
+    fn test_limited_ready_hybrid_falls_back_when_high_bucket_is_short() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let high = make_issue(
+            "bd-ready-window-high",
+            "High priority ready issue",
+            Status::Open,
+            1,
+            None,
+            created_at,
+            None,
+        );
+        let medium = make_issue(
+            "bd-ready-window-medium",
+            "Medium priority fallback issue",
+            Status::Open,
+            2,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+
+        storage.create_issue(&high, "tester").unwrap();
+        storage.create_issue(&medium, "tester").unwrap();
+
+        let filters = ReadyFilters {
+            limit: Some(2),
+            ..ReadyFilters::default()
+        };
+        let issues = storage
+            .get_ready_issues_for_command_output(&filters, ReadySortPolicy::Hybrid)
+            .unwrap();
+
+        let ids = issues
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["bd-ready-window-high", "bd-ready-window-medium"]);
     }
 
     #[test]

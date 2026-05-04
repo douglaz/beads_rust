@@ -22,7 +22,9 @@ use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 
-const LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD: usize = 128;
+// Large default-visible structured pages are faster through the existing full
+// scan/relation path; smaller pages keep the medium-page relation queries.
+const LARGE_STRUCTURED_LIST_FULL_SCAN_THRESHOLD: usize = 96;
 
 /// Execute the list command.
 ///

@@ -1,6 +1,6 @@
 mod common;
 
-use beads_rust::model::{Issue, IssueType, Priority, Status};
+use beads_rust::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use chrono::Utc;
 use common::cli::{
@@ -916,6 +916,187 @@ fn e2e_no_db_mixed_prefixes_are_supported() {
         .collect();
     assert!(ids.contains(&"aa-abc"), "expected aa-abc in {ids:?}");
     assert!(ids.contains(&"bb-def"), "expected bb-def in {ids:?}");
+}
+
+#[test]
+fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
+    let workspace = BrWorkspace::new();
+    let beads_dir = workspace.root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+
+    let now = Utc::now();
+    let parent = make_issue("bd-rchk0.5", "Dotted parent", now);
+    let mut target = make_issue("bd-rchk0.5.6", "Dotted target", now);
+    target.dependencies.push(Dependency {
+        issue_id: target.id.clone(),
+        depends_on_id: parent.id.clone(),
+        dep_type: DependencyType::ParentChild,
+        created_at: now,
+        created_by: Some("tester".to_string()),
+        metadata: Some("{}".to_string()),
+        thread_id: None,
+    });
+    let mut child = make_issue("bd-rchk0.5.6.1", "Dotted child", now);
+    child.dependencies.push(Dependency {
+        issue_id: child.id.clone(),
+        depends_on_id: target.id.clone(),
+        dep_type: DependencyType::ParentChild,
+        created_at: now,
+        created_by: Some("tester".to_string()),
+        metadata: Some("{}".to_string()),
+        thread_id: None,
+    });
+    let blocker = make_issue("bd-blocker7", "Dotted blocker", now);
+    let records = [&parent, &target, &child, &blocker]
+        .into_iter()
+        .map(|issue| serde_json::to_string(issue).expect("serialize dotted fixture"))
+        .collect::<Vec<_>>();
+    fs::write(&jsonl_path, records.join("\n") + "\n").expect("write dotted jsonl");
+
+    let no_db_show = run_br(
+        &workspace,
+        ["--no-db", "show", "bd-rchk0.5.6", "--json"],
+        "dotted_no_db_show",
+    );
+    assert!(
+        no_db_show.status.success(),
+        "no-db show failed for dotted id: {}",
+        no_db_show.stderr
+    );
+    let show_payload = extract_json_payload(&no_db_show.stdout);
+    let shown: Vec<Value> = serde_json::from_str(&show_payload).expect("show json");
+    assert_eq!(shown[0]["id"].as_str(), Some("bd-rchk0.5.6"));
+
+    let no_db_update = run_br(
+        &workspace,
+        [
+            "--no-db",
+            "update",
+            "bd-rchk0.5.6",
+            "--priority",
+            "1",
+            "--json",
+        ],
+        "dotted_no_db_update",
+    );
+    assert!(
+        no_db_update.status.success(),
+        "no-db update failed for dotted id: {}",
+        no_db_update.stderr
+    );
+    let updated_payload = extract_json_payload(&no_db_update.stdout);
+    let updated: Vec<Value> = serde_json::from_str(&updated_payload).expect("update json");
+    assert_eq!(updated[0]["id"].as_str(), Some("bd-rchk0.5.6"));
+    assert_eq!(updated[0]["priority"].as_i64(), Some(1));
+
+    let imported = run_br(
+        &workspace,
+        ["sync", "--import-only", "--json"],
+        "dotted_import",
+    );
+    assert!(
+        imported.status.success(),
+        "import failed for dotted ids: {}",
+        imported.stderr
+    );
+    let import_json: Value =
+        serde_json::from_str(&extract_json_payload(&imported.stdout)).expect("import json");
+    assert_eq!(import_json["created"].as_i64(), Some(4));
+
+    let db_show = run_br(
+        &workspace,
+        ["show", "bd-rchk0.5.6", "--json"],
+        "dotted_db_show",
+    );
+    assert!(
+        db_show.status.success(),
+        "db show failed for dotted id: {}",
+        db_show.stderr
+    );
+    let db_show_json: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&db_show.stdout)).expect("db show json");
+    assert_eq!(db_show_json[0]["id"].as_str(), Some("bd-rchk0.5.6"));
+    assert!(
+        db_show_json[0]["dependents"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["id"].as_str() == Some("bd-rchk0.5.6.1"))),
+        "dotted child dependent should resolve to the exact parent"
+    );
+
+    let db_update = run_br(
+        &workspace,
+        [
+            "--no-auto-flush",
+            "update",
+            "bd-rchk0.5.6",
+            "--priority",
+            "0",
+            "--json",
+        ],
+        "dotted_db_update",
+    );
+    assert!(
+        db_update.status.success(),
+        "db update failed for dotted id: {}",
+        db_update.stderr
+    );
+    let db_update_json: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&db_update.stdout)).expect("db update json");
+    assert_eq!(db_update_json[0]["id"].as_str(), Some("bd-rchk0.5.6"));
+    assert_eq!(db_update_json[0]["priority"].as_i64(), Some(0));
+
+    let dep_add = run_br(
+        &workspace,
+        [
+            "--no-auto-flush",
+            "dep",
+            "add",
+            "bd-rchk0.5.6",
+            "bd-blocker7",
+            "--json",
+        ],
+        "dotted_dep_add",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed for dotted id: {}",
+        dep_add.stderr
+    );
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "dotted_flush",
+    );
+    assert!(
+        flush.status.success(),
+        "flush failed after dotted mutations: {}",
+        flush.stderr
+    );
+
+    let exported = fs::read_to_string(&jsonl_path).expect("read exported dotted jsonl");
+    let exported_issues: Vec<Value> = exported
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse exported issue"))
+        .collect();
+    assert_eq!(exported_issues.len(), 4);
+    let exported_target = exported_issues
+        .iter()
+        .find(|issue| issue["id"].as_str() == Some("bd-rchk0.5.6"))
+        .expect("exported dotted target");
+    assert_eq!(exported_target["priority"].as_i64(), Some(0));
+    assert!(
+        exported_target["dependencies"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["depends_on_id"].as_str() == Some("bd-blocker7"))),
+        "exported dotted target should retain the added dependency"
+    );
 }
 
 #[test]

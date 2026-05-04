@@ -191,6 +191,9 @@ fn render_search_results(
         }
         OutputFormat::Toon => {
             let issues_with_counts = attach_counts(storage, issues)?;
+            if early_ctx.toon_issue_counts_array_with_stats(&issues_with_counts, list_args.stats) {
+                return Ok(());
+            }
             early_ctx.toon_with_stats(&issues_with_counts, list_args.stats);
             return Ok(());
         }

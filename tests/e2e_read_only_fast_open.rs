@@ -40,15 +40,23 @@ fn assert_success(run: &BrRun, label: &str) {
     );
 }
 
+fn run_success(workspace: &BrWorkspace, args: &[&str], label: &str) -> BrRun {
+    let run = run_br(workspace, args.iter().copied(), label);
+    assert_success(&run, label);
+    run
+}
+
+fn create_issue(workspace: &BrWorkspace, args: &[&str], label: &str) -> String {
+    parse_created_id(&run_success(workspace, args, label).stdout)
+}
+
 fn seed_workspace() -> SeededWorkspace {
     let workspace = BrWorkspace::new();
 
-    let init = run_br(&workspace, ["init"], "init");
-    assert_success(&init, "init");
-
-    let epic = run_br(
+    run_success(&workspace, &["init"], "init");
+    let epic_id = create_issue(
         &workspace,
-        [
+        &[
             "create",
             "Fast-open roadmap epic",
             "-p",
@@ -60,12 +68,9 @@ fn seed_workspace() -> SeededWorkspace {
         ],
         "create_epic",
     );
-    assert_success(&epic, "create_epic");
-    let epic_id = parse_created_id(&epic.stdout);
-
-    let blocker = run_br(
+    let blocker_id = create_issue(
         &workspace,
-        [
+        &[
             "create",
             "Fast-open blocker issue",
             "-p",
@@ -77,12 +82,9 @@ fn seed_workspace() -> SeededWorkspace {
         ],
         "create_blocker",
     );
-    assert_success(&blocker, "create_blocker");
-    let blocker_id = parse_created_id(&blocker.stdout);
-
-    let blocked = run_br(
+    let blocked_id = create_issue(
         &workspace,
-        [
+        &[
             "create",
             "Fast-open blocked issue",
             "-p",
@@ -96,12 +98,9 @@ fn seed_workspace() -> SeededWorkspace {
         ],
         "create_blocked",
     );
-    assert_success(&blocked, "create_blocked");
-    let blocked_id = parse_created_id(&blocked.stdout);
-
-    let ready = run_br(
+    create_issue(
         &workspace,
-        [
+        &[
             "create",
             "Fast-open ready issue",
             "-p",
@@ -115,11 +114,9 @@ fn seed_workspace() -> SeededWorkspace {
         ],
         "create_ready",
     );
-    assert_success(&ready, "create_ready");
-
-    let comment = run_br(
+    run_success(
         &workspace,
-        [
+        &[
             "comments",
             "add",
             &blocker_id,
@@ -129,24 +126,21 @@ fn seed_workspace() -> SeededWorkspace {
         ],
         "add_comment",
     );
-    assert_success(&comment, "add_comment");
-
-    let dep = run_br(
+    run_success(
         &workspace,
-        ["dep", "add", &blocked_id, &blocker_id],
+        &["dep", "add", &blocked_id, &blocker_id],
         "dep_add",
     );
-    assert_success(&dep, "dep_add");
-
-    let save_query = run_br(
+    run_success(
         &workspace,
-        ["query", "save", "fast-open-p1", "--priority", "1"],
+        &["query", "save", "fast-open-p1", "--priority", "1"],
         "query_save",
     );
-    assert_success(&save_query, "query_save");
-
-    let flush = run_br(&workspace, ["sync", "--flush-only", "--json"], "sync_flush");
-    assert_success(&flush, "sync_flush");
+    run_success(
+        &workspace,
+        &["sync", "--flush-only", "--json"],
+        "sync_flush",
+    );
 
     SeededWorkspace {
         workspace,
@@ -156,6 +150,14 @@ fn seed_workspace() -> SeededWorkspace {
 }
 
 fn matrix_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
+    let mut commands = Vec::new();
+    commands.extend(core_read_commands(seed));
+    commands.extend(status_and_report_commands());
+    commands.extend(relation_and_query_commands(seed));
+    commands
+}
+
+fn core_read_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
     vec![
         exact_command(
             "list_json",
@@ -207,6 +209,11 @@ fn matrix_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
             "blocked_json",
             strings(["--lock-timeout", "50", "blocked", "--json", "--limit", "5"]),
         ),
+    ]
+}
+
+fn status_and_report_commands() -> Vec<MatrixCommand> {
+    vec![
         exact_command(
             "count_json",
             strings(["--lock-timeout", "50", "count", "--json"]),
@@ -255,6 +262,11 @@ fn matrix_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
             "orphans_robot",
             strings(["--lock-timeout", "50", "orphans", "--robot"]),
         ),
+    ]
+}
+
+fn relation_and_query_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
+    vec![
         exact_command(
             "comments_json",
             vec![

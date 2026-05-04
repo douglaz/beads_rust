@@ -103,12 +103,9 @@ fn execute_inner(
 
     info!("Computing project statistics");
 
-    let all_issues = storage.list_stats_issues()?;
-
-    debug!(total = all_issues.len(), "Loaded all issues for stats");
-
-    // Compute summary counts
     let now = Utc::now();
+    let all_issues = list_issues_for_stats(storage, args)?;
+    debug!(total = all_issues.len(), "Loaded issues for stats");
     let has_potential_ready_candidates = all_issues
         .iter()
         .any(|issue| is_potential_ready_candidate(issue, &now));
@@ -277,6 +274,18 @@ const fn should_include_activity(args: &StatsArgs) -> bool {
 
 const fn should_collect_activity(args: &StatsArgs, output_mode: OutputMode) -> bool {
     should_include_activity(args) && !matches!(output_mode, OutputMode::Quiet)
+}
+
+const fn needs_stats_issue_rows(args: &StatsArgs) -> bool {
+    args.by_type || args.by_priority || args.by_assignee || args.by_label
+}
+
+fn list_issues_for_stats(storage: &SqliteStorage, args: &StatsArgs) -> Result<Vec<StatsIssueRow>> {
+    if needs_stats_issue_rows(args) {
+        storage.list_stats_issues()
+    } else {
+        storage.list_stats_summary_issues()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1487,7 +1496,7 @@ mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use chrono::{TimeZone, Utc};
+    use chrono::{Duration, TimeZone, Utc};
     use std::fs;
     use tempfile::TempDir;
 
@@ -1804,6 +1813,90 @@ mod tests {
 
         // t-2 should NOT be blocked because t-1 is closed
         assert_eq!(summary.blocked_issues, 0);
+    }
+
+    #[test]
+    fn test_stats_summary_rows_match_full_summary() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+
+        let open_issue = make_issue("t-open", Status::Open, IssueType::Task);
+        let in_progress_issue = make_issue("t-progress", Status::InProgress, IssueType::Task);
+        let status_blocked_issue = make_issue("t-status-blocked", Status::Blocked, IssueType::Task);
+        let blocking_issue = make_issue("t-blocker", Status::Open, IssueType::Task);
+        let dependent_issue = make_issue("t-dependent", Status::Open, IssueType::Task);
+        let mut closed_issue = make_issue("t-closed", Status::Closed, IssueType::Bug);
+        closed_issue.created_at = now - Duration::hours(48);
+        closed_issue.closed_at = Some(now);
+        let deferred_issue = make_issue("t-deferred", Status::Deferred, IssueType::Task);
+        let draft_issue = make_issue("t-draft", Status::Draft, IssueType::Task);
+        let mut pinned_issue = make_issue("t-pinned", Status::Open, IssueType::Task);
+        pinned_issue.pinned = true;
+        let mut template_issue = make_issue("t-template", Status::Open, IssueType::Task);
+        template_issue.is_template = true;
+        let wisp_issue = make_issue("t-wisp-1", Status::Open, IssueType::Task);
+        let epic_issue = make_issue("t-epic", Status::Open, IssueType::Epic);
+        let mut epic_child = make_issue("t-epic-child", Status::Closed, IssueType::Task);
+        epic_child.created_at = now - Duration::hours(1);
+        epic_child.closed_at = Some(now);
+        let tombstone_issue = make_issue("t-tombstone", Status::Open, IssueType::Task);
+
+        for issue in [
+            &open_issue,
+            &in_progress_issue,
+            &status_blocked_issue,
+            &blocking_issue,
+            &dependent_issue,
+            &closed_issue,
+            &deferred_issue,
+            &draft_issue,
+            &pinned_issue,
+            &template_issue,
+            &wisp_issue,
+            &epic_issue,
+            &epic_child,
+            &tombstone_issue,
+        ] {
+            storage.create_issue(issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency("t-dependent", "t-blocker", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("t-epic-child", "t-epic", "parent-child", "tester")
+            .unwrap();
+        storage
+            .delete_issue("t-tombstone", "tester", "summary parity", None)
+            .unwrap();
+
+        let full_rows = storage.list_stats_issues().unwrap();
+        let summary_rows = storage.list_stats_summary_issues().unwrap();
+        let mut external_blockers = std::collections::HashMap::new();
+        external_blockers.insert("t-open".to_string(), vec!["external-1".to_string()]);
+        let has_potential_ready_candidates = full_rows
+            .iter()
+            .any(|issue| is_potential_ready_candidate(issue, &now));
+        let full = compute_summary(
+            &storage,
+            &full_rows,
+            Some(&external_blockers),
+            &now,
+            has_potential_ready_candidates,
+        )
+        .unwrap();
+        let lean = compute_summary(
+            &storage,
+            &summary_rows,
+            Some(&external_blockers),
+            &now,
+            has_potential_ready_candidates,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&lean).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
     }
 
     #[test]

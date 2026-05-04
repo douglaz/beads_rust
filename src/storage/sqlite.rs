@@ -2829,6 +2829,10 @@ impl SqliteStorage {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<String>> {
+        self.query_issue_ids_from_sql(sql, params)
+    }
+
+    fn query_issue_ids_from_sql(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(sql, params)?;
         Ok(rows
             .iter()
@@ -3510,6 +3514,24 @@ impl SqliteStorage {
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             issues.push(Self::stats_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
+    /// Get the narrowest issue rows needed for stats summary computation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_stats_summary_issues(&self) -> Result<Vec<StatsIssueRow>> {
+        let rows = self.conn.query(
+            r"SELECT id, status, issue_type, created_at, closed_at,
+                     defer_until, ephemeral, pinned, is_template
+              FROM issues",
+        )?;
+        let mut issues = Vec::with_capacity(rows.len());
+        for row in &rows {
+            issues.push(Self::stats_summary_issue_from_row(row)?);
         }
         Ok(issues)
     }
@@ -9268,6 +9290,35 @@ impl SqliteStorage {
             ephemeral: get_bool(8),
             pinned: get_bool(9),
             is_template: get_bool(10),
+        })
+    }
+
+    fn stats_summary_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_bool = |idx: usize| -> bool {
+            row.get(idx).and_then(SqliteValue::as_integer).unwrap_or(0) != 0
+        };
+        let get_opt_datetime = |idx: usize| -> Result<Option<DateTime<Utc>>> {
+            parse_opt_datetime_value(row.get(idx))
+        };
+
+        Ok(StatsIssueRow {
+            id: get_str(0),
+            status: parse_status(row.get(1).and_then(SqliteValue::as_text)),
+            priority: Priority::default(),
+            issue_type: parse_issue_type(row.get(2).and_then(SqliteValue::as_text)),
+            assignee: None,
+            created_at: parse_datetime_value(row.get(3))?,
+            closed_at: get_opt_datetime(4)?,
+            defer_until: get_opt_datetime(5)?,
+            ephemeral: get_bool(6),
+            pinned: get_bool(7),
+            is_template: get_bool(8),
         })
     }
 

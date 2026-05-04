@@ -439,6 +439,324 @@ pub struct PolicyDecision {
     pub reason: String,
 }
 
+/// Current sequential drift-guard document schema version.
+pub const DRIFT_GUARD_SCHEMA_VERSION: u32 = 1;
+
+/// A deterministic safety rail for one adaptive fast-path action.
+///
+/// Drift guards are intentionally separate from `AdaptivePolicy`: a policy can
+/// say which fast path would be useful, while a guard decides whether recent
+/// replay or live evidence is still good enough to allow that action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SequentialDriftGuard {
+    /// Schema version of this drift-guard document format.
+    pub schema_version: u32,
+    /// Stable identifier for audit logs and replay bundles.
+    pub guard_id: String,
+    /// Adaptive policy this guard protects.
+    pub policy_id: String,
+    /// Deterministic policy state the evidence applies to.
+    pub state: AdaptivePolicyState,
+    /// Candidate fast-path action controlled by this guard.
+    pub action: AdaptivePolicyAction,
+    /// Loss and sample budgets for accepting the candidate.
+    pub loss: SequentialLossBudget,
+    /// Caller-provided replay or live evidence.
+    pub evidence: SequentialEvidence,
+    /// Proof obligations that must be satisfied before accepting evidence.
+    pub proof_obligations: DriftProofObligations,
+    /// Conservative fallback output when evidence is missing, stale, or lossy.
+    pub fallback: DriftGuardFallback,
+}
+
+impl SequentialDriftGuard {
+    /// Validate static document shape and names.
+    pub fn validate(&self) -> Result<(), Vec<PolicyValidationError>> {
+        let mut errors = Vec::new();
+
+        if self.schema_version != DRIFT_GUARD_SCHEMA_VERSION {
+            errors.push(PolicyValidationError::new(
+                "schema_version",
+                format!(
+                    "unsupported schema version {}; expected {DRIFT_GUARD_SCHEMA_VERSION}",
+                    self.schema_version
+                ),
+            ));
+        }
+
+        validate_name("guard_id", &self.guard_id, &mut errors);
+        validate_name("policy_id", &self.policy_id, &mut errors);
+        validate_name("state.operation", &self.state.operation, &mut errors);
+        validate_name("state.corpus_hash", &self.state.corpus_hash, &mut errors);
+        validate_name(
+            "state.policy_revision",
+            &self.state.policy_revision,
+            &mut errors,
+        );
+        validate_name("action.action_id", &self.action.action_id, &mut errors);
+        validate_name(
+            "action.fast_path_name",
+            &self.action.fast_path_name,
+            &mut errors,
+        );
+        validate_name("action.output_name", &self.action.output_name, &mut errors);
+        validate_name(
+            "evidence.expected_corpus_hash",
+            &self.evidence.expected_corpus_hash,
+            &mut errors,
+        );
+        validate_name(
+            "evidence.corpus_hash",
+            &self.evidence.corpus_hash,
+            &mut errors,
+        );
+        validate_name("fallback.reason", &self.fallback.reason, &mut errors);
+
+        if self.loss.min_sample_count == 0 {
+            errors.push(PolicyValidationError::new(
+                "loss.min_sample_count",
+                "must be greater than zero",
+            ));
+        }
+        if self.evidence.baseline_p95_ms == 0 {
+            errors.push(PolicyValidationError::new(
+                "evidence.baseline_p95_ms",
+                "must be greater than zero",
+            ));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Evaluate evidence without reading clocks, random state, or global state.
+    #[must_use]
+    pub fn evaluate(&self) -> DriftGuardDecision {
+        if let Err(errors) = self.validate() {
+            return self.disable_decision(format!(
+                "invalid_guard: {}",
+                summarize_validation_errors(&errors)
+            ));
+        }
+
+        if let Some(reason) = self.proof_obligations.failure_reason() {
+            return self.disable_decision(reason);
+        }
+
+        if self.evidence.sample_count < self.loss.min_sample_count {
+            return self.disable_decision(format!(
+                "insufficient_samples: got {} need {}",
+                self.evidence.sample_count, self.loss.min_sample_count
+            ));
+        }
+
+        if self.evidence.corpus_hash != self.evidence.expected_corpus_hash {
+            return self.disable_decision("corpus_hash_drift".to_string());
+        }
+
+        if self.state.corpus_hash != self.evidence.expected_corpus_hash {
+            return self.disable_decision("corpus_hash_drift".to_string());
+        }
+
+        let error_delta = self.evidence.candidate_error_count - self.evidence.baseline_error_count;
+        if error_delta > i64::from(self.loss.max_error_delta) {
+            return self.disable_decision(format!(
+                "error_delta_exceeded: got {error_delta} budget {}",
+                self.loss.max_error_delta
+            ));
+        }
+
+        let allowed_candidate_p95 = allowed_candidate_p95(
+            self.evidence.baseline_p95_ms,
+            self.loss.max_p95_regression_pct,
+        );
+        if u128::from(self.evidence.candidate_p95_ms) > allowed_candidate_p95 {
+            return self.disable_decision(format!(
+                "p95_regression_exceeded: baseline={} candidate={} budget_pct={}",
+                self.evidence.baseline_p95_ms,
+                self.evidence.candidate_p95_ms,
+                self.loss.max_p95_regression_pct
+            ));
+        }
+
+        DriftGuardDecision {
+            guard_id: self.guard_id.clone(),
+            policy_id: self.policy_id.clone(),
+            action_id: self.action.action_id.clone(),
+            outcome: DriftGuardOutcome::AcceptFastPath,
+            outputs: BTreeMap::from([(
+                self.action.output_name.clone(),
+                self.action.accept_value.clone(),
+            )]),
+            evidence_terms: self.evidence_terms(),
+            fallback_active: false,
+            reason: "evidence_within_budget".to_string(),
+        }
+    }
+
+    fn disable_decision(&self, reason: String) -> DriftGuardDecision {
+        DriftGuardDecision {
+            guard_id: self.guard_id.clone(),
+            policy_id: self.policy_id.clone(),
+            action_id: self.action.action_id.clone(),
+            outcome: DriftGuardOutcome::DisableFastPath,
+            outputs: BTreeMap::from([(
+                self.action.output_name.clone(),
+                self.fallback.output_value.clone(),
+            )]),
+            evidence_terms: self.evidence_terms(),
+            fallback_active: true,
+            reason,
+        }
+    }
+
+    fn evidence_terms(&self) -> BTreeMap<String, PolicyValue> {
+        BTreeMap::from([
+            (
+                "baseline_p95_ms".to_string(),
+                PolicyValue::Integer(i64::from(self.evidence.baseline_p95_ms)),
+            ),
+            (
+                "candidate_p95_ms".to_string(),
+                PolicyValue::Integer(i64::from(self.evidence.candidate_p95_ms)),
+            ),
+            (
+                "p95_delta_pct".to_string(),
+                PolicyValue::Integer(p95_delta_pct(
+                    self.evidence.baseline_p95_ms,
+                    self.evidence.candidate_p95_ms,
+                )),
+            ),
+            (
+                "max_p95_regression_pct".to_string(),
+                PolicyValue::Integer(i64::from(self.loss.max_p95_regression_pct)),
+            ),
+            (
+                "sample_count".to_string(),
+                PolicyValue::Integer(i64::from(self.evidence.sample_count)),
+            ),
+            (
+                "min_sample_count".to_string(),
+                PolicyValue::Integer(i64::from(self.loss.min_sample_count)),
+            ),
+            (
+                "error_delta".to_string(),
+                PolicyValue::Integer(
+                    self.evidence.candidate_error_count - self.evidence.baseline_error_count,
+                ),
+            ),
+            (
+                "replay_seed".to_string(),
+                PolicyValue::Integer(i64::from(self.evidence.replay_seed)),
+            ),
+        ])
+    }
+}
+
+/// Deterministic state covered by a drift guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptivePolicyState {
+    pub operation: String,
+    pub corpus_hash: String,
+    pub policy_revision: String,
+}
+
+/// Candidate action controlled by a drift guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptivePolicyAction {
+    pub action_id: String,
+    pub fast_path_name: String,
+    pub output_name: String,
+    pub accept_value: PolicyValue,
+}
+
+/// Loss and sample budgets for sequential drift evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SequentialLossBudget {
+    pub max_p95_regression_pct: u32,
+    pub max_error_delta: u32,
+    pub min_sample_count: u32,
+}
+
+/// Replay or live evidence supplied by the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SequentialEvidence {
+    pub expected_corpus_hash: String,
+    pub corpus_hash: String,
+    pub replay_seed: u32,
+    pub sample_count: u32,
+    pub baseline_p95_ms: u32,
+    pub candidate_p95_ms: u32,
+    pub baseline_error_count: i64,
+    pub candidate_error_count: i64,
+}
+
+/// Proof obligations that keep adaptive decisions replayable and conservative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DriftProofObligations {
+    pub deterministic_input_evidence: bool,
+    pub no_hidden_clocks_or_rng: bool,
+    pub bounded_runtime_cost: bool,
+    pub conservative_fallback: bool,
+}
+
+impl DriftProofObligations {
+    fn failure_reason(self) -> Option<String> {
+        if !self.deterministic_input_evidence {
+            return Some("proof_obligation_failed: deterministic_input_evidence".to_string());
+        }
+        if !self.no_hidden_clocks_or_rng {
+            return Some("proof_obligation_failed: no_hidden_clocks_or_rng".to_string());
+        }
+        if !self.bounded_runtime_cost {
+            return Some("proof_obligation_failed: bounded_runtime_cost".to_string());
+        }
+        if !self.conservative_fallback {
+            return Some("proof_obligation_failed: conservative_fallback".to_string());
+        }
+        None
+    }
+}
+
+/// Conservative output used when a drift guard disables a fast path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DriftGuardFallback {
+    pub output_value: PolicyValue,
+    pub reason: String,
+}
+
+/// Drift-guard evaluation result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DriftGuardDecision {
+    pub guard_id: String,
+    pub policy_id: String,
+    pub action_id: String,
+    pub outcome: DriftGuardOutcome,
+    pub outputs: BTreeMap<String, PolicyValue>,
+    pub evidence_terms: BTreeMap<String, PolicyValue>,
+    pub fallback_active: bool,
+    pub reason: String,
+}
+
+/// Drift-guard outcome for the protected action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftGuardOutcome {
+    AcceptFastPath,
+    DisableFastPath,
+}
+
 /// One validation failure found inside a policy document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -462,6 +780,17 @@ fn summarize_validation_errors(errors: &[PolicyValidationError]) -> String {
         .map(|error| format!("{} {}", error.field, error.message))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn allowed_candidate_p95(baseline_p95_ms: u32, budget_pct: u32) -> u128 {
+    u128::from(baseline_p95_ms) * (100 + u128::from(budget_pct)) / 100
+}
+
+fn p95_delta_pct(baseline_p95_ms: u32, candidate_p95_ms: u32) -> i64 {
+    if baseline_p95_ms == 0 {
+        return 0;
+    }
+    (i64::from(candidate_p95_ms) - i64::from(baseline_p95_ms)) * 100 / i64::from(baseline_p95_ms)
 }
 
 fn validate_inputs(
@@ -898,6 +1227,160 @@ mod tests {
 
         let decision_a = policy.evaluate(&context_a);
         let decision_b = policy.evaluate(&context_b);
+
+        assert_eq!(decision_a, decision_b);
+        assert_eq!(
+            serde_json::to_string(&decision_a).expect("decision serializes"),
+            serde_json::to_string(&decision_b).expect("decision serializes")
+        );
+    }
+
+    fn sample_drift_guard() -> SequentialDriftGuard {
+        SequentialDriftGuard {
+            schema_version: DRIFT_GUARD_SCHEMA_VERSION,
+            guard_id: "scheduler-window-p95-guard".to_string(),
+            policy_id: "swarm-scale-defaults".to_string(),
+            state: AdaptivePolicyState {
+                operation: "scheduler".to_string(),
+                corpus_hash: "sha256:corpus-a".to_string(),
+                policy_revision: "policy-rev-1".to_string(),
+            },
+            action: AdaptivePolicyAction {
+                action_id: "enable_scheduler_window_100".to_string(),
+                fast_path_name: "scheduler_candidate_limit_100".to_string(),
+                output_name: "candidate_window_enabled".to_string(),
+                accept_value: PolicyValue::Boolean(true),
+            },
+            loss: SequentialLossBudget {
+                max_p95_regression_pct: 5,
+                max_error_delta: 0,
+                min_sample_count: 10,
+            },
+            evidence: SequentialEvidence {
+                expected_corpus_hash: "sha256:corpus-a".to_string(),
+                corpus_hash: "sha256:corpus-a".to_string(),
+                replay_seed: 42,
+                sample_count: 10,
+                baseline_p95_ms: 240,
+                candidate_p95_ms: 230,
+                baseline_error_count: 0,
+                candidate_error_count: 0,
+            },
+            proof_obligations: DriftProofObligations {
+                deterministic_input_evidence: true,
+                no_hidden_clocks_or_rng: true,
+                bounded_runtime_cost: true,
+                conservative_fallback: true,
+            },
+            fallback: DriftGuardFallback {
+                output_value: PolicyValue::Boolean(false),
+                reason: "disable candidate window".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn drift_guard_schema_declares_state_action_loss_and_evidence() {
+        let schema = schemars::schema_for!(SequentialDriftGuard);
+        let value = serde_json::to_value(schema).expect("schema serializes");
+        let required = value
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("schema has required fields");
+
+        for field in [
+            "schema_version",
+            "guard_id",
+            "policy_id",
+            "state",
+            "action",
+            "loss",
+            "evidence",
+            "proof_obligations",
+            "fallback",
+        ] {
+            assert!(
+                required.contains(&json!(field)),
+                "SequentialDriftGuard schema should require {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn drift_guard_accepts_fast_path_under_clean_evidence() {
+        let guard = sample_drift_guard();
+
+        let decision = guard.evaluate();
+
+        assert_eq!(decision.outcome, DriftGuardOutcome::AcceptFastPath);
+        assert!(!decision.fallback_active);
+        assert_eq!(decision.reason, "evidence_within_budget");
+        assert_eq!(
+            decision.outputs.get("candidate_window_enabled"),
+            Some(&PolicyValue::Boolean(true))
+        );
+        assert_eq!(
+            decision.evidence_terms.get("p95_delta_pct"),
+            Some(&PolicyValue::Integer(-4))
+        );
+    }
+
+    #[test]
+    fn drift_guard_disables_fast_path_under_regression_evidence() {
+        let mut guard = sample_drift_guard();
+        guard.evidence.candidate_p95_ms = 260;
+
+        let decision = guard.evaluate();
+
+        assert_eq!(decision.outcome, DriftGuardOutcome::DisableFastPath);
+        assert!(decision.fallback_active);
+        assert!(decision.reason.contains("p95_regression_exceeded"));
+        assert_eq!(
+            decision.outputs.get("candidate_window_enabled"),
+            Some(&PolicyValue::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn drift_guard_disables_fast_path_under_corpus_drift() {
+        let mut guard = sample_drift_guard();
+        guard.evidence.corpus_hash = "sha256:other-corpus".to_string();
+
+        let decision = guard.evaluate();
+
+        assert_eq!(decision.outcome, DriftGuardOutcome::DisableFastPath);
+        assert_eq!(decision.reason, "corpus_hash_drift");
+        assert_eq!(
+            decision.outputs.get("candidate_window_enabled"),
+            Some(&PolicyValue::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn drift_guard_disables_fast_path_when_proof_obligation_fails() {
+        let mut guard = sample_drift_guard();
+        guard.proof_obligations.no_hidden_clocks_or_rng = false;
+
+        let decision = guard.evaluate();
+
+        assert_eq!(decision.outcome, DriftGuardOutcome::DisableFastPath);
+        assert!(
+            decision
+                .reason
+                .contains("proof_obligation_failed: no_hidden_clocks_or_rng")
+        );
+        assert!(decision.fallback_active);
+    }
+
+    #[test]
+    fn drift_guard_replay_serializes_same_decision() {
+        let guard = sample_drift_guard();
+        let replayed_guard: SequentialDriftGuard =
+            serde_json::from_value(serde_json::to_value(&guard).expect("guard serializes"))
+                .expect("guard replays from JSON");
+
+        let decision_a = guard.evaluate();
+        let decision_b = replayed_guard.evaluate();
 
         assert_eq!(decision_a, decision_b);
         assert_eq!(

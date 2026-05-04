@@ -224,7 +224,65 @@ Policy modes:
   commands.
 - `enforcing`: a baseline manifest path and passing comparison are required.
 
-### 6. NUMA Read-Command Profile (manifest.json + env.json)
+### 6. Sequential Drift Guard (br.sequential-drift-guard.v1)
+
+Adaptive fast paths must have an inspectable safety rail before they are enabled
+by runtime policy. The sequential drift guard is a pure policy-adjacent document:
+callers provide every state, action, loss, proof, and evidence field, and the
+evaluator returns either `accept_fast_path` or `disable_fast_path`.
+
+The canonical Rust schema lives in `src/policy.rs` as `SequentialDriftGuard`:
+
+```json
+{
+  "schema_version": 1,
+  "guard_id": "scheduler-window-p95-guard",
+  "policy_id": "swarm-scale-defaults",
+  "state": {
+    "operation": "scheduler",
+    "corpus_hash": "sha256:corpus-a",
+    "policy_revision": "policy-rev-1"
+  },
+  "action": {
+    "action_id": "enable_scheduler_window_100",
+    "fast_path_name": "scheduler_candidate_limit_100",
+    "output_name": "candidate_window_enabled",
+    "accept_value": true
+  },
+  "loss": {
+    "max_p95_regression_pct": 5,
+    "max_error_delta": 0,
+    "min_sample_count": 10
+  },
+  "evidence": {
+    "expected_corpus_hash": "sha256:corpus-a",
+    "corpus_hash": "sha256:corpus-a",
+    "replay_seed": 42,
+    "sample_count": 10,
+    "baseline_p95_ms": 240,
+    "candidate_p95_ms": 230,
+    "baseline_error_count": 0,
+    "candidate_error_count": 0
+  },
+  "proof_obligations": {
+    "deterministic_input_evidence": true,
+    "no_hidden_clocks_or_rng": true,
+    "bounded_runtime_cost": true,
+    "conservative_fallback": true
+  },
+  "fallback": {
+    "output_value": false,
+    "reason": "disable candidate window"
+  }
+}
+```
+
+Guard decisions include the chosen output, machine-readable evidence terms,
+fallback status, and reason string. Regression, corpus drift, insufficient
+samples, new errors, invalid documents, or failed proof obligations all disable
+the fast path and return the configured fallback output.
+
+### 7. NUMA Read-Command Profile (manifest.json + env.json)
 
 Manual high-core profiling bundles use `manifest.json` and `env.json` when the
 goal is not a before/after optimization gate, but an evidence map for future
@@ -407,6 +465,10 @@ tests/artifacts/perf/
     standard command labels, default-scheduler timing, pinned-core timing,
     syscall summaries, golden stdout/stderr checksums, and a cross-NUMA profile
     entry that is either populated or explicitly marked unavailable.
+14. **Drift guard fail-closed behavior**: Sequential drift guards must disable
+    the fast path when proof obligations fail, corpus hashes drift, sample counts
+    are below budget, candidate errors increase beyond budget, or p95 regression
+    exceeds the configured percentage.
 
 ### Cross-Platform Normalization
 

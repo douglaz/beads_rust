@@ -1776,6 +1776,7 @@ impl SqliteStorage {
     #[allow(clippy::too_many_lines)]
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
         IssueValidator::validate(issue).map_err(BeadsError::from_validation_errors)?;
+        validate_issue_comments_for_create(issue)?;
 
         self.mutate("create_issue", actor, |conn, ctx| {
             // Explicit duplicate check since fsqlite does not enforce
@@ -11187,6 +11188,14 @@ fn validate_new_comment(issue_id: &str, author: &str, text: &str) -> Result<()> 
     CommentValidator::validate(&comment).map_err(BeadsError::from_validation_errors)
 }
 
+fn validate_issue_comments_for_create(issue: &Issue) -> Result<()> {
+    for comment in &issue.comments {
+        validate_new_comment(&issue.id, &comment.author, &comment.body)?;
+    }
+
+    Ok(())
+}
+
 fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &str) -> Result<i64> {
     conn.execute_with_params(
         "INSERT INTO comments (issue_id, author, text, created_at)
@@ -13607,6 +13616,45 @@ mod tests {
         assert!(
             comments.is_empty(),
             "invalid comments must not be inserted: {comments:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_issue_rejects_invalid_embedded_comment_without_inserting_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+        let mut issue = make_issue(
+            "bd-c-create-invalid",
+            "Create comment validation target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        issue.comments.push(Comment {
+            id: 1,
+            issue_id: "bd-c-create-invalid".to_string(),
+            author: "alice".to_string(),
+            body: "   ".to_string(),
+            created_at: t1,
+        });
+
+        let err = storage.create_issue(&issue, "tester").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Validation { field, reason }
+                    if field == "content" && reason.contains("cannot be empty")
+            ),
+            "unexpected embedded comment validation error: {err:?}"
+        );
+        assert!(storage.get_issue("bd-c-create-invalid").unwrap().is_none());
+        assert!(
+            storage
+                .get_comments("bd-c-create-invalid")
+                .unwrap()
+                .is_empty()
         );
     }
 

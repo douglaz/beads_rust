@@ -3035,6 +3035,12 @@ impl SqliteStorage {
             return self.list_issues(filters);
         }
 
+        if let Some(limit) = filters.limit
+            && limit > 0
+        {
+            return self.list_text_issues_by_priority_window(filters, limit);
+        }
+
         let mut sql = String::from(
             "SELECT id, title, status, priority, issue_type, created_at, updated_at
              FROM issues
@@ -3060,6 +3066,50 @@ impl SqliteStorage {
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
             issues.push(Self::command_summary_issue_from_row(row)?);
+        }
+        Ok(issues)
+    }
+
+    fn list_text_issues_by_priority_window(
+        &self,
+        filters: &ListFilters,
+        limit: usize,
+    ) -> Result<Vec<Issue>> {
+        let mut offset = filters.offset.unwrap_or(0);
+        let mut issues = Vec::with_capacity(limit);
+        for priority in Priority::CRITICAL.0..=Priority::BACKLOG.0 {
+            let remaining = limit - issues.len();
+            if remaining == 0 {
+                break;
+            }
+
+            let query_limit = remaining.saturating_add(offset);
+            let rows = self.conn.query_with_params(
+                "SELECT id, title, status, priority, issue_type, created_at, updated_at
+                 FROM issues INDEXED BY idx_issues_list_active_order
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND (is_template = 0 OR is_template IS NULL)
+                   AND priority = ?
+                 ORDER BY created_at DESC, id ASC
+                 LIMIT ?",
+                &[
+                    SqliteValue::from(i64::from(priority)),
+                    SqliteValue::from(i64::try_from(query_limit).unwrap_or(i64::MAX)),
+                ],
+            )?;
+
+            if offset >= rows.len() {
+                offset -= rows.len();
+                continue;
+            }
+
+            for row in rows.iter().skip(offset) {
+                if issues.len() == limit {
+                    break;
+                }
+                issues.push(Self::command_summary_issue_from_row(row)?);
+            }
+            offset = 0;
         }
         Ok(issues)
     }

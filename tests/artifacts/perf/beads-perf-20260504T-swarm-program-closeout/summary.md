@@ -35,7 +35,7 @@ Concrete deliverables implied by that prompt:
 | Requirement | Evidence |
 | --- | --- |
 | Use `idea-wizard` through all phases | Epic `beads_rust-72yf` records Phase 1 context, a 30-idea pool, top 5, next 10, and a 46-child executable bead graph. |
-| Create self-contained beads with dependencies | `br epic status --json` reports `total_children=46`, `closed_children=46`, `eligible_for_close=true`; `bv --robot-insights | jq '.Cycles'` returned `null`. |
+| Create self-contained beads with dependencies | Pre-close `br epic status --json` reported `total_children=46`, `closed_children=46`, `eligible_for_close=true`; `bv --robot-insights | jq '.Cycles'` returned `null`. After closing the epic, `br epic status --json` returns `[]` because there are no open epics left. |
 | Apply `extreme-software-optimization` | Accepted and rejected slices include hyperfine/time/RSS/strace/golden evidence in `tests/artifacts/perf/beads-perf-20260503T-*` and `tests/artifacts/perf/beads-perf-20260504T-*`. No-go slices are closed as measured rejections, not silently kept. |
 | Apply `alien-artifact-coding` | `src/policy.rs` sequential drift guard, scheduler evidence, capacity report, and proof/de-scope artifacts use explicit proof obligations, fallback policy, and decision evidence. |
 | Apply `alien-graveyard` | Shipped or evaluated S3-FIFO, seqlock-style startup cache, write-combining / flat-combining design, Merkle witnesses, morsel-style export preparation, graph projection, queueing/capacity planning, and adaptive controller guards. |
@@ -124,12 +124,15 @@ env CARGO_TARGET_DIR=/data/tmp/cargo_target_beads_rust_pinktiger_72yf51_release 
 
 Observed closeout results:
 
-- `br epic status --json`: `total_children=46`, `closed_children=46`,
+- Pre-close `br epic status --json`: `total_children=46`, `closed_children=46`,
   `eligible_for_close=true`.
 - `bv --robot-insights | jq '.Cycles'`: `null`.
 - Focused witness/export parity tests: passed.
 - Current release 12k JSONL import probe: imported 12,000 records, dirty count
   0, expected JSONL hash, healthy doctor checks.
+- Post-close state: `br ready --json`, `br list --status open --json`, and
+  `br list --status in_progress --json` all returned empty result sets; current
+  `br epic status --json` returns `[]`.
 
 ## Known Boundaries
 

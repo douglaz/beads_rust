@@ -507,7 +507,9 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
                 );
             }
         }
-        "db.recoverable_anomalies" if matches!(check.status, CheckStatus::Error) => {
+        "db.recoverable_anomalies"
+            if matches!(check.status, CheckStatus::Error | CheckStatus::Warn) =>
+        {
             append_recoverable_anomaly_findings(check, anomalies);
         }
         "db.null_defaults" if matches!(check.status, CheckStatus::Warn) => {
@@ -3804,6 +3806,51 @@ mod tests {
             }),
             "expected count mismatch anomaly: {:?}",
             classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_warn_recoverable_anomalies_degraded() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "db.recoverable_anomalies".to_string(),
+            status: CheckStatus::Warn,
+            message: Some(BLOCKED_CACHE_STALE_FINDING.to_string()),
+            details: Some(serde_json::json!({
+                "findings": [
+                    BLOCKED_CACHE_STALE_FINDING,
+                    BLOCKED_CACHE_CONTENT_MISMATCH_FINDING,
+                    READY_PROJECTION_CONTENT_MISMATCH_FINDING,
+                ]
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        let anomalies = &classification.anomalies;
+        assert!(
+            anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::BlockedCacheStale)),
+            "expected blocked-cache stale anomaly: {:?}",
+            anomalies
+        );
+        assert!(
+            anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::BlockedCacheContentMismatch)),
+            "expected blocked-cache content mismatch anomaly: {:?}",
+            anomalies
+        );
+        assert!(
+            anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::ReadyProjectionContentMismatch)),
+            "expected ready projection mismatch anomaly: {:?}",
+            anomalies
         );
     }
 

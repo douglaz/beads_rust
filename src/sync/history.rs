@@ -441,6 +441,10 @@ pub fn backup_before_export(
         return Ok(());
     }
 
+    if history_artifact_metadata(target_path, "backup source")?.is_none() {
+        return Ok(());
+    }
+
     ensure_history_dir_path(&history_dir)?;
 
     // Determine backup filename based on target filename
@@ -806,6 +810,67 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_before_export_rejects_symlinked_source_target() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let outside_target = outside_dir.join("issues.jsonl");
+        fs::write(&outside_target, "outside\n").unwrap();
+        let target_path = beads_dir.join("issues.jsonl");
+        symlink(&outside_target, &target_path).unwrap();
+
+        let err =
+            backup_before_export(&beads_dir, &HistoryConfig::default(), &target_path).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("backup source") && message.contains("must not be a symlink"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !beads_dir.join(".br_history").exists(),
+            "rejected symlinked source must not create history state"
+        );
+    }
+
+    #[test]
+    fn test_backup_before_export_rejects_directory_source_target() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::create_dir(&target_path).unwrap();
+
+        let err =
+            backup_before_export(&beads_dir, &HistoryConfig::default(), &target_path).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("backup source") && message.contains("must be a regular file"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !beads_dir.join(".br_history").exists(),
+            "rejected directory source must not create history state"
         );
     }
 

@@ -10991,6 +10991,19 @@ impl SqliteStorage {
         let mut seen_deps = HashSet::new();
         let mut unique_deps = Vec::new();
         for dep in dependencies {
+            if issue_id == dep.depends_on_id {
+                return Err(BeadsError::SelfDependency {
+                    id: issue_id.to_string(),
+                });
+            }
+            if let Some(metadata) = dep.metadata.as_deref() {
+                serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
+                    BeadsError::Validation {
+                        field: "metadata".to_string(),
+                        reason: format!("dependency metadata must be valid JSON: {err}"),
+                    }
+                })?;
+            }
             Self::validate_parent_child_endpoints(
                 issue_id,
                 &dep.depends_on_id,
@@ -13053,6 +13066,48 @@ mod tests {
         storage
             .add_dependency(&issue.id, &stable_parent.id, "blocks", "tester")
             .unwrap();
+
+        let self_dependency = crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: issue.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: None,
+            thread_id: None,
+        };
+        let err = storage
+            .sync_dependencies_for_import(&issue.id, &[self_dependency])
+            .expect_err("self-dependency must fail before deleting old dependencies");
+        assert!(matches!(err, BeadsError::SelfDependency { id } if id == issue.id));
+        let dependencies = storage.get_dependencies_full(&issue.id).unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, stable_parent.id);
+        assert_eq!(
+            dependencies[0].dep_type,
+            crate::model::DependencyType::Blocks
+        );
+
+        let invalid_metadata = crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: stable_parent.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: t1,
+            created_by: Some("import".to_string()),
+            metadata: Some("{not-json".to_string()),
+            thread_id: None,
+        };
+        let err = storage
+            .sync_dependencies_for_import(&issue.id, &[invalid_metadata])
+            .expect_err("invalid dependency metadata must fail before deleting old dependencies");
+        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "metadata"));
+        let dependencies = storage.get_dependencies_full(&issue.id).unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, stable_parent.id);
+        assert_eq!(
+            dependencies[0].dep_type,
+            crate::model::DependencyType::Blocks
+        );
 
         let invalid_parent = crate::model::Dependency {
             issue_id: issue.id.clone(),

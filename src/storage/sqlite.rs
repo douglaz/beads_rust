@@ -10272,11 +10272,6 @@ impl SqliteStorage {
 
         let mut deps = Vec::with_capacity(rows.len());
         for row in &rows {
-            let created_at_str = row
-                .get(3)
-                .and_then(SqliteValue::as_text)
-                .unwrap_or("")
-                .to_string();
             deps.push(crate::model::Dependency {
                 issue_id: row
                     .get(0)
@@ -10293,7 +10288,7 @@ impl SqliteStorage {
                     .and_then(SqliteValue::as_text)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(crate::model::DependencyType::Blocks),
-                created_at: parse_datetime(&created_at_str)?,
+                created_at: parse_datetime_value(row.get(3))?,
                 created_by: row
                     .get(4)
                     .and_then(SqliteValue::as_text)
@@ -10347,11 +10342,6 @@ impl SqliteStorage {
             let rows = self.conn.query_with_params(&sql, &params)?;
 
             for row in &rows {
-                let created_at_str = row
-                    .get(3)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
                 let dep = crate::model::Dependency {
                     issue_id: row
                         .get(0)
@@ -10368,7 +10358,7 @@ impl SqliteStorage {
                         .and_then(SqliteValue::as_text)
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(crate::model::DependencyType::Blocks),
-                    created_at: parse_datetime(&created_at_str)?,
+                    created_at: parse_datetime_value(row.get(3))?,
                     created_by: row
                         .get(4)
                         .and_then(SqliteValue::as_text)
@@ -11353,11 +11343,10 @@ fn comment_from_row(row: &fsqlite::Row) -> Result<Comment> {
         .and_then(SqliteValue::as_text)
         .ok_or_else(|| BeadsError::Config(format!("comments row missing body for {id}")))?
         .to_string();
-    let created_at_str = row
+    let created_at_value = row
         .get(4)
-        .and_then(SqliteValue::as_text)
         .ok_or_else(|| BeadsError::Config(format!("comments row missing created_at for {id}")))?;
-    let created_at = parse_datetime(created_at_str).map_err(|err| match err {
+    let created_at = parse_datetime_value(Some(created_at_value)).map_err(|err| match err {
         BeadsError::Config(msg) => {
             BeadsError::Config(format!("invalid comment timestamp for {id}: {msg}"))
         }
@@ -13546,6 +13535,44 @@ mod tests {
     }
 
     #[test]
+    fn test_get_dependencies_full_preserves_numeric_created_at() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-b1", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage
+            .add_dependency("bd-a1", "bd-b1", "blocks", "tester")
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "UPDATE dependencies SET created_at = ? WHERE issue_id = ? AND depends_on_id = ?",
+                &[
+                    SqliteValue::Integer(1_776_651_488_000_000),
+                    SqliteValue::from("bd-a1"),
+                    SqliteValue::from("bd-b1"),
+                ],
+            )
+            .unwrap();
+
+        let deps = storage.get_dependencies_full("bd-a1").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].created_at.year(), 2026);
+        assert_eq!(deps[0].created_at.month(), 4);
+        assert_eq!(deps[0].created_at.day(), 20);
+        assert_eq!(deps[0].created_at.hour(), 2);
+        assert_eq!(deps[0].created_at.minute(), 18);
+
+        let by_issue = storage
+            .get_dependencies_full_for_issues(&["bd-a1".to_string()])
+            .unwrap();
+        assert_eq!(by_issue["bd-a1"][0].created_at, deps[0].created_at);
+    }
+
+    #[test]
     fn test_add_dependency_with_metadata_rejects_invalid_json() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
@@ -13863,6 +13890,81 @@ mod tests {
                         && msg.contains("unparseable datetime")
             ),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_comments_preserves_numeric_created_at() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = Issue {
+            id: "bd-c-numeric-time".to_string(),
+            content_hash: None,
+            title: "Comment issue".to_string(),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: t1,
+            created_by: None,
+            updated_at: t1,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            defer_until: None,
+            due_at: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                &[
+                    SqliteValue::from("bd-c-numeric-time"),
+                    SqliteValue::from("alice"),
+                    SqliteValue::from("fractional"),
+                    SqliteValue::Float(1_776_651_488.25),
+                ],
+            )
+            .unwrap();
+
+        let comments = storage.get_comments("bd-c-numeric-time").unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].created_at.year(), 2026);
+        assert_eq!(comments[0].created_at.timestamp(), 1_776_651_488);
+        assert_eq!(comments[0].created_at.timestamp_subsec_nanos(), 250_000_000);
+
+        let by_issue = storage
+            .get_comments_for_issues(&["bd-c-numeric-time".to_string()])
+            .unwrap();
+        assert_eq!(
+            by_issue["bd-c-numeric-time"][0].created_at,
+            comments[0].created_at
         );
     }
 

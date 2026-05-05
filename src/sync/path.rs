@@ -149,6 +149,33 @@ fn normalize_path_lexically(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
+fn symlink_escape_for_existing_ancestor(
+    path: &Path,
+    canonical_beads: &Path,
+) -> Option<PathValidation> {
+    for ancestor in path.ancestors() {
+        let Ok(metadata) = std::fs::symlink_metadata(ancestor) else {
+            continue;
+        };
+
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let target = dunce::canonicalize(ancestor)
+            .or_else(|_| std::fs::read_link(ancestor))
+            .unwrap_or_else(|_| ancestor.to_path_buf());
+        if !target.starts_with(canonical_beads) {
+            return Some(PathValidation::SymlinkEscape {
+                path: ancestor.to_path_buf(),
+                target,
+            });
+        }
+    }
+
+    None
+}
+
 /// Validates that a path does not target git internals.
 ///
 /// This is a hard safety invariant: sync operations NEVER access `.git/` directories.
@@ -276,6 +303,15 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
             return result;
         }
     };
+
+    if let Some(result) = symlink_escape_for_existing_ancestor(&normalized_path, &canonical_beads) {
+        warn!(
+            path = %path.display(),
+            reason = %result.rejection_reason().unwrap_or_default(),
+            "Path validation rejected"
+        );
+        return result;
+    }
 
     if had_parent_dir
         && !normalized_path.starts_with(beads_dir)
@@ -504,12 +540,6 @@ pub fn is_sync_path_allowed(path: &Path, beads_dir: &Path) -> bool {
         return false;
     };
 
-    // Check if path is under beads_dir and has allowed extension
-    if normalized_path.starts_with(beads_dir) {
-        return validate_extension_and_name(&normalized_path).is_allowed();
-    }
-
-    // Full validation for edge cases
     validate_sync_path(&normalized_path, beads_dir).is_allowed()
 }
 
@@ -1141,6 +1171,30 @@ mod tests {
         assert!(
             result.is_err(),
             "Internal-looking paths must not bypass .beads symlink-escape checks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_path_rejects_missing_descendant_under_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+        let symlink_parent = beads_dir.join("linked");
+        symlink(&outside_dir, &symlink_parent).expect("create symlinked parent");
+
+        let path = symlink_parent.join("nested").join("issues.jsonl");
+        let result = validate_sync_path(&path, &beads_dir);
+
+        assert!(
+            matches!(result, PathValidation::SymlinkEscape { .. }),
+            "Missing descendants below an escaping symlink parent must be rejected"
+        );
+        assert!(
+            !outside_dir.join("nested").exists(),
+            "validation must not create external parent directories"
         );
     }
 

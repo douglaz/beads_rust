@@ -545,11 +545,12 @@ fn restore_backup(
         )));
     }
 
+    let pid = std::process::id();
+    let temp_path = target_path.with_extension(format!("jsonl.{pid}.tmp"));
+    validate_temp_file_path(&temp_path, &target_path, beads_dir, true)?;
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let pid = std::process::id();
-    let temp_path = target_path.with_extension(format!("jsonl.{pid}.tmp"));
     validate_temp_file_path(&temp_path, &target_path, beads_dir, true)?;
     let mut reader = File::open(&backup_path)?;
     let mut writer = OpenOptions::new()
@@ -1569,6 +1570,49 @@ mod tests {
         assert!(
             !outside_dir.join("issues.jsonl").exists(),
             "restore must not write through symlinked .beads parents"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_backup_rejects_missing_descendant_under_symlinked_parent_without_side_effects()
+    {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&history_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, beads_dir.join("linked")).unwrap();
+
+        let backup_name = "issues.20260220_120000.jsonl";
+        let backup_path = history_dir.join(backup_name);
+        fs::write(&backup_path, "restored\n").unwrap();
+        fs::write(
+            backup_path.with_extension("jsonl.meta.json"),
+            serde_json::json!({
+                "target": {
+                    "kind": "relative",
+                    "path": "linked/nested/issues.jsonl",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        let err =
+            restore_backup(&beads_dir, &history_dir, backup_name, true, None, &ctx).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !outside_dir.join("nested").exists(),
+            "restore must not create directories through symlinked .beads parents"
         );
     }
 

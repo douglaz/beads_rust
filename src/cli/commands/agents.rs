@@ -585,11 +585,31 @@ fn write_new_agent_file(file_path: &Path, contents: &[u8]) -> Result<()> {
     }
 }
 
+fn validate_agent_rewrite_target(file_path: &Path) -> Result<Option<fs::Permissions>> {
+    match fs::symlink_metadata(file_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(BeadsError::Config(format!(
+                    "Agent instruction file '{}' must not be a symlink",
+                    file_path.display()
+                )));
+            }
+            if !file_type.is_file() {
+                return Err(BeadsError::Config(format!(
+                    "Agent instruction file '{}' must be a regular file",
+                    file_path.display()
+                )));
+            }
+            Ok(Some(metadata.permissions()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn write_agent_file_atomically(file_path: &Path, contents: &[u8]) -> Result<()> {
-    let existing_permissions = fs::symlink_metadata(file_path)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .map(|metadata| metadata.permissions());
+    let existing_permissions = validate_agent_rewrite_target(file_path)?;
     let (temp_path, mut temp_file) = create_temp_agent_file(file_path)?;
     if let Some(permissions) = existing_permissions
         && let Err(error) = fs::set_permissions(&temp_path, permissions)
@@ -627,9 +647,14 @@ fn write_added_agent_file(
     }
 }
 
+fn read_agent_file_for_backup(file_path: &Path) -> Result<Vec<u8>> {
+    validate_agent_rewrite_target(file_path)?;
+    fs::read(file_path).map_err(Into::into)
+}
+
 fn backup_agent_file(file_path: &Path, ctx: &OutputContext) -> Option<PathBuf> {
     let backup_path = file_path.with_extension("md.bak");
-    let backup_bytes = match fs::read(file_path) {
+    let backup_bytes = match read_agent_file_for_backup(file_path) {
         Ok(bytes) => bytes,
         Err(e) => {
             eprintln!(
@@ -2012,6 +2037,72 @@ mod tests {
             "symlinked AGENTS.md should be reported as unsupported"
         );
         assert!(detection.content.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_agent_file_atomically_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let outside_target = temp_dir.path().join("outside-agents.md");
+        fs::write(&outside_target, "# Outside\n").unwrap();
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        symlink(&outside_target, &agents_path).unwrap();
+
+        let err = write_agent_file_atomically(&agents_path, b"# New\n")
+            .expect_err("atomic rewrite should reject symlink targets");
+
+        assert!(
+            format!("{err}").contains("must not be a symlink"),
+            "error should explain that symlinked rewrite targets are unsupported"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_target).unwrap(),
+            "# Outside\n",
+            "rewrite must not modify the symlink target"
+        );
+        assert!(
+            fs::symlink_metadata(&agents_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected rewrite target symlink should be left untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_agent_file_refuses_symlinked_backup_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        fs::write(&agents_path, "# Agents\n").unwrap();
+        let outside_backup_target = temp_dir.path().join("outside-backup.md");
+        fs::write(&outside_backup_target, "# Outside backup\n").unwrap();
+        let backup_path = agents_path.with_extension("md.bak");
+        symlink(&outside_backup_target, &backup_path).unwrap();
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        let backup = backup_agent_file(&agents_path, &ctx);
+
+        assert!(
+            backup.is_none(),
+            "backup creation should fail when the backup path is a symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_backup_target).unwrap(),
+            "# Outside backup\n",
+            "backup creation must not modify the symlink target"
+        );
+        assert!(
+            fs::symlink_metadata(&backup_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected backup path symlink should be left untouched"
+        );
     }
 
     #[cfg(unix)]

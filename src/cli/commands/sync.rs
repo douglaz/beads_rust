@@ -29,7 +29,7 @@ use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, IsTerminal};
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -1367,12 +1367,16 @@ fn write_manifest_atomically(manifest_path: &Path, manifest: &serde_json::Value)
         let _ = fs::remove_file(path);
     };
 
-    let mut file = File::create(&temp_path).map_err(|e| {
-        BeadsError::Config(format!(
-            "failed to create temp manifest file {}: {e}",
-            temp_path.display()
-        ))
-    })?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|e| {
+            BeadsError::Config(format!(
+                "failed to create temp manifest file {}: {e}",
+                temp_path.display()
+            ))
+        })?;
 
     // write_all / sync_all / durable_rename all must clean up the temp
     // file on failure; otherwise a torn manifest.json.<pid>.tmp can
@@ -1568,7 +1572,7 @@ fn push_cli_rerun_overrides(rerun: &mut Vec<String>, cli: &config::CliOverrides)
 }
 
 fn integrity_check_is_clean(messages: &[String]) -> bool {
-    messages.len() == 1 && messages[0].trim().eq_ignore_ascii_case("ok")
+    matches!(messages, [message] if message.trim().eq_ignore_ascii_case("ok"))
 }
 
 fn fresh_force_import_maintenance_gate_applies(
@@ -2601,6 +2605,7 @@ mod tests {
         jsonl_contains_prefix_mismatch, merge_conflict_resolution, prepare_sync_startup,
         should_defer_jsonl_recovery, should_render_human_sync_output, sync_operation,
         validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
+        write_manifest_atomically,
     };
     use crate::cli::SyncArgs;
     use crate::config::{self, CliOverrides};
@@ -2661,6 +2666,55 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_manifest_atomically_rejects_existing_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let manifest_path = beads_dir.join(".manifest.json");
+        let temp_path = manifest_path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let outside_target = temp.path().join("outside.json");
+        fs::write(&outside_target, "preserve").unwrap();
+        symlink(&outside_target, &temp_path).unwrap();
+
+        let err = write_manifest_atomically(&manifest_path, &serde_json::json!({ "ok": true }))
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains("failed to create temp manifest file"),
+            "unexpected message: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_target).unwrap(),
+            "preserve",
+            "manifest temp symlink target must not receive manifest bytes"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "failed manifest write must not install a manifest"
+        );
+        assert!(
+            fs::symlink_metadata(&temp_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected pre-existing temp symlink should be left untouched"
+        );
     }
 
     #[test]

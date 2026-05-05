@@ -13056,11 +13056,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_sync_dependencies_for_import_validates_before_replacing_existing_dependencies() {
+    fn setup_dependency_import_validation_storage() -> (SqliteStorage, Issue, Issue, DateTime<Utc>)
+    {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
-
         let issue = make_issue(
             "bd-d-import-invalid",
             "Import dependencies",
@@ -13085,6 +13084,27 @@ mod tests {
             .add_dependency(&issue.id, &stable_parent.id, "blocks", "tester")
             .unwrap();
 
+        (storage, issue, stable_parent, t1)
+    }
+
+    fn assert_stable_dependency_unchanged(
+        storage: &SqliteStorage,
+        issue_id: &str,
+        stable_parent_id: &str,
+    ) {
+        let dependencies = storage.get_dependencies_full(issue_id).unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].depends_on_id, stable_parent_id);
+        assert_eq!(
+            dependencies[0].dep_type,
+            crate::model::DependencyType::Blocks
+        );
+    }
+
+    #[test]
+    fn test_sync_dependencies_for_import_rejects_self_and_wrong_source_before_replacing() {
+        let (storage, issue, stable_parent, t1) = setup_dependency_import_validation_storage();
+
         let self_dependency = crate::model::Dependency {
             issue_id: issue.id.clone(),
             depends_on_id: issue.id.clone(),
@@ -13098,13 +13118,7 @@ mod tests {
             .sync_dependencies_for_import(&issue.id, &[self_dependency])
             .expect_err("self-dependency must fail before deleting old dependencies");
         assert!(matches!(err, BeadsError::SelfDependency { id } if id == issue.id));
-        let dependencies = storage.get_dependencies_full(&issue.id).unwrap();
-        assert_eq!(dependencies.len(), 1);
-        assert_eq!(dependencies[0].depends_on_id, stable_parent.id);
-        assert_eq!(
-            dependencies[0].dep_type,
-            crate::model::DependencyType::Blocks
-        );
+        assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
 
         let wrong_source = crate::model::Dependency {
             issue_id: "bd-d-import-other".to_string(),
@@ -13122,9 +13136,12 @@ mod tests {
             err.to_string().contains("dependency.issue_id"),
             "unexpected dependency owner validation error: {err:?}"
         );
-        let dependencies = storage.get_dependencies_full(&issue.id).unwrap();
-        assert_eq!(dependencies.len(), 1);
-        assert_eq!(dependencies[0].depends_on_id, stable_parent.id);
+        assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
+    }
+
+    #[test]
+    fn test_sync_dependencies_for_import_rejects_metadata_and_parent_before_replacing() {
+        let (storage, issue, stable_parent, t1) = setup_dependency_import_validation_storage();
 
         let invalid_metadata = crate::model::Dependency {
             issue_id: issue.id.clone(),
@@ -13139,13 +13156,7 @@ mod tests {
             .sync_dependencies_for_import(&issue.id, &[invalid_metadata])
             .expect_err("invalid dependency metadata must fail before deleting old dependencies");
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "metadata"));
-        let dependencies = storage.get_dependencies_full(&issue.id).unwrap();
-        assert_eq!(dependencies.len(), 1);
-        assert_eq!(dependencies[0].depends_on_id, stable_parent.id);
-        assert_eq!(
-            dependencies[0].dep_type,
-            crate::model::DependencyType::Blocks
-        );
+        assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
 
         let invalid_parent = crate::model::Dependency {
             issue_id: issue.id.clone(),
@@ -13161,13 +13172,7 @@ mod tests {
             .expect_err("invalid import dependency must fail before deleting old dependencies");
         assert!(err.to_string().contains("parent-child dependencies"));
 
-        let dependencies = storage.get_dependencies_full(&issue.id).unwrap();
-        assert_eq!(dependencies.len(), 1);
-        assert_eq!(dependencies[0].depends_on_id, stable_parent.id);
-        assert_eq!(
-            dependencies[0].dep_type,
-            crate::model::DependencyType::Blocks
-        );
+        assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
     }
 
     #[test]

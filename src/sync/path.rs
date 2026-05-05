@@ -162,8 +162,8 @@ fn symlink_escape_for_existing_ancestor(
             continue;
         }
 
-        let target = dunce::canonicalize(ancestor)
-            .or_else(|_| std::fs::read_link(ancestor))
+        let target = std::fs::read_link(ancestor)
+            .map(|target| resolve_symlink_target_for_validation(ancestor, &target))
             .unwrap_or_else(|_| ancestor.to_path_buf());
         if !target.starts_with(canonical_beads) {
             return Some(PathValidation::SymlinkEscape {
@@ -174,6 +174,19 @@ fn symlink_escape_for_existing_ancestor(
     }
 
     None
+}
+
+fn resolve_symlink_target_for_validation(link_path: &Path, target: &Path) -> PathBuf {
+    let anchored = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target)
+    };
+    let normalized = normalize_path_lexically(&anchored).unwrap_or(anchored);
+    dunce::canonicalize(&normalized).unwrap_or(normalized)
 }
 
 /// Validates that a path does not target git internals.
@@ -379,7 +392,7 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     if normalized_path.is_symlink()
         && let Ok(target) = std::fs::read_link(&normalized_path)
     {
-        let canonical_target = dunce::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        let canonical_target = resolve_symlink_target_for_validation(&normalized_path, &target);
         if !canonical_target.starts_with(&canonical_beads) {
             let result = PathValidation::SymlinkEscape {
                 path: path.to_path_buf(),
@@ -1102,6 +1115,25 @@ mod tests {
         assert!(
             matches!(result, PathValidation::SymlinkEscape { .. }),
             "Symlinks escaping beads dir should be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_relative_internal_symlink_is_not_misclassified_as_escape() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let target_path = beads_dir.join("actual.jsonl");
+        std::fs::write(&target_path, "{}\n").expect("write target");
+        let symlink_path = beads_dir.join("linked.jsonl");
+        symlink("actual.jsonl", &symlink_path).expect("create relative symlink");
+
+        let result = validate_sync_path(&symlink_path, &beads_dir);
+
+        assert!(
+            matches!(result, PathValidation::NonRegularFile { .. }),
+            "internal relative symlink should be rejected as non-regular, not as an escape: {result:?}"
         );
     }
 

@@ -134,9 +134,14 @@ fn create_temp_config_file(config_path: &Path) -> Result<(PathBuf, File)> {
 }
 
 fn write_config_atomically(config_path: &Path, yaml: &str) -> Result<()> {
-    let existing_permissions = fs::metadata(config_path)
-        .ok()
-        .map(|metadata| metadata.permissions());
+    let existing_permissions = match fs::symlink_metadata(config_path) {
+        Ok(metadata) => {
+            validate_edit_config_target(config_path, &metadata)?;
+            Some(metadata.permissions())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let (temp_path, mut temp_file) = create_temp_config_file(config_path)?;
     let mut guard = TempConfigFileGuard::new(temp_path.clone());
     if let Some(permissions) = existing_permissions
@@ -159,7 +164,7 @@ fn write_config_atomically(config_path: &Path, yaml: &str) -> Result<()> {
 fn validate_edit_config_target(config_path: &Path, metadata: &fs::Metadata) -> Result<()> {
     if metadata.file_type().is_symlink() {
         return Err(BeadsError::Config(format!(
-            "Refusing to create default config through symbolic link: {}",
+            "Refusing to edit config through symbolic link: {}",
             config_path.display()
         )));
     }
@@ -936,9 +941,14 @@ fn yaml_value_to_string(value: &serde_yml::Value) -> Option<String> {
 }
 
 fn load_mutable_yaml_config(config_path: &Path) -> Result<serde_yml::Value> {
-    if !config_path.exists() {
-        return Ok(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
-    }
+    let metadata = match fs::symlink_metadata(config_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_edit_config_target(config_path, &metadata)?;
 
     let contents = fs::read_to_string(config_path)?;
     match serde_yml::from_str(&contents) {
@@ -1511,6 +1521,37 @@ mod tests {
 
         let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "atomic rewrite should preserve file mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_mutable_config_helpers_refuse_existing_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let target_path = dir.path().join("outside-target.yaml");
+        fs::write(&target_path, "display:\n  color: true\n").unwrap();
+        symlink(&target_path, &config_path).unwrap();
+
+        let load_err = load_mutable_yaml_config(&config_path).unwrap_err();
+        assert!(load_err.to_string().contains("symbolic link"));
+
+        let write_err =
+            write_config_atomically(&config_path, "display:\n  color: false\n").unwrap_err();
+        assert!(write_err.to_string().contains("symbolic link"));
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "display:\n  color: true\n",
+            "mutable config helpers must not read-edit-write a symlink target"
+        );
+        assert!(
+            fs::symlink_metadata(&config_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected config symlink should be left untouched"
+        );
     }
 
     #[test]

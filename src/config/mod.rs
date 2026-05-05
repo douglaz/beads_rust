@@ -1100,7 +1100,7 @@ pub(crate) fn repair_database_from_jsonl_with_import_config(
 ) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
     let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, jsonl_path)?;
     import_config.beads_dir = Some(beads_dir.to_path_buf());
-    import_config.allow_external_jsonl =
+    import_config.allow_external_jsonl |=
         implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path);
     import_config.show_progress = show_progress;
 
@@ -6887,6 +6887,49 @@ routing:
             &external_db,
             &external_jsonl
         ));
+    }
+
+    #[test]
+    fn repair_database_replay_preserves_explicit_external_jsonl_allowance() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let external_dir = temp.path().join("external-store");
+        let jsonl_path = external_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_dir).expect("create external dir");
+
+        write_single_issue_jsonl(&jsonl_path, "source-extimp", "Imported from external JSONL");
+        let mut bootstrap_layer = ConfigLayer::default();
+        bootstrap_layer
+            .runtime
+            .insert("issue_prefix".to_string(), "target".to_string());
+        let import_config = ImportConfig {
+            allow_external_jsonl: true,
+            rename_on_import: true,
+            clear_duplicate_external_refs: true,
+            beads_dir: Some(beads_dir.clone()),
+            ..ImportConfig::default()
+        };
+
+        let (storage, import_result, _) = repair_database_from_jsonl_with_import_config(
+            &beads_dir,
+            &db_path,
+            &jsonl_path,
+            None,
+            &bootstrap_layer,
+            false,
+            import_config,
+        )
+        .expect("external JSONL repair replay should preserve explicit allowance");
+
+        assert_eq!(import_result.created_count, 1);
+        let ids = storage.get_all_ids().expect("query rebuilt ids");
+        assert_eq!(ids.len(), 1);
+        assert!(
+            ids[0].starts_with("target-"),
+            "rename-prefix replay should import with target prefix, got {ids:?}"
+        );
     }
 
     #[test]

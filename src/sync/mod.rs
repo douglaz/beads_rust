@@ -46,6 +46,7 @@ const EXPORT_FULL_SCAN_ISSUE_THRESHOLD: usize = 20_000;
 const EXPORT_PARALLEL_PREPARE_MIN_ISSUES: usize = 256;
 const DEFAULT_JSONL_EXPORT_PARALLELISM: usize = 64;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
+const MAX_JSONL_TEMP_PATH_ATTEMPTS: u32 = 64;
 
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
 ///
@@ -196,7 +197,63 @@ impl Drop for TempFileGuard {
 }
 
 pub(crate) fn export_temp_path(output_path: &Path) -> PathBuf {
-    output_path.with_extension(format!("jsonl.{}.tmp", std::process::id()))
+    export_temp_path_for_attempt(output_path, 0)
+}
+
+fn export_temp_path_for_attempt(output_path: &Path, attempt: u32) -> PathBuf {
+    let pid = std::process::id();
+    if attempt == 0 {
+        return output_path.with_extension(format!("jsonl.{pid}.tmp"));
+    }
+
+    let retry_suffix = u64::from(pid)
+        .saturating_mul(100)
+        .saturating_add(u64::from(attempt));
+    output_path.with_extension(format!("jsonl.{retry_suffix}.tmp"))
+}
+
+fn create_jsonl_temp_file(output_path: &Path, config: &ExportConfig) -> Result<(PathBuf, File)> {
+    for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
+        let temp_path = export_temp_path_for_attempt(output_path, attempt);
+
+        if let Some(ref beads_dir) = config.beads_dir {
+            validate_temp_file_path(
+                &temp_path,
+                output_path,
+                beads_dir,
+                config.allow_external_jsonl,
+            )?;
+            tracing::debug!(
+                temp_path = %temp_path.display(),
+                target_path = %output_path.display(),
+                "Temp file path validated"
+            );
+        }
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp_file) => return Ok((temp_path, temp_file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&temp_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(BeadsError::Config(format!(
+                        "Temporary export file already exists: {}",
+                        temp_path.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temporary export file for {}",
+        output_path.display()
+    )))
 }
 
 #[cfg(unix)]
@@ -1999,37 +2056,7 @@ pub fn export_to_jsonl_with_policy(
     // Ensure parent directory exists
     fs::create_dir_all(parent_dir)?;
 
-    let temp_path = export_temp_path(output_path);
-
-    // Validate temp file path (PC-4: temp files must be in same directory as target)
-    if let Some(ref beads_dir) = config.beads_dir {
-        validate_temp_file_path(
-            &temp_path,
-            output_path,
-            beads_dir,
-            config.allow_external_jsonl,
-        )?;
-        tracing::debug!(
-            temp_path = %temp_path.display(),
-            target_path = %output_path.display(),
-            "Temp file path validated"
-        );
-    }
-
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary export file already exists: {}",
-                    temp_path.display()
-                ))
-            } else {
-                err.into()
-            }
-        })?;
+    let (temp_path, temp_file) = create_jsonl_temp_file(output_path, config)?;
     let mut temp_guard = TempFileGuard::new(temp_path.clone());
     set_restrictive_jsonl_permissions(&temp_path);
     let mut writer = BufWriter::new(temp_file);
@@ -3033,30 +3060,7 @@ fn prepare_jsonl_temp_output(output_path: &Path, config: &ExportConfig) -> Resul
     })?;
     fs::create_dir_all(parent_dir)?;
 
-    let temp_path = export_temp_path(output_path);
-    if let Some(ref beads_dir) = config.beads_dir {
-        validate_temp_file_path(
-            &temp_path,
-            output_path,
-            beads_dir,
-            config.allow_external_jsonl,
-        )?;
-    }
-
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary export file already exists: {}",
-                    temp_path.display()
-                ))
-            } else {
-                err.into()
-            }
-        })?;
+    let (temp_path, temp_file) = create_jsonl_temp_file(output_path, config)?;
     let temp_guard = TempFileGuard::new(temp_path.clone());
     set_restrictive_jsonl_permissions(&temp_path);
 

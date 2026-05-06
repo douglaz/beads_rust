@@ -802,6 +802,36 @@ fn execute_route(
         )
     };
 
+    let mut policy_evaluations_by_id: HashMap<String, EvaluatedGates> = HashMap::new();
+    if policy_active {
+        for id in &resolved_ids {
+            let Some(issue) = open_issues.get(id) else {
+                continue;
+            };
+            if !args.force && !batch_closable_ids.contains(id) {
+                continue;
+            }
+
+            let evaluated_gates = evaluate_close_policy(
+                &policy_doc.close_policy,
+                &storage_ctx.storage,
+                id,
+                issue,
+                args,
+                &actor,
+            )?;
+            if !evaluated_gates.violations.is_empty() && !args.bypass_policy {
+                let summary = summarize_violations(&evaluated_gates.violations);
+                return Err(BeadsError::PolicyViolation {
+                    issue_id: id.clone(),
+                    summary,
+                    violations: evaluated_gates.violations,
+                });
+            }
+            policy_evaluations_by_id.insert(id.clone(), evaluated_gates);
+        }
+    }
+
     for id in &resolved_ids {
         let Some(issue) = open_issues.get(id) else {
             continue;
@@ -834,38 +864,14 @@ fn execute_route(
             continue;
         }
 
-        // Closure-time policy gate evaluation (issue #274 Phase 1).
-        //
-        // Skipped entirely when the project has no policy.yaml or every gate
-        // is disabled, preserving the current behavior for solo-dev workflows.
-        // When `--bypass-policy --bypass-reason "<text>"` is supplied AND the
-        // project's policy.yaml allows it, gate violations are recorded in
-        // `close_metadata` (with `bypassed_policy = 1`) but do not block the
-        // close.
-        let gates_fired = if policy_active {
-            let evaluated_gates = evaluate_close_policy(
-                &policy_doc.close_policy,
-                &storage_ctx.storage,
-                id,
-                issue,
-                args,
-                &actor,
-            )?;
-            if !evaluated_gates.violations.is_empty() && !args.bypass_policy {
-                let summary = summarize_violations(&evaluated_gates.violations);
-                return Err(BeadsError::PolicyViolation {
-                    issue_id: id.clone(),
-                    summary,
-                    violations: evaluated_gates.violations,
-                });
-            }
+        let gates_fired = if let Some(evaluated_gates) = policy_evaluations_by_id.get(id) {
             if !evaluated_gates.violations.is_empty() && args.bypass_policy {
                 emit_bypass_warning(ctx, id, &evaluated_gates.violations);
             }
             evaluated_gates
                 .violations
-                .into_iter()
-                .map(|v| v.gate)
+                .iter()
+                .map(|v| v.gate.clone())
                 .collect::<Vec<String>>()
         } else {
             Vec::new()
@@ -1760,6 +1766,66 @@ mod tests {
         assert!(metadata.closed_by_agent_name.is_none());
         assert!(metadata.closed_by_harness.is_none());
         assert!(metadata.closed_by_model.is_none());
+    }
+
+    #[test]
+    fn execute_with_args_policy_violation_in_batch_does_not_close_earlier_issue() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-clean", "Clean policy issue"), "tester")
+            .expect("create clean issue");
+        let mut failing_issue = make_issue("bd-policy-fail", "Policy failing issue");
+        failing_issue.acceptance_criteria = Some("- [ ] Finish remaining work\n".to_string());
+        storage
+            .create_issue(&failing_issue, "tester")
+            .expect("create failing issue");
+        drop(storage);
+
+        std::fs::write(
+            beads_dir.join(close_policy::POLICY_FILE_NAME),
+            "close_policy:\n  require_acceptance_criteria_satisfied:\n    enabled: true\n",
+        )
+        .expect("write policy");
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-clean".to_string(), "bd-policy-fail".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect_err("policy violation should abort the batch before mutation");
+        assert!(
+            matches!(err, BeadsError::PolicyViolation { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let clean = storage
+            .get_issue("bd-clean")
+            .expect("read clean issue")
+            .expect("clean issue exists");
+        let failing = storage
+            .get_issue("bd-policy-fail")
+            .expect("read failing issue")
+            .expect("failing issue exists");
+        assert_eq!(clean.status, Status::Open);
+        assert_eq!(failing.status, Status::Open);
+        assert!(
+            storage
+                .get_close_metadata("bd-clean")
+                .expect("read clean metadata")
+                .is_none()
+        );
     }
 
     #[test]

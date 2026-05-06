@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 /// Configuration for history backups.
@@ -99,10 +99,25 @@ impl BackupTarget {
         }
     }
 
-    fn resolve_path(&self, beads_dir: &Path) -> PathBuf {
+    fn resolve_path(&self, beads_dir: &Path) -> Result<PathBuf> {
         match self {
-            Self::Relative { path } => beads_dir.join(path),
-            Self::Absolute { path } => PathBuf::from(path),
+            Self::Relative { path } => {
+                let relative_path = Path::new(path);
+                if relative_path.is_absolute()
+                    || relative_path.components().any(|component| {
+                        matches!(
+                            component,
+                            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+                        )
+                    })
+                {
+                    return Err(BeadsError::Config(format!(
+                        "Invalid relative backup target metadata path: {path}"
+                    )));
+                }
+                Ok(beads_dir.join(relative_path))
+            }
+            Self::Absolute { path } => Ok(PathBuf::from(path)),
         }
     }
 
@@ -373,10 +388,20 @@ fn backup_target_details(
     };
 
     match read_backup_metadata(backup_path) {
-        Ok(Some(metadata)) => {
-            let target_path = metadata.target.resolve_path(beads_dir);
-            (target_path, metadata.target.key())
-        }
+        Ok(Some(metadata)) => match metadata.target.resolve_path(beads_dir) {
+            Ok(target_path) => (target_path, metadata.target.key()),
+            Err(err) => {
+                tracing::warn!(
+                    backup = %backup_path.display(),
+                    error = %err,
+                    "Ignoring invalid history backup metadata during history rotation/listing"
+                );
+                (
+                    invalid_metadata_target_path(backup_name),
+                    format!("invalid-metadata:{backup_name}"),
+                )
+            }
+        },
         Ok(None) => legacy_backup_target_path(beads_dir, backup_name).map_or_else(
             |_| {
                 let fallback = PathBuf::from(backup_name);
@@ -429,7 +454,7 @@ pub(crate) fn resolve_backup_target_path(beads_dir: &Path, backup_path: &Path) -
             "History backup '{backup_name}' is missing target metadata and cannot be safely restored or diffed"
         ))
     })?;
-    let target_path = metadata.target.resolve_path(beads_dir);
+    let target_path = metadata.target.resolve_path(beads_dir)?;
 
     validate_sync_path_with_external(&target_path, beads_dir, true)?;
     Ok(target_path)
@@ -1179,6 +1204,81 @@ mod tests {
         assert_eq!(
             backups[0].target_path,
             invalid_metadata_target_path(backup_name)
+        );
+    }
+
+    #[test]
+    fn test_list_backups_marks_invalid_relative_metadata_without_guessing_target() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+        let cases = [
+            (
+                "issues.20260307_120000.jsonl",
+                temp.path().join("escape.jsonl").display().to_string(),
+            ),
+            (
+                "labels.20260307_120001.jsonl",
+                "../escape.jsonl".to_string(),
+            ),
+        ];
+
+        for (backup_name, metadata_path) in cases {
+            let backup_path = history_dir.join(backup_name);
+            fs::write(&backup_path, "backup\n").unwrap();
+            fs::write(
+                backup_metadata_path(&backup_path),
+                serde_json::json!({
+                    "target": {
+                        "kind": "relative",
+                        "path": metadata_path,
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let backups = list_backups(history_dir, None).unwrap();
+        assert_eq!(backups.len(), 2);
+        for backup in backups {
+            let backup_name = backup
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap();
+            assert_eq!(backup.target_key, format!("invalid-metadata:{backup_name}"));
+            assert_eq!(
+                backup.target_path,
+                invalid_metadata_target_path(backup_name)
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_backup_target_path_rejects_invalid_relative_metadata() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+
+        let backup_path = history_dir.join("issues.20260307_120000.jsonl");
+        fs::write(&backup_path, "backup\n").unwrap();
+        fs::write(
+            backup_metadata_path(&backup_path),
+            serde_json::json!({
+                "target": {
+                    "kind": "relative",
+                    "path": temp.path().join("escape.jsonl").display().to_string(),
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = resolve_backup_target_path(&beads_dir, &backup_path).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(message) if message.contains("Invalid relative backup target metadata path")),
+            "unexpected error: {err:?}"
         );
     }
 

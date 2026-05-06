@@ -1681,7 +1681,8 @@ impl SqliteStorage {
     /// supplied attribution + bypass auditing values. All fields are optional:
     /// passing every-`None` still records a row that pins `bypassed_policy = 0`
     /// for the close, which keeps the table strictly additive — every close
-    /// performed under an active policy is queryable later.
+    /// performed under an active policy is queryable later. Callers decide
+    /// whether policy metadata is active enough to warrant a row.
     ///
     /// `policy_gates_fired` is stored as the JSON serialisation of the gate
     /// names that fired (or that were waived by `--bypass-policy`). An empty
@@ -1699,14 +1700,6 @@ impl SqliteStorage {
         bypass_reason: Option<&str>,
         policy_gates_fired: &[String],
     ) -> Result<()> {
-        // Skip when the row would carry no information whatsoever — keeps the
-        // table empty for repos that haven't enabled any policy and didn't
-        // pass any attribution flags. This preserves the "no observable change
-        // for solo dev" invariant (#274 default behavior).
-        if attribution.is_empty() && !bypassed && policy_gates_fired.is_empty() {
-            return Ok(());
-        }
-
         let gates_json = serde_json::to_string(policy_gates_fired).map_err(BeadsError::from)?;
 
         // INSERT OR REPLACE: a re-close (e.g. close → reopen → close) overwrites

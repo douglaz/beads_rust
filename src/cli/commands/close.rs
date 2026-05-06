@@ -899,29 +899,31 @@ fn execute_route(
         cache_dirty = true;
         tracing::info!(id = %id, reason = ?args.reason, "Issue closed");
 
-        // Best-effort persistence of attribution + bypass auditing. Failure to
-        // record metadata never undoes a successful close: the close already
-        // committed, and burning down a successful close because of an
-        // optional auxiliary table would be a regression for solo-dev users
-        // whose schema couldn't migrate. We log and move on.
-        let bypass_reason = if args.bypass_policy {
-            args.bypass_reason.as_deref()
-        } else {
-            None
-        };
-        let metadata_result = storage_ctx.storage.record_close_metadata(
-            id,
-            &attribution,
-            args.bypass_policy && !gates_fired.is_empty(),
-            bypass_reason,
-            &gates_fired,
-        );
-        if let Err(error) = metadata_result {
-            tracing::warn!(
-                issue_id = %id,
-                error = %error,
-                "failed to record closure-time policy metadata; close already committed"
+        if policy_active {
+            // Best-effort persistence of attribution + bypass auditing. Failure
+            // to record metadata never undoes a successful close: the close
+            // already committed, and burning down a successful close because of
+            // an optional auxiliary table would be a regression for users whose
+            // schema could not migrate. We log and move on.
+            let bypass_reason = if args.bypass_policy {
+                args.bypass_reason.as_deref()
+            } else {
+                None
+            };
+            let metadata_result = storage_ctx.storage.record_close_metadata(
+                id,
+                &attribution,
+                args.bypass_policy && !gates_fired.is_empty(),
+                bypass_reason,
+                &gates_fired,
             );
+            if let Err(error) = metadata_result {
+                tracing::warn!(
+                    issue_id = %id,
+                    error = %error,
+                    "failed to record closure-time policy metadata; close already committed"
+                );
+            }
         }
 
         let closed = ClosedIssue {
@@ -1714,5 +1716,84 @@ mod tests {
         let err = execute_with_args(&args, true, &CliOverrides::default(), &ctx)
             .expect_err("all-skipped close should fail");
         assert!(matches!(err, BeadsError::NothingToDo { .. }));
+    }
+
+    #[test]
+    fn execute_with_args_records_clean_policy_close_metadata() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-policy", "Policy governed"), "tester")
+            .expect("create policy issue");
+        drop(storage);
+
+        std::fs::write(
+            beads_dir.join(close_policy::POLICY_FILE_NAME),
+            "close_policy:\n  require_close_reason:\n    enabled: true\n    min_length: 4\n",
+        )
+        .expect("write policy");
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-policy".to_string()],
+            reason: Some("done cleanly".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx).expect("close issue");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let metadata = storage
+            .get_close_metadata("bd-policy")
+            .expect("read close metadata")
+            .expect("active policy should record metadata even when no gate fires");
+        assert!(!metadata.bypassed_policy);
+        assert!(metadata.bypass_reason.is_none());
+        assert!(metadata.policy_gates_fired.is_empty());
+        assert!(metadata.closed_by_agent_name.is_none());
+        assert!(metadata.closed_by_harness.is_none());
+        assert!(metadata.closed_by_model.is_none());
+    }
+
+    #[test]
+    fn execute_with_args_leaves_no_policy_close_metadata_invisible() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-no-policy", "No policy"), "tester")
+            .expect("create no-policy issue");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-no-policy".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx).expect("close issue");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        assert!(
+            storage
+                .get_close_metadata("bd-no-policy")
+                .expect("read close metadata")
+                .is_none(),
+            "repos without an active policy should retain the no-observable-change invariant"
+        );
     }
 }

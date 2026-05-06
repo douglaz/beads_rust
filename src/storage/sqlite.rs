@@ -2683,6 +2683,10 @@ impl SqliteStorage {
                     SqliteValue::from(id),
                 ],
             )?;
+            conn.execute_with_params(
+                "DELETE FROM close_metadata WHERE issue_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
 
             if !was_terminal {
                 ctx.record_event(
@@ -12809,6 +12813,48 @@ mod tests {
             .unwrap();
 
         assert!(storage.get_close_metadata("bd-rmeta").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_issue_clears_close_metadata() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-dmeta",
+            "Delete metadata",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let close_update = IssueUpdate {
+            status: Some(Status::Closed),
+            close_reason: Some(Some("done".to_string())),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-dmeta", &close_update, "tester")
+            .unwrap();
+        storage
+            .record_close_metadata(
+                "bd-dmeta",
+                &crate::close_policy::AttributionValues::default(),
+                false,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert!(storage.get_close_metadata("bd-dmeta").unwrap().is_some());
+
+        storage
+            .delete_issue("bd-dmeta", "tester", "cleanup", None)
+            .unwrap();
+
+        assert!(storage.get_close_metadata("bd-dmeta").unwrap().is_none());
     }
 
     #[test]

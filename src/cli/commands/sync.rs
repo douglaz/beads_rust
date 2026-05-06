@@ -1655,6 +1655,7 @@ fn repair_import_integrity_if_needed(
     jsonl_path: &Path,
     db_path: &Path,
     show_progress: bool,
+    allow_external_jsonl: bool,
 ) -> Result<()> {
     let messages = storage.integrity_check_messages()?;
     if integrity_check_is_clean(&messages) {
@@ -1684,6 +1685,7 @@ fn repair_import_integrity_if_needed(
         cli.lock_timeout,
         &startup.merged_config,
         show_progress,
+        allow_external_jsonl,
     )?;
     restore_tombstones_after_rebuild(&mut rebuilt_storage, &preserved_tombstones)?;
     *storage = rebuilt_storage;
@@ -2276,6 +2278,7 @@ fn execute_import(
                 jsonl_path,
                 db_path,
                 show_progress,
+                path_policy.allow_external_jsonl,
             )?;
         }
     }

@@ -1265,6 +1265,7 @@ fn repair_database_from_jsonl(
         cli.lock_timeout,
         &bootstrap_layer,
         show_progress,
+        false,
     )?;
 
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;

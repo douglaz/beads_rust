@@ -530,17 +530,27 @@ enum JsonlRecoveryStrategy {
     DeferToExplicitImport,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SqliteStartupOpenOptions {
+    defer_jsonl_recovery: bool,
+    read_only_fast_open: bool,
+    write_lock_already_held: bool,
+    allow_external_jsonl: bool,
+}
+
 fn open_sqlite_storage_with_recovery(
     beads_dir: &Path,
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     open_sqlite_storage_with_recovery_strategy(
         beads_dir,
         paths,
         lock_timeout,
         bootstrap_layer,
+        allow_external_jsonl,
         JsonlRecoveryStrategy::RebuildFromJsonl,
     )
 }
@@ -551,13 +561,20 @@ fn open_sqlite_storage_with_recovery_after_fast_open_miss(
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
     write_lock_already_held: bool,
+    allow_external_jsonl: bool,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     let _write_lock = if write_lock_already_held {
         None
     } else {
         Some(blocking_write_lock_with_timeout(beads_dir, lock_timeout)?)
     };
-    open_sqlite_storage_with_recovery(beads_dir, paths, lock_timeout, bootstrap_layer)
+    open_sqlite_storage_with_recovery(
+        beads_dir,
+        paths,
+        lock_timeout,
+        bootstrap_layer,
+        allow_external_jsonl,
+    )
 }
 
 fn open_sqlite_storage_with_deferred_jsonl_recovery(
@@ -565,12 +582,14 @@ fn open_sqlite_storage_with_deferred_jsonl_recovery(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     open_sqlite_storage_with_recovery_strategy(
         beads_dir,
         paths,
         lock_timeout,
         bootstrap_layer,
+        allow_external_jsonl,
         JsonlRecoveryStrategy::DeferToExplicitImport,
     )
 }
@@ -580,6 +599,7 @@ fn open_sqlite_storage_with_recovery_strategy(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     if !paths.db_path.is_file() && paths.jsonl_path.is_file() {
@@ -588,6 +608,7 @@ fn open_sqlite_storage_with_recovery_strategy(
             paths,
             lock_timeout,
             bootstrap_layer,
+            allow_external_jsonl,
             recovery_strategy,
         );
     }
@@ -608,6 +629,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                 paths,
                 lock_timeout,
                 bootstrap_layer,
+                allow_external_jsonl,
                 recovery_strategy,
                 &prepare_fresh_storage,
             ),
@@ -626,6 +648,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                     paths,
                     lock_timeout,
                     bootstrap_layer,
+                    allow_external_jsonl,
                     recovery_strategy,
                     &prepare_fresh_storage,
                 )
@@ -641,6 +664,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                 paths,
                 lock_timeout,
                 bootstrap_layer,
+                allow_external_jsonl,
                 recovery_strategy,
                 &prepare_fresh_storage,
             )
@@ -656,12 +680,18 @@ fn open_when_db_file_is_missing(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     match recovery_strategy {
         JsonlRecoveryStrategy::RebuildFromJsonl => {
-            let storage =
-                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+            let storage = rebuild_database_from_jsonl(
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                allow_external_jsonl,
+            )?;
             Ok((storage, true, None))
         }
         JsonlRecoveryStrategy::DeferToExplicitImport => {
@@ -788,12 +818,19 @@ fn rebuild_or_defer_after_open_error(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
     match recovery_strategy {
         JsonlRecoveryStrategy::RebuildFromJsonl => {
-            match rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer) {
+            match rebuild_database_from_jsonl(
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                allow_external_jsonl,
+            ) {
                 Ok(storage) => Ok((storage, true, None)),
                 Err(recovery_err) => {
                     warn!(
@@ -897,6 +934,7 @@ fn rebuild_or_defer_after_recoverable_anomaly(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
@@ -923,6 +961,7 @@ fn rebuild_or_defer_after_recoverable_anomaly(
                 paths,
                 lock_timeout,
                 bootstrap_layer,
+                allow_external_jsonl,
             )?;
             Ok((storage, true, None))
         }
@@ -953,6 +992,7 @@ fn rebuild_or_defer_after_probe_error(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
@@ -977,6 +1017,7 @@ fn rebuild_or_defer_after_probe_error(
                 paths,
                 lock_timeout,
                 bootstrap_layer,
+                allow_external_jsonl,
             )?;
             Ok((storage, true, None))
         }
@@ -1002,10 +1043,17 @@ fn rebuild_with_tombstone_preservation(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
 ) -> Result<SqliteStorage> {
     let preserved_tombstones = preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
     drop(storage);
-    let mut storage = rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)?;
+    let mut storage = rebuild_database_from_jsonl(
+        beads_dir,
+        paths,
+        lock_timeout,
+        bootstrap_layer,
+        allow_external_jsonl,
+    )?;
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
     Ok(storage)
 }
@@ -1015,6 +1063,7 @@ fn rebuild_database_from_jsonl(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
+    allow_external_jsonl: bool,
 ) -> Result<SqliteStorage> {
     repair_database_from_jsonl(
         beads_dir,
@@ -1023,6 +1072,7 @@ fn rebuild_database_from_jsonl(
         lock_timeout,
         bootstrap_layer,
         false,
+        allow_external_jsonl,
     )
     .map(|(storage, _, _)| storage)
 }
@@ -1074,8 +1124,10 @@ pub(crate) fn repair_database_from_jsonl(
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
     show_progress: bool,
+    allow_external_jsonl: bool,
 ) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
-    let mut import_config = import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path, false);
+    let mut import_config =
+        import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path, allow_external_jsonl);
     import_config.show_progress = show_progress;
     import_config.skip_prefix_validation = true;
 
@@ -2254,6 +2306,7 @@ pub fn open_storage(
         &startup.paths,
         resolved_lock_timeout,
         &merged_layer,
+        false,
     )?;
     Ok((storage, startup.paths))
 }
@@ -2356,6 +2409,7 @@ impl OpenStorageResult {
             self.resolved_lock_timeout,
             &self.bootstrap_layer,
             false,
+            self.allow_external_jsonl,
         )?;
         self.storage = storage;
         self.loaded_jsonl_hash = None;
@@ -2587,18 +2641,17 @@ fn open_sqlite_storage_for_startup(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-    defer_jsonl_recovery: bool,
-    read_only_fast_open: bool,
-    write_lock_already_held: bool,
+    options: SqliteStartupOpenOptions,
 ) -> Result<(SqliteStorage, bool, Option<RecoveryBackupSet>)> {
-    if defer_jsonl_recovery {
+    if options.defer_jsonl_recovery {
         open_sqlite_storage_with_deferred_jsonl_recovery(
             beads_dir,
             paths,
             lock_timeout,
             bootstrap_layer,
+            options.allow_external_jsonl,
         )
-    } else if read_only_fast_open {
+    } else if options.read_only_fast_open {
         match SqliteStorage::open_current_read_only(&paths.db_path) {
             Ok(Some(storage)) => Ok((storage, false, None)),
             Ok(None) => open_sqlite_storage_with_recovery_after_fast_open_miss(
@@ -2606,7 +2659,8 @@ fn open_sqlite_storage_for_startup(
                 paths,
                 lock_timeout,
                 bootstrap_layer,
-                write_lock_already_held,
+                options.write_lock_already_held,
+                options.allow_external_jsonl,
             ),
             Err(err) => {
                 tracing::debug!(
@@ -2618,12 +2672,19 @@ fn open_sqlite_storage_for_startup(
                     paths,
                     lock_timeout,
                     bootstrap_layer,
-                    write_lock_already_held,
+                    options.write_lock_already_held,
+                    options.allow_external_jsonl,
                 )
             }
         }
     } else {
-        open_sqlite_storage_with_recovery(beads_dir, paths, lock_timeout, bootstrap_layer)
+        open_sqlite_storage_with_recovery(
+            beads_dir,
+            paths,
+            lock_timeout,
+            bootstrap_layer,
+            options.allow_external_jsonl,
+        )
     }
 }
 
@@ -2720,9 +2781,12 @@ fn open_storage_with_startup_config_impl(
             &paths,
             resolved_lock_timeout,
             &merged_layer,
-            defer_jsonl_recovery,
-            cli.read_only_fast_open,
-            write_lock_already_held,
+            SqliteStartupOpenOptions {
+                defer_jsonl_recovery,
+                read_only_fast_open: cli.read_only_fast_open,
+                write_lock_already_held,
+                allow_external_jsonl,
+            },
         )?;
         Ok(OpenStorageResult {
             storage,

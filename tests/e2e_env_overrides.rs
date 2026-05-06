@@ -368,6 +368,73 @@ fn e2e_beads_jsonl_external_rename_prefix_honors_allow_flag_during_config_load()
 }
 
 #[test]
+fn e2e_beads_jsonl_external_missing_db_recovery_honors_allow_flag() {
+    let _log = common::test_log("e2e_beads_jsonl_external_missing_db_recovery_honors_allow_flag");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_external_missing_db_recovery");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let external_dir = workspace.temp_dir.path().join("external-recovery");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_jsonl = external_dir.join("recovery-source.jsonl");
+    fs::write(
+        &external_jsonl,
+        "{\"id\":\"ext-1\",\"title\":\"External missing DB recovery\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .expect("write external jsonl");
+
+    let alt_db = workspace
+        .root
+        .join(".beads")
+        .join("external-missing-db-recovery.db");
+    let env_vars = vec![("BEADS_JSONL", external_jsonl.to_str().unwrap())];
+    let status = run_br_with_env(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "sync",
+            "--status",
+            "--allow-external-jsonl",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        env_vars,
+        "sync_external_missing_db_recovery_status",
+    );
+    assert!(
+        status.status.success(),
+        "external JSONL missing-db recovery should honor --allow-external-jsonl during startup rebuild: stdout={} stderr={}",
+        status.stdout,
+        status.stderr
+    );
+
+    let list = run_br(
+        &workspace,
+        [
+            "--db",
+            alt_db.to_str().expect("alt db path"),
+            "--no-auto-import",
+            "--no-auto-flush",
+            "list",
+            "--json",
+        ],
+        "list_external_missing_db_recovery",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let issues = parse_list_issues(&list.stdout);
+    assert!(
+        issues.iter().any(|issue| matches!(
+            issue.get("title").and_then(Value::as_str),
+            Some("External missing DB recovery")
+        )),
+        "issue imported during missing-db recovery should be listed"
+    );
+}
+
+#[test]
 fn e2e_beads_jsonl_env_overrides_metadata() {
     let _log = common::test_log("e2e_beads_jsonl_env_overrides_metadata");
     let workspace = BrWorkspace::new();

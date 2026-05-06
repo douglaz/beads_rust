@@ -70,6 +70,7 @@ impl Drop for TempRestoreGuard {
     }
 }
 
+const MAX_HISTORY_RESTORE_TEMP_PATH_ATTEMPTS: u32 = 64;
 const MAX_RESTORE_ROLLBACK_PATH_ATTEMPTS: u64 = 1024;
 const MAX_HISTORY_TEXT_DIFF_BYTES: u64 = 8 * 1024 * 1024;
 const DIFF_COMPARE_BUFFER_SIZE: usize = 16 * 1024;
@@ -92,6 +93,55 @@ fn history_display_filename(path: &Path) -> String {
         .to_string_lossy()
         .to_string();
     history_display_text(&filename)
+}
+
+fn restore_temp_path_for_attempt(target_path: &Path, attempt: u32) -> PathBuf {
+    let pid = std::process::id();
+    if attempt == 0 {
+        return target_path.with_extension(format!("jsonl.{pid}.tmp"));
+    }
+
+    let retry_suffix = u64::from(pid)
+        .saturating_mul(100)
+        .saturating_add(u64::from(attempt));
+    target_path.with_extension(format!("jsonl.{retry_suffix}.tmp"))
+}
+
+fn create_restore_temp_file(
+    target_path: &Path,
+    beads_dir: &Path,
+) -> Result<(PathBuf, File, TempRestoreGuard)> {
+    for attempt in 0..MAX_HISTORY_RESTORE_TEMP_PATH_ATTEMPTS {
+        let temp_path = restore_temp_path_for_attempt(target_path, attempt);
+        validate_temp_file_path(&temp_path, target_path, beads_dir, true)?;
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => {
+                let temp_guard = TempRestoreGuard::new(temp_path.clone());
+                return Ok((temp_path, file, temp_guard));
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&temp_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(BeadsError::Config(format!(
+                        "Temporary restore file already exists: {}",
+                        history_display_path(&temp_path)
+                    )));
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temporary restore file for '{}'",
+        history_display_path(target_path)
+    )))
 }
 
 fn create_restore_rollback_snapshot(
@@ -545,29 +595,18 @@ fn restore_backup(
         )));
     }
 
-    let pid = std::process::id();
-    let temp_path = target_path.with_extension(format!("jsonl.{pid}.tmp"));
-    validate_temp_file_path(&temp_path, &target_path, beads_dir, true)?;
+    validate_temp_file_path(
+        &restore_temp_path_for_attempt(&target_path, 0),
+        &target_path,
+        beads_dir,
+        true,
+    )?;
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    validate_temp_file_path(&temp_path, &target_path, beads_dir, true)?;
     let mut reader = File::open(&backup_path)?;
-    let mut writer = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary restore file already exists: {}",
-                    history_display_path(&temp_path)
-                ))
-            } else {
-                err.into()
-            }
-        })?;
-    let mut temp_guard = TempRestoreGuard::new(temp_path.clone());
+    let (temp_path, mut writer, mut temp_guard) =
+        create_restore_temp_file(&target_path, beads_dir)?;
     io::copy(&mut reader, &mut writer)?;
     writer.sync_all()?;
     drop(writer);
@@ -1323,6 +1362,49 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&nested_target).unwrap(),
             "nested-state\n"
+        );
+    }
+
+    #[test]
+    fn test_restore_backup_skips_stale_regular_temp_file() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::write(&target_path, "backup-state\n").unwrap();
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+        };
+        history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
+        fs::write(&target_path, "current-state\n").unwrap();
+
+        let stale_temp_path = restore_temp_path_for_attempt(&target_path, 0);
+        fs::write(&stale_temp_path, "stale temp\n").unwrap();
+
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        restore_backup(&beads_dir, &history_dir, &backup_name, true, None, &ctx).unwrap();
+
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "backup-state\n");
+        assert_eq!(
+            fs::read_to_string(&stale_temp_path).unwrap(),
+            "stale temp\n",
+            "restore should not overwrite or delete a stale regular temp file"
         );
     }
 

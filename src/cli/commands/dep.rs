@@ -1171,6 +1171,14 @@ fn build_dep_tree_nodes_global(
             let mut new_path = item.path.clone();
             new_path.push(item.id.clone());
 
+            hydrate_dep_tree_metadata_for_ids(
+                storage,
+                root_id,
+                root_issue,
+                &dependencies,
+                external_statuses,
+                &mut metadata_cache,
+            )?;
             sort_dep_tree_siblings(&mut dependencies, &metadata_cache);
             // Push in reverse order so first sorted item pops first.
             for dep_id in dependencies.into_iter().rev() {
@@ -1985,12 +1993,21 @@ mod tests {
         ] {
             storage.create_issue(&issue, "tester").unwrap();
         }
+        let mut low_priority = make_test_issue("bd-005", "Issue 5");
+        low_priority.priority = Priority(3);
+        storage.create_issue(&low_priority, "tester").unwrap();
 
         storage
             .add_dependency("bd-001", "bd-002", "blocks", "tester")
             .unwrap();
         storage
             .add_dependency("bd-001", "bd-003", "related", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-001", "bd-005", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-001", "external:ext:cap", "blocks", "tester")
             .unwrap();
         storage
             .add_dependency("bd-004", "bd-001", "blocks", "tester")

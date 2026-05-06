@@ -2382,6 +2382,10 @@ impl SqliteStorage {
                 } else {
                     if was_terminal && !status.is_terminal() {
                         ctx.record_event(EventType::Reopened, id, None);
+                        conn.execute_with_params(
+                            "DELETE FROM close_metadata WHERE issue_id = ?",
+                            &[SqliteValue::from(id)],
+                        )?;
                     }
                     if issue.closed_at.is_some() && updates.closed_at.is_none() {
                         // Reopening (or fixing state): Clear closed_at if it was set
@@ -12756,6 +12760,55 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == EventType::Reopened)
         );
+    }
+
+    #[test]
+    fn test_reopen_clears_close_metadata() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-rmeta",
+            "Reopen metadata",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let close_update = IssueUpdate {
+            status: Some(Status::Closed),
+            close_reason: Some(Some("done".to_string())),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-rmeta", &close_update, "tester")
+            .unwrap();
+        storage
+            .record_close_metadata(
+                "bd-rmeta",
+                &crate::close_policy::AttributionValues::default(),
+                false,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert!(storage.get_close_metadata("bd-rmeta").unwrap().is_some());
+
+        let reopen_update = IssueUpdate {
+            status: Some(Status::Open),
+            closed_at: Some(None),
+            close_reason: Some(None),
+            closed_by_session: Some(None),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-rmeta", &reopen_update, "tester")
+            .unwrap();
+
+        assert!(storage.get_close_metadata("bd-rmeta").unwrap().is_none());
     }
 
     #[test]

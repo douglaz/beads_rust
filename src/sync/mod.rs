@@ -1160,6 +1160,7 @@ pub fn preflight_import(
                     "Use a path within .beads/ directory or set --allow-external-jsonl.",
                 ));
                 tracing::debug!(path = %input_path.display(), error = %e, "Path validation: FAIL");
+                return Ok(result);
             }
         }
     }
@@ -7936,6 +7937,40 @@ mod tests {
                 .failures()
                 .iter()
                 .any(|c| c.name == "no_conflict_markers")
+        );
+    }
+
+    #[test]
+    fn test_preflight_import_does_not_inspect_rejected_path() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let outside_jsonl_path = temp.path().join("outside.jsonl");
+        std::fs::write(&outside_jsonl_path, "not json\n").unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            allow_external_jsonl: false,
+            ..Default::default()
+        };
+
+        let result = preflight_import(&outside_jsonl_path, &config, Some("bd")).unwrap();
+
+        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
+        assert!(
+            result
+                .failures()
+                .iter()
+                .any(|c| c.name == "path_validation"),
+            "rejected path should fail path validation"
+        );
+        assert!(
+            result.checks.iter().all(|c| c.name != "file_readable"
+                && c.name != "no_conflict_markers"
+                && c.name != "json_valid"
+                && c.name != "prefix_match"),
+            "preflight should not read or parse rejected paths: {:?}",
+            result.checks
         );
     }
 

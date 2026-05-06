@@ -3,6 +3,9 @@
 //! Enables br to update itself to the latest version using the `self_update` crate.
 
 use crate::cli::UpgradeArgs;
+use crate::cli::commands::{
+    GITHUB_REPO_NAME, GITHUB_REPO_OWNER, github_raw_main_url, github_releases_url,
+};
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
 use crate::util::hex_encode;
@@ -17,12 +20,6 @@ use std::env;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-
-/// Repo owner for GitHub releases.
-const REPO_OWNER: &str = "Dicklesworthstone";
-
-/// Repo name for GitHub releases.
-const REPO_NAME: &str = "beads_rust";
 
 /// Binary name.
 const BIN_NAME: &str = "br";
@@ -224,16 +221,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     let status = update_with_checksum(updater.as_ref(), &release).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("archive-tar") || msg.contains("ArchiveNotEnabled") || msg.contains("tar") {
-            BeadsError::upgrade(format!(
-                "{msg}\n\n\
-                 This binary was built without archive support for the required format (e.g., .tar.gz).\n\
-                 This is a known issue in some older versions (e.g., 0.1.21 - 0.1.26). Version 0.1.27 and later include the correct 'archive-tar' linkage.\n\n\
-                 Please upgrade manually by running:\n\n  \
-                 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash\n\n\
-                 Or by downloading the release from:\n  \
-                 https://github.com/Dicklesworthstone/beads_rust/releases\n\n\
-                 After that, `br upgrade` will work correctly for future updates."
-            ))
+            BeadsError::upgrade(archive_support_error_message(&msg))
         } else {
             map_update_error(e)
         }
@@ -265,6 +253,21 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     }
 
     Ok(())
+}
+
+fn archive_support_error_message(msg: &str) -> String {
+    let install_url = github_raw_main_url("install.sh");
+    let releases_url = github_releases_url();
+    format!(
+        "{msg}\n\n\
+         This binary was built without archive support for the required format (e.g., .tar.gz).\n\
+         This is a known issue in some older versions (e.g., 0.1.21 - 0.1.26). Version 0.1.27 and later include the correct 'archive-tar' linkage.\n\n\
+         Please upgrade manually by running:\n\n  \
+         curl -fsSL {install_url} | bash\n\n\
+         Or by downloading the release from:\n  \
+         {releases_url}\n\n\
+         After that, `br upgrade` will work correctly for future updates."
+    )
 }
 
 fn render_not_updated(
@@ -556,8 +559,8 @@ fn download_asset_to_writer(
 fn build_updater(current_version: &str) -> Result<Box<dyn ReleaseUpdate>> {
     let mut builder = github::Update::configure();
     builder
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
+        .repo_owner(GITHUB_REPO_OWNER)
+        .repo_name(GITHUB_REPO_NAME)
         .bin_name(BIN_NAME)
         .target(asset_target_name())
         .show_download_progress(true)
@@ -580,8 +583,8 @@ fn build_updater_with_target(
 ) -> Result<Box<dyn ReleaseUpdate>> {
     let mut builder = github::Update::configure();
     builder
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
+        .repo_owner(GITHUB_REPO_OWNER)
+        .repo_name(GITHUB_REPO_NAME)
         .bin_name(BIN_NAME)
         .target(asset_target_name())
         .show_download_progress(show_progress)
@@ -814,6 +817,14 @@ mod tests {
     fn test_version_more_parts() {
         assert!(version_newer("0.1.0.1", "0.1.0"));
         assert!(!version_newer("0.1.0", "0.1.0.1"));
+    }
+
+    #[test]
+    fn archive_support_error_message_uses_shared_repo_urls() {
+        let message = archive_support_error_message("archive-tar disabled");
+
+        assert!(message.contains(&github_raw_main_url("install.sh")));
+        assert!(message.contains(&github_releases_url()));
     }
 
     fn release_with_assets(names: &[&str]) -> Release {

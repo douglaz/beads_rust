@@ -3520,6 +3520,8 @@ pub fn auto_flush(
         return Ok(AutoFlushResult::default());
     }
 
+    validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+
     // Refuse to auto-flush over a JSONL that still holds unresolved
     // merge-conflict markers. The downstream export path would otherwise
     // silently overwrite the `<<<<<<<` / `=======` / `>>>>>>>` regions
@@ -6334,13 +6336,38 @@ mod tests {
         assert!(
             err.to_string().contains("directory")
                 || err.to_string().contains("Is a directory")
-                || err.to_string().contains("not a regular file"),
+                || err.to_string().contains("not a regular file")
+                || err.to_string().contains("must be a regular file"),
             "unexpected error: {err}"
         );
         assert_eq!(
             storage.get_dirty_issue_ids().unwrap(),
             vec!["bd-scan-error".to_string()],
             "failed auto-flush must leave dirty markers intact"
+        );
+    }
+
+    #[test]
+    fn test_auto_flush_validates_path_before_reading_existing_jsonl() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let outside_jsonl_path = temp_dir.path().join("outside.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(&outside_jsonl_path, "<<<<<<< HEAD\n").unwrap();
+
+        let issue = make_test_issue("bd-auto-flush-path", "Dirty issue");
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the beads directory"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec!["bd-auto-flush-path".to_string()],
+            "rejected auto-flush must leave dirty markers intact"
         );
     }
 

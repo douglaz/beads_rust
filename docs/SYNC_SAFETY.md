@@ -171,6 +171,7 @@ Paths outside `.beads/` require the explicit `--allow-external-jsonl` opt-in.
 - External paths bypass the default confinement
 - Symlinks pointing outside `.beads/` are rejected
 - If import preflight rejects a path, it stops before opening or parsing that path
+- Automatic flush validates the JSONL target before inspecting an existing file
 - Paths are canonicalized before use
 
 ---

@@ -256,6 +256,40 @@ fn create_jsonl_temp_file(output_path: &Path, config: &ExportConfig) -> Result<(
     )))
 }
 
+fn create_base_snapshot_temp_file(
+    snapshot_path: &Path,
+    jsonl_dir: &Path,
+) -> Result<(PathBuf, File)> {
+    for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
+        let temp_path = export_temp_path_for_attempt(snapshot_path, attempt);
+        validate_temp_file_path(&temp_path, snapshot_path, jsonl_dir, false)?;
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp_file) => return Ok((temp_path, temp_file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&temp_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(BeadsError::Config(format!(
+                        "Temporary base snapshot file already exists: {}",
+                        temp_path.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temporary base snapshot file for {}",
+        snapshot_path.display()
+    )))
+}
+
 #[cfg(unix)]
 fn set_restrictive_jsonl_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -4965,24 +4999,7 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
     jsonl_dir: &Path,
 ) -> Result<()> {
     let snapshot_path = jsonl_dir.join("beads.base.jsonl");
-    let pid = std::process::id();
-    let temp_path = snapshot_path.with_extension(format!("jsonl.{pid}.tmp"));
-    validate_temp_file_path(&temp_path, &snapshot_path, jsonl_dir, false)?;
-
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary base snapshot file already exists: {}",
-                    temp_path.display()
-                ))
-            } else {
-                err.into()
-            }
-        })?;
+    let (temp_path, temp_file) = create_base_snapshot_temp_file(&snapshot_path, jsonl_dir)?;
     let mut temp_guard = TempFileGuard::new(temp_path.clone());
     let mut writer = BufWriter::new(temp_file);
 
@@ -5732,6 +5749,46 @@ mod tests {
         assert_eq!(result.exported_count, 0);
         assert!(result.exported_ids.is_empty());
         assert!(output_path.exists());
+    }
+
+    #[test]
+    fn test_save_base_snapshot_skips_stale_regular_temp_file() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let snapshot_path = beads_dir.join("beads.base.jsonl");
+        fs::write(&snapshot_path, "old-snapshot\n").unwrap();
+        let stale_temp_path = export_temp_path_for_attempt(&snapshot_path, 0);
+        let retry_temp_path = export_temp_path_for_attempt(&snapshot_path, 1);
+        fs::write(&stale_temp_path, "stale temp\n").unwrap();
+
+        let mut issues = HashMap::new();
+        issues.insert(
+            "bd-base".to_string(),
+            Issue {
+                id: "bd-base".to_string(),
+                title: "New base snapshot".to_string(),
+                ..Issue::default()
+            },
+        );
+
+        save_base_snapshot(&issues, &beads_dir).unwrap();
+
+        let snapshot = fs::read_to_string(&snapshot_path).unwrap();
+        assert!(
+            snapshot.contains("\"id\":\"bd-base\""),
+            "base snapshot should be rewritten with the requested issue: {snapshot}"
+        );
+        assert_eq!(
+            fs::read_to_string(&stale_temp_path).unwrap(),
+            "stale temp\n",
+            "stale regular temp file should be left untouched"
+        );
+        assert!(
+            !retry_temp_path.exists(),
+            "successful retry temp path should be renamed away"
+        );
     }
 
     #[cfg(unix)]

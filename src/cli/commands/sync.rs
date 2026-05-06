@@ -20,7 +20,7 @@ use crate::sync::{
     METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, analyze_jsonl, compute_jsonl_hash,
     compute_staleness, export_temp_path, export_to_jsonl_with_policy, finalize_export,
     get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
-    require_safe_sync_overwrite_path, restore_tombstones_after_rebuild,
+    require_safe_sync_overwrite_path, require_valid_sync_path, restore_tombstones_after_rebuild,
     save_base_snapshot_from_jsonl, scan_jsonl_for_tombstone_filter, snapshot_tombstones,
     three_way_merge, tombstones_missing_from_jsonl_tombstones, validate_no_git_path,
     validate_sync_path_with_external,
@@ -985,15 +985,38 @@ fn build_base_witness_artifacts(
     current_witness: &JsonlMerkleWitness,
 ) -> Result<BaseWitnessArtifacts> {
     let base_jsonl_path = path_policy.beads_dir.join("beads.base.jsonl");
-    if !base_jsonl_path.is_file() {
-        return Ok(BaseWitnessArtifacts {
-            jsonl_path: None,
-            comparison: None,
-            reuse_plan: None,
-            parallel_work_plan: None,
-            reuse_materialization: None,
-        });
+    match fs::symlink_metadata(&base_jsonl_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(BeadsError::Config(format!(
+                "Base JSONL snapshot '{}' must not be a symlink",
+                base_jsonl_path.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(BeadsError::Config(format!(
+                "Base JSONL snapshot '{}' must be a regular file",
+                base_jsonl_path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BaseWitnessArtifacts {
+                jsonl_path: None,
+                comparison: None,
+                reuse_plan: None,
+                parallel_work_plan: None,
+                reuse_materialization: None,
+            });
+        }
+        Err(err) => {
+            return Err(BeadsError::Config(format!(
+                "Failed to inspect base JSONL snapshot '{}': {err}",
+                base_jsonl_path.display()
+            )));
+        }
     }
+
+    require_valid_sync_path(&base_jsonl_path, &path_policy.beads_dir)?;
 
     let base_witness = build_witness_for_path(&base_jsonl_path, chunk_size_lines, max_parallelism)?;
     let comparison = compare_jsonl_merkle_witnesses(&base_witness, current_witness);
@@ -2672,13 +2695,13 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncOperation, auto_rebuild_semantic_conflict_field,
-        auto_rebuild_semantic_flag_conflict_reason, detect_prefix_from_jsonl,
-        fresh_force_import_maintenance_gate_applies, jsonl_contains_duplicate_external_refs,
-        jsonl_contains_prefix_mismatch, merge_conflict_resolution, prepare_sync_startup,
-        should_defer_jsonl_recovery, should_render_human_sync_output, sync_operation,
-        validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
-        write_manifest_atomically,
+        SyncOperation, SyncPathPolicy, auto_rebuild_semantic_conflict_field,
+        auto_rebuild_semantic_flag_conflict_reason, build_base_witness_artifacts,
+        detect_prefix_from_jsonl, fresh_force_import_maintenance_gate_applies,
+        jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
+        merge_conflict_resolution, prepare_sync_startup, should_defer_jsonl_recovery,
+        should_render_human_sync_output, sync_operation, validate_operator_requested_sync_path,
+        validate_sync_mode_args, validate_sync_paths, write_manifest_atomically,
     };
     use crate::cli::SyncArgs;
     use crate::config::{self, CliOverrides};
@@ -2879,6 +2902,47 @@ mod tests {
 
         assert_eq!(sync_operation(&args), SyncOperation::Witness);
         assert!(!should_defer_jsonl_recovery(&args));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_base_witness_artifacts_rejects_symlinked_base_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let current_jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&current_jsonl_path, "current\n").unwrap();
+        let outside_base_path = outside_dir.join("beads.base.jsonl");
+        fs::write(&outside_base_path, "outside\n").unwrap();
+        symlink(&outside_base_path, beads_dir.join("beads.base.jsonl")).unwrap();
+
+        let path_policy = SyncPathPolicy {
+            jsonl_path: current_jsonl_path.clone(),
+            jsonl_temp_path: current_jsonl_path.with_extension("jsonl.tmp"),
+            manifest_path: beads_dir.join(".manifest.json"),
+            beads_dir,
+            is_external: false,
+            allow_external_jsonl: false,
+        };
+        let current_witness = super::build_witness_for_path(&current_jsonl_path, 1, 1)
+            .expect("current witness should build");
+
+        let result = build_base_witness_artifacts(&path_policy, 1, 1, &current_witness);
+        assert!(
+            result.is_err(),
+            "base witness should reject symlinked base snapshot"
+        );
+        let err = result.err().expect("checked error result");
+
+        assert!(
+            matches!(&err, BeadsError::Config(message) if message.contains("must not be a symlink")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

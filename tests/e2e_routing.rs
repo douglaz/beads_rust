@@ -15,7 +15,7 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
-use toon_rust::try_decode;
+use toon_rust::try_decode as decode_toon;
 
 /// Helper to create a routes.jsonl file with given entries.
 fn create_routes_file(workspace: &BrWorkspace, entries: &[(&str, &str)]) {
@@ -450,7 +450,7 @@ fn e2e_routing_show_format_toon_routes_external_issue() {
     );
     assert!(show.status.success(), "show failed: {}", show.stderr);
 
-    let shown = Value::from(try_decode(show.stdout.trim(), None).expect("valid show TOON"));
+    let shown = Value::from(decode_toon(show.stdout.trim(), None).expect("valid show TOON"));
     let items = shown.as_array().expect("show TOON array");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"].as_str(), Some(external_id.as_str()));
@@ -1905,6 +1905,95 @@ fn e2e_routing_delete_preview_does_not_mutate_earlier_local_batch() {
 
     let external_issue = issue_from_jsonl(&external_workspace, &blocker_id);
     assert_eq!(external_issue["status"].as_str(), Some("open"));
+}
+
+#[test]
+fn e2e_routing_delete_force_dry_run_reports_orphans_not_cascade() {
+    let _log = common::test_log("e2e_routing_delete_force_dry_run_reports_orphans_not_cascade");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main");
+    init_workspace(&external_workspace, "init_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let blocker_id = create_issue_and_get_id(
+        &external_workspace,
+        "External dry-run force blocker",
+        "create_external_dry_run_force_blocker",
+    );
+    let child_id = create_issue_and_get_id(
+        &external_workspace,
+        "External dry-run force child",
+        "create_external_dry_run_force_child",
+    );
+    let grandchild_id = create_issue_and_get_id(
+        &external_workspace,
+        "External dry-run force grandchild",
+        "create_external_dry_run_force_grandchild",
+    );
+
+    let child_dep = run_br(
+        &external_workspace,
+        ["dep", "add", &child_id, &blocker_id, "--json"],
+        "external_child_dep_add_for_force_dry_run",
+    );
+    assert!(
+        child_dep.status.success(),
+        "child dep add failed: {}",
+        child_dep.stderr
+    );
+    let grandchild_dep = run_br(
+        &external_workspace,
+        ["dep", "add", &grandchild_id, &child_id, "--json"],
+        "external_grandchild_dep_add_for_force_dry_run",
+    );
+    assert!(
+        grandchild_dep.status.success(),
+        "grandchild dep add failed: {}",
+        grandchild_dep.stderr
+    );
+
+    let routed_blocker = routed_partial_id(&blocker_id);
+    let delete = run_br(
+        &main_workspace,
+        ["delete", &routed_blocker, "--dry-run", "--force", "--json"],
+        "delete_force_dry_run_external_via_route",
+    );
+    assert!(
+        delete.status.success(),
+        "force dry-run delete failed: {}",
+        delete.stderr
+    );
+
+    let json: Value =
+        serde_json::from_str(&extract_json_payload(&delete.stdout)).expect("delete preview json");
+    assert_eq!(json["preview"].as_bool(), Some(true));
+    assert_eq!(
+        json["would_delete"].as_array().expect("would_delete array"),
+        &[Value::String(blocker_id.clone())]
+    );
+    assert_eq!(
+        json["orphaned_issues"]
+            .as_array()
+            .expect("orphaned_issues array"),
+        &[Value::String(child_id.clone())]
+    );
+    assert!(
+        json["cascade_delete"]
+            .as_array()
+            .expect("cascade_delete array")
+            .is_empty(),
+        "force dry-run must not report cascade deletes: {json}"
+    );
+
+    let blocker_issue = issue_from_jsonl(&external_workspace, &blocker_id);
+    assert_eq!(blocker_issue["status"].as_str(), Some("open"));
+    let child_issue = issue_from_jsonl(&external_workspace, &child_id);
+    assert_eq!(child_issue["status"].as_str(), Some("open"));
+    let grandchild_issue = issue_from_jsonl(&external_workspace, &grandchild_id);
+    assert_eq!(grandchild_issue["status"].as_str(), Some("open"));
 }
 
 #[test]

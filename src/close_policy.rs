@@ -386,14 +386,16 @@ pub fn find_unchecked_acceptance_criteria(body: &str) -> Vec<String> {
 
     // If the body has no markdown headers, treat the whole body as the
     // acceptance criteria section. acceptance_criteria column flow.
-    let has_any_header = body
-        .lines()
-        .any(|line| markdown_heading_text(line).is_some());
+    let has_any_header = has_markdown_heading_outside_fences(body);
     if !has_any_header {
         in_section = true;
     }
 
+    let mut fence_marker = None;
     for line in body.lines() {
+        if update_code_fence(line, &mut fence_marker) || fence_marker.is_some() {
+            continue;
+        }
         let trimmed = line.trim_start();
         if let Some(header_text) = markdown_heading_text(trimmed) {
             // Determine if this header opens / closes the acceptance criteria block.
@@ -422,6 +424,37 @@ pub fn find_unchecked_acceptance_criteria(body: &str) -> Vec<String> {
     }
 
     out
+}
+
+fn has_markdown_heading_outside_fences(body: &str) -> bool {
+    let mut fence_marker = None;
+    for line in body.lines() {
+        if update_code_fence(line, &mut fence_marker) || fence_marker.is_some() {
+            continue;
+        }
+        if markdown_heading_text(line).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+fn update_code_fence(line: &str, fence_marker: &mut Option<char>) -> bool {
+    let trimmed = line.trim_start();
+    let Some(marker @ ('`' | '~')) = trimmed.chars().next() else {
+        return false;
+    };
+    let marker_len = trimmed.chars().take_while(|ch| *ch == marker).count();
+    if marker_len < 3 {
+        return false;
+    }
+
+    if fence_marker.is_some_and(|open_marker| open_marker == marker) {
+        *fence_marker = None;
+    } else if fence_marker.is_none() {
+        *fence_marker = Some(marker);
+    }
+    true
 }
 
 fn markdown_heading_text(line: &str) -> Option<&str> {
@@ -658,6 +691,34 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].gate, "acceptance_criteria_unchecked");
         assert!(violations[0].message.contains("Finish after the reference"));
+    }
+
+    #[test]
+    fn acceptance_criteria_ignores_section_headers_inside_fenced_code() {
+        let mut policy = ClosePolicy::default();
+        policy.require_acceptance_criteria_satisfied.enabled = true;
+        let body = "## Notes\n```markdown\n## Acceptance Criteria\n- [ ] Example only\n```\n## Acceptance Criteria\n- [x] Real criterion\n";
+        let mut evidence = evidence_with_reason("done done done done done", "bd-1");
+        evidence.description = Some(body);
+
+        assert!(
+            evaluate(&policy, &evidence).is_empty(),
+            "unchecked boxes inside fenced examples should not block close"
+        );
+    }
+
+    #[test]
+    fn acceptance_criteria_ignores_unchecked_boxes_inside_fenced_code() {
+        let mut policy = ClosePolicy::default();
+        policy.require_acceptance_criteria_satisfied.enabled = true;
+        let body = "## Acceptance Criteria\n- [x] Real criterion\n```sh\n- [ ] Example only\n```\n";
+        let mut evidence = evidence_with_reason("done done done done done", "bd-1");
+        evidence.description = Some(body);
+
+        assert!(
+            evaluate(&policy, &evidence).is_empty(),
+            "unchecked boxes inside fenced examples should not block close"
+        );
     }
 
     #[test]

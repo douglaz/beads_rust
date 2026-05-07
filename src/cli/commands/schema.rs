@@ -17,7 +17,7 @@ use crate::cli::{
 };
 use crate::error::Result;
 use crate::format::{
-    BlockedIssue, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics, TreeNode,
+    BlockedIssue, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics,
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
@@ -45,6 +45,29 @@ struct ErrorBody {
     retryable: bool,
     /// Additional context for debugging (arbitrary JSON)
     context: Option<serde_json::Value>,
+}
+
+/// Row emitted by `br dep tree --json`.
+///
+/// Keep this in sync with `cli::commands::dep::TreeNode`. The command emits a
+/// compact traversal node, not the older `format::output::TreeNode` shape that
+/// flattened a full `Issue`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct TreeNode {
+    /// Stable issue ID, external dependency ID, or missing-issue placeholder ID.
+    id: String,
+    /// Human-readable title used in text/tree output.
+    title: String,
+    /// Depth from the requested root issue. The root is depth 0.
+    depth: usize,
+    /// Parent node issue ID, or null for the root.
+    parent_id: Option<String>,
+    /// Numeric issue priority used for sibling sorting.
+    priority: i32,
+    /// Issue status string, or synthesized status for external/missing nodes.
+    status: String,
+    /// True when the node has children omitted by `--max-depth`.
+    truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -475,6 +498,41 @@ mod tests {
                     "{name}: item_schema {item_schema:?} is not a known schema target"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn tree_node_schema_matches_dep_tree_payload_shape() {
+        let schemas = build_schemas(SchemaTarget::TreeNode);
+        let schema = schemas
+            .get("TreeNode")
+            .expect("TreeNode schema should be present");
+        let schema = serde_json::to_value(schema).expect("TreeNode schema should serialize");
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("TreeNode schema should expose object properties");
+
+        for field in [
+            "id",
+            "title",
+            "depth",
+            "parent_id",
+            "priority",
+            "status",
+            "truncated",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "TreeNode schema missing actual dep tree field {field:?}"
+            );
+        }
+
+        for stale_issue_field in ["created_at", "updated_at", "issue_type", "labels"] {
+            assert!(
+                !properties.contains_key(stale_issue_field),
+                "TreeNode schema should not flatten full Issue field {stale_issue_field:?}"
+            );
         }
     }
 

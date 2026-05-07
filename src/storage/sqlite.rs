@@ -6913,6 +6913,11 @@ impl SqliteStorage {
                 .first()
                 .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
                 .map(str::to_string);
+
+            if previous_parent.as_deref() == parent_id {
+                return Ok(());
+            }
+
             // Remove existing parent
             conn.execute_with_params(
                 "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
@@ -13778,6 +13783,125 @@ mod tests {
 
         let deps = storage.get_dependencies("bd-dep-child").unwrap();
         assert_eq!(deps, vec!["bd-dep-old-parent".to_string()]);
+    }
+
+    #[test]
+    fn test_set_parent_same_parent_is_noop() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 3, 0, 0, 0).unwrap();
+
+        let child = make_issue(
+            "bd-parent-noop-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let parent = make_issue(
+            "bd-parent-noop-parent",
+            "Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&parent, "tester").unwrap();
+        storage
+            .set_parent(
+                "bd-parent-noop-child",
+                Some("bd-parent-noop-parent"),
+                "tester",
+            )
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let before = storage
+            .get_issue("bd-parent-noop-child")
+            .unwrap()
+            .expect("child exists");
+        let event_count_before = storage
+            .get_events("bd-parent-noop-child", 100)
+            .unwrap()
+            .len();
+
+        storage
+            .set_parent(
+                "bd-parent-noop-child",
+                Some("bd-parent-noop-parent"),
+                "tester",
+            )
+            .unwrap();
+
+        let after = storage
+            .get_issue("bd-parent-noop-child")
+            .unwrap()
+            .expect("child exists");
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(
+            storage
+                .get_parent_id("bd-parent-noop-child")
+                .unwrap()
+                .as_deref(),
+            Some("bd-parent-noop-parent")
+        );
+        assert_eq!(
+            storage
+                .get_events("bd-parent-noop-child", 100)
+                .unwrap()
+                .len(),
+            event_count_before
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_set_parent_clear_absent_parent_is_noop() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = make_issue(
+            "bd-parent-clear-noop",
+            "Already root",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let before = storage
+            .get_issue("bd-parent-clear-noop")
+            .unwrap()
+            .expect("issue exists");
+        let event_count_before = storage
+            .get_events("bd-parent-clear-noop", 100)
+            .unwrap()
+            .len();
+
+        storage
+            .set_parent("bd-parent-clear-noop", None, "tester")
+            .unwrap();
+
+        let after = storage
+            .get_issue("bd-parent-clear-noop")
+            .unwrap()
+            .expect("issue exists");
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(storage.get_parent_id("bd-parent-clear-noop").unwrap(), None);
+        assert_eq!(
+            storage
+                .get_events("bd-parent-clear-noop", 100)
+                .unwrap()
+                .len(),
+            event_count_before
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
     }
 
     #[test]

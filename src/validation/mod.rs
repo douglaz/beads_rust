@@ -737,8 +737,9 @@ mod tests {
     }
 
     #[test]
-    fn label_validation_allows_path_style_labels() {
-        assert!(LabelValidator::validate("sys/stat").is_ok());
+    fn label_validation_rejects_path_style_labels() {
+        let err = LabelValidator::validate("sys/stat").unwrap_err();
+        assert_eq!(err.field, "label");
     }
 
     #[test]

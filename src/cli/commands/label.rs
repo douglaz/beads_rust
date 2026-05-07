@@ -114,7 +114,7 @@ struct RenameResult {
 
 /// Validate a label name.
 ///
-/// Labels must be alphanumeric with dashes and underscores allowed.
+/// Labels may contain ASCII alphanumeric characters, hyphens, underscores, and colons.
 fn validate_label(label: &str) -> Result<()> {
     LabelValidator::validate(label).map_err(|error| BeadsError::validation("label", error.message))
 }
@@ -745,19 +745,11 @@ fn render_label_action_results_rich(
     for result in results {
         let mut text = Text::new("");
 
-        let (icon, verb, style) = if action == "add" {
-            if result.status == "added" {
-                ("\u{2713}", "Added", theme.success.clone())
-            } else {
-                ("\u{2022}", "Exists", theme.dimmed.clone())
-            }
-        } else {
-            // remove
-            if result.status == "removed" {
-                ("\u{2713}", "Removed", theme.success.clone())
-            } else {
-                ("\u{2022}", "Not found", theme.dimmed.clone())
-            }
+        let (icon, verb, style) = match (action, result.status.as_str()) {
+            ("add", "added") => ("\u{2713}", "Added", theme.success.clone()),
+            ("add", _) => ("\u{2022}", "Exists", theme.dimmed.clone()),
+            (_, "removed") => ("\u{2713}", "Removed", theme.success.clone()),
+            _ => ("\u{2022}", "Not found", theme.dimmed.clone()),
         };
 
         text.append_styled(&format!("{icon} {verb} label "), style);
@@ -1004,6 +996,7 @@ mod tests {
     fn test_validate_label_invalid() {
         assert!(validate_label("").is_err());
         assert!(validate_label("has space").is_err());
+        assert!(validate_label("has/slash").is_err());
         assert!(validate_label("special@char").is_err());
         assert!(validate_label("dot.not.allowed").is_err());
         assert!(validate_label(&"a".repeat(51)).is_err());

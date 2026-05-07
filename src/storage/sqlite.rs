@@ -6905,16 +6905,18 @@ impl SqliteStorage {
             };
             Self::ensure_issue_mutable_in_tx(conn, issue_id, action)?;
 
-            let previous_parent = conn
-                .query_with_params(
-                    "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' LIMIT 1",
-                    &[SqliteValue::from(issue_id)],
-                )?
-                .first()
-                .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
-                .map(str::to_string);
+            let previous_parent_rows = conn.query_with_params(
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid ASC",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            let previous_parents = previous_parent_rows
+                .iter()
+                .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_string))
+                .collect::<Vec<_>>();
 
-            if previous_parent.as_deref() == parent_id {
+            if previous_parents.len() == usize::from(parent_id.is_some())
+                && previous_parents.first().map(String::as_str) == parent_id
+            {
                 return Ok(());
             }
 
@@ -6977,11 +6979,16 @@ impl SqliteStorage {
                 ctx.invalidate_cache_deferred();
             } else {
                 let mut cache_ids = vec![issue_id];
-                if let Some(parent_id) = previous_parent.as_deref() {
-                    cache_ids.push(parent_id);
+                for previous_parent in &previous_parents {
+                    let previous_parent = previous_parent.as_str();
+                    if !cache_ids.contains(&previous_parent) {
+                        cache_ids.push(previous_parent);
+                    }
                 }
                 if let Some(parent_id) = parent_id {
-                    cache_ids.push(parent_id);
+                    if !cache_ids.contains(&parent_id) {
+                        cache_ids.push(parent_id);
+                    }
                 }
                 ctx.invalidate_cache_for(&cache_ids);
             }
@@ -13856,6 +13863,111 @@ mod tests {
             event_count_before
         );
         assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_set_parent_same_requested_parent_cleans_extra_parent_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 5, 0, 0, 0).unwrap();
+
+        let child = make_issue(
+            "bd-parent-cleanup-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let parent = make_issue(
+            "bd-parent-cleanup-parent",
+            "Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let extra_parent = make_issue(
+            "bd-parent-cleanup-extra-parent",
+            "Extra parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&extra_parent, "tester").unwrap();
+        assert!(
+            storage
+                .add_dependency(
+                    "bd-parent-cleanup-child",
+                    "bd-parent-cleanup-parent",
+                    "parent-child",
+                    "tester",
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .add_dependency(
+                    "bd-parent-cleanup-child",
+                    "bd-parent-cleanup-extra-parent",
+                    "parent-child",
+                    "tester",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            storage
+                .get_parent_id("bd-parent-cleanup-child")
+                .unwrap()
+                .as_deref(),
+            Some("bd-parent-cleanup-extra-parent")
+        );
+        storage.clear_all_dirty_issues().unwrap();
+
+        storage
+            .set_parent(
+                "bd-parent-cleanup-child",
+                Some("bd-parent-cleanup-parent"),
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_parent_id("bd-parent-cleanup-child")
+                .unwrap()
+                .as_deref(),
+            Some("bd-parent-cleanup-parent")
+        );
+        let parent_rows = storage
+            .conn
+            .query_with_params(
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY depends_on_id",
+                &[SqliteValue::from("bd-parent-cleanup-child")],
+            )
+            .unwrap();
+        let parent_ids = parent_rows
+            .iter()
+            .filter_map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parent_ids,
+            vec!["bd-parent-cleanup-parent".to_string()],
+            "set_parent must canonicalize duplicate parent-child rows"
+        );
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec!["bd-parent-cleanup-child".to_string()]
+        );
     }
 
     #[test]

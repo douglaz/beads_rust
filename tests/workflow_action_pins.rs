@@ -3,10 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 const INVENTORY_PATH: &str = ".github/action-pins.jsonl";
+const UPSTREAMS_PATH: &str = ".github/action-pin-upstreams.jsonl";
 const WORKFLOW_DIR: &str = ".github/workflows";
 const WORKFLOW_DIR_PREFIX: &str = ".github/workflows/";
 
@@ -236,6 +239,138 @@ jobs:
     require_error_contains(&errors, "workflow must live under")
 }
 
+#[test]
+fn audit_report_marks_up_to_date_actions() -> Result<(), String> {
+    let fixture = PinFixture::new()?;
+    fixture.write_inventory(&[inventory_line_with_tag(
+        ".github/workflows/example.yml",
+        "actions/checkout",
+        PIN_A,
+        "v1",
+    )])?;
+    fixture.write_upstreams(&[upstream_line("actions/checkout", "v1", PIN_A)])?;
+
+    let report = run_update_audit_json(&fixture)?;
+    require_entry_status(&report, "actions/checkout", "up_to_date")?;
+    require_summary_count(&report, "up_to_date", 1)
+}
+
+#[test]
+fn audit_report_marks_update_available_actions() -> Result<(), String> {
+    let fixture = PinFixture::new()?;
+    fixture.write_inventory(&[inventory_line_with_tag(
+        ".github/workflows/example.yml",
+        "actions/checkout",
+        PIN_A,
+        "v1",
+    )])?;
+    fixture.write_upstreams(&[upstream_line("actions/checkout", "v2", PIN_B)])?;
+
+    let report = run_update_audit_json(&fixture)?;
+    require_entry_status(&report, "actions/checkout", "update_available")?;
+    require_entry_contains_step(
+        &report,
+        "actions/checkout",
+        "Update .github/action-pins.jsonl",
+    )
+}
+
+#[test]
+fn audit_report_records_upstream_unreachable_without_failing() -> Result<(), String> {
+    let fixture = PinFixture::new()?;
+    fixture.write_inventory(&[inventory_line_with_tag(
+        ".github/workflows/example.yml",
+        "actions/checkout",
+        PIN_A,
+        "v1",
+    )])?;
+    fixture.write_upstreams(&[upstream_line_with_lookup_status(
+        "actions/checkout",
+        "v2",
+        PIN_B,
+        "upstream_unreachable",
+    )])?;
+
+    let report = run_update_audit_json(&fixture)?;
+    require_entry_status(&report, "actions/checkout", "upstream_unreachable")
+}
+
+#[test]
+fn audit_report_records_missing_tag_without_failing() -> Result<(), String> {
+    let fixture = PinFixture::new()?;
+    fixture.write_inventory(&[inventory_line_with_tag(
+        ".github/workflows/example.yml",
+        "actions/checkout",
+        PIN_A,
+        "v1",
+    )])?;
+    fixture.write_upstreams(&[upstream_line_with_lookup_status(
+        "actions/checkout",
+        "v9",
+        PIN_B,
+        "missing_tag",
+    )])?;
+
+    let report = run_update_audit_json(&fixture)?;
+    require_entry_status(&report, "actions/checkout", "missing_tag")
+}
+
+#[test]
+fn audit_report_rejects_disallowed_downgrades() -> Result<(), String> {
+    let fixture = PinFixture::new()?;
+    fixture.write_inventory(&[inventory_line_with_tag(
+        ".github/workflows/example.yml",
+        "actions/checkout",
+        PIN_B,
+        "v2",
+    )])?;
+    fixture.write_upstreams(&[upstream_line("actions/checkout", "v1", PIN_A)])?;
+
+    let report = run_update_audit_json(&fixture)?;
+    require_entry_status(&report, "actions/checkout", "disallowed_downgrade")
+}
+
+#[test]
+fn audit_text_report_is_concise_human_output() -> Result<(), String> {
+    let fixture = PinFixture::new()?;
+    fixture.write_inventory(&[inventory_line_with_tag(
+        ".github/workflows/example.yml",
+        "actions/checkout",
+        PIN_A,
+        "v1",
+    )])?;
+    fixture.write_upstreams(&[upstream_line("actions/checkout", "v2", PIN_B)])?;
+
+    let text = run_update_audit_text(&fixture)?;
+    require_text_contains(&text, "Action pin update audit")?;
+    require_text_contains(&text, "update_available")?;
+    if text.contains("\"entries\"") {
+        return Err(format!("text report should not contain raw JSON: {text}"));
+    }
+    Ok(())
+}
+
+#[test]
+fn audit_text_report_suppresses_current_rows_by_default() -> Result<(), String> {
+    let fixture = PinFixture::new()?;
+    fixture.write_inventory(&[inventory_line_with_tag(
+        ".github/workflows/example.yml",
+        "actions/checkout",
+        PIN_A,
+        "v1",
+    )])?;
+    fixture.write_upstreams(&[upstream_line("actions/checkout", "v1", PIN_A)])?;
+
+    let text = run_update_audit_text(&fixture)?;
+    require_text_contains(&text, "All action pins match configured upstream refs.")?;
+    if text.contains("- up_to_date:") {
+        return Err(format!(
+            "text report should hide up-to-date rows unless --all is used: {text}"
+        ));
+    }
+    Ok(())
+}
+
 fn verify_action_pins(repo_root: &Path, inventory_path: &Path) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     let inventory = match load_inventory(inventory_path) {
@@ -442,10 +577,7 @@ fn scan_workflows(repo_root: &Path) -> Result<Vec<WorkflowUse>, Vec<String>> {
 
             match parse_external_action_ref(value) {
                 Ok((action, sha)) => workflow_uses.push(WorkflowUse {
-                    key: InventoryKey {
-                        workflow: workflow.clone(),
-                        action: action.to_owned(),
-                    },
+                    key: inventory_key(&workflow, action),
                     revision: sha.to_owned(),
                     line: line_number,
                 }),
@@ -536,6 +668,13 @@ fn parse_external_action_ref(value: &str) -> Result<(&str, &str), &'static str> 
     Ok((action, reference))
 }
 
+fn inventory_key(workflow: &str, action: &str) -> InventoryKey {
+    InventoryKey {
+        workflow: workflow.to_owned(),
+        action: action.to_owned(),
+    }
+}
+
 fn is_workflow_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(std::ffi::OsStr::to_str),
@@ -574,6 +713,10 @@ impl PinFixture {
         self.root().join(INVENTORY_PATH)
     }
 
+    fn upstream_path(&self) -> PathBuf {
+        self.root().join(UPSTREAMS_PATH)
+    }
+
     fn write_workflow(&self, content: &str) -> Result<(), String> {
         let workflow_path = self.root().join(".github/workflows/example.yml");
         let parent = workflow_path
@@ -595,15 +738,54 @@ impl PinFixture {
         fs::write(inventory_path, format!("{}\n", lines.join("\n")))
             .map_err(|error| format!("failed to write inventory fixture: {error}"))
     }
+
+    fn write_upstreams(&self, lines: &[String]) -> Result<(), String> {
+        let upstream_path = self.upstream_path();
+        let parent = upstream_path
+            .parent()
+            .ok_or_else(|| "upstream policy path has no parent".to_owned())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create upstream fixture directory: {error}"))?;
+        fs::write(upstream_path, format!("{}\n", lines.join("\n")))
+            .map_err(|error| format!("failed to write upstream fixture: {error}"))
+    }
 }
 
 #[cfg(test)]
 fn inventory_line(workflow: &str, action: &str, sha: &str) -> String {
+    inventory_line_with_tag(workflow, action, sha, "fixture-tag")
+}
+
+#[cfg(test)]
+fn inventory_line_with_tag(workflow: &str, action: &str, sha: &str, tag: &str) -> String {
     serde_json::json!({
         "workflow": workflow,
         "action": action,
         "sha": sha,
-        "tag": "fixture-tag",
+        "tag": tag,
+        "source": "fixture-source"
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+fn upstream_line(action: &str, latest_allowed_tag: &str, latest_allowed_sha: &str) -> String {
+    upstream_line_with_lookup_status(action, latest_allowed_tag, latest_allowed_sha, "ok")
+}
+
+#[cfg(test)]
+fn upstream_line_with_lookup_status(
+    action: &str,
+    latest_allowed_tag: &str,
+    latest_allowed_sha: &str,
+    lookup_status: &str,
+) -> String {
+    serde_json::json!({
+        "action": action,
+        "repo": format!("https://github.com/{action}.git"),
+        "latest_allowed_tag": latest_allowed_tag,
+        "latest_allowed_sha": latest_allowed_sha,
+        "lookup_status": lookup_status,
         "source": "fixture-source"
     })
     .to_string()
@@ -625,5 +807,131 @@ fn require_error_contains(errors: &[String], needle: &str) -> Result<(), String>
         Err(format!(
             "expected an error containing {needle:?}, got {errors:#?}"
         ))
+    }
+}
+
+#[cfg(test)]
+fn run_update_audit_json(fixture: &PinFixture) -> Result<Value, String> {
+    let output = Command::new("bash")
+        .arg("scripts/audit-workflow-action-pins.sh")
+        .arg("--inventory")
+        .arg(fixture.inventory_path())
+        .arg("--upstreams")
+        .arg(fixture.upstream_path())
+        .arg("--format")
+        .arg("json")
+        .output()
+        .map_err(|error| format!("failed to run update audit script: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "update audit script failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "failed to parse update audit JSON: {error}\nstdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+#[cfg(test)]
+fn run_update_audit_text(fixture: &PinFixture) -> Result<String, String> {
+    let output = Command::new("bash")
+        .arg("scripts/audit-workflow-action-pins.sh")
+        .arg("--inventory")
+        .arg(fixture.inventory_path())
+        .arg("--upstreams")
+        .arg(fixture.upstream_path())
+        .arg("--format")
+        .arg("text")
+        .output()
+        .map_err(|error| format!("failed to run update audit script: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(format!(
+            "update audit script failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+#[cfg(test)]
+fn require_entry_status(report: &Value, action: &str, expected_status: &str) -> Result<(), String> {
+    let entry = find_report_entry(report, action)?;
+    let status = entry
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("report entry for {action} has no string status: {entry}"))?;
+    if status == expected_status {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected {action} status {expected_status:?}, got {status:?}: {entry}"
+        ))
+    }
+}
+
+#[cfg(test)]
+fn require_entry_contains_step(report: &Value, action: &str, needle: &str) -> Result<(), String> {
+    let entry = find_report_entry(report, action)?;
+    let steps = entry
+        .get("manual_update_steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("report entry for {action} has no manual steps: {entry}"))?;
+    if steps
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|step| step.contains(needle))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected {action} manual steps to contain {needle:?}: {entry}"
+        ))
+    }
+}
+
+#[cfg(test)]
+fn require_summary_count(report: &Value, key: &str, expected: u64) -> Result<(), String> {
+    let summary = report
+        .get("summary")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("report has no summary object: {report}"))?;
+    let actual = summary
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("report summary has no numeric {key:?}: {report}"))?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected summary {key}={expected}, got {actual}: {report}"
+        ))
+    }
+}
+
+#[cfg(test)]
+fn find_report_entry<'a>(report: &'a Value, action: &str) -> Result<&'a Value, String> {
+    let entries = report
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("report has no entries array: {report}"))?;
+    entries
+        .iter()
+        .find(|entry| entry.get("action").and_then(Value::as_str) == Some(action))
+        .ok_or_else(|| format!("report has no entry for {action}: {report}"))
+}
+
+#[cfg(test)]
+fn require_text_contains(text: &str, needle: &str) -> Result<(), String> {
+    if text.contains(needle) {
+        Ok(())
+    } else {
+        Err(format!("expected text to contain {needle:?}:\n{text}"))
     }
 }

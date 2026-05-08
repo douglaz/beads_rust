@@ -49,6 +49,7 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
         "Validate required artifacts present",
         "Generate combined checksums",
         "Verify all checksums",
+        "Sign archive with Ed25519 (Linux/macOS)",
         "Generate changelog",
     ] {
         release_step_script(step_name)?;
@@ -170,6 +171,20 @@ fn verify_checksums_fragment_fails_on_corrupt_checksum() -> Result<(), String> {
 
     let result = run_bash_step(&script, fixture.root(), &[])?;
     require_failure(&result, "corrupt checksum should fail release verification")
+}
+
+#[test]
+fn signing_fragment_uses_private_ephemeral_key_file() -> Result<(), String> {
+    let script = release_step_script("Sign archive with Ed25519 (Linux/macOS)")?;
+
+    require_contains(&script, "mktemp")?;
+    require_contains(&script, "RUNNER_TEMP")?;
+    require_contains(&script, "chmod 600 \"$signing_key\"")?;
+    require_contains(&script, "trap 'rm -f \"$signing_key\"' EXIT")?;
+    require_contains(&script, "printf '%s\\n' \"$MINISIGN_SECRET_KEY\"")?;
+    require_contains(&script, "-s \"$signing_key\"")?;
+    require_not_contains(&script, "/tmp/minisign.key")?;
+    require_not_contains(&script, "echo \"$MINISIGN_SECRET_KEY\"")
 }
 
 #[test]

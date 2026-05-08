@@ -340,9 +340,11 @@ jobs:
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
-          echo "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
-          minisign -Sm br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }} -s /tmp/minisign.key -t "br ${{ github.ref_name }} ${{ matrix.name }}"
-          rm -f /tmp/minisign.key
+          signing_key="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/minisign-key.XXXXXX")"
+          trap 'rm -f "$signing_key"' EXIT
+          chmod 600 "$signing_key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$signing_key"
+          minisign -Sm br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }} -s "$signing_key" -t "br ${{ github.ref_name }} ${{ matrix.name }}"
 
       - name: Upload artifacts
         if: ${{ env.ACT != 'true' }}

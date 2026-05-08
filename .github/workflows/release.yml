@@ -82,7 +82,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: nightly
 
@@ -206,7 +206,7 @@ jobs:
           fetch-depth: 0  # Full history for vergen
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: nightly
           targets: ${{ matrix.target }}
@@ -390,7 +390,7 @@ jobs:
         run: |
           MISSING=()
           for platform in linux_amd64 linux_musl_amd64 linux_arm64 linux_musl_arm64 darwin_amd64 darwin_arm64 windows_amd64; do
-            if ! ls artifacts/br-*-${platform}.* 1>/dev/null 2>&1; then
+            if ! compgen -G "artifacts/br-*-${platform}.*" > /dev/null; then
               MISSING+=("$platform")
             fi
           done
@@ -405,7 +405,11 @@ jobs:
       - name: Generate combined checksums
         run: |
           cd artifacts
-          cat *.sha256 | sort > checksums.sha256
+          combined_checksums="$(mktemp)"
+          find . -maxdepth 1 -type f -name '*.sha256' ! -name checksums.sha256 -print0 \
+            | sort -z \
+            | xargs -0 cat > "$combined_checksums"
+          mv "$combined_checksums" checksums.sha256
           echo "=== Combined checksums ==="
           cat checksums.sha256
 
@@ -413,12 +417,12 @@ jobs:
         run: |
           cd artifacts
           echo "=== Verifying all checksums ==="
-          for checksum_file in *.sha256; do
-            if [ "$checksum_file" != "checksums.sha256" ]; then
+          while IFS= read -r -d '' checksum_file; do
+            if [ "$checksum_file" != "./checksums.sha256" ]; then
               echo "Verifying $checksum_file..."
               sha256sum -c "$checksum_file" || echo "Skipping non-Unix checksum"
             fi
-          done
+          done < <(find . -maxdepth 1 -type f -name '*.sha256' -print0 | sort -z)
 
       - name: Generate changelog
         id: changelog
@@ -431,7 +435,7 @@ jobs:
 
           if [ -n "$PREV_TAG" ]; then
             echo "Generating changelog from $PREV_TAG to ${{ github.ref_name }}"
-            COMMITS=$(git log --pretty=format:"- %s (%h)" $PREV_TAG..HEAD)
+            COMMITS=$(git log --pretty=format:"- %s (%h)" "${PREV_TAG}..HEAD")
             PREV_TAG_DATE=$(git log -1 --format=%ci "$PREV_TAG" 2>/dev/null | cut -d' ' -f1 || echo "")
           else
             echo "No previous tag found, generating changelog from start"
@@ -479,18 +483,19 @@ jobs:
           fi
 
           # Create release notes file
-          cat << EOF > RELEASE_NOTES.md
+          {
+            cat << EOF
           ## What's Changed
 
           ${BEADS_SECTION}### Commits
 
           EOF
-          echo "$COMMITS" >> RELEASE_NOTES.md
-          cat << EOF >> RELEASE_NOTES.md
+            echo "$COMMITS"
+            cat << EOF
 
           ${RELIABILITY_SECTION}
           EOF
-          cat << 'EOF' >> RELEASE_NOTES.md
+            cat << 'EOF'
           ## Platforms
 
           | Platform | Architecture | File |
@@ -542,6 +547,7 @@ jobs:
 
           See [CHANGELOG.md](https://github.com/Dicklesworthstone/beads_rust/blob/main/CHANGELOG.md) for the complete history.
           EOF
+          } > RELEASE_NOTES.md
 
           echo "=== Generated release notes ==="
           cat RELEASE_NOTES.md
@@ -587,7 +593,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: nightly
 

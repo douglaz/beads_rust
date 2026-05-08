@@ -15,6 +15,7 @@
 use crate::cli::{
     OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic_with_outer_mode,
 };
+use crate::coordination::{CoordinationClaimRow, CoordinationStatusOutput};
 use crate::error::Result;
 use crate::format::{
     BlockedIssue, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics,
@@ -181,6 +182,11 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
             schemas.insert("BlockedIssue", schema_for!(BlockedIssue));
             schemas.insert("TreeNode", schema_for!(TreeNode));
             schemas.insert("Statistics", schema_for!(Statistics));
+            schemas.insert(
+                "CoordinationStatusOutput",
+                schema_for!(CoordinationStatusOutput),
+            );
+            schemas.insert("CoordinationClaimRow", schema_for!(CoordinationClaimRow));
             schemas.insert("ErrorEnvelope", schema_for!(ErrorEnvelope));
         }
         SchemaTarget::Issue => {
@@ -206,6 +212,13 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
         }
         SchemaTarget::Statistics => {
             schemas.insert("Statistics", schema_for!(Statistics));
+        }
+        SchemaTarget::CoordinationStatus => {
+            schemas.insert(
+                "CoordinationStatusOutput",
+                schema_for!(CoordinationStatusOutput),
+            );
+            schemas.insert("CoordinationClaimRow", schema_for!(CoordinationClaimRow));
         }
         SchemaTarget::Error => {
             schemas.insert("ErrorEnvelope", schema_for!(ErrorEnvelope));
@@ -397,6 +410,20 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             item_schema: None,
             error_envelope_on_stderr: false,
             notes: Some("Workspace info object (paths, mode, config snapshot)."),
+        },
+    );
+    commands.insert(
+        "coordination status",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".claims[]",
+            items_at: Some(".claims"),
+            item_schema: Some("CoordinationClaimRow"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Read-only object with workspace summary and `claims[]` rows. The \
+                 full envelope schema is `CoordinationStatusOutput`.",
+            ),
         },
     );
 }

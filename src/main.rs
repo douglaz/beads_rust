@@ -347,6 +347,23 @@ fn main() {
                 commands::label::execute(&command, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Coordination { command } => match command {
+            beads_rust::cli::CoordinationCommands::Status(args) => {
+                if let (Some(res), Some(beads_dir)) =
+                    (storage_result.as_ref(), ctx.beads_dir.as_ref())
+                {
+                    commands::coordination::execute_status_with_storage_ctx(
+                        &args,
+                        &overrides,
+                        &output_ctx,
+                        beads_dir,
+                        res,
+                    )
+                } else {
+                    commands::coordination::execute_status(&args, &overrides, &output_ctx)
+                }
+            }
+        },
         Commands::Count(args) => {
             if let Some(res) = storage_result.as_ref() {
                 commands::count::execute_with_storage(&args, &output_ctx, &res.storage)
@@ -781,6 +798,7 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
+        | Commands::Coordination { .. }
         | Commands::Ready(_)
         | Commands::Scheduler(_)
         | Commands::Blocked(_)
@@ -823,6 +841,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
+        | Commands::Coordination { .. }
         | Commands::Ready(_)
         | Commands::Scheduler(_)
         | Commands::Blocked(_)
@@ -874,6 +893,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         Commands::Sync(args) => args.status,
         Commands::Stats(_)
         | Commands::Status(_)
+        | Commands::Coordination { .. }
         | Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
@@ -905,6 +925,7 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
+        | Commands::Coordination { .. }
         | Commands::Ready(_)
         | Commands::Scheduler(_)
         | Commands::Blocked(_)
@@ -966,6 +987,9 @@ fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
         Commands::List(args) => args.format,
         Commands::Search(args) => args.filters.format,
         Commands::Show(args) => args.format.map(Into::into),
+        Commands::Coordination { command } => match command {
+            beads_rust::cli::CoordinationCommands::Status(args) => args.format.map(Into::into),
+        },
         Commands::Ready(args) => args.format.map(Into::into),
         Commands::Scheduler(args) => args.format.map(Into::into),
         Commands::Blocked(args) => args.format.map(Into::into),

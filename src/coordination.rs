@@ -5,6 +5,7 @@
 //! evidence, then receive a deterministic classification that future CLI, MCP,
 //! scheduler, and audit surfaces can share.
 
+use crate::model::{Comment, IssueType, Priority, Status};
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -99,6 +100,22 @@ pub enum ClaimClassification {
     Ambiguous,
 }
 
+impl ClaimClassification {
+    /// Stable snake_case value used in text projections.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unassigned => "unassigned",
+            Self::Fresh => "fresh",
+            Self::BlockedByActiveReservation => "blocked_by_active_reservation",
+            Self::StaleCandidate => "stale_candidate",
+            Self::AbandonedLikely => "abandoned_likely",
+            Self::NoMailSnapshot => "no_mail_snapshot",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
 /// Suggested next action for an operator or agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +133,20 @@ pub enum RecommendedAction {
     LeaveActive,
 }
 
+impl RecommendedAction {
+    /// Stable snake_case value used in text projections.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::AskOwner => "ask_owner",
+            Self::InspectMail => "inspect_mail",
+            Self::ReclaimCandidate => "reclaim_candidate",
+            Self::LeaveActive => "leave_active",
+        }
+    }
+}
+
 /// Evidence categories present in a claim assessment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -128,6 +159,24 @@ pub enum CoordinationEvidenceSource {
     AgentMailSnapshot,
     /// Explicit absence of an Agent Mail snapshot.
     NoAgentMailSnapshot,
+}
+
+/// Bounded comment excerpt included with a coordination claim row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CoordinationComment {
+    pub author: String,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&Comment> for CoordinationComment {
+    fn from(comment: &Comment) -> Self {
+        Self {
+            author: comment.author.clone(),
+            text: comment.body.clone(),
+            created_at: comment.created_at,
+        }
+    }
 }
 
 /// Caller-provided input for one claim assessment.
@@ -156,10 +205,43 @@ pub struct ClaimAssessment {
     pub evidence_sources: Vec<CoordinationEvidenceSource>,
 }
 
+/// Issue context attached to one coordination claim row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CoordinationIssueRow {
+    pub id: String,
+    pub title: String,
+    pub status: Status,
+    pub priority: Priority,
+    pub issue_type: IssueType,
+    pub labels: Vec<String>,
+    pub dependency_count: usize,
+    pub dependent_count: usize,
+    pub latest_comments: Vec<CoordinationComment>,
+}
+
+/// One in-progress issue plus its deterministic coordination assessment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CoordinationClaimRow {
+    pub issue: CoordinationIssueRow,
+    pub assessment: ClaimAssessment,
+}
+
+/// Workspace context counts shown next to hidden-claim diagnosis.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CoordinationWorkspaceCounts {
+    pub open: usize,
+    pub ready: usize,
+    pub blocked: usize,
+    pub in_progress: usize,
+    pub deferred: usize,
+    pub closed: usize,
+}
+
 /// Count summary for coordination status output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CoordinationSummary {
     pub total_claims: usize,
+    pub workspace: CoordinationWorkspaceCounts,
     pub unassigned: usize,
     pub fresh: usize,
     pub blocked_by_active_reservation: usize,
@@ -175,14 +257,18 @@ pub struct CoordinationStatusOutput {
     pub schema_version: String,
     pub generated_at: DateTime<Utc>,
     pub summary: CoordinationSummary,
-    pub claims: Vec<ClaimAssessment>,
+    pub claims: Vec<CoordinationClaimRow>,
 }
 
 impl CoordinationStatusOutput {
     /// Build a coordination status envelope with current schema version.
     #[must_use]
-    pub fn new(generated_at: DateTime<Utc>, claims: Vec<ClaimAssessment>) -> Self {
-        let summary = CoordinationSummary::from_claims(&claims);
+    pub fn new(
+        generated_at: DateTime<Utc>,
+        workspace: CoordinationWorkspaceCounts,
+        claims: Vec<CoordinationClaimRow>,
+    ) -> Self {
+        let summary = CoordinationSummary::from_claims(&claims, workspace);
         Self {
             schema_version: COORDINATION_SCHEMA_VERSION.to_string(),
             generated_at,
@@ -195,9 +281,13 @@ impl CoordinationStatusOutput {
 impl CoordinationSummary {
     /// Count claim classifications for a status envelope.
     #[must_use]
-    pub fn from_claims(claims: &[ClaimAssessment]) -> Self {
+    pub fn from_claims(
+        claims: &[CoordinationClaimRow],
+        workspace: CoordinationWorkspaceCounts,
+    ) -> Self {
         let mut summary = Self {
             total_claims: claims.len(),
+            workspace,
             unassigned: 0,
             fresh: 0,
             blocked_by_active_reservation: 0,
@@ -208,7 +298,7 @@ impl CoordinationSummary {
         };
 
         for claim in claims {
-            match claim.classification {
+            match claim.assessment.classification {
                 ClaimClassification::Unassigned => summary.unassigned += 1,
                 ClaimClassification::Fresh => summary.fresh += 1,
                 ClaimClassification::BlockedByActiveReservation => {
@@ -341,9 +431,11 @@ fn evidence_sources_for(reservation: &ReservationEvidence) -> Vec<CoordinationEv
 mod tests {
     use super::{
         COORDINATION_SCHEMA_VERSION, ClaimAssessmentInput, ClaimClassification, ClaimOwnerKind,
-        CoordinationEvidenceSource, CoordinationStatusOutput, RecommendedAction,
-        ReservationEvidence, assess_claim,
+        CoordinationClaimRow, CoordinationComment, CoordinationEvidenceSource,
+        CoordinationIssueRow, CoordinationStatusOutput, CoordinationWorkspaceCounts,
+        RecommendedAction, ReservationEvidence, assess_claim,
     };
+    use crate::model::{IssueType, Priority, Status};
     use chrono::{Duration, TimeZone, Utc};
 
     fn now() -> chrono::DateTime<Utc> {
@@ -363,6 +455,27 @@ mod tests {
             now: now(),
             owner_kind,
             reservation,
+        }
+    }
+
+    fn claim_row(id: &str, assessment: super::ClaimAssessment) -> CoordinationClaimRow {
+        CoordinationClaimRow {
+            issue: CoordinationIssueRow {
+                id: id.to_string(),
+                title: format!("Claim {id}"),
+                status: Status::InProgress,
+                priority: Priority(1),
+                issue_type: IssueType::Task,
+                labels: vec!["coordination".to_string()],
+                dependency_count: 1,
+                dependent_count: 2,
+                latest_comments: vec![CoordinationComment {
+                    author: "TopazFox".to_string(),
+                    text: "latest evidence".to_string(),
+                    created_at: now(),
+                }],
+            },
+            assessment,
         }
     }
 
@@ -547,12 +660,29 @@ mod tests {
             ClaimOwnerKind::SwarmAgent,
             ReservationEvidence::NoReservation,
         ));
-        let output = CoordinationStatusOutput::new(now(), vec![fresh, stale]);
+        let workspace = CoordinationWorkspaceCounts {
+            open: 3,
+            ready: 1,
+            blocked: 1,
+            in_progress: 2,
+            deferred: 0,
+            closed: 5,
+        };
+        let output = CoordinationStatusOutput::new(
+            now(),
+            workspace,
+            vec![claim_row("bd-fresh", fresh), claim_row("bd-stale", stale)],
+        );
 
         assert_eq!(output.schema_version, COORDINATION_SCHEMA_VERSION);
         assert_eq!(output.summary.total_claims, 2);
+        assert_eq!(output.summary.workspace.in_progress, 2);
         assert_eq!(output.summary.fresh, 1);
         assert_eq!(output.summary.stale_candidate, 1);
+        assert_eq!(
+            output.claims[0].issue.latest_comments[0].text,
+            "latest evidence"
+        );
     }
 
     #[test]

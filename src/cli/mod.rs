@@ -762,6 +762,13 @@ pub enum Commands {
         command: ConfigCommands,
     },
 
+    /// Diagnose swarm coordination state without mutating claims
+    #[command(alias = "coord")]
+    Coordination {
+        #[command(subcommand)]
+        command: CoordinationCommands,
+    },
+
     /// Count issues with optional grouping
     Count(CountArgs),
 
@@ -1253,6 +1260,49 @@ pub struct SchemaArgs {
     pub stats: bool,
 }
 
+/// Subcommands for coordination diagnosis.
+#[derive(Subcommand, Debug)]
+pub enum CoordinationCommands {
+    /// Show hidden in-progress claims with stale-claim evidence
+    Status(CoordinationStatusArgs),
+}
+
+/// Arguments for `br coordination status`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct CoordinationStatusArgs {
+    /// Assumed owner kind for current claims when no snapshot supplies owner metadata
+    #[arg(long, value_enum, default_value_t)]
+    pub owner_kind: CoordinationOwnerKindArg,
+
+    /// Number of latest comments to include per claim
+    #[arg(long, default_value_t = 2)]
+    pub comments: usize,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Owner-kind policy for coordination claim assessment.
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum CoordinationOwnerKindArg {
+    /// Treat assigned in-progress claims as swarm-agent claims
+    #[default]
+    SwarmAgent,
+    /// Treat assigned claims as human-owned
+    Human,
+    /// Treat assigned claims as unclear ownership
+    Unknown,
+}
+
 /// Schema targets for `br schema`.
 #[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum SchemaTarget {
@@ -1275,6 +1325,8 @@ pub enum SchemaTarget {
     TreeNode,
     /// Stats output
     Statistics,
+    /// Coordination status output
+    CoordinationStatus,
     /// Structured error envelope (stderr JSON when robot mode or non-TTY)
     Error,
     /// Per-command JSON output envelope map (top-level shape + jq filter per command)
@@ -1368,6 +1420,7 @@ pub fn resolve_output_format(
 pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
     match cmd {
         Commands::Close(args) => args.robot,
+        Commands::Coordination { command } => coordination_command_requests_robot_json(command),
         Commands::Reopen(args) => args.robot,
         Commands::Ready(args) => args.robot,
         Commands::Scheduler(args) => args.robot,
@@ -1379,6 +1432,12 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
         _ => false,
+    }
+}
+
+const fn coordination_command_requests_robot_json(command: &CoordinationCommands) -> bool {
+    match command {
+        CoordinationCommands::Status(args) => args.robot,
     }
 }
 

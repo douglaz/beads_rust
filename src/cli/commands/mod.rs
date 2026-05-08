@@ -18,6 +18,7 @@ pub mod close;
 pub mod comments;
 pub mod completions;
 pub mod config;
+pub mod coordination;
 pub mod count;
 pub mod create;
 pub mod defer;

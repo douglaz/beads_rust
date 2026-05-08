@@ -1,7 +1,8 @@
 # Coordination Evidence Contract
 
 Status: design and helper contract for future coordination CLI, MCP, scheduler,
-and audit work. There is no user-facing coordination command yet.
+and audit work. The first user-facing surface is the read-only
+`br coordination status` command.
 
 ## Purpose
 
@@ -84,6 +85,24 @@ Each claim assessment includes:
 Future CLI and MCP surfaces should expose this shape directly in JSON mode and
 may convert it to TOON using the normal output layer. Human text output should be
 a projection of the same fields, not a separate policy.
+
+## CLI Surface
+
+`br coordination status` enumerates `in_progress` claims and emits the shared
+`br.coordination.v1` envelope:
+
+```bash
+br coordination status --json
+br coordination status --format toon
+br coordination status --owner-kind swarm-agent
+```
+
+The command is read-only. It opens the same local storage as other list-style
+commands, computes local issue counts and relation counts, attaches bounded
+latest-comment excerpts, and classifies each claim with `ReservationEvidence` set
+to `no_snapshot`. Snapshot correlation is a separate follow-up; until then stale
+assigned claims become `no_mail_snapshot` with `inspect_mail`, not
+`reclaim_candidate`.
 
 ## Agent Mail Boundary
 

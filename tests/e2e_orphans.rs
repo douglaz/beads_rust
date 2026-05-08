@@ -100,6 +100,21 @@ fn rewrite_jsonl_issue_as_closed(workspace: &BrWorkspace, issue_id: &str) {
     fs::write(&jsonl_path, format!("{rewritten}\n")).expect("write issues.jsonl");
 }
 
+fn imported_issue_from_seed(seed_issue: &Value, id: &str, title: &str, description: &str) -> Value {
+    let mut issue = seed_issue.clone();
+    issue["id"] = Value::String(id.to_string());
+    issue["title"] = Value::String(title.to_string());
+    issue["description"] = Value::String(description.to_string());
+    issue["content_hash"] = Value::Null;
+    issue
+}
+
+fn mark_imported_issue_closed(issue: &mut Value) {
+    issue["status"] = Value::String("closed".to_string());
+    issue["closed_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
+    issue["close_reason"] = Value::String("Closed before commit scan".to_string());
+}
+
 // =============================================================================
 // Success Path Tests
 // =============================================================================
@@ -377,29 +392,25 @@ fn e2e_orphans_detects_mixed_prefix_and_dotted_child_refs() {
     let seed_payload = extract_json_payload(&create.stdout);
     let seed_issue: Value = serde_json::from_str(&seed_payload).expect("seed issue JSON");
 
-    let mut imported_root = seed_issue.clone();
-    imported_root["id"] = Value::String("other-abc12".to_string());
-    imported_root["title"] = Value::String("Imported mixed-prefix root".to_string());
-    imported_root["description"] =
-        Value::String("Open issue with a non-default prefix".to_string());
-    imported_root["content_hash"] = Value::Null;
-
-    let mut imported_child = seed_issue.clone();
-    imported_child["id"] = Value::String("other-abc12.1".to_string());
-    imported_child["title"] = Value::String("Imported dotted child".to_string());
-    imported_child["description"] =
-        Value::String("Open hierarchical issue with a non-default prefix".to_string());
-    imported_child["content_hash"] = Value::Null;
-
-    let mut imported_closed_child = seed_issue.clone();
-    imported_closed_child["id"] = Value::String("other-dead99.1".to_string());
-    imported_closed_child["title"] = Value::String("Imported closed dotted child".to_string());
-    imported_closed_child["description"] =
-        Value::String("Closed hierarchical issue with a non-default prefix".to_string());
-    imported_closed_child["status"] = Value::String("closed".to_string());
-    imported_closed_child["closed_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
-    imported_closed_child["close_reason"] = Value::String("Closed before commit scan".to_string());
-    imported_closed_child["content_hash"] = Value::Null;
+    let imported_root = imported_issue_from_seed(
+        &seed_issue,
+        "other-abc12",
+        "Imported mixed-prefix root",
+        "Open issue with a non-default prefix",
+    );
+    let imported_child = imported_issue_from_seed(
+        &seed_issue,
+        "other-abc12.1",
+        "Imported dotted child",
+        "Open hierarchical issue with a non-default prefix",
+    );
+    let mut imported_closed_child = imported_issue_from_seed(
+        &seed_issue,
+        "other-dead99.1",
+        "Imported closed dotted child",
+        "Closed hierarchical issue with a non-default prefix",
+    );
+    mark_imported_issue_closed(&mut imported_closed_child);
 
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
     fs::write(

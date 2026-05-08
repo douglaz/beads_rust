@@ -594,14 +594,29 @@ detect_platform() {
     # (see #284).
     libc=""
     if [ "$os" = "linux" ]; then
+        # Detection order, cheapest and most reliable first:
+        #   1. /etc/alpine-release  — Alpine fast path (cheap stat).
+        #   2. /proc/self/maps      — what *this running bash* is linked
+        #      against. Bulletproof: it survives systems that have the
+        #      musl cross-toolchain installed alongside glibc (which
+        #      makes /lib/ld-musl-*.so* present even on glibc hosts), and
+        #      side-steps the `set -o pipefail` interaction with `ldd`.
+        #   3. `ldd --version` output sniff — last resort for exotic
+        #      systems with no /proc (e.g. heavily restricted containers).
+        #
+        # Note on the ldd path: musl's `ldd` exits non-zero even when it
+        # prints "musl libc" to stderr, so `if … | grep -q …` is never
+        # taken under `pipefail`. We capture combined output first and
+        # match with `case` to avoid the pipeline entirely.
         if [ -f /etc/alpine-release ]; then
             libc="musl"
+        elif grep -q 'ld-musl' /proc/self/maps 2>/dev/null; then
+            libc="musl"
         elif command -v ldd >/dev/null 2>&1; then
-            # `ldd --version` emits to stderr on glibc and stdout on musl;
-            # capture both. musl's ldd identifies itself as "musl libc".
-            if ldd --version 2>&1 | grep -qi 'musl'; then
-                libc="musl"
-            fi
+            ldd_output=$(ldd --version 2>&1 || true)
+            case "$ldd_output" in
+                *[Mm]usl*) libc="musl" ;;
+            esac
         fi
         # Only musl_arm64 and musl_amd64 are published; armv7 keeps gnu (no musl
         # artifact yet). If we somehow detected musl on armv7, fall back to gnu

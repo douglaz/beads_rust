@@ -163,9 +163,13 @@ is safe.
 
 ## Scheduler Boundary
 
-The scheduler may reuse the same age and owner-kind thresholds. It should not
-claim that a stale issue is abandoned unless it also receives trustworthy
-reservation evidence. When in doubt, scheduler output should point agents to the
+The scheduler reuses the same claim classifier for stale assignment evidence,
+but it does not parse Agent Mail snapshots. Scheduler rows therefore classify
+assigned stale work with `reservation_status: "no_snapshot"` and
+`recommended_action: "inspect_mail"` instead of claiming abandonment. The
+`--stale-claim-hours` option still controls the scheduler's age threshold, while
+the classifier keeps the owner/reservation semantics aligned with
+`br coordination status`. When in doubt, scheduler output points agents to the
 coordination status surface for deeper diagnosis.
 
 ## Reclaim Boundary

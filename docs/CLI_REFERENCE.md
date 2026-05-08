@@ -500,6 +500,11 @@ bounded candidate set with deterministic evidence terms for priority,
 dependency impact, stale claims, fairness, and domain contention. JSON and TOON
 output include `schema: "br.scheduler.v1"` plus a fallback policy so agents can
 parse the result safely and preserve conservative ordering when evidence ties.
+The `evidence.stale_claim` object uses the shared coordination policy with
+`reservation_status: "no_snapshot"` because `scheduler` does not parse Agent
+Mail snapshots. A stale assigned row can therefore recommend `inspect_mail`, but
+it is not proof that the claim is abandoned; run `br coordination status` with
+reservation evidence before reclaiming ownership.
 
 **Options:**
 | Option | Description |

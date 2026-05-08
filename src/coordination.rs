@@ -282,6 +282,24 @@ pub struct ClaimAssessmentInput {
     pub reservation: ReservationEvidence,
 }
 
+/// Thresholds used when classifying a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimAssessmentPolicy {
+    pub stale_candidate_after_minutes: i64,
+    pub abandoned_likely_after_minutes: i64,
+}
+
+impl ClaimAssessmentPolicy {
+    /// Build the default coordination policy for an owner class.
+    #[must_use]
+    pub const fn for_owner_kind(owner_kind: ClaimOwnerKind) -> Self {
+        Self {
+            stale_candidate_after_minutes: owner_kind.stale_candidate_after_minutes(),
+            abandoned_likely_after_minutes: owner_kind.abandoned_likely_after_minutes(),
+        }
+    }
+}
+
 /// Deterministic assessment for one in-progress claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClaimAssessment {
@@ -417,6 +435,16 @@ impl CoordinationSummary {
 /// Classify one in-progress claim from caller-supplied evidence.
 #[must_use]
 pub fn assess_claim(input: ClaimAssessmentInput) -> ClaimAssessment {
+    let policy = ClaimAssessmentPolicy::for_owner_kind(input.owner_kind);
+    assess_claim_with_policy(input, policy)
+}
+
+/// Classify one claim with caller-supplied thresholds.
+#[must_use]
+pub fn assess_claim_with_policy(
+    input: ClaimAssessmentInput,
+    policy: ClaimAssessmentPolicy,
+) -> ClaimAssessment {
     let assignee = input
         .assignee
         .as_deref()
@@ -428,8 +456,10 @@ pub fn assess_claim(input: ClaimAssessmentInput) -> ClaimAssessment {
         .signed_duration_since(input.updated_at)
         .num_minutes()
         .max(0);
-    let stale_threshold_minutes = input.owner_kind.stale_candidate_after_minutes();
-    let abandoned_threshold_minutes = input.owner_kind.abandoned_likely_after_minutes();
+    let stale_threshold_minutes = policy.stale_candidate_after_minutes.max(0);
+    let abandoned_threshold_minutes = policy
+        .abandoned_likely_after_minutes
+        .max(stale_threshold_minutes);
 
     let (classification, recommended_action) = classify_claim(
         assignee.as_deref(),

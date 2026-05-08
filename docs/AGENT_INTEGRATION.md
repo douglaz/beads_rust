@@ -241,6 +241,12 @@ follow-up degraded-coordination comment. The newest assignee owns the claim, but
 the old owner can still return; in that case, coordinate in the bead thread and
 split or hand off the work instead of silently overwriting each other.
 
+`br scheduler --json` uses the same coordination age policy for its
+`evidence.stale_claim` object, but it deliberately assumes
+`reservation_status: "no_snapshot"`. Treat `classification: "no_mail_snapshot"`
+and `recommended_action: "inspect_mail"` as a prompt to gather Agent Mail
+evidence, not as permission to reclaim the bead.
+
 For a read-only preflight, use coordination status with an explicit reservation
 snapshot when available:
 

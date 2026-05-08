@@ -115,6 +115,39 @@ fn mark_imported_issue_closed(issue: &mut Value) {
     issue["close_reason"] = Value::String("Closed before commit scan".to_string());
 }
 
+fn assert_mixed_prefix_dotted_orphans(stdout: &str) {
+    let payload = extract_json_payload(stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse orphans JSON");
+    let arr = json.as_array().expect("orphans output should be an array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|orphan| orphan["issue_id"].as_str())
+        .collect();
+
+    assert!(
+        ids.contains(&"other-abc12"),
+        "missing mixed-prefix root issue in {ids:?}"
+    );
+    assert!(
+        ids.contains(&"other-abc12.1"),
+        "missing dotted mixed-prefix child issue in {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"other-dead99.1"),
+        "closed dotted child should not be reported as an orphan"
+    );
+
+    let child = arr
+        .iter()
+        .find(|orphan| orphan["issue_id"].as_str() == Some("other-abc12.1"))
+        .expect("dotted child orphan should be present");
+    assert_eq!(
+        child["title"].as_str(),
+        Some("Imported dotted child"),
+        "dotted child should retain imported issue details"
+    );
+}
+
 // =============================================================================
 // Success Path Tests
 // =============================================================================
@@ -453,36 +486,7 @@ fn e2e_orphans_detects_mixed_prefix_and_dotted_child_refs() {
         orphans.stderr
     );
 
-    let payload = extract_json_payload(&orphans.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("parse orphans JSON");
-    let arr = json.as_array().expect("orphans output should be an array");
-    let ids: Vec<&str> = arr
-        .iter()
-        .filter_map(|orphan| orphan["issue_id"].as_str())
-        .collect();
-
-    assert!(
-        ids.contains(&"other-abc12"),
-        "missing mixed-prefix root issue in {ids:?}"
-    );
-    assert!(
-        ids.contains(&"other-abc12.1"),
-        "missing dotted mixed-prefix child issue in {ids:?}"
-    );
-    assert!(
-        !ids.contains(&"other-dead99.1"),
-        "closed dotted child should not be reported as an orphan"
-    );
-
-    let child = arr
-        .iter()
-        .find(|orphan| orphan["issue_id"].as_str() == Some("other-abc12.1"))
-        .expect("dotted child orphan should be present");
-    assert_eq!(
-        child["title"].as_str(),
-        Some("Imported dotted child"),
-        "dotted child should retain imported issue details"
-    );
+    assert_mixed_prefix_dotted_orphans(&orphans.stdout);
 
     info!("e2e_orphans_detects_mixed_prefix_and_dotted_child_refs: assertions passed");
 }

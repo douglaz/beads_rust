@@ -117,6 +117,12 @@ fn write_snapshot_files(workspace: &BrWorkspace) -> (String, String) {
     )
 }
 
+fn write_empty_reservations(workspace: &BrWorkspace) -> String {
+    let path = workspace.root.join("empty-reservations.json");
+    fs::write(&path, r#"{"reservations":[]}"#).expect("write empty reservations snapshot");
+    path.to_string_lossy().into_owned()
+}
+
 fn parse_error_json(stderr: &str) -> Option<Value> {
     serde_json::from_str(stderr).ok().or_else(|| {
         stderr
@@ -165,6 +171,14 @@ fn coordination_status_json_reports_fresh_and_stale_claims() {
     );
     assert_eq!(stale["assessment"]["classification"], "no_mail_snapshot");
     assert_eq!(stale["assessment"]["recommended_action"], "inspect_mail");
+    assert_eq!(stale["reclaim_allowed_by_policy"], false);
+    assert_eq!(stale["required_human_confirmation"], false);
+    assert!(
+        stale["evidence_summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("reservation_status=no_snapshot"))
+    );
+    assert_eq!(stale["suggested_commands"], json!([]));
 }
 
 #[test]
@@ -200,10 +214,112 @@ fn coordination_status_uses_offline_snapshot_files_without_live_mail() {
     );
     assert_eq!(stale["assessment"]["recommended_action"], "leave_active");
     assert_eq!(stale["agent"]["name"], "AmberLion");
+    assert_eq!(stale["reclaim_allowed_by_policy"], false);
+    assert_eq!(stale["suggested_commands"], json!([]));
     assert_eq!(
         stale["assessment"]["reservation"]["detail"]["provenance"]["matched_on"],
         json!(["holder_matches_assignee", "issue_id"])
     );
+}
+
+#[test]
+fn coordination_status_emits_reclaim_commands_only_after_snapshot_clears_policy() {
+    let _log = common::test_log(
+        "coordination_status_emits_reclaim_commands_only_after_snapshot_clears_policy",
+    );
+    let workspace = BrWorkspace::new();
+    seed_coordination_workspace(&workspace);
+    let reservations = write_empty_reservations(&workspace);
+
+    let json = coordination_json(
+        &workspace,
+        &[
+            "coordination",
+            "status",
+            "--json",
+            "--owner-kind",
+            "swarm-agent",
+            "--reservations",
+            &reservations,
+        ],
+        "coordination_reclaim_advisory",
+    );
+    let claims = json["claims"].as_array().expect("claims array");
+    let stale = claims
+        .iter()
+        .find(|claim| claim["issue"]["id"] == "bd-stale")
+        .expect("stale claim");
+    let commands = stale["suggested_commands"]
+        .as_array()
+        .expect("suggested commands");
+
+    assert_eq!(stale["assessment"]["classification"], "abandoned_likely");
+    assert_eq!(
+        stale["assessment"]["recommended_action"],
+        "reclaim_candidate"
+    );
+    assert_eq!(stale["reclaim_allowed_by_policy"], true);
+    assert_eq!(stale["required_human_confirmation"], false);
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0]["purpose"], "add_reclaim_audit_comment");
+    assert_eq!(commands[1]["purpose"], "claim_issue");
+    assert!(
+        commands[0]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("br comments add"))
+    );
+    assert!(
+        commands[1]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("br update"))
+    );
+    for expected in [
+        "updated_at=2020-01-01",
+        "assignee=AmberLion",
+        "stale_threshold_minutes=120",
+        "reservation_status=no_reservation",
+    ] {
+        assert!(
+            commands[0]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains(expected)),
+            "audit command should include {expected}"
+        );
+    }
+}
+
+#[test]
+fn coordination_status_human_owner_requires_confirmation_without_reclaim_command() {
+    let _log = common::test_log(
+        "coordination_status_human_owner_requires_confirmation_without_reclaim_command",
+    );
+    let workspace = BrWorkspace::new();
+    seed_coordination_workspace(&workspace);
+    let reservations = write_empty_reservations(&workspace);
+
+    let json = coordination_json(
+        &workspace,
+        &[
+            "coordination",
+            "status",
+            "--json",
+            "--owner-kind",
+            "human",
+            "--reservations",
+            &reservations,
+        ],
+        "coordination_human_confirmation",
+    );
+    let claims = json["claims"].as_array().expect("claims array");
+    let stale = claims
+        .iter()
+        .find(|claim| claim["issue"]["id"] == "bd-stale")
+        .expect("stale claim");
+
+    assert_eq!(stale["assessment"]["recommended_action"], "ask_owner");
+    assert_eq!(stale["reclaim_allowed_by_policy"], false);
+    assert_eq!(stale["required_human_confirmation"], true);
+    assert_eq!(stale["suggested_commands"], json!([]));
 }
 
 #[test]
@@ -259,6 +375,8 @@ fn coordination_status_text_is_concise_and_sanitized() {
     assert!(result.stdout.contains("bd-stale"));
     assert!(result.stdout.contains("classification: no_mail_snapshot"));
     assert!(result.stdout.contains("next_action: inspect_mail"));
+    assert!(result.stdout.contains("reclaim_allowed_by_policy=false"));
+    assert!(result.stdout.contains("reservation_status=no_snapshot"));
     assert!(!result.stdout.contains('\u{1b}'));
     assert!(result.stdout.contains(r"\u{1b}[31m"));
 }

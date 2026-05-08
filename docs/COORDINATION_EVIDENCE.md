@@ -82,6 +82,20 @@ Each claim assessment includes:
 - recommended action,
 - evidence source list.
 
+Each claim row also includes advisory-only reclaim guidance:
+
+- `reclaim_allowed_by_policy`: true only when the shared policy has enough
+  evidence to suggest the audit-comment plus claim sequence for a swarm-agent
+  claim.
+- `required_human_confirmation`: true for human or unknown owners that are old
+  enough to inspect but must not be reclaimed automatically.
+- `evidence_summary`: compact evidence values suitable for an audit comment,
+  including `updated_at`, assignee, owner kind, age, thresholds, and
+  reservation/snapshot status.
+- `suggested_commands`: reviewed-by-human shell commands. These are empty for
+  fresh claims, active reservations, missing/invalid snapshots, and human or
+  unknown ownership.
+
 Future CLI and MCP surfaces should expose this shape directly in JSON mode and
 may convert it to TOON using the normal output layer. Human text output should be
 a projection of the same fields, not a separate policy.
@@ -168,3 +182,9 @@ br update <id> --claim --json
 
 Human or unknown ownership keeps the safer `ask_owner` recommendation even after
 the stale threshold.
+
+`br coordination status` can emit the same sequence in `suggested_commands`, but
+only as an advisory. It never executes either command. The first suggested
+command is always the audit comment; only then does the second command show
+`br update <id> --claim --json`. Operators should still review the evidence and
+confirm any external pane/process state that `br` cannot observe.

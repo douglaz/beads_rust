@@ -8,8 +8,8 @@ use crate::config;
 use crate::coordination::{
     AgentMailAgentSnapshot, AgentMailReservationSnapshot, ClaimAssessmentInput, ClaimOwnerKind,
     CoordinationClaimRow, CoordinationComment, CoordinationIssueRow, CoordinationStatusOutput,
-    CoordinationWorkspaceCounts, ReservationEvidence, ReservationEvidenceProvenance, assess_claim,
-    reservation_evidence_from_snapshots,
+    CoordinationWorkspaceCounts, ReservationEvidence, ReservationEvidenceProvenance,
+    advisory_for_claim, assess_claim, reservation_evidence_from_snapshots,
 };
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, truncate_title};
@@ -181,6 +181,7 @@ struct ClaimRowContext<'a> {
 
 fn build_claim_row(issue: Issue, context: ClaimRowContext<'_>) -> CoordinationClaimRow {
     let latest_comments = latest_comments(context.comments, context.comment_limit);
+    let issue_id = issue.id;
     let assessment = assess_claim(ClaimAssessmentInput {
         assignee: issue.assignee.clone(),
         updated_at: issue.updated_at,
@@ -188,8 +189,9 @@ fn build_claim_row(issue: Issue, context: ClaimRowContext<'_>) -> CoordinationCl
         owner_kind: context.owner_kind,
         reservation: context.reservation,
     });
+    let advisory = advisory_for_claim(&issue_id, &assessment);
     let issue = CoordinationIssueRow {
-        id: issue.id,
+        id: issue_id,
         title: issue.title,
         status: issue.status,
         priority: issue.priority,
@@ -204,6 +206,10 @@ fn build_claim_row(issue: Issue, context: ClaimRowContext<'_>) -> CoordinationCl
         issue,
         agent: context.agent,
         assessment,
+        reclaim_allowed_by_policy: advisory.reclaim_allowed_by_policy,
+        required_human_confirmation: advisory.required_human_confirmation,
+        evidence_summary: advisory.evidence_summary,
+        suggested_commands: advisory.suggested_commands,
     }
 }
 
@@ -474,6 +480,18 @@ fn print_text_output(output: &CoordinationStatusOutput) {
                 text_match_reasons(provenance)
             );
         }
+        println!(
+            "  advisory: reclaim_allowed_by_policy={} | required_human_confirmation={} | evidence: {}",
+            claim.reclaim_allowed_by_policy,
+            claim.required_human_confirmation,
+            sanitize_terminal_inline(&claim.evidence_summary)
+        );
+        for command in &claim.suggested_commands {
+            println!(
+                "  suggested_command: {}",
+                sanitize_terminal_inline(&command.command)
+            );
+        }
         if let Some(comment) = claim.issue.latest_comments.first() {
             println!(
                 "  latest_comment: {}: {}",
@@ -587,6 +605,8 @@ mod tests {
             row.assessment.recommended_action,
             RecommendedAction::InspectMail
         );
+        assert!(!row.reclaim_allowed_by_policy);
+        assert!(row.suggested_commands.is_empty());
     }
 
     #[test]

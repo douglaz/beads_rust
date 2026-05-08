@@ -522,6 +522,48 @@ br scheduler --format toon --stats
 
 ---
 
+### coordination status
+
+Diagnose hidden `in_progress` claims without mutating ownership.
+
+```bash
+br coordination status [OPTIONS]
+```
+
+`coordination status` emits the `br.coordination.v1` evidence envelope used to
+spot stale claims, missing Agent Mail evidence, and active reservation matches.
+The command is read-only: it never calls Agent Mail directly and never changes
+issue status or assignee.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--owner-kind <KIND>` | Fallback ownership policy: swarm-agent, human, or unknown |
+| `--comments <N>` | Latest comments to include per claim (default: 2) |
+| `--reservations <PATH>` | Offline Agent Mail reservation snapshot (JSON array, wrapper object, or JSONL) |
+| `--agents <PATH>` | Offline Agent Mail agent snapshot (JSON array, wrapper object, or JSONL) |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
+
+JSON/TOON claim rows include advisory fields:
+`reclaim_allowed_by_policy`, `required_human_confirmation`,
+`evidence_summary`, and `suggested_commands`. Suggested commands are emitted
+only when the policy has enough evidence to propose the documented audit-comment
+plus `br update --claim` sequence. Fresh claims, active reservations, missing or
+invalid snapshots, and human/unknown ownership do not emit reclaim commands.
+
+**Examples:**
+```bash
+# Inspect current in-progress claims
+br coordination status --json
+
+# Use offline Agent Mail snapshots without requiring a live MCP service
+br coordination status --reservations reservations.json --agents agents.jsonl --json
+```
+
+---
+
 ### blocked
 
 List blocked issues.

@@ -241,6 +241,20 @@ follow-up degraded-coordination comment. The newest assignee owns the claim, but
 the old owner can still return; in that case, coordinate in the bead thread and
 split or hand off the work instead of silently overwriting each other.
 
+For a read-only preflight, use coordination status with an explicit reservation
+snapshot when available:
+
+```bash
+br coordination status --reservations reservations.json --agents agents.jsonl --json
+```
+
+The output is advisory only. `reclaim_allowed_by_policy=true` means the local
+policy and supplied snapshot evidence allow the documented audit-comment plus
+claim sequence. `suggested_commands` is empty for fresh claims, active
+reservations, missing or malformed snapshots, and human or unknown owners.
+`required_human_confirmation=true` means ask the owner or operator instead of
+copying a claim command.
+
 ### Creating Related Issues
 
 ```bash

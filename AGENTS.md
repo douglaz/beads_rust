@@ -45,6 +45,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## CI/Release Workflow Supply-Chain Policy
+
+For any `.github/workflows/` edit, use
+[`docs/CI_SUPPLY_CHAIN.md`](docs/CI_SUPPLY_CHAIN.md) as the canonical policy.
+It defines the immutable external GitHub Action pin inventory, upstream update
+audit, workflow-fragment harnesses, branch-trigger expectations, and proof
+commands for workflow changes.
+
+Important boundaries:
+
+- `br` never performs workflow git operations, releases, pull requests, network
+  dispatches, or upstream lookups automatically.
+- Agents run workflow proof Cargo targets directly through RCH; local shell
+  verifier scripts are operator shortcuts and may call Cargo internally.
+- Whole-crate `cargo check --all-targets` and
+  `cargo clippy --all-targets -- -D warnings` are required when Rust code
+  changes, and must be offloaded through RCH in agent sessions.
+- Run `git diff --check`, `actionlint` when available, the relevant workflow
+  harnesses, and `ubs` on changed workflow-related files before committing.
+
+---
+
 ## Toolchain: Rust & Cargo
 
 We only use **Cargo** in this project, NEVER any other package manager.

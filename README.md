@@ -910,6 +910,11 @@ br is designed for AI coding agents. See [AGENTS.md](AGENTS.md) for:
 - Robot mode flags
 - Best practices
 
+For CI and release workflow edits, use
+[CI_SUPPLY_CHAIN.md](docs/CI_SUPPLY_CHAIN.md) as the canonical maintenance
+policy for immutable GitHub Action pins, workflow fragment harnesses, update
+audits, and required proof commands.
+
 You can also emit machine-readable JSON Schema documents directly:
 
 ```bash

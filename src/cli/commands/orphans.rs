@@ -362,6 +362,7 @@ fn issue_prefixes_for_orphan_scan(issues: &[Issue], default_prefix: &str) -> Vec
     prefixes
 }
 
+#[cfg(test)]
 fn get_git_commit_refs(prefix: &str, repo_root: &Path) -> Result<Vec<(String, String, String)>> {
     get_git_commit_refs_for_prefixes(&[prefix.to_string()], repo_root)
 }
@@ -404,6 +405,7 @@ fn get_git_commit_refs_for_prefixes(
 /// Parse git log output and extract issue ID references.
 ///
 /// Looks for patterns like `(bd-abc123)` or `bd-abc123` in commit messages.
+#[cfg(test)]
 fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, String, String)>> {
     parse_git_log_for_prefixes(reader, &[prefix.to_string()])
 }

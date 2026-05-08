@@ -1901,6 +1901,8 @@ pub struct CommentListArgs {
 pub enum AuditCommands {
     /// Append an audit interaction entry
     Record(AuditRecordArgs),
+    /// Record coordination status rows as bounded audit interactions
+    Coordination(AuditCoordinationArgs),
     /// Append a label entry referencing an existing interaction
     Label(AuditLabelArgs),
     /// View audit log for an issue
@@ -1947,6 +1949,17 @@ pub struct AuditRecordArgs {
     /// Read a JSON object from stdin (must match audit.Entry schema)
     #[arg(long)]
     pub stdin: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AuditCoordinationArgs {
+    /// Read a coordination status JSON object or JSONL stream from stdin
+    #[arg(long)]
+    pub stdin: bool,
+
+    /// Command that produced the coordination snapshot
+    #[arg(long, default_value = "br coordination status")]
+    pub command: String,
 }
 
 #[derive(Args, Debug, Clone)]

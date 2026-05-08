@@ -261,6 +261,21 @@ reservations, missing or malformed snapshots, and human or unknown owners.
 `required_human_confirmation=true` means ask the owner or operator instead of
 copying a claim command.
 
+When a coordination snapshot matters for a handoff or review, record it through
+the audit log before taking follow-up action:
+
+```bash
+br coordination status --json \
+  | br audit coordination --stdin --command "br coordination status --json" --json
+```
+
+This appends one `coordination_incident` interaction per claim to the existing
+`.beads/interactions.jsonl` flight recorder. The recorded fields are bounded and
+normalized: `issue_id`, `classification`, `recommended_action` as
+`suggested_action`, `evidence_summary`, the producing `command`, and a stable
+`snapshot_hash`. After a human or agent reviews the evidence, label the
+interaction with `br audit label <interaction-id> --label reviewed --json`.
+
 ### Creating Related Issues
 
 ```bash

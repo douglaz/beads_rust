@@ -1183,6 +1183,44 @@ br audit [OPTIONS]
 
 Appends to `.beads/interactions.jsonl`.
 
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `record` | Append one interaction entry |
+| `coordination` | Record coordination status rows as audit interactions |
+| `label` | Label a prior interaction entry |
+| `log` | View audit entries for an issue |
+| `summary` | Summarize interaction counts |
+
+#### audit coordination
+
+`audit coordination` turns a `br coordination status` snapshot into durable
+`coordination_incident` rows in the existing `.beads/interactions.jsonl` audit
+log. It does not create a second coordination datastore.
+
+```bash
+br coordination status --json \
+  | br audit coordination --stdin --command "br coordination status --json" --json
+```
+
+Input may be a `br.coordination.v1` status object with `claims`, a JSON array,
+or JSONL rows where each row is either a claim or a wrapper with `claims`.
+Each recorded row stores bounded normalized fields in `extra`: `command`,
+`issue_id`, `classification`, `evidence_summary`, `snapshot_hash`, and
+`suggested_action`. The snapshot hash is computed from stable JSON with object
+keys normalized, so equivalent key order produces the same hash.
+
+The text output prints one interaction id per recorded claim. JSON and TOON
+output return:
+
+```json
+{
+  "recorded": 1,
+  "snapshot_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "ids": ["int-..."]
+}
+```
+
 ---
 
 ### history

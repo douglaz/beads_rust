@@ -153,6 +153,37 @@ active reservation changes stale-looking work to
 Malformed or unreadable snapshot files fail with structured validation errors
 instead of silently weakening evidence.
 
+## Audit Flight Recorder
+
+`br audit coordination --stdin` records coordination snapshots through the
+existing `.beads/interactions.jsonl` audit log. It accepts the same
+`br.coordination.v1` status object emitted by `br coordination status --json`,
+JSON arrays of claims, or JSONL streams of claim rows/wrapper objects:
+
+```bash
+br coordination status --json \
+  | br audit coordination --stdin --command "br coordination status --json" --json
+```
+
+For every claim in the snapshot, the command appends a `coordination_incident`
+interaction with the claim issue id and bounded normalized `extra` fields:
+
+- `command`
+- `issue_id`
+- `classification`
+- `evidence_summary`
+- `snapshot_hash`
+- `suggested_action`
+
+The snapshot hash is computed over normalized JSON with sorted object keys, so
+field order differences do not create separate evidence hashes. Long command and
+evidence strings are sanitized for terminal control characters and truncated
+before they enter the audit log.
+
+This is a durable flight recorder, not a second coordination state store.
+Reviews, follow-up labels, and issue audit views continue to use the ordinary
+`br audit label`, `br audit log`, and `br audit summary` surfaces.
+
 ## Agent Mail Boundary
 
 Agent Mail remains the collision-avoidance layer. `br` must not depend on a live

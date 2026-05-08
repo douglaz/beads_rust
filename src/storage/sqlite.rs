@@ -6832,14 +6832,17 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn remove_parent(&mut self, issue_id: &str, actor: &str) -> Result<bool> {
         self.mutate("remove_parent", actor, |conn, ctx| {
-            let previous_parent = conn
-                .query_with_params(
-                    "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' LIMIT 1",
-                    &[SqliteValue::from(issue_id)],
-                )?
-                .first()
-                .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
-                .map(str::to_string);
+            Self::ensure_issue_mutable_in_tx(conn, issue_id, "clear parent from")?;
+
+            let previous_parent_rows = conn.query_with_params(
+                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid ASC",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            let previous_parents = previous_parent_rows
+                .iter()
+                .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_string))
+                .collect::<Vec<_>>();
+
             let rows = conn.execute_with_params(
                 "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
                 &[SqliteValue::from(issue_id)],
@@ -6861,8 +6864,11 @@ impl SqliteStorage {
                 );
                 ctx.mark_dirty(issue_id);
                 let mut cache_ids = vec![issue_id];
-                if let Some(parent_id) = previous_parent.as_deref() {
-                    cache_ids.push(parent_id);
+                for previous_parent in &previous_parents {
+                    let previous_parent = previous_parent.as_str();
+                    if !cache_ids.contains(&previous_parent) {
+                        cache_ids.push(previous_parent);
+                    }
                 }
                 ctx.invalidate_cache_for(&cache_ids);
             }
@@ -13775,6 +13781,19 @@ mod tests {
             "unexpected clear parent error: {clear_parent_error:?}"
         );
 
+        let remove_parent_error = storage.remove_parent("bd-dep-child", "tester").unwrap_err();
+        assert!(
+            matches!(
+                &remove_parent_error,
+                BeadsError::Validation { field, reason }
+                    if field == "issue_id"
+                        && reason.contains(
+                            "cannot clear parent from tombstone issue: bd-dep-child"
+                        )
+            ),
+            "unexpected remove_parent error: {remove_parent_error:?}"
+        );
+
         let set_parent_error = storage
             .set_parent("bd-dep-child", Some("bd-dep-new-parent"), "tester")
             .unwrap_err();
@@ -13967,6 +13986,92 @@ mod tests {
         assert_eq!(
             storage.get_dirty_issue_ids().unwrap(),
             vec!["bd-parent-cleanup-child".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_remove_parent_invalidates_all_duplicate_parent_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 6, 0, 0, 0).unwrap();
+
+        let child = make_issue(
+            "bd-remove-parent-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let mut parent_a = make_issue(
+            "bd-remove-parent-a",
+            "Parent A",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        parent_a.issue_type = IssueType::Epic;
+        let mut parent_b = make_issue(
+            "bd-remove-parent-b",
+            "Parent B",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        parent_b.issue_type = IssueType::Epic;
+
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&parent_a, "tester").unwrap();
+        storage.create_issue(&parent_b, "tester").unwrap();
+        assert!(
+            storage
+                .add_dependency(
+                    "bd-remove-parent-child",
+                    "bd-remove-parent-a",
+                    "parent-child",
+                    "tester",
+                )
+                .unwrap()
+        );
+        assert!(
+            storage
+                .add_dependency(
+                    "bd-remove-parent-child",
+                    "bd-remove-parent-b",
+                    "parent-child",
+                    "tester",
+                )
+                .unwrap()
+        );
+        storage.rebuild_blocked_cache(true).unwrap();
+        assert!(storage.is_blocked("bd-remove-parent-a").unwrap());
+        assert!(storage.is_blocked("bd-remove-parent-b").unwrap());
+
+        assert!(
+            storage
+                .remove_parent("bd-remove-parent-child", "tester")
+                .unwrap()
+        );
+
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "remove_parent should eagerly refresh the affected cache entries"
+        );
+        assert!(
+            !storage.is_blocked("bd-remove-parent-a").unwrap(),
+            "first old parent must not keep a stale child-open cache row"
+        );
+        assert!(
+            !storage.is_blocked("bd-remove-parent-b").unwrap(),
+            "second old parent must not keep a stale child-open cache row"
+        );
+        assert_eq!(
+            storage.get_parent_id("bd-remove-parent-child").unwrap(),
+            None
         );
     }
 

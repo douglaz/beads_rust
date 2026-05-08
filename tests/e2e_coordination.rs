@@ -1,10 +1,21 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_stdin};
 use serde_json::{Value, json};
 use std::fs;
 use toon_rust::try_decode as parse_toon;
 
+fn claim_by_id<'a>(json: &'a Value, id: &str) -> &'a Value {
+    json["claims"]
+        .as_array()
+        .expect("claims array")
+        .iter()
+        .find(|claim| claim["issue"]["id"] == id)
+        .expect("claim should exist")
+}
+
+// The lab fixtures stay in JSONL so the tests exercise the same import path
+// real agents use when sharing Beads state through git.
 fn seed_coordination_workspace(workspace: &BrWorkspace) {
     let init = run_br(workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -54,7 +65,7 @@ fn seed_coordination_workspace(workspace: &BrWorkspace) {
                 "id": 2,
                 "issue_id": "bd-stale",
                 "author": "AmberLion",
-                "text": "old \u{1b}[31m stale claim note",
+                "text": "degraded-coordination: Agent Mail unavailable; files: src/coordination.rs, tests/e2e_coordination.rs; old \u{1b}[31m stale claim note",
                 "created_at": "2020-01-01T00:00:00Z"
             }
         ]
@@ -93,7 +104,7 @@ fn write_snapshot_files(workspace: &BrWorkspace) -> (String, String) {
         "reservations": [
             {
                 "holder": "AmberLion",
-                "path_pattern": "src/coordination.rs",
+                "path_pattern": "src/cli/commands/coordination.rs",
                 "exclusive": true,
                 "reason": "beads_rust-sc6u fixture for bd-stale",
                 "expires_ts": "2099-01-01T01:00:00Z",
@@ -117,10 +128,47 @@ fn write_snapshot_files(workspace: &BrWorkspace) -> (String, String) {
     )
 }
 
+// This snapshot intentionally avoids holder, reason, and thread matches so the
+// reservation can only attach through the degraded-coordination file scope in
+// the stale issue comment.
+fn write_expired_comment_path_reservation(workspace: &BrWorkspace) -> String {
+    let path = workspace
+        .root
+        .join("expired-comment-path-reservations.json");
+    let reservations = json!({
+        "reservations": [
+            {
+                "holder": "OtherAgent",
+                "path_pattern": "tests/e2e_coordination.rs",
+                "exclusive": true,
+                "reason": "fixture with only degraded comment path evidence",
+                "expires_ts": "2020-01-01T01:00:00Z",
+                "released_ts": "2020-01-01T02:00:00Z",
+                "thread_id": "unrelated-thread"
+            }
+        ]
+    });
+    fs::write(&path, reservations.to_string()).expect("write expired reservation snapshot");
+    path.to_string_lossy().into_owned()
+}
+
 fn write_empty_reservations(workspace: &BrWorkspace) -> String {
     let path = workspace.root.join("empty-reservations.json");
     fs::write(&path, r#"{"reservations":[]}"#).expect("write empty reservations snapshot");
     path.to_string_lossy().into_owned()
+}
+
+fn read_interactions(workspace: &BrWorkspace) -> Vec<Value> {
+    let path = workspace.root.join(".beads").join("interactions.jsonl");
+    if !path.exists() {
+        return Vec::new();
+    }
+    let contents = fs::read_to_string(&path).expect("read interactions.jsonl");
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse interaction entry"))
+        .collect()
 }
 
 fn parse_error_json(stderr: &str) -> Option<Value> {
@@ -153,15 +201,8 @@ fn coordination_status_json_reports_fresh_and_stale_claims() {
     assert_eq!(json["schema_version"], "br.coordination.v1");
     assert_eq!(json["summary"]["total_claims"], 2);
     assert_eq!(json["summary"]["workspace"]["in_progress"], 2);
-    let claims = json["claims"].as_array().expect("claims array");
-    let fresh = claims
-        .iter()
-        .find(|claim| claim["issue"]["id"] == "bd-fresh")
-        .expect("fresh claim");
-    let stale = claims
-        .iter()
-        .find(|claim| claim["issue"]["id"] == "bd-stale")
-        .expect("stale claim");
+    let fresh = claim_by_id(&json, "bd-fresh");
+    let stale = claim_by_id(&json, "bd-stale");
 
     assert_eq!(fresh["assessment"]["classification"], "fresh");
     assert_eq!(fresh["issue"]["labels"], json!(["coordination"]));
@@ -202,11 +243,7 @@ fn coordination_status_uses_offline_snapshot_files_without_live_mail() {
         ],
         "coordination_snapshot_json",
     );
-    let claims = json["claims"].as_array().expect("claims array");
-    let stale = claims
-        .iter()
-        .find(|claim| claim["issue"]["id"] == "bd-stale")
-        .expect("stale claim");
+    let stale = claim_by_id(&json, "bd-stale");
 
     assert_eq!(
         stale["assessment"]["classification"],
@@ -244,11 +281,7 @@ fn coordination_status_emits_reclaim_commands_only_after_snapshot_clears_policy(
         ],
         "coordination_reclaim_advisory",
     );
-    let claims = json["claims"].as_array().expect("claims array");
-    let stale = claims
-        .iter()
-        .find(|claim| claim["issue"]["id"] == "bd-stale")
-        .expect("stale claim");
+    let stale = claim_by_id(&json, "bd-stale");
     let commands = stale["suggested_commands"]
         .as_array()
         .expect("suggested commands");
@@ -289,6 +322,64 @@ fn coordination_status_emits_reclaim_commands_only_after_snapshot_clears_policy(
 }
 
 #[test]
+fn coordination_status_expired_reservation_from_degraded_comment_still_allows_reclaim_advisory() {
+    let _log = common::test_log(
+        "coordination_status_expired_reservation_from_degraded_comment_still_allows_reclaim_advisory",
+    );
+    let workspace = BrWorkspace::new();
+    seed_coordination_workspace(&workspace);
+    let reservations = write_expired_comment_path_reservation(&workspace);
+
+    let json = coordination_json(
+        &workspace,
+        &[
+            "coordination",
+            "status",
+            "--json",
+            "--owner-kind",
+            "swarm-agent",
+            "--reservations",
+            &reservations,
+        ],
+        "coordination_expired_comment_path_reclaim",
+    );
+    let stale = claim_by_id(&json, "bd-stale");
+    let commands = stale["suggested_commands"]
+        .as_array()
+        .expect("suggested commands");
+
+    assert_eq!(stale["assessment"]["classification"], "abandoned_likely");
+    assert_eq!(
+        stale["assessment"]["recommended_action"],
+        "reclaim_candidate"
+    );
+    assert_eq!(stale["reclaim_allowed_by_policy"], true);
+    assert_eq!(stale["assessment"]["reservation"]["state"], "expired");
+    assert_eq!(
+        stale["assessment"]["reservation"]["detail"]["provenance"]["matched_on"],
+        json!(["comment_path"])
+    );
+    assert_eq!(
+        stale["assessment"]["reservation"]["detail"]["provenance"]["path_pattern"],
+        "tests/e2e_coordination.rs"
+    );
+    assert!(
+        stale["issue"]["latest_comments"][0]["text"]
+            .as_str()
+            .is_some_and(|comment| comment.contains("degraded-coordination"))
+    );
+    assert!(stale["evidence_summary"].as_str().is_some_and(|summary| {
+        summary.contains("reservation_status=expired(holder=OtherAgent,released_at=2020-01-01")
+    }));
+    assert_eq!(commands.len(), 2);
+    assert!(
+        commands[0]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("reservation_status=expired"))
+    );
+}
+
+#[test]
 fn coordination_status_human_owner_requires_confirmation_without_reclaim_command() {
     let _log = common::test_log(
         "coordination_status_human_owner_requires_confirmation_without_reclaim_command",
@@ -310,11 +401,7 @@ fn coordination_status_human_owner_requires_confirmation_without_reclaim_command
         ],
         "coordination_human_confirmation",
     );
-    let claims = json["claims"].as_array().expect("claims array");
-    let stale = claims
-        .iter()
-        .find(|claim| claim["issue"]["id"] == "bd-stale")
-        .expect("stale claim");
+    let stale = claim_by_id(&json, "bd-stale");
 
     assert_eq!(stale["assessment"]["recommended_action"], "ask_owner");
     assert_eq!(stale["reclaim_allowed_by_policy"], false);
@@ -379,6 +466,7 @@ fn coordination_status_text_is_concise_and_sanitized() {
     assert!(result.stdout.contains("reservation_status=no_snapshot"));
     assert!(!result.stdout.contains('\u{1b}'));
     assert!(result.stdout.contains(r"\u{1b}[31m"));
+    assert!(result.stdout.contains("degraded-coordination"));
 }
 
 #[test]
@@ -398,4 +486,91 @@ fn coordination_status_toon_decodes() {
     let json = Value::from(decoded);
     assert_eq!(json["schema_version"], "br.coordination.v1");
     assert_eq!(json["claims"].as_array().expect("claims").len(), 2);
+}
+
+#[test]
+fn coordination_status_snapshot_imports_to_audit_flight_recorder() {
+    let _log = common::test_log("coordination_status_snapshot_imports_to_audit_flight_recorder");
+    let workspace = BrWorkspace::new();
+    seed_coordination_workspace(&workspace);
+    let reservations = write_empty_reservations(&workspace);
+
+    let status = coordination_json(
+        &workspace,
+        &[
+            "coordination",
+            "status",
+            "--json",
+            "--owner-kind",
+            "swarm-agent",
+            "--reservations",
+            &reservations,
+        ],
+        "coordination_status_for_audit",
+    );
+    let stale_claim = claim_by_id(&status, "bd-stale").clone();
+    let incident_snapshot = json!({
+        "schema_version": "br.coordination.v1",
+        "claims": [stale_claim]
+    });
+
+    let audit = run_br_with_stdin(
+        &workspace,
+        [
+            "--actor",
+            "coord-lab",
+            "audit",
+            "coordination",
+            "--stdin",
+            "--command",
+            "br coordination status --json --reservations empty-reservations.json",
+            "--json",
+        ],
+        &incident_snapshot.to_string(),
+        "coordination_audit_import",
+    );
+
+    assert!(
+        audit.status.success(),
+        "audit import failed: stdout={} stderr={}",
+        audit.stdout,
+        audit.stderr
+    );
+    let audit_json: Value =
+        serde_json::from_str(&extract_json_payload(&audit.stdout)).expect("audit output JSON");
+    assert_eq!(audit_json["recorded"], 1);
+    assert_eq!(
+        audit_json["snapshot_hash"]
+            .as_str()
+            .expect("snapshot hash")
+            .len(),
+        64
+    );
+
+    let record_id = audit_json["ids"]
+        .as_array()
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .expect("audit record id");
+    let entries = read_interactions(&workspace);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], record_id);
+    assert_eq!(entries[0]["kind"], "coordination_incident");
+    assert_eq!(entries[0]["actor"], "coord-lab");
+    assert_eq!(entries[0]["issue_id"], "bd-stale");
+    assert_eq!(
+        entries[0]["extra"]["command"],
+        "br coordination status --json --reservations empty-reservations.json"
+    );
+    assert_eq!(entries[0]["extra"]["classification"], "abandoned_likely");
+    assert_eq!(entries[0]["extra"]["suggested_action"], "reclaim_candidate");
+    assert!(
+        entries[0]["extra"]["evidence_summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("reservation_status=no_reservation"))
+    );
+    assert_eq!(
+        entries[0]["extra"]["snapshot_hash"],
+        audit_json["snapshot_hash"]
+    );
 }

@@ -193,6 +193,585 @@ schemas:
             type: string
             format: date-time
         required[5]: id,issue_id,author,text,created_at
+  CoordinationClaimRow:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: CoordinationClaimRow
+    description: One in-progress issue plus its deterministic coordination assessment.
+    type: object
+    properties:
+      issue:
+        "$ref": #/$defs/CoordinationIssueRow
+      agent.anyOf[2]:
+        - "$ref": #/$defs/AgentMailAgentSnapshot
+        - type: "null"
+      assessment:
+        "$ref": #/$defs/ClaimAssessment
+      reclaim_allowed_by_policy.type: boolean
+      required_human_confirmation.type: boolean
+      evidence_summary.type: string
+      suggested_commands:
+        type: array
+        items:
+          "$ref": #/$defs/CoordinationSuggestedCommand
+    required[6]: issue,assessment,reclaim_allowed_by_policy,required_human_confirmation,evidence_summary,suggested_commands
+    "$defs":
+      CoordinationIssueRow:
+        description: Issue context attached to one coordination claim row.
+        type: object
+        properties:
+          id.type: string
+          title.type: string
+          status:
+            "$ref": #/$defs/Status
+          priority:
+            "$ref": #/$defs/Priority
+          issue_type:
+            "$ref": #/$defs/IssueType
+          labels:
+            type: array
+            items.type: string
+          dependency_count:
+            type: integer
+            format: uint
+            minimum: 0
+          dependent_count:
+            type: integer
+            format: uint
+            minimum: 0
+          latest_comments:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationComment
+        required[9]: id,title,status,priority,issue_type,labels,dependency_count,dependent_count,latest_comments
+      Status:
+        description: Issue lifecycle status.
+        anyOf[2]:
+          - type: string
+            enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - type: string
+      Priority:
+        description: "Issue priority (0=Critical, 4=Backlog)."
+        type: integer
+        format: int32
+      IssueType:
+        description: Issue type category.
+        anyOf[2]:
+          - type: string
+            enum[7]: task,bug,feature,epic,chore,docs,question
+          - type: string
+      CoordinationComment:
+        description: Bounded comment excerpt included with a coordination claim row.
+        type: object
+        properties:
+          author.type: string
+          text.type: string
+          created_at:
+            type: string
+            format: date-time
+        required[3]: author,text,created_at
+      AgentMailAgentSnapshot:
+        description: Minimal offline agent-liveness snapshot row exported from Agent Mail.
+        type: object
+        properties:
+          name.type: string
+          task_description.type: string
+          last_active_ts:
+            type: string
+            format: date-time
+          contact_policy.type: string
+        required[4]: name,task_description,last_active_ts,contact_policy
+      ClaimAssessment:
+        description: Deterministic assessment for one in-progress claim.
+        type: object
+        properties:
+          assignee.type[2]: string,"null"
+          owner_kind:
+            "$ref": #/$defs/ClaimOwnerKind
+          updated_at:
+            type: string
+            format: date-time
+          updated_age_minutes:
+            type: integer
+            format: int64
+          stale_threshold_minutes:
+            type: integer
+            format: int64
+          abandoned_threshold_minutes:
+            type: integer
+            format: int64
+          reservation:
+            "$ref": #/$defs/ReservationEvidence
+          classification:
+            "$ref": #/$defs/ClaimClassification
+          recommended_action:
+            "$ref": #/$defs/RecommendedAction
+          evidence_sources:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationEvidenceSource
+        required[9]: owner_kind,updated_at,updated_age_minutes,stale_threshold_minutes,abandoned_threshold_minutes,reservation,classification,recommended_action,evidence_sources
+      ClaimOwnerKind:
+        description: Who appears to own the current claim.
+        oneOf[3]{description,type,const}:
+          A named coding-agent swarm participant.,string,swarm_agent
+          A human assignee or operator-owned claim.,string,human
+          Ownership cannot be confidently classified.,string,unknown
+      ReservationEvidence:
+        description: Optional Agent Mail reservation evidence supplied by the caller.
+        oneOf[5]:
+          - description: "No Agent Mail snapshot was supplied, so absence of reservations is not\nevidence of abandonment."
+            type: object
+            properties.state:
+              type: string
+              const: no_snapshot
+            required[1]: state
+          - description: A snapshot was supplied and no matching reservation was found.
+            type: object
+            properties.state:
+              type: string
+              const: no_reservation
+            required[1]: state
+          - description: A matching active reservation exists.
+            type: object
+            properties:
+              state:
+                type: string
+                const: active
+              detail:
+                type: object
+                properties:
+                  holder.type: string
+                  expires_at:
+                    type[2]: string,"null"
+                    format: date-time
+                  provenance.anyOf[2]:
+                    - "$ref": #/$defs/ReservationEvidenceProvenance
+                    - type: "null"
+                required[1]: holder
+            required[2]: state,detail
+          - description: A matching reservation exists but is no longer active.
+            type: object
+            properties:
+              state:
+                type: string
+                const: expired
+              detail:
+                type: object
+                properties:
+                  holder.type: string
+                  released_at:
+                    type[2]: string,"null"
+                    format: date-time
+                  provenance.anyOf[2]:
+                    - "$ref": #/$defs/ReservationEvidenceProvenance
+                    - type: "null"
+                required[1]: holder
+            required[2]: state,detail
+          - description: Snapshot data was supplied but could not be trusted.
+            type: object
+            properties:
+              state:
+                type: string
+                const: invalid_snapshot
+              detail:
+                type: object
+                properties.reason.type: string
+                required[1]: reason
+            required[2]: state,detail
+      ReservationEvidenceProvenance:
+        description: Provenance copied from a matching reservation snapshot.
+        type: object
+        properties:
+          path_pattern.type: string
+          exclusive.type: boolean
+          reason.type[2]: string,"null"
+          expires_ts:
+            type: string
+            format: date-time
+          released_ts:
+            type[2]: string,"null"
+            format: date-time
+          thread_id.type[2]: string,"null"
+          matched_on:
+            type: array
+            items:
+              "$ref": #/$defs/ReservationSnapshotMatchReason
+        required[4]: path_pattern,exclusive,expires_ts,matched_on
+      ReservationSnapshotMatchReason:
+        description: Why an Agent Mail reservation snapshot was associated with an issue.
+        oneOf[3]{description,type,const}:
+          Reservation holder matches the issue assignee.,string,holder_matches_assignee
+          Reservation reason or thread id names the issue id.,string,issue_id
+          A recent issue comment names the reservation path pattern.,string,comment_path
+      ClaimClassification:
+        description: Stable claim classifications used by coordination-aware surfaces.
+        oneOf[7]{description,type,const}:
+          The issue is in progress but has no meaningful assignee.,string,unassigned
+          The claim is still within the owner-specific freshness window.,string,fresh
+          "A live reservation exists, so the claim must not be treated as abandoned.",string,blocked_by_active_reservation
+          "The claim has crossed the stale threshold and no active reservation was\nfound in a supplied snapshot.",string,stale_candidate
+          The claim has crossed a more conservative abandoned threshold.,string,abandoned_likely
+          "The claim is old enough to inspect, but no Agent Mail snapshot was\nsupplied.",string,no_mail_snapshot
+          Evidence conflicts or cannot be trusted.,string,ambiguous
+      RecommendedAction:
+        description: Suggested next action for an operator or agent.
+        oneOf[5]{description,type,const}:
+          Do nothing except continue normal observation.,string,observe
+          Ask the assignee or human operator before touching the claim.,string,ask_owner
+          Inspect Agent Mail reservations or capture a fresh snapshot.,string,inspect_mail
+          "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",string,reclaim_candidate
+          Leave the claim alone because evidence says work may still be active.,string,leave_active
+      CoordinationEvidenceSource:
+        description: Evidence categories present in a claim assessment.
+        oneOf[4]{description,type,const}:
+          "Issue status, assignee, and updated timestamp.",string,issue_metadata
+          Owner-specific stale and abandoned thresholds.,string,policy_threshold
+          A caller-supplied Agent Mail snapshot.,string,agent_mail_snapshot
+          Explicit absence of an Agent Mail snapshot.,string,no_agent_mail_snapshot
+      CoordinationSuggestedCommand:
+        description: A command suggestion emitted for an operator to review and run manually.
+        type: object
+        properties:
+          purpose:
+            "$ref": #/$defs/CoordinationSuggestedCommandPurpose
+          command.type: string
+        required[2]: purpose,command
+      CoordinationSuggestedCommandPurpose:
+        description: Role for a suggested coordination command.
+        oneOf[2]{description,type,const}:
+          Record the reclaim evidence before touching ownership.,string,add_reclaim_audit_comment
+          Claim the issue after the audit comment is recorded.,string,claim_issue
+  CoordinationStatusOutput:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: CoordinationStatusOutput
+    description: Top-level machine-readable coordination status shape.
+    type: object
+    properties:
+      schema_version.type: string
+      generated_at:
+        type: string
+        format: date-time
+      summary:
+        "$ref": #/$defs/CoordinationSummary
+      claims:
+        type: array
+        items:
+          "$ref": #/$defs/CoordinationClaimRow
+    required[4]: schema_version,generated_at,summary,claims
+    "$defs":
+      CoordinationSummary:
+        description: Count summary for coordination status output.
+        type: object
+        properties:
+          total_claims:
+            type: integer
+            format: uint
+            minimum: 0
+          workspace:
+            "$ref": #/$defs/CoordinationWorkspaceCounts
+          unassigned:
+            type: integer
+            format: uint
+            minimum: 0
+          fresh:
+            type: integer
+            format: uint
+            minimum: 0
+          blocked_by_active_reservation:
+            type: integer
+            format: uint
+            minimum: 0
+          stale_candidate:
+            type: integer
+            format: uint
+            minimum: 0
+          abandoned_likely:
+            type: integer
+            format: uint
+            minimum: 0
+          no_mail_snapshot:
+            type: integer
+            format: uint
+            minimum: 0
+          ambiguous:
+            type: integer
+            format: uint
+            minimum: 0
+        required[9]: total_claims,workspace,unassigned,fresh,blocked_by_active_reservation,stale_candidate,abandoned_likely,no_mail_snapshot,ambiguous
+      CoordinationWorkspaceCounts:
+        description: Workspace context counts shown next to hidden-claim diagnosis.
+        type: object
+        properties:
+          open:
+            type: integer
+            format: uint
+            minimum: 0
+          ready:
+            type: integer
+            format: uint
+            minimum: 0
+          blocked:
+            type: integer
+            format: uint
+            minimum: 0
+          in_progress:
+            type: integer
+            format: uint
+            minimum: 0
+          deferred:
+            type: integer
+            format: uint
+            minimum: 0
+          closed:
+            type: integer
+            format: uint
+            minimum: 0
+        required[6]: open,ready,blocked,in_progress,deferred,closed
+      CoordinationClaimRow:
+        description: One in-progress issue plus its deterministic coordination assessment.
+        type: object
+        properties:
+          issue:
+            "$ref": #/$defs/CoordinationIssueRow
+          agent.anyOf[2]:
+            - "$ref": #/$defs/AgentMailAgentSnapshot
+            - type: "null"
+          assessment:
+            "$ref": #/$defs/ClaimAssessment
+          reclaim_allowed_by_policy.type: boolean
+          required_human_confirmation.type: boolean
+          evidence_summary.type: string
+          suggested_commands:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationSuggestedCommand
+        required[6]: issue,assessment,reclaim_allowed_by_policy,required_human_confirmation,evidence_summary,suggested_commands
+      CoordinationIssueRow:
+        description: Issue context attached to one coordination claim row.
+        type: object
+        properties:
+          id.type: string
+          title.type: string
+          status:
+            "$ref": #/$defs/Status
+          priority:
+            "$ref": #/$defs/Priority
+          issue_type:
+            "$ref": #/$defs/IssueType
+          labels:
+            type: array
+            items.type: string
+          dependency_count:
+            type: integer
+            format: uint
+            minimum: 0
+          dependent_count:
+            type: integer
+            format: uint
+            minimum: 0
+          latest_comments:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationComment
+        required[9]: id,title,status,priority,issue_type,labels,dependency_count,dependent_count,latest_comments
+      Status:
+        description: Issue lifecycle status.
+        anyOf[2]:
+          - type: string
+            enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - type: string
+      Priority:
+        description: "Issue priority (0=Critical, 4=Backlog)."
+        type: integer
+        format: int32
+      IssueType:
+        description: Issue type category.
+        anyOf[2]:
+          - type: string
+            enum[7]: task,bug,feature,epic,chore,docs,question
+          - type: string
+      CoordinationComment:
+        description: Bounded comment excerpt included with a coordination claim row.
+        type: object
+        properties:
+          author.type: string
+          text.type: string
+          created_at:
+            type: string
+            format: date-time
+        required[3]: author,text,created_at
+      AgentMailAgentSnapshot:
+        description: Minimal offline agent-liveness snapshot row exported from Agent Mail.
+        type: object
+        properties:
+          name.type: string
+          task_description.type: string
+          last_active_ts:
+            type: string
+            format: date-time
+          contact_policy.type: string
+        required[4]: name,task_description,last_active_ts,contact_policy
+      ClaimAssessment:
+        description: Deterministic assessment for one in-progress claim.
+        type: object
+        properties:
+          assignee.type[2]: string,"null"
+          owner_kind:
+            "$ref": #/$defs/ClaimOwnerKind
+          updated_at:
+            type: string
+            format: date-time
+          updated_age_minutes:
+            type: integer
+            format: int64
+          stale_threshold_minutes:
+            type: integer
+            format: int64
+          abandoned_threshold_minutes:
+            type: integer
+            format: int64
+          reservation:
+            "$ref": #/$defs/ReservationEvidence
+          classification:
+            "$ref": #/$defs/ClaimClassification
+          recommended_action:
+            "$ref": #/$defs/RecommendedAction
+          evidence_sources:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationEvidenceSource
+        required[9]: owner_kind,updated_at,updated_age_minutes,stale_threshold_minutes,abandoned_threshold_minutes,reservation,classification,recommended_action,evidence_sources
+      ClaimOwnerKind:
+        description: Who appears to own the current claim.
+        oneOf[3]{description,type,const}:
+          A named coding-agent swarm participant.,string,swarm_agent
+          A human assignee or operator-owned claim.,string,human
+          Ownership cannot be confidently classified.,string,unknown
+      ReservationEvidence:
+        description: Optional Agent Mail reservation evidence supplied by the caller.
+        oneOf[5]:
+          - description: "No Agent Mail snapshot was supplied, so absence of reservations is not\nevidence of abandonment."
+            type: object
+            properties.state:
+              type: string
+              const: no_snapshot
+            required[1]: state
+          - description: A snapshot was supplied and no matching reservation was found.
+            type: object
+            properties.state:
+              type: string
+              const: no_reservation
+            required[1]: state
+          - description: A matching active reservation exists.
+            type: object
+            properties:
+              state:
+                type: string
+                const: active
+              detail:
+                type: object
+                properties:
+                  holder.type: string
+                  expires_at:
+                    type[2]: string,"null"
+                    format: date-time
+                  provenance.anyOf[2]:
+                    - "$ref": #/$defs/ReservationEvidenceProvenance
+                    - type: "null"
+                required[1]: holder
+            required[2]: state,detail
+          - description: A matching reservation exists but is no longer active.
+            type: object
+            properties:
+              state:
+                type: string
+                const: expired
+              detail:
+                type: object
+                properties:
+                  holder.type: string
+                  released_at:
+                    type[2]: string,"null"
+                    format: date-time
+                  provenance.anyOf[2]:
+                    - "$ref": #/$defs/ReservationEvidenceProvenance
+                    - type: "null"
+                required[1]: holder
+            required[2]: state,detail
+          - description: Snapshot data was supplied but could not be trusted.
+            type: object
+            properties:
+              state:
+                type: string
+                const: invalid_snapshot
+              detail:
+                type: object
+                properties.reason.type: string
+                required[1]: reason
+            required[2]: state,detail
+      ReservationEvidenceProvenance:
+        description: Provenance copied from a matching reservation snapshot.
+        type: object
+        properties:
+          path_pattern.type: string
+          exclusive.type: boolean
+          reason.type[2]: string,"null"
+          expires_ts:
+            type: string
+            format: date-time
+          released_ts:
+            type[2]: string,"null"
+            format: date-time
+          thread_id.type[2]: string,"null"
+          matched_on:
+            type: array
+            items:
+              "$ref": #/$defs/ReservationSnapshotMatchReason
+        required[4]: path_pattern,exclusive,expires_ts,matched_on
+      ReservationSnapshotMatchReason:
+        description: Why an Agent Mail reservation snapshot was associated with an issue.
+        oneOf[3]{description,type,const}:
+          Reservation holder matches the issue assignee.,string,holder_matches_assignee
+          Reservation reason or thread id names the issue id.,string,issue_id
+          A recent issue comment names the reservation path pattern.,string,comment_path
+      ClaimClassification:
+        description: Stable claim classifications used by coordination-aware surfaces.
+        oneOf[7]{description,type,const}:
+          The issue is in progress but has no meaningful assignee.,string,unassigned
+          The claim is still within the owner-specific freshness window.,string,fresh
+          "A live reservation exists, so the claim must not be treated as abandoned.",string,blocked_by_active_reservation
+          "The claim has crossed the stale threshold and no active reservation was\nfound in a supplied snapshot.",string,stale_candidate
+          The claim has crossed a more conservative abandoned threshold.,string,abandoned_likely
+          "The claim is old enough to inspect, but no Agent Mail snapshot was\nsupplied.",string,no_mail_snapshot
+          Evidence conflicts or cannot be trusted.,string,ambiguous
+      RecommendedAction:
+        description: Suggested next action for an operator or agent.
+        oneOf[5]{description,type,const}:
+          Do nothing except continue normal observation.,string,observe
+          Ask the assignee or human operator before touching the claim.,string,ask_owner
+          Inspect Agent Mail reservations or capture a fresh snapshot.,string,inspect_mail
+          "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",string,reclaim_candidate
+          Leave the claim alone because evidence says work may still be active.,string,leave_active
+      CoordinationEvidenceSource:
+        description: Evidence categories present in a claim assessment.
+        oneOf[4]{description,type,const}:
+          "Issue status, assignee, and updated timestamp.",string,issue_metadata
+          Owner-specific stale and abandoned thresholds.,string,policy_threshold
+          A caller-supplied Agent Mail snapshot.,string,agent_mail_snapshot
+          Explicit absence of an Agent Mail snapshot.,string,no_agent_mail_snapshot
+      CoordinationSuggestedCommand:
+        description: A command suggestion emitted for an operator to review and run manually.
+        type: object
+        properties:
+          purpose:
+            "$ref": #/$defs/CoordinationSuggestedCommandPurpose
+          command.type: string
+        required[2]: purpose,command
+      CoordinationSuggestedCommandPurpose:
+        description: Role for a suggested coordination command.
+        oneOf[2]{description,type,const}:
+          Record the reclaim evidence before touching ownership.,string,add_reclaim_audit_comment
+          Claim the issue after the audit comment is recorded.,string,claim_issue
   ErrorEnvelope:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: ErrorEnvelope
@@ -1061,6 +1640,13 @@ commands:
     items_at: .
     error_envelope_on_stderr: true
     notes: Empty array if no comments. ErrorEnvelope on stderr if the issue id cannot be resolved.
+  "coordination status":
+    shape: object
+    jq_filter: ".claims[]"
+    items_at: .claims
+    item_schema: CoordinationClaimRow
+    error_envelope_on_stderr: false
+    notes: "Read-only object with workspace summary and `claims[]` rows. The full envelope schema is `CoordinationStatusOutput`."
   count:
     shape: object
     jq_filter: .count

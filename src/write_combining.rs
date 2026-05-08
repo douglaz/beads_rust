@@ -1179,15 +1179,10 @@ mod tests {
         issue
     }
 
-    fn apply_test_create(
-        storage: &mut SqliteStorage,
+    fn success_result_for_created_issue(
         envelope: &MutationEnvelope,
-        sequence: usize,
+        issue: &Issue,
     ) -> MutationResult {
-        let issue = test_create_issue_from_envelope(envelope, sequence);
-        storage
-            .create_issue(&issue, &envelope.actor)
-            .expect("test create should write");
         let stdout = serde_json::to_string(&json!({
             "id": issue.id,
             "title": issue.title,
@@ -1201,6 +1196,42 @@ mod tests {
             stdout,
             "",
             CombinedFlushOutcome::NotRequested,
+        )
+    }
+
+    fn try_apply_test_create(
+        storage: &mut SqliteStorage,
+        envelope: &MutationEnvelope,
+        sequence: usize,
+    ) -> std::result::Result<MutationResult, String> {
+        let issue = test_create_issue_from_envelope(envelope, sequence);
+        storage
+            .create_issue(&issue, &envelope.actor)
+            .map_err(|err| err.to_string())?;
+        Ok(success_result_for_created_issue(envelope, &issue))
+    }
+
+    fn apply_test_create(
+        storage: &mut SqliteStorage,
+        envelope: &MutationEnvelope,
+        sequence: usize,
+    ) -> MutationResult {
+        try_apply_test_create(storage, envelope, sequence).expect("test create should write")
+    }
+
+    fn failed_result(
+        envelope: &MutationEnvelope,
+        exit_code: i32,
+        stderr: impl Into<String>,
+        flush: CombinedFlushOutcome,
+    ) -> MutationResult {
+        MutationResult::new(
+            envelope.idempotency_key.clone(),
+            envelope.family,
+            exit_code,
+            "",
+            stderr,
+            flush,
         )
     }
 
@@ -1218,6 +1249,21 @@ mod tests {
         fs::read_to_string(jsonl_path).expect("read exported JSONL")
     }
 
+    fn stored_issues(storage: &SqliteStorage) -> Vec<Issue> {
+        let mut issues = storage
+            .get_all_issues_for_export()
+            .expect("read exported issues");
+        issues.sort_by(|left, right| left.id.cmp(&right.id));
+        issues
+    }
+
+    fn stored_issue_titles(storage: &SqliteStorage) -> Vec<String> {
+        stored_issues(storage)
+            .into_iter()
+            .map(|issue| issue.title)
+            .collect()
+    }
+
     fn event_fingerprints(events: Vec<Event>) -> Vec<EventFingerprint> {
         events
             .into_iter()
@@ -1229,6 +1275,20 @@ mod tests {
                 comment: event.comment,
             })
             .collect()
+    }
+
+    fn stored_event_issue_ids(storage: &SqliteStorage) -> Vec<String> {
+        event_fingerprints(storage.get_all_events(0).expect("read events"))
+            .into_iter()
+            .map(|event| event.issue_id)
+            .collect()
+    }
+
+    fn stored_unique_event_issue_ids(storage: &SqliteStorage) -> Vec<String> {
+        let mut issue_ids = stored_event_issue_ids(storage);
+        issue_ids.sort();
+        issue_ids.dedup();
+        issue_ids
     }
 
     fn export_hashes_for(storage: &SqliteStorage, issues: &[Issue]) -> Vec<(String, String)> {
@@ -1249,10 +1309,7 @@ mod tests {
         jsonl_bytes: String,
         results: Vec<MutationResult>,
     ) -> CreateBurstState {
-        let mut issues = storage
-            .get_all_issues_for_export()
-            .expect("read exported issues");
-        issues.sort_by(|left, right| left.id.cmp(&right.id));
+        let issues = stored_issues(storage);
         let event_order = event_fingerprints(storage.get_all_events(0).expect("read events"));
         let dirty_ids = storage.get_dirty_issue_ids().expect("read dirty ids");
         let needs_flush = storage
@@ -1348,6 +1405,43 @@ mod tests {
         let jsonl_bytes = flush_to_jsonl(&mut storage, &jsonl_path);
         mark_report_flushed(&mut report);
         create_burst_state(&storage, jsonl_bytes, applied_results(&report))
+    }
+
+    fn response_outcome(report: &BatchReport, index: usize) -> &BatchResponseOutcome {
+        report
+            .responses
+            .iter()
+            .find(|response| response.index == index)
+            .map(|response| &response.outcome)
+            .expect("response exists")
+    }
+
+    fn move_accepted_after_failure_to_skipped(plan: &BatchPlan, failed_index: usize) -> BatchPlan {
+        let mut shrunk = BatchPlan {
+            family: plan.family,
+            accepted: Vec::new(),
+            skipped: plan.skipped.clone(),
+            used_argument_bytes: 0,
+        };
+        let mut failure_seen = false;
+
+        for mutation in &plan.accepted {
+            if failure_seen {
+                shrunk.skipped.push(skipped(
+                    mutation.index,
+                    BatchSkipReason::BlockedByBatchBoundary,
+                ));
+                continue;
+            }
+
+            shrunk.used_argument_bytes += mutation.argument_bytes;
+            shrunk.accepted.push(mutation.clone());
+            if mutation.index == failed_index {
+                failure_seen = true;
+            }
+        }
+
+        shrunk
     }
 
     fn reported(result: std::result::Result<BatchReport, BatchReportError>) -> BatchReport {
@@ -2338,6 +2432,276 @@ mod tests {
         assert_eq!(direct.needs_flush.as_deref(), Some("false"));
         assert_eq!(combined.needs_flush.as_deref(), Some("false"));
         assert_eq!(direct.export_hashes, combined.export_hashes);
+    }
+
+    #[test]
+    fn command_validation_failure_does_not_create_issue_or_hide_neighbors() {
+        let mut invalid = create_burst_envelope(2, "Missing title", "bug", 0, &["bad"]);
+        invalid
+            .arguments
+            .as_object_mut()
+            .expect("object payload")
+            .remove("title");
+        let envelopes = vec![
+            create_burst_envelope(1, "First valid create", "task", 1, &["ok"]),
+            invalid,
+            create_burst_envelope(3, "Third valid create", "feature", 2, &["ok"]),
+        ];
+        let mut storage = SqliteStorage::open_memory().expect("open storage");
+        let mut sequence = 0;
+
+        let report = executed(execute_batch_with(
+            &envelopes,
+            BatchLimits::default(),
+            NOW_UNIX_MS,
+            |envelope| {
+                if envelope
+                    .arguments
+                    .get("title")
+                    .and_then(JsonValue::as_str)
+                    .is_none()
+                {
+                    return failed_result(
+                        envelope,
+                        2,
+                        "validation error: missing title",
+                        CombinedFlushOutcome::NotRequested,
+                    );
+                }
+                sequence += 1;
+                apply_test_create(&mut storage, envelope, sequence)
+            },
+        ));
+
+        assert_eq!(
+            report.outcome_summary(),
+            BatchOutcomeSummary {
+                response_count: 3,
+                applied_count: 3,
+                skipped_count: 0,
+                successful_mutations: 2,
+                failed_mutations: 1,
+                flush_failures: 0,
+                first_failed_index: Some(1),
+                first_flush_failure_index: None,
+            }
+        );
+        assert_eq!(
+            response_outcome(&report, 1),
+            &BatchResponseOutcome::Applied(failed_result(
+                &envelopes[1],
+                2,
+                "validation error: missing title",
+                CombinedFlushOutcome::NotRequested,
+            ))
+        );
+        assert_eq!(
+            stored_issue_titles(&storage),
+            vec![
+                "First valid create".to_string(),
+                "Third valid create".to_string()
+            ]
+        );
+        assert_eq!(
+            stored_unique_event_issue_ids(&storage),
+            vec!["bd-burst-001".to_string(), "bd-burst-002".to_string()]
+        );
+    }
+
+    #[test]
+    fn pre_execution_rejections_do_not_touch_storage() {
+        let first = create_burst_envelope(1, "First accepted", "task", 1, &["ok"]);
+        let mut duplicate = create_burst_envelope(2, "Duplicate skipped", "bug", 0, &["skip"]);
+        duplicate.idempotency_key = first.idempotency_key.clone();
+        let second = create_burst_envelope(3, "Second accepted", "feature", 2, &["ok"]);
+        let mut expired = create_burst_envelope(4, "Expired skipped", "task", 1, &["skip"]);
+        expired.deadline_unix_ms = NOW_UNIX_MS;
+        let third = create_burst_envelope(5, "Queue-full skipped", "task", 1, &["skip"]);
+        let envelopes = vec![first, duplicate, second, expired, third];
+        let mut storage = SqliteStorage::open_memory().expect("open storage");
+        let mut executed_keys = Vec::new();
+        let mut sequence = 0;
+
+        let report = executed(execute_batch_with(
+            &envelopes,
+            BatchLimits::new(2, DEFAULT_MAX_COMBINED_ARGUMENT_BYTES),
+            NOW_UNIX_MS,
+            |envelope| {
+                executed_keys.push(envelope.idempotency_key.clone());
+                sequence += 1;
+                apply_test_create(&mut storage, envelope, sequence)
+            },
+        ));
+
+        assert_eq!(
+            executed_keys,
+            vec!["create-1".to_string(), "create-3".to_string()]
+        );
+        assert_eq!(
+            response_outcome(&report, 1),
+            &BatchResponseOutcome::Skipped(BatchSkipReason::DuplicateIdempotencyKey {
+                idempotency_key: "create-1".to_string(),
+            })
+        );
+        assert_eq!(
+            response_outcome(&report, 3),
+            &BatchResponseOutcome::Skipped(BatchSkipReason::Expired)
+        );
+        assert_eq!(
+            response_outcome(&report, 4),
+            &BatchResponseOutcome::Skipped(BatchSkipReason::QueueFull)
+        );
+        assert_eq!(
+            stored_issue_titles(&storage),
+            vec!["First accepted".to_string(), "Second accepted".to_string()]
+        );
+        assert_eq!(
+            stored_unique_event_issue_ids(&storage),
+            vec!["bd-burst-001".to_string(), "bd-burst-002".to_string()]
+        );
+    }
+
+    #[test]
+    fn storage_failure_rolls_back_current_envelope_and_shrinks_batch() {
+        let envelopes = vec![
+            create_burst_envelope(1, "First committed", "task", 1, &["ok"]),
+            create_burst_envelope(2, "Duplicate storage id", "bug", 0, &["fail"]),
+            create_burst_envelope(3, "Never executed", "feature", 2, &["blocked"]),
+        ];
+        let plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+        let mut storage = SqliteStorage::open_memory().expect("open storage");
+        let first_envelope = envelopes.first().expect("first envelope");
+        let mut results = vec![apply_test_create(&mut storage, first_envelope, 1)];
+        let failing_envelope = envelopes.get(1).expect("failing envelope");
+        let storage_err = try_apply_test_create(&mut storage, failing_envelope, 1)
+            .expect_err("duplicate create should fail");
+        results.push(failed_result(
+            failing_envelope,
+            1,
+            format!("storage error: {storage_err}"),
+            CombinedFlushOutcome::NotRequested,
+        ));
+
+        let shrunk_plan = move_accepted_after_failure_to_skipped(&plan, 1);
+        let report = reported(assemble_batch_report(&envelopes, &shrunk_plan, &results));
+
+        assert!(matches!(
+            response_outcome(&report, 1),
+            BatchResponseOutcome::Applied(result)
+                if result.exit_code == 1 && result.stderr.starts_with("storage error:")
+        ));
+        assert_eq!(
+            response_outcome(&report, 2),
+            &BatchResponseOutcome::Skipped(BatchSkipReason::BlockedByBatchBoundary)
+        );
+        assert_eq!(
+            report.outcome_summary(),
+            BatchOutcomeSummary {
+                response_count: 3,
+                applied_count: 2,
+                skipped_count: 1,
+                successful_mutations: 1,
+                failed_mutations: 1,
+                flush_failures: 0,
+                first_failed_index: Some(1),
+                first_flush_failure_index: None,
+            }
+        );
+        assert_eq!(
+            stored_issue_titles(&storage),
+            vec!["First committed".to_string()]
+        );
+        assert_eq!(
+            stored_unique_event_issue_ids(&storage),
+            vec!["bd-burst-001".to_string()]
+        );
+    }
+
+    #[test]
+    fn flush_failure_after_commit_preserves_dirty_db_state() {
+        let envelopes = vec![
+            create_burst_envelope(1, "First committed before flush", "task", 1, &["dirty"]),
+            create_burst_envelope(2, "Second committed before flush", "bug", 0, &["dirty"]),
+        ];
+        let mut storage = SqliteStorage::open_memory().expect("open storage");
+        let mut sequence = 0;
+        let mut report = executed(execute_batch_with(
+            &envelopes,
+            BatchLimits::default(),
+            NOW_UNIX_MS,
+            |envelope| {
+                sequence += 1;
+                apply_test_create(&mut storage, envelope, sequence)
+            },
+        ));
+
+        for response in &mut report.responses {
+            if let BatchResponseOutcome::Applied(result) = &mut response.outcome {
+                result.flush = CombinedFlushOutcome::FailedAfterCommit;
+                result.stderr.push_str("auto-flush failed");
+            }
+        }
+        let mut dirty_ids = storage.get_dirty_issue_ids().expect("read dirty ids");
+        dirty_ids.sort();
+
+        assert_eq!(
+            report.outcome_summary(),
+            BatchOutcomeSummary {
+                response_count: 2,
+                applied_count: 2,
+                skipped_count: 0,
+                successful_mutations: 2,
+                failed_mutations: 0,
+                flush_failures: 2,
+                first_failed_index: None,
+                first_flush_failure_index: Some(0),
+            }
+        );
+        assert_eq!(
+            stored_issue_titles(&storage),
+            vec![
+                "First committed before flush".to_string(),
+                "Second committed before flush".to_string()
+            ]
+        );
+        assert_eq!(
+            dirty_ids,
+            vec!["bd-burst-001".to_string(), "bd-burst-002".to_string()]
+        );
+        assert_eq!(stored_unique_event_issue_ids(&storage), dirty_ids);
+    }
+
+    #[test]
+    fn missing_response_after_accept_is_not_reported_as_success() {
+        let envelopes = vec![create_burst_envelope(
+            1,
+            "Accepted before missing response",
+            "task",
+            1,
+            &["probe"],
+        )];
+        let plan = planned(plan_batch(&envelopes, BatchLimits::default(), NOW_UNIX_MS));
+        let mut storage = SqliteStorage::open_memory().expect("open storage");
+        let accepted_envelope = envelopes.first().expect("accepted envelope");
+        let accepted_key = accepted_envelope.idempotency_key.clone();
+        let committed = apply_test_create(&mut storage, accepted_envelope, 1);
+
+        assert_eq!(committed.idempotency_key, accepted_key);
+        assert_eq!(
+            assemble_batch_report(&envelopes, &plan, &[]),
+            Err(BatchReportError::MissingResult {
+                index: 0,
+                idempotency_key: accepted_key,
+            })
+        );
+        assert_eq!(
+            stored_issue_titles(&storage),
+            vec!["Accepted before missing response".to_string()]
+        );
+        assert_eq!(
+            stored_unique_event_issue_ids(&storage),
+            vec!["bd-burst-001".to_string()]
+        );
     }
 
     #[test]

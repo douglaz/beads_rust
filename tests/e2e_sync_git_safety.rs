@@ -1604,16 +1604,17 @@ fn integration_sync_after_recovery_artifact_present_does_not_touch_artifacts() {
     if let Ok(entries) = fs::read_dir(&recovery_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let ext_matches = |e: &str| -> bool {
-                path.extension()
-                    .is_some_and(|x| x.eq_ignore_ascii_case(e))
-            };
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let ext_matches =
+                |e: &str| -> bool { path.extension().is_some_and(|x| x.eq_ignore_ascii_case(e)) };
             // suffix `truncated-wal` and `rebuild-failed` are the trailing
             // dotted token; for `bak` it's the final extension.
-            let valid = ext_matches("bak")
-                || ext_matches("rebuild-failed")
-                || ext_matches("truncated-wal");
+            let valid =
+                ext_matches("bak") || ext_matches("rebuild-failed") || ext_matches("truncated-wal");
             assert!(
                 valid,
                 "PC-RECOVERY: unexpected file in .br_recovery/: {name} (must end in .bak/.rebuild-failed/.truncated-wal)"

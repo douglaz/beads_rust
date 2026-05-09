@@ -633,7 +633,18 @@ fn regression_sync_never_touches_source_files() {
 // ============================================================================
 
 /// Files that sync is allowed to modify within `.beads/`.
-/// This matches the allowlist in `src/sync/path.rs`.
+///
+/// This matches the allowlist in `src/sync/path.rs` for sync-direct writes,
+/// PLUS recognizes recovery artifacts under `.beads/.br_recovery/` that may
+/// be created as a side effect of storage recovery flows triggered during
+/// sync's invocation (e.g., `br sync --import-only --force` may invoke a
+/// rebuild that backs up the existing DB family to `.br_recovery/<name>.<stamp>.bak`
+/// before overwriting). The recovery flow has its own path validation in
+/// `src/config/mod.rs::backup_database_family_for_recovery`; it does not
+/// flow through `src/sync/path.rs::validate_sync_path`.
+///
+/// See `.beads/SYNC_SAFETY_INVARIANTS.md` invariant **PC-RECOVERY** for the
+/// precise contract.
 fn is_allowed_sync_file(rel_path: &str) -> bool {
     // Must be under .beads/
     if !rel_path.starts_with(".beads/") && !rel_path.starts_with(".beads\\") {
@@ -669,6 +680,24 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
         && (rel_path.contains(".br_history/") || rel_path.contains(".br_history\\"))
     {
         return true;
+    }
+
+    // Allow .br_recovery artifacts created as a side effect of storage
+    // recovery flows triggered during sync invocations. These are written
+    // by `src/config/mod.rs::recovery_backup_filename` (format
+    // `<original-filename>.<stamp>.<suffix>`); recognized suffixes:
+    //   - "bak"             → routine pre-rebuild backup of the DB family
+    //   - "rebuild-failed"  → rollback marker after a failed rebuild
+    //   - "truncated-wal"   → quarantined WAL/SHM sidecar (< 32 bytes)
+    // PC-RECOVERY invariant: any file under .beads/.br_recovery/ ending in
+    // one of these suffixes is allowed; arbitrary other contents are NOT
+    // (so we still catch a regression that scatters non-recovery files into
+    // the recovery dir).
+    if rel_path.contains(".br_recovery/") || rel_path.contains(".br_recovery\\") {
+        const RECOVERY_SUFFIXES: &[&str] = &[".bak", ".rebuild-failed", ".truncated-wal"];
+        if RECOVERY_SUFFIXES.iter().any(|s| filename.ends_with(s)) {
+            return true;
+        }
     }
 
     // Check extension matches

@@ -406,6 +406,86 @@ fn e2e_capabilities_command_detail_high_traffic_safety_notes_json() {
 }
 
 #[test]
+fn e2e_capabilities_command_detail_machine_output_contracts_json() {
+    let _log = common::test_log("e2e_capabilities_command_detail_machine_output_contracts_json");
+    let workspace = BrWorkspace::new();
+
+    let cases = [
+        (
+            "create",
+            "write",
+            "machine_output",
+            "toon",
+            "create TOON contract",
+        ),
+        (
+            "q",
+            "write",
+            "machine_output",
+            "json",
+            "quick create JSON contract",
+        ),
+        (
+            "comments add",
+            "write",
+            "machine_output",
+            "toon",
+            "comment add TOON contract",
+        ),
+        (
+            "dep add",
+            "write",
+            "machine_output",
+            "toon",
+            "dependency add TOON contract",
+        ),
+        (
+            "query save",
+            "write",
+            "machine_output",
+            "toon",
+            "query save TOON contract",
+        ),
+        (
+            "query list",
+            "read",
+            "machine_output",
+            "toon",
+            "query list TOON contract",
+        ),
+        (
+            "epic status",
+            "read",
+            "machine_output",
+            "toon",
+            "epic status TOON contract",
+        ),
+        (
+            "count",
+            "read",
+            "machine_output",
+            "toon",
+            "count TOON contract",
+        ),
+        (
+            "graph",
+            "mixed",
+            "machine_output",
+            "toon",
+            "graph TOON contract",
+        ),
+    ];
+
+    assert_command_detail_cases(&workspace, &cases);
+
+    let output = capabilities_command_detail_output(&workspace, "query save");
+    let detail = output
+        .get("command_detail")
+        .expect("capabilities output should include command_detail");
+    assert_array_text_excludes(detail, "machine_output", "csv", "query save");
+}
+
+#[test]
 fn e2e_capabilities_command_detail_dependency_safety_notes_json() {
     let _log = common::test_log("e2e_capabilities_command_detail_dependency_safety_notes_json");
     let workspace = BrWorkspace::new();

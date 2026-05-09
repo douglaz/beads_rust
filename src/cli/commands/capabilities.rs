@@ -646,7 +646,7 @@ fn command_contract(name: &str) -> CommandContract {
         "comments add" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &[
                 "br comments add br-abc --message \"Investigation notes\" --json",
                 "br comment add br-abc \"Short note\" --json",
@@ -656,7 +656,7 @@ fn command_contract(name: &str) -> CommandContract {
         "comments list" => CommandContract {
             operation: "read",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &[
                 "br comments list br-abc --json",
                 "br comments br-abc --json",
@@ -665,7 +665,7 @@ fn command_contract(name: &str) -> CommandContract {
         "dep add" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &[
                 "br dep add br-task br-blocker --type blocks --json",
                 "br dep add br-child br-parent --type parent-child --json",
@@ -675,7 +675,7 @@ fn command_contract(name: &str) -> CommandContract {
         "dep remove" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br dep remove br-task br-blocker --json"],
         },
         "dep list" => CommandContract {
@@ -710,7 +710,7 @@ fn command_contract(name: &str) -> CommandContract {
         "query save" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "csv", "toon", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &[
                 "br query save p0-open --priority 0 --status open --description \"P0 open work\" --format json",
                 "br query save mine --assignee agent-name --status in_progress --format json",
@@ -728,49 +728,49 @@ fn command_contract(name: &str) -> CommandContract {
         "query list" => CommandContract {
             operation: "read",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br query list --json"],
         },
         "query delete" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br query delete stale-filter --json"],
         },
         "label add" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br label add br-abc --label needs-review --json"],
         },
         "label remove" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br label remove br-abc --label needs-review --json"],
         },
         "label list" => CommandContract {
             operation: "read",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br label list --json"],
         },
         "label rename" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br label rename old-label new-label --json"],
         },
         "epic status" => CommandContract {
             operation: "read",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br epic status --json"],
         },
         "epic close-eligible" => CommandContract {
             operation: "read",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br epic close-eligible --dry-run --json"],
         },
         "capabilities" => CommandContract {
@@ -812,7 +812,7 @@ fn command_contract(name: &str) -> CommandContract {
         "create" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &[
                 "br create \"Fix login\" --type bug --priority 1 --json",
                 "br create --title \"Investigate slow ready\" --slug slow-ready --labels perf,agent-workflow --json",
@@ -822,13 +822,13 @@ fn command_contract(name: &str) -> CommandContract {
         "q" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br q \"Quick note\""],
         },
         "update" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &[
                 "br update br-abc --claim --json",
                 "br update br-abc --status in_progress --assignee agent-name --json",
@@ -838,7 +838,7 @@ fn command_contract(name: &str) -> CommandContract {
         "close" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &[
                 "br close br-abc --reason \"Completed\" --json",
                 "br close br-abc --reason \"Completed\" --suggest-next --json",
@@ -848,25 +848,25 @@ fn command_contract(name: &str) -> CommandContract {
         "reopen" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br reopen br-abc --json"],
         },
         "delete" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br delete br-abc --reason duplicate --json"],
         },
         "defer" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br defer br-abc --until tomorrow --json"],
         },
         "undefer" => CommandContract {
             operation: "write",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &["br undefer br-abc --json"],
         },
         "list" => CommandContract {
@@ -920,7 +920,7 @@ fn command_contract(name: &str) -> CommandContract {
         "count" => CommandContract {
             operation: "read",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &[
                 "br count --by status --json",
                 "br count --by-label --status open --json",
@@ -965,7 +965,7 @@ fn command_contract(name: &str) -> CommandContract {
         "graph" | "orphans" | "changelog" | "lint" | "audit" => CommandContract {
             operation: "mixed",
             workspace: "required",
-            machine_output: &["json", "text"],
+            machine_output: &["json", "toon", "text"],
             examples: &[],
         },
         "agents" => CommandContract {

@@ -568,7 +568,7 @@ fn coordination_status_snapshot_imports_to_audit_flight_recorder() {
     assert_eq!(entries[0]["id"], record_id);
     assert_eq!(entries[0]["kind"], "coordination_incident");
     assert_eq!(entries[0]["actor"], "coord-lab");
-    assert_eq!(entries[0]["issue_id"], "bd-stale");
+    assert_eq!(entries[0]["issue_id"], "bd-stale"); // invariant: fixture round-trip
     assert_eq!(
         entries[0]["extra"]["command"],
         "br coordination status --json --reservations empty-reservations.json"

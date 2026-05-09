@@ -150,32 +150,31 @@ log_summary "  files after sync: $(wc -l < "$SNAPSHOT_AFTER")"
 # --- assert allowlist ------------------------------------------------------
 
 log_summary "Phase 5: assert each modified file is in PC-1/PC-RECOVERY allowlist"
-VIOLATIONS=0
-TOTAL_CHECKED=0
+
+# Note: pipe-fed `while` loops below run in a subshell under bash, so any
+# in-loop counter increments would NOT persist to the outer shell. We rely
+# on the event-log file (appended via `emit_event`) as the source of truth
+# and count lines in that file after both loops complete.
 
 # Diff: new files in after
 comm -13 "$SNAPSHOT_BEFORE" "$SNAPSHOT_AFTER" | while IFS= read -r path; do
     rel="${path#./}"
-    TOTAL_CHECKED=$((TOTAL_CHECKED+1))
     if is_allowed_path "$rel"; then
         emit_event "create" "$rel" "true" ""
     else
         emit_event "create" "$rel" "false" "not in allowlist"
         log_summary "  VIOLATION: created '$rel' (not in PC-1/PC-RECOVERY allowlist)"
-        VIOLATIONS=$((VIOLATIONS+1))
     fi
 done
 
 # Removed files (rare, but possible during rebuild)
 comm -23 "$SNAPSHOT_BEFORE" "$SNAPSHOT_AFTER" | while IFS= read -r path; do
     rel="${path#./}"
-    TOTAL_CHECKED=$((TOTAL_CHECKED+1))
     if is_allowed_path "$rel"; then
         emit_event "delete" "$rel" "true" ""
     else
         emit_event "delete" "$rel" "false" "not in allowlist"
         log_summary "  VIOLATION: deleted '$rel' (not in PC-1/PC-RECOVERY allowlist)"
-        VIOLATIONS=$((VIOLATIONS+1))
     fi
 done
 
@@ -186,13 +185,8 @@ rm -f "$SNAPSHOT_BEFORE" "$SNAPSHOT_AFTER"
 
 emit_event "harness_end" "$WORKSPACE" "true" ""
 
-# We need the violation count from the subshell — write it via exit-code-style file
-VIO_FILE=$(mktemp)
-echo "0" > "$VIO_FILE"
-
-# Re-derive violation count by greping the event log (single-line int).
-# Use awk for counting to avoid grep returning 1 on no-matches under
-# set -euo pipefail.
+# Count from the event log (the source of truth across subshell boundaries).
+# Use awk so a zero-match doesn't trigger set -e under -o pipefail.
 ACTUAL_VIOLATIONS=$(awk '/"allowed":false/ { c++ } END { print c+0 }' "$EVENT_LOG")
 ACTUAL_TOTAL=$(awk '/"op":"(create|delete)"/ { c++ } END { print c+0 }' "$EVENT_LOG")
 
@@ -203,12 +197,10 @@ log_summary "  event log: ${EVENT_LOG}"
 
 if [[ "$ACTUAL_VIOLATIONS" -gt 0 ]]; then
     log_summary "FAIL"
-    rm -f "$VIO_FILE"
     rm -rf "$WORKSPACE"
     exit 1
 else
     log_summary "PASS"
-    rm -f "$VIO_FILE"
     rm -rf "$WORKSPACE"
     exit 0
 fi

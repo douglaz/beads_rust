@@ -1846,7 +1846,7 @@ fn integration_sync_with_external_jsonl_path_touches_only_target_and_beads() {
             return false;
         }
         // Allow the realistic-project files that already existed before the test
-        snapshot_before.files.contains_key(path.as_str()).not()
+        !snapshot_before.files.contains_key(path.as_str())
             && !path.starts_with("src/")
             && !path.starts_with("tests/")
             && !path.starts_with("docs/")
@@ -1883,16 +1883,6 @@ fn integration_sync_with_external_jsonl_path_touches_only_target_and_beads() {
             "sync rejection must mention external/outside/allow context; got:\n{combined}"
         );
         eprintln!("  [PASS] sync clearly rejected external path with operator-readable error");
-    }
-}
-
-/// Helper trait so we can use `not()` on bool — purely for readability above.
-trait BoolExt {
-    fn not(self) -> bool;
-}
-impl BoolExt for bool {
-    fn not(self) -> bool {
-        !self
     }
 }
 

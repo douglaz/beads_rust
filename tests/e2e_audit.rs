@@ -151,7 +151,7 @@ fn e2e_audit_record_with_all_optional_fields() {
     let entries = read_interactions(&workspace);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["kind"], "llm_call");
-    assert_eq!(entries[0]["issue_id"], "bd-test123");
+    assert_eq!(entries[0]["issue_id"], "bd-test123"); // invariant: fixture round-trip
     assert_eq!(entries[0]["model"], "claude-3-opus");
     assert_eq!(entries[0]["prompt"], "What is 2+2?");
     assert_eq!(entries[0]["response"], "The answer is 4.");
@@ -924,7 +924,7 @@ fn e2e_audit_with_actor_override() {
 
     let entries = read_interactions(&workspace);
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["actor"], "test-agent");
+    assert_eq!(entries[0]["actor"], "test-agent"); // invariant: hardcoded actor name, not an issue ID
     info!("e2e_audit_with_actor_override: done");
 }
 

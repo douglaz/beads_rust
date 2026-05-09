@@ -1973,6 +1973,141 @@ fn push_recoverable_anomalies_check(checks: &mut Vec<CheckResult>, findings: &[S
     }
 }
 
+/// beads_rust-m3mi: flag closed beads whose `close_reason` matches a
+/// well-known audit-suspect pattern (e.g. "Forced close due to cycle"),
+/// unless the bead carries an `audit-historical-cycle-close-*` label
+/// which acts as the explicit triage escape hatch.
+///
+/// Default patterns are defined inline; documented allowlist (substring
+/// matches that should never be flagged) skips legitimate close-reasons
+/// like "auto-closed by doctor" or "merged into".
+///
+/// Severity: Warn — these are NOT broken DB states; just audit-suspect
+/// closures that deserve operator attention.
+fn check_suspect_close_reasons(conn: &Connection, checks: &mut Vec<CheckResult>) {
+    // Default patterns: (case-insensitive substring matches; lowercase form below)
+    let default_patterns: &[&str] = &[
+        "forced close due to cycle",
+        "due to dep cycle",
+        "due to dependency cycle",
+        "temporarily closed",
+        "wip close",
+    ];
+    // Default allowlist: substrings that must never be flagged
+    let default_allowlist: &[&str] = &[
+        "auto-closed by doctor",
+        "closed by epic close-eligible",
+        "merged into",
+        "superseded by",
+    ];
+
+    // Query closed beads' id, close_reason, labels (joined as ASCII-unit-
+    // separated, since `br update --add-label` rejects this character so
+    // it can never appear inside a label and is a safe split delimiter).
+    // GROUP_CONCAT separator can't contain commas in case a label ever
+    // does — the validator forbids commas today, but we don't want to
+    // create a latent bug if the schema ever changes.
+    let rows = match conn.query(
+        "SELECT i.id, i.close_reason,
+                COALESCE(GROUP_CONCAT(l.label, char(31)), '') AS labels
+         FROM issues i
+         LEFT JOIN labels l ON l.issue_id = i.id
+         WHERE i.status = 'closed' AND i.close_reason IS NOT NULL
+         GROUP BY i.id
+         ORDER BY i.id",
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            push_check(
+                checks,
+                "audit.suspect_close_reasons",
+                CheckStatus::Warn,
+                Some(format!(
+                    "Failed to query closed beads for close_reason audit: {err}"
+                )),
+                None,
+            );
+            return;
+        }
+    };
+
+    let mut matches: Vec<serde_json::Value> = Vec::new();
+    for row in rows {
+        let id = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string();
+        let reason = row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string();
+        let labels = row
+            .get(2)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() || reason.is_empty() {
+            continue;
+        }
+
+        // Skip if any label starts with the historical-triage prefix.
+        // Split on ASCII unit separator (matches the GROUP_CONCAT separator
+        // above; safe even if a label ever contained a comma).
+        let has_historical_label = labels.split('\x1f').any(|l| {
+            l.trim().starts_with("audit-historical-cycle-close-")
+                || l.trim() == "audit-suspect-allowed"
+        });
+        if has_historical_label {
+            continue;
+        }
+
+        let reason_lower = reason.to_lowercase();
+
+        // Skip if any allowlist substring matches
+        if default_allowlist.iter().any(|a| reason_lower.contains(a)) {
+            continue;
+        }
+
+        // Match against suspect patterns
+        if let Some(matched) = default_patterns.iter().find(|p| reason_lower.contains(*p)) {
+            matches.push(serde_json::json!({
+                "bead_id": id,
+                "matched_pattern": matched,
+                "close_reason": reason,
+                "has_historical_label": false,
+            }));
+        }
+    }
+
+    if matches.is_empty() {
+        push_check(
+            checks,
+            "audit.suspect_close_reasons",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+
+    let count = matches.len();
+    push_check(
+        checks,
+        "audit.suspect_close_reasons",
+        CheckStatus::Warn,
+        Some(format!(
+            "{count} closed bead(s) have audit-suspect close_reason text without an audit-historical-cycle-close-<DATE> escape-hatch label"
+        )),
+        Some(serde_json::json!({
+            "patterns_used": default_patterns,
+            "allowlist_used": default_allowlist,
+            "matches": matches,
+        })),
+    );
+}
+
 fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
     let duplicate_schema_rows = conn.query(
         "SELECT type, name, COUNT(*) AS row_count
@@ -3287,6 +3422,8 @@ fn inspect_existing_doctor_database(
         }
         check_null_defaults(&conn, checks);
         check_integrity(&conn, checks);
+        // beads_rust-m3mi: audit-suspect close_reasons (warn level)
+        check_suspect_close_reasons(&conn, checks);
         if let Err(err) = check_db_count(&conn, jsonl_count, checks) {
             push_inspection_error(
                 checks,
@@ -5799,5 +5936,114 @@ mod tests {
         };
 
         assert!(!warning_repair_verified(&report, true, false));
+    }
+
+    // ========================================================================
+    // beads_rust-m3mi: audit.suspect_close_reasons check tests (added 2026-05-09)
+    // ========================================================================
+
+    fn closed_issue_with_reason(id: &str, title: &str, reason: &str) -> Issue {
+        let mut issue = sample_issue(id, title);
+        issue.status = Status::Closed;
+        issue.closed_at = Some(Utc::now());
+        issue.close_reason = Some(reason.to_string());
+        issue
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_finds_matching_bead() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let bad = closed_issue_with_reason(
+            "br-bad",
+            "Bad close",
+            "Implemented foo. Forced close due to cycle.",
+        );
+        storage.create_issue(&bad, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        let matches_arr = details["matches"].as_array().expect("matches array");
+        assert_eq!(matches_arr.len(), 1);
+        assert_eq!(matches_arr[0]["bead_id"], "br-bad");
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_skips_beads_with_historical_label() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let mut triaged = closed_issue_with_reason(
+            "br-triaged",
+            "Triaged",
+            "Implemented bar. Forced close due to cycle.",
+        );
+        triaged.labels = vec!["audit-historical-cycle-close-2026-05-09".to_string()];
+        storage.create_issue(&triaged, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "historical-label bead must NOT trigger warn; got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_returns_ok_when_no_matches() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let normal = closed_issue_with_reason(
+            "br-normal",
+            "Normal close",
+            "Verified by tests/e2e_basic_lifecycle.rs::list_basic.",
+        );
+        storage.create_issue(&normal, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_skips_default_allowlist() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let auto = closed_issue_with_reason(
+            "br-auto",
+            "Auto-closed",
+            "auto-closed by doctor: stale recovery artifact",
+        );
+        storage.create_issue(&auto, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "allowlist entry must NOT trigger warn; got {:?}",
+            check.status
+        );
     }
 }

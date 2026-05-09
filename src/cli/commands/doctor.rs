@@ -14,7 +14,7 @@ use crate::sync::{
     snapshot_tombstones, tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
     validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
 };
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use fsqlite::Connection;
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
@@ -1975,7 +1975,7 @@ fn push_recoverable_anomalies_check(checks: &mut Vec<CheckResult>, findings: &[S
 
 /// beads_rust-m3mi: flag closed beads whose `close_reason` matches a
 /// well-known audit-suspect pattern (e.g. "Forced close due to cycle"),
-/// unless the bead carries an `audit-historical-cycle-close-*` label
+/// unless the bead carries an `audit-historical-cycle-close-YYYY-MM-DD` label
 /// which acts as the explicit triage escape hatch.
 ///
 /// Default patterns are defined inline; documented allowlist (substring
@@ -1984,6 +1984,31 @@ fn push_recoverable_anomalies_check(checks: &mut Vec<CheckResult>, findings: &[S
 ///
 /// Severity: Warn — these are NOT broken DB states; just audit-suspect
 /// closures that deserve operator attention.
+const HISTORICAL_CYCLE_CLOSE_LABEL_PREFIX: &str = "audit-historical-cycle-close-";
+
+fn is_historical_cycle_close_label(label: &str) -> bool {
+    let Some(date) = label
+        .trim()
+        .strip_prefix(HISTORICAL_CYCLE_CLOSE_LABEL_PREFIX)
+    else {
+        return false;
+    };
+
+    let bytes = date.as_bytes();
+    let has_date_shape = bytes.len() == 10
+        && bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[4] == b'-'
+        && bytes[5].is_ascii_digit()
+        && bytes[6].is_ascii_digit()
+        && bytes[7] == b'-'
+        && bytes[8].is_ascii_digit()
+        && bytes[9].is_ascii_digit();
+    has_date_shape && NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+}
+
 fn check_suspect_close_reasons(conn: &Connection, checks: &mut Vec<CheckResult>) {
     // Default patterns: (case-insensitive substring matches; lowercase form below)
     let default_patterns: &[&str] = &[
@@ -2052,13 +2077,10 @@ fn check_suspect_close_reasons(conn: &Connection, checks: &mut Vec<CheckResult>)
             continue;
         }
 
-        // Skip if any label starts with the historical-triage prefix.
+        // Skip only if a label is the documented dated historical-triage marker.
         // Split on ASCII unit separator (matches the GROUP_CONCAT separator
         // above; safe even if a label ever contained a comma).
-        let has_historical_label = labels.split('\x1f').any(|l| {
-            l.trim().starts_with("audit-historical-cycle-close-")
-                || l.trim() == "audit-suspect-allowed"
-        });
+        let has_historical_label = labels.split('\x1f').any(is_historical_cycle_close_label);
         if has_historical_label {
             continue;
         }
@@ -2098,7 +2120,7 @@ fn check_suspect_close_reasons(conn: &Connection, checks: &mut Vec<CheckResult>)
         "audit.suspect_close_reasons",
         CheckStatus::Warn,
         Some(format!(
-            "{count} closed bead(s) have audit-suspect close_reason text without an audit-historical-cycle-close-<DATE> escape-hatch label"
+            "{count} closed bead(s) have audit-suspect close_reason text without an audit-historical-cycle-close-<YYYY-MM-DD> escape-hatch label"
         )),
         Some(serde_json::json!({
             "patterns_used": default_patterns,
@@ -6001,6 +6023,64 @@ mod tests {
             "historical-label bead must NOT trigger warn; got {:?}",
             check.status
         );
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_rejects_malformed_historical_label() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let mut malformed = closed_issue_with_reason(
+            "br-malformed",
+            "Malformed label",
+            "Implemented bar. Forced close due to cycle.",
+        );
+        malformed.labels = vec!["audit-historical-cycle-close-not-a-date".to_string()];
+        storage.create_issue(&malformed, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "malformed historical-label bead must trigger warn; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        let matches_arr = details["matches"].as_array().expect("matches array");
+        assert_eq!(matches_arr.len(), 1);
+        assert_eq!(matches_arr[0]["bead_id"], "br-malformed");
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_does_not_honor_undocumented_allowed_label() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let mut suspect = closed_issue_with_reason(
+            "br-allowed",
+            "Undocumented allow label",
+            "Implemented baz. Forced close due to cycle.",
+        );
+        suspect.labels = vec!["audit-suspect-allowed".to_string()];
+        storage.create_issue(&suspect, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "undocumented allow label must trigger warn; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        let matches_arr = details["matches"].as_array().expect("matches array");
+        assert_eq!(matches_arr.len(), 1);
+        assert_eq!(matches_arr[0]["bead_id"], "br-allowed");
     }
 
     #[test]

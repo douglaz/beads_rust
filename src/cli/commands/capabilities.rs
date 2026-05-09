@@ -956,7 +956,13 @@ fn command_contract(name: &str) -> CommandContract {
             machine_output: &["json", "text"],
             examples: &["br doctor --json"],
         },
-        "config" | "history" | "query" | "dep" | "label" | "comments" | "epic" => CommandContract {
+        "config" => CommandContract {
+            operation: "mixed",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: parent_examples(name),
+        },
+        "history" | "query" | "dep" | "label" | "comments" | "epic" => CommandContract {
             operation: "mixed",
             workspace: "required",
             machine_output: &["json", "toon", "text"],

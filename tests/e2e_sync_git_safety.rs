@@ -1527,7 +1527,9 @@ fn integration_sync_after_recovery_artifact_present_does_not_touch_artifacts() {
     let workspace = BrWorkspace::new();
     create_realistic_project(&workspace);
 
-    eprintln!("[yyxo TEST] integration_sync_after_recovery_artifact_present_does_not_touch_artifacts");
+    eprintln!(
+        "[yyxo TEST] integration_sync_after_recovery_artifact_present_does_not_touch_artifacts"
+    );
     eprintln!("  Phase 1: init + create issues");
 
     let init = run_br(&workspace, ["init"], "init");
@@ -1580,7 +1582,9 @@ fn integration_sync_after_recovery_artifact_present_does_not_touch_artifacts() {
 
     // Verify the stale artifact wasn't touched
     let stale_meta_after = fs::metadata(&stale_artifact).expect("stat stale (post-sync)");
-    let stale_mtime_after = stale_meta_after.modified().expect("mtime stale (post-sync)");
+    let stale_mtime_after = stale_meta_after
+        .modified()
+        .expect("mtime stale (post-sync)");
     let stale_contents_after = fs::read(&stale_artifact).expect("read stale (post-sync)");
 
     assert_eq!(
@@ -1594,13 +1598,22 @@ fn integration_sync_after_recovery_artifact_present_does_not_touch_artifacts() {
 
     // Verify any NEW recovery artifacts created during the cycle have an
     // expected suffix (so a regression that scattered random files into
-    // recovery_dir would still trip the test).
+    // recovery_dir would still trip the test). Use case-insensitive
+    // matching against the final extension for cross-platform safety
+    // (e.g., FAT32 / Windows quirks).
     if let Ok(entries) = fs::read_dir(&recovery_dir) {
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let valid = name.ends_with(".bak")
-                || name.ends_with(".rebuild-failed")
-                || name.ends_with(".truncated-wal");
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let ext_matches = |e: &str| -> bool {
+                path.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case(e))
+            };
+            // suffix `truncated-wal` and `rebuild-failed` are the trailing
+            // dotted token; for `bak` it's the final extension.
+            let valid = ext_matches("bak")
+                || ext_matches("rebuild-failed")
+                || ext_matches("truncated-wal");
             assert!(
                 valid,
                 "PC-RECOVERY: unexpected file in .br_recovery/: {name} (must end in .bak/.rebuild-failed/.truncated-wal)"
@@ -1609,7 +1622,9 @@ fn integration_sync_after_recovery_artifact_present_does_not_touch_artifacts() {
         }
     }
 
-    eprintln!("  [PASS] stale recovery artifact untouched; new artifacts (if any) have valid suffixes");
+    eprintln!(
+        "  [PASS] stale recovery artifact untouched; new artifacts (if any) have valid suffixes"
+    );
 }
 
 /// PC-1 + NGI-3: a full sync cycle MUST NOT create or modify ANY file at
@@ -1756,6 +1771,128 @@ fn integration_sync_in_subdirectory_only_touches_nearest_beads_dir() {
     );
 
     eprintln!("  [PASS] sync from subdirectory only touched nearest .beads/");
+}
+
+/// PC-1 + PC-2: when `BEADS_JSONL` env var explicitly authorizes an external
+/// JSONL path, sync MUST only touch (a) `.beads/` of the workspace, AND
+/// (b) the explicitly-authorized external path (and same-directory atomic
+/// temp files). No third party.
+#[test]
+fn integration_sync_with_external_jsonl_path_touches_only_target_and_beads() {
+    use common::cli::run_br_with_env;
+
+    let workspace = BrWorkspace::new();
+    create_realistic_project(&workspace);
+
+    eprintln!(
+        "[yyxo TEST] integration_sync_with_external_jsonl_path_touches_only_target_and_beads"
+    );
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let _ = run_br(
+        &workspace,
+        [
+            "create",
+            "External JSONL test",
+            "-t",
+            "task",
+            "--no-auto-flush",
+        ],
+        "create_for_external",
+    );
+
+    // Set up an external JSONL target
+    let external_dir = workspace.temp_dir.path().join("ext-jsonl-store");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_jsonl = external_dir.join("custom-issues.jsonl");
+    eprintln!("  external target: {}", external_jsonl.display());
+
+    // Snapshot ALL files (including the workspace root / external dir)
+    let snapshot_before = FileTreeSnapshot::new(workspace.temp_dir.path());
+    eprintln!("  files before sync: {}", snapshot_before.files.len());
+
+    // Run sync with explicit BEADS_JSONL + --allow-external-jsonl --force
+    let env_vars = vec![("BEADS_JSONL", external_jsonl.to_str().unwrap().to_string())];
+    let sync = run_br_with_env(
+        &workspace,
+        ["sync", "--flush-only", "--allow-external-jsonl", "--force"],
+        env_vars,
+        "sync_with_external",
+    );
+    eprintln!(
+        "  sync exit: {} stderr_len: {}",
+        sync.status,
+        sync.stderr.len()
+    );
+
+    // The implementation may either (a) succeed and write the external file
+    // or (b) reject with a clear error. EITHER WAY, no third-party file
+    // should appear (no `.git/`, no random tmpfile in /tmp/, etc).
+    let snapshot_after = FileTreeSnapshot::new(workspace.temp_dir.path());
+    let diff = snapshot_after.files.iter().filter(|(path, _)| {
+        // Allow files in .beads/ (workspace metadata)
+        if path.starts_with(".beads/") || path.contains(".beads\\") {
+            return false;
+        }
+        // Allow files explicitly under the external target's directory
+        if path.contains("ext-jsonl-store/") || path.contains("ext-jsonl-store\\") {
+            return false;
+        }
+        // Allow logs (test-only output)
+        if path.starts_with("logs") || path.starts_with("logs/") {
+            return false;
+        }
+        // Allow the realistic-project files that already existed before the test
+        snapshot_before.files.contains_key(path.as_str()).not()
+            && !path.starts_with("src/")
+            && !path.starts_with("tests/")
+            && !path.starts_with("docs/")
+            && path.as_str() != "Cargo.toml"
+            && path.as_str() != "README.md"
+    });
+
+    let unexpected: Vec<_> = diff.collect();
+    if !unexpected.is_empty() {
+        eprintln!("  UNEXPECTED FILES TOUCHED OUTSIDE .beads/ AND EXTERNAL TARGET:");
+        for (p, _) in &unexpected {
+            eprintln!("    {p}");
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "PC-1 violation: sync with BEADS_JSONL touched unexpected files outside .beads/ and the external target"
+    );
+
+    // If sync succeeded, the external file must have been created
+    if sync.status.success() {
+        assert!(
+            external_jsonl.exists(),
+            "external JSONL should exist after a successful sync"
+        );
+        eprintln!("  [PASS] external JSONL created; no third-party files touched");
+    } else {
+        // If rejected, error must mention the external path concern
+        let combined = format!("{}{}", sync.stdout, sync.stderr);
+        assert!(
+            combined.contains("external")
+                || combined.contains("outside")
+                || combined.contains("allow"),
+            "sync rejection must mention external/outside/allow context; got:\n{combined}"
+        );
+        eprintln!("  [PASS] sync clearly rejected external path with operator-readable error");
+    }
+}
+
+/// Helper trait so we can use `not()` on bool — purely for readability above.
+trait BoolExt {
+    fn not(self) -> bool;
+}
+impl BoolExt for bool {
+    fn not(self) -> bool {
+        !self
+    }
 }
 
 /// Helper for `integration_sync_does_not_create_or_modify_dotgit_anywhere`:

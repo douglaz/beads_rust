@@ -33,10 +33,10 @@ fn fresh_workspace() -> (TempDir, PathBuf) {
     (temp, beads)
 }
 
-/// PC-3 + NGI-3: any filename whose path component contains `.git` ANYWHERE
-/// in the .beads/-rooted ancestor chain MUST be rejected. The invariant is
-/// hard — even subdirectories whose names *contain* `.git` as a substring
-/// are not necessarily git, but exact-match `.git` components are.
+// PC-3 + NGI-3: any filename whose path component contains `.git` ANYWHERE
+// in the .beads/-rooted ancestor chain MUST be rejected. The invariant is
+// hard — even subdirectories whose names *contain* `.git` as a substring
+// are not necessarily git, but exact-match `.git` components are.
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 64,

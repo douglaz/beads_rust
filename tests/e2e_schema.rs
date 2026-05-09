@@ -5,9 +5,7 @@
 
 mod common;
 
-#[cfg(feature = "self_update")]
-use common::cli::parse_created_id;
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, parse_created_id, run_br, run_br_with_env};
 use serde_json::Value;
 #[cfg(feature = "self_update")]
 use std::{fs, path::PathBuf};
@@ -323,6 +321,37 @@ fn assert_array_text_contains(detail: &Value, field: &str, needle: &str, context
     );
 }
 
+fn assert_json_command_succeeds<const N: usize>(
+    workspace: &BrWorkspace,
+    args: [&str; N],
+    label: &str,
+) -> Value {
+    let run = run_br(workspace, args, label);
+    assert!(
+        run.status.success(),
+        "{label} JSON command failed: {}",
+        run.stderr
+    );
+    let payload = extract_json_payload(&run.stdout);
+    serde_json::from_str(&payload).expect("valid JSON output")
+}
+
+fn assert_toon_command_succeeds<const N: usize>(
+    workspace: &BrWorkspace,
+    args: [&str; N],
+    label: &str,
+) -> Value {
+    let run = run_br_with_env(workspace, args, [("BR_OUTPUT_FORMAT", "toon")], label);
+    assert!(
+        run.status.success(),
+        "{label} TOON command failed: {}",
+        run.stderr
+    );
+    let toon = run.stdout.trim();
+    assert!(!toon.is_empty(), "{label} TOON output should be non-empty");
+    Value::from(parse_toon(toon, None).expect("valid TOON output"))
+}
+
 type CommandDetailCase = (
     &'static str,
     &'static str,
@@ -483,6 +512,99 @@ fn e2e_capabilities_command_detail_machine_output_contracts_json() {
         .get("command_detail")
         .expect("capabilities output should include command_detail");
     assert_array_text_excludes(detail, "machine_output", "csv", "query save");
+}
+
+#[test]
+fn e2e_capabilities_machine_output_contracts_execute_representative_modes() {
+    let _log =
+        common::test_log("e2e_capabilities_machine_output_contracts_execute_representative_modes");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init", "--prefix", "br"], "cap_runtime_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create_issue = run_br(
+        &workspace,
+        ["create", "Runtime contract issue"],
+        "cap_runtime_create_issue",
+    );
+    assert!(
+        create_issue.status.success(),
+        "create issue failed: {}",
+        create_issue.stderr
+    );
+    let issue_id = parse_created_id(&create_issue.stdout);
+    assert!(!issue_id.is_empty(), "created issue id missing");
+
+    let create_blocker = run_br(
+        &workspace,
+        ["create", "Runtime contract blocker"],
+        "cap_runtime_create_blocker",
+    );
+    assert!(
+        create_blocker.status.success(),
+        "create blocker failed: {}",
+        create_blocker.stderr
+    );
+    let blocker_id = parse_created_id(&create_blocker.stdout);
+    assert!(!blocker_id.is_empty(), "created blocker id missing");
+
+    assert_json_command_succeeds(
+        &workspace,
+        ["--json", "q", "Runtime contract quick issue"],
+        "cap_runtime_q_json",
+    );
+    assert_toon_command_succeeds(
+        &workspace,
+        [
+            "comments",
+            "add",
+            issue_id.as_str(),
+            "--message",
+            "Runtime note",
+        ],
+        "cap_runtime_comments_add_toon",
+    );
+    assert_toon_command_succeeds(
+        &workspace,
+        [
+            "dep",
+            "add",
+            issue_id.as_str(),
+            blocker_id.as_str(),
+            "--type",
+            "blocks",
+        ],
+        "cap_runtime_dep_add_toon",
+    );
+    assert_toon_command_succeeds(
+        &workspace,
+        [
+            "label",
+            "add",
+            issue_id.as_str(),
+            "--label",
+            "runtime-contract",
+        ],
+        "cap_runtime_label_add_toon",
+    );
+    assert_toon_command_succeeds(
+        &workspace,
+        ["query", "save", "open-runtime", "--status", "open"],
+        "cap_runtime_query_save_toon",
+    );
+    assert_toon_command_succeeds(&workspace, ["query", "list"], "cap_runtime_query_list_toon");
+    assert_toon_command_succeeds(
+        &workspace,
+        ["epic", "status"],
+        "cap_runtime_epic_status_toon",
+    );
+    assert_toon_command_succeeds(
+        &workspace,
+        ["count", "--by", "status"],
+        "cap_runtime_count_toon",
+    );
+    assert_toon_command_succeeds(&workspace, ["graph", "--all"], "cap_runtime_graph_toon");
 }
 
 #[test]

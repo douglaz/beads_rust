@@ -22,7 +22,7 @@ use common::cli::{BrWorkspace, run_br};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn visit_dir(dir: &Path, base: &Path, hash_map: &mut BTreeMap<String, String>) {
@@ -1509,4 +1509,279 @@ fn integration_sync_manifest_only_touches_allowed_files() {
         "[PASS] sync --manifest only touched {} allowed files",
         allowed.len()
     );
+}
+
+// ============================================================================
+// beads_rust-yyxo: additional sync-safety regression tests (added 2026-05-09)
+// Per SYNC_SAFETY_INVARIANTS.md PC-1, PC-3, PC-RECOVERY, NGI-3.
+// Each test emits tracing-style eprintln! lines per phase so the test log
+// alone tells the story.
+// ============================================================================
+
+/// PC-1 + PC-RECOVERY: when a stale `.br_recovery/*.bak` exists at workspace
+/// open time (e.g., from a prior sync invocation), a fresh sync export +
+/// import cycle MUST NOT touch the existing recovery artifact (no rewrite,
+/// no delete). Recovery artifacts are an append-only side-effect surface.
+#[test]
+fn integration_sync_after_recovery_artifact_present_does_not_touch_artifacts() {
+    let workspace = BrWorkspace::new();
+    create_realistic_project(&workspace);
+
+    eprintln!("[yyxo TEST] integration_sync_after_recovery_artifact_present_does_not_touch_artifacts");
+    eprintln!("  Phase 1: init + create issues");
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let _ = run_br(
+        &workspace,
+        ["create", "Test issue", "-t", "task", "--no-auto-flush"],
+        "create_test",
+    );
+    let _ = run_br(&workspace, ["sync", "--flush-only"], "initial_flush");
+
+    // Pre-place a fake recovery artifact and capture its hash + mtime
+    eprintln!("  Phase 2: pre-place a stale .br_recovery artifact");
+    let recovery_dir = workspace.root.join(".beads").join(".br_recovery");
+    fs::create_dir_all(&recovery_dir).expect("create recovery dir");
+    let stale_artifact = recovery_dir.join("beads.db.20260101_000000_000000000.bak");
+    let stale_contents = b"STALE_RECOVERY_ARTIFACT_DO_NOT_TOUCH";
+    fs::write(&stale_artifact, stale_contents).expect("write stale artifact");
+    let stale_meta_before = fs::metadata(&stale_artifact).expect("stat stale");
+    let stale_mtime_before = stale_meta_before.modified().expect("mtime stale");
+    eprintln!(
+        "    stale artifact: {} ({} bytes, mtime={:?})",
+        stale_artifact.display(),
+        stale_meta_before.len(),
+        stale_mtime_before
+    );
+
+    // Snapshot before
+    let snapshot_before = FileTreeSnapshot::new(&workspace.root);
+    eprintln!("    files before: {}", snapshot_before.files.len());
+
+    // Run a sync cycle
+    eprintln!("  Phase 3: run sync export + import (should NOT touch the stale artifact)");
+    let _ = run_br(
+        &workspace,
+        ["create", "Another issue", "-t", "task"],
+        "create_2nd",
+    );
+    let _ = run_br(&workspace, ["sync", "--flush-only"], "second_flush");
+    let _ = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force"],
+        "second_import",
+    );
+
+    // Snapshot after
+    let snapshot_after = FileTreeSnapshot::new(&workspace.root);
+    eprintln!("    files after: {}", snapshot_after.files.len());
+
+    // Verify the stale artifact wasn't touched
+    let stale_meta_after = fs::metadata(&stale_artifact).expect("stat stale (post-sync)");
+    let stale_mtime_after = stale_meta_after.modified().expect("mtime stale (post-sync)");
+    let stale_contents_after = fs::read(&stale_artifact).expect("read stale (post-sync)");
+
+    assert_eq!(
+        stale_contents_after, stale_contents,
+        "PC-RECOVERY: pre-existing recovery artifact contents were modified by sync"
+    );
+    assert_eq!(
+        stale_mtime_before, stale_mtime_after,
+        "PC-RECOVERY: pre-existing recovery artifact mtime was changed by sync"
+    );
+
+    // Verify any NEW recovery artifacts created during the cycle have an
+    // expected suffix (so a regression that scattered random files into
+    // recovery_dir would still trip the test).
+    if let Ok(entries) = fs::read_dir(&recovery_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let valid = name.ends_with(".bak")
+                || name.ends_with(".rebuild-failed")
+                || name.ends_with(".truncated-wal");
+            assert!(
+                valid,
+                "PC-RECOVERY: unexpected file in .br_recovery/: {name} (must end in .bak/.rebuild-failed/.truncated-wal)"
+            );
+            eprintln!("    recovery dir entry: {name} (valid suffix)");
+        }
+    }
+
+    eprintln!("  [PASS] stale recovery artifact untouched; new artifacts (if any) have valid suffixes");
+}
+
+/// PC-1 + NGI-3: a full sync cycle MUST NOT create or modify ANY file at
+/// `.beads/.git/*` or any other `.git/*` path under the workspace.
+/// This is a hard invariant; even an accidental traversal would be a
+/// CRITICAL regression. Note: this is in addition to the sync-touches-source
+/// regressions (regression_full_sync_cycle_does_not_touch_git etc.) and
+/// is paranoid by design — checks both `.git/` directories *adjacent* to
+/// `.beads/` AND any `.git/` *under* `.beads/`.
+#[test]
+fn integration_sync_does_not_create_or_modify_dotgit_anywhere() {
+    let workspace = BrWorkspace::new();
+    create_realistic_project(&workspace);
+
+    eprintln!("[yyxo TEST] integration_sync_does_not_create_or_modify_dotgit_anywhere");
+    eprintln!("  Phase 1: init + create + initial sync");
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let _ = run_br(
+        &workspace,
+        ["create", "T1", "-t", "task", "--no-auto-flush"],
+        "create_1",
+    );
+    let _ = run_br(
+        &workspace,
+        ["create", "T2", "-t", "bug", "--no-auto-flush"],
+        "create_2",
+    );
+
+    // Snapshot dotgit state (none expected)
+    let dotgit_paths_before = collect_all_dotgit_paths(&workspace.root);
+    eprintln!(
+        "    dotgit paths before: {} (expected 0)",
+        dotgit_paths_before.len()
+    );
+    assert!(
+        dotgit_paths_before.is_empty(),
+        "test fixture leaked dotgit paths before sync (test setup bug, not a sync regression): {dotgit_paths_before:?}"
+    );
+
+    // Phase 2: Run a multi-step sync cycle
+    eprintln!("  Phase 2: full sync cycle");
+    let _ = run_br(&workspace, ["sync", "--flush-only"], "flush");
+    let _ = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force"],
+        "import_force",
+    );
+    let _ = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--force"],
+        "flush_force",
+    );
+
+    // Phase 3: Verify still no dotgit paths
+    let dotgit_paths_after = collect_all_dotgit_paths(&workspace.root);
+    eprintln!(
+        "    dotgit paths after: {} (expected 0)",
+        dotgit_paths_after.len()
+    );
+
+    assert!(
+        dotgit_paths_after.is_empty(),
+        "PC-1/NGI-3 VIOLATION: sync created dotgit paths: {dotgit_paths_after:?}"
+    );
+
+    eprintln!("  [PASS] no .git/ paths created or modified by sync cycle");
+}
+
+/// PC-1 + PC-3: when a sync invocation is made from a SUBDIRECTORY of the
+/// project (e.g., `cd src/cli && br sync`), the workspace resolution MUST
+/// land on the nearest `.beads/` and not escape via `..` traversal during
+/// canonicalization.
+#[test]
+fn integration_sync_in_subdirectory_only_touches_nearest_beads_dir() {
+    let workspace = BrWorkspace::new();
+    create_realistic_project(&workspace);
+
+    eprintln!("[yyxo TEST] integration_sync_in_subdirectory_only_touches_nearest_beads_dir");
+    eprintln!("  Phase 1: init + create issues");
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let _ = run_br(
+        &workspace,
+        ["create", "Subdir test", "-t", "task", "--no-auto-flush"],
+        "create_subdir",
+    );
+
+    // Phase 2: Snapshot before
+    let snapshot_before = FileTreeSnapshot::new(&workspace.root);
+    eprintln!("    files before: {}", snapshot_before.files.len());
+
+    // Phase 3: Run sync from a subdirectory
+    eprintln!("  Phase 2: sync from subdir (mimics `cd src/cli && br sync`)");
+    let subdir = workspace.root.join("src");
+    if !subdir.exists() {
+        fs::create_dir_all(&subdir).expect("create src/");
+    }
+
+    // Run br sync with cwd=subdir; the binary should auto-discover the
+    // workspace .beads/ via parent-walk
+    let br_path = std::env::var("CARGO_BIN_EXE_br")
+        .or_else(|_| std::env::var("BR_BIN").map(|b| b.trim().to_string()))
+        .unwrap_or_else(|_| "br".to_string());
+    let output = std::process::Command::new(&br_path)
+        .args(["sync", "--flush-only"])
+        .current_dir(&subdir)
+        .env("RUST_LOG", "info")
+        .env("RCH_DISABLED", "1")
+        .output()
+        .expect("spawn br sync from subdir");
+    eprintln!(
+        "    sync exit: {} stderr_len: {}",
+        output.status,
+        output.stderr.len()
+    );
+    assert!(
+        output.status.success() || output.status.code() == Some(2),
+        "sync from subdir should either succeed or surface a clear workspace-discovery error; got status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Phase 4: Snapshot after; verify only the workspace .beads/ was touched
+    let snapshot_after = FileTreeSnapshot::new(&workspace.root);
+    let diff = snapshot_before.diff(&snapshot_after);
+    let (violations, allowed) = diff.check_allowed_changes();
+    eprintln!(
+        "    diff: {} allowed, {} violations",
+        allowed.len(),
+        violations.len()
+    );
+    assert!(
+        violations.is_empty(),
+        "PC-1: sync from subdir touched files outside the nearest .beads/: {:?}",
+        violations
+            .iter()
+            .map(|c| c.format_detail())
+            .collect::<Vec<_>>()
+    );
+
+    eprintln!("  [PASS] sync from subdirectory only touched nearest .beads/");
+}
+
+/// Helper for `integration_sync_does_not_create_or_modify_dotgit_anywhere`:
+/// recursively collects every `.git`-named entry under the given root.
+fn collect_all_dotgit_paths(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == ".git" {
+                out.push(entry.path());
+                continue; // don't descend into dotgit (defensive)
+            }
+            // Skip the test's own logs dir
+            if name == "logs" {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
 }

@@ -1,11 +1,14 @@
 //! Comments command implementation.
 
 use super::{
-    auto_import_storage_ctx_if_stale, resolve_issue_id, retry_mutation_with_jsonl_recovery,
+    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
+    auto_import_storage_ctx_if_stale, cli_for_routed_workspace, report_auto_flush_failure,
+    resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{CommentAddArgs, CommentCommands, CommentsArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
 use crate::model::Comment;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
@@ -45,13 +48,57 @@ pub fn execute(
     }
 }
 
+/// Execute local read-only comments commands using storage already opened by the caller.
+///
+/// Returns `Ok(false)` when the command must use the normal routed or mutating path.
+///
+/// # Errors
+///
+/// Returns an error if route resolution, config loading, ID resolution, or comment lookup fails.
+pub fn execute_with_storage_ctx(
+    args: &CommentsArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    match &args.command {
+        Some(CommentCommands::Add(_)) => Ok(false),
+        Some(CommentCommands::List(list_args)) => execute_list_with_storage_ctx(
+            &list_args.id,
+            json,
+            cli,
+            ctx,
+            local_beads_dir,
+            list_args.wrap,
+            storage_ctx,
+        ),
+        None => {
+            let id = args
+                .id
+                .as_deref()
+                .ok_or_else(|| BeadsError::validation("id", "missing issue id"))?;
+            execute_list_with_storage_ctx(
+                id,
+                json,
+                cli,
+                ctx,
+                local_beads_dir,
+                args.wrap,
+                storage_ctx,
+            )
+        }
+    }
+}
+
 fn execute_add(
     args: &CommentAddArgs,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
     beads_dir: &Path,
 ) -> Result<()> {
-    let (mut storage_ctx, route_cli, auto_flush_external) =
+    let (mut storage_ctx, route_cli, auto_flush_external, _routed_write_lock) =
         open_routed_storage_for_input(beads_dir, cli, &args.id)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
@@ -69,10 +116,11 @@ fn execute_add(
     )?;
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
     crate::util::set_last_touched_id(beads_dir, &issue_id);
@@ -88,7 +136,7 @@ fn execute_add(
     } else if ctx.is_rich() {
         render_comment_added_rich(&issue_id, &comment, ctx);
     } else {
-        println!("Comment added to {issue_id}");
+        println!("{}", comment_added_message(&issue_id));
     }
 
     Ok(())
@@ -102,7 +150,8 @@ fn execute_list(
     beads_dir: &Path,
     wrap: bool,
 ) -> Result<()> {
-    let (storage_ctx, route_cli, _) = open_routed_storage_for_input(beads_dir, cli, issue_input)?;
+    let (storage_ctx, route_cli, _, _routed_write_lock) =
+        open_routed_storage_for_input(beads_dir, cli, issue_input)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
@@ -117,19 +166,56 @@ fn execute_list(
     )
 }
 
+fn execute_list_with_storage_ctx(
+    issue_input: &str,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+    wrap: bool,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+    if route.is_external {
+        return Ok(false);
+    }
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+
+    list_comments_by_id(
+        issue_input,
+        &storage_ctx.storage,
+        &resolver,
+        json,
+        ctx,
+        wrap,
+    )?;
+    Ok(true)
+}
+
 fn open_routed_storage_for_input(
     local_beads_dir: &Path,
     cli: &config::CliOverrides,
     issue_input: &str,
-) -> Result<(config::OpenStorageResult, config::CliOverrides, bool)> {
+) -> Result<(
+    config::OpenStorageResult,
+    config::CliOverrides,
+    bool,
+    RoutedWorkspaceWriteLock,
+)> {
     let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-    let mut route_cli = cli.clone();
-    if route.is_external {
-        route_cli.db = None;
-    }
+    let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
+    let routed_write_lock = acquire_routed_workspace_write_lock(
+        &route.beads_dir,
+        route.is_external,
+        route_cli.lock_timeout,
+    )?;
+    routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
     let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
-    Ok((storage_ctx, route_cli, route.is_external))
+    Ok((storage_ctx, route_cli, route.is_external, routed_write_lock))
 }
 
 fn prepare_comment_add(
@@ -181,15 +267,22 @@ fn list_comments_by_id(
     }
 
     if comments.is_empty() {
-        println!("No comments for {issue_id}.");
+        println!("{}", no_comments_message(&issue_id));
         return Ok(());
     }
 
-    println!("Comments for {issue_id}:");
+    println!("{}", comments_header(&issue_id));
     for comment in comments {
         let timestamp = comment.created_at.format("%Y-%m-%d %H:%M UTC");
-        println!("[{}] at {}", comment.author, timestamp);
-        println!("{}", comment.body.trim_end_matches('\n'));
+        println!(
+            "[{}] at {}",
+            sanitize_terminal_inline(&comment.author),
+            timestamp
+        );
+        println!(
+            "{}",
+            sanitize_terminal_text(comment.body.trim_end_matches('\n'))
+        );
         println!();
     }
 
@@ -210,10 +303,7 @@ fn render_comments_list_rich(
     if comments.is_empty() {
         let mut text = Text::new("");
         text.append_styled("\u{1f4ad} ", theme.dimmed.clone());
-        text.append_styled(
-            &format!("No comments for {issue_id}."),
-            theme.dimmed.clone(),
-        );
+        text.append_styled(&no_comments_message(issue_id), theme.dimmed.clone());
         console.print_renderable(&text);
         return;
     }
@@ -232,7 +322,10 @@ fn render_comments_list_rich(
         }
 
         // Author and timestamp
-        content.append_styled(&format!("@{}", comment.author), theme.username.clone());
+        content.append_styled(
+            &format!("@{}", sanitize_terminal_inline(&comment.author)),
+            theme.username.clone(),
+        );
         content.append_styled(" \u{2022} ", theme.dimmed.clone());
         content.append_styled(
             &format_relative_time(comment.created_at, now),
@@ -241,11 +334,11 @@ fn render_comments_list_rich(
         content.append("\n");
 
         // Comment body
-        content.append(comment.body.trim_end_matches('\n'));
+        content.append(sanitize_terminal_text(comment.body.trim_end_matches('\n')).as_ref());
         content.append("\n\n");
     }
 
-    let title = format!("Comments: {} ({})", issue_id, comments.len());
+    let title = comments_panel_title(issue_id, comments.len());
     let content = if wrap {
         wrap_rich_text(&content, width)
     } else {
@@ -279,18 +372,40 @@ fn render_comment_added_rich(issue_id: &str, comment: &Comment, ctx: &OutputCont
     let mut text = Text::new("");
     text.append_styled("\u{2713} ", theme.success.clone());
     text.append_styled("Added comment to ", theme.success.clone());
-    text.append_styled(issue_id, theme.issue_id.clone());
+    text.append_styled(
+        sanitize_terminal_inline(issue_id).as_ref(),
+        theme.issue_id.clone(),
+    );
     console.print_renderable(&text);
 
     console.print("");
 
     // Show the comment that was added
     let mut comment_text = Text::new("");
-    comment_text.append_styled(&format!("@{}", comment.author), theme.username.clone());
+    comment_text.append_styled(
+        &format!("@{}", sanitize_terminal_inline(&comment.author)),
+        theme.username.clone(),
+    );
     comment_text.append_styled(" \u{2022} just now", theme.timestamp.clone());
     comment_text.append("\n");
-    comment_text.append(comment.body.trim_end_matches('\n'));
+    comment_text.append(sanitize_terminal_text(comment.body.trim_end_matches('\n')).as_ref());
     console.print_renderable(&comment_text);
+}
+
+fn comment_added_message(issue_id: &str) -> String {
+    format!("Comment added to {}", sanitize_terminal_inline(issue_id))
+}
+
+fn comments_header(issue_id: &str) -> String {
+    format!("Comments for {}:", sanitize_terminal_inline(issue_id))
+}
+
+fn no_comments_message(issue_id: &str) -> String {
+    format!("No comments for {}.", sanitize_terminal_inline(issue_id))
+}
+
+fn comments_panel_title(issue_id: &str, count: usize) -> String {
+    format!("Comments: {} ({count})", sanitize_terminal_inline(issue_id))
 }
 
 const MAX_STDIN_COMMENT_BYTES: usize = 10 * 1024 * 1024;
@@ -300,15 +415,17 @@ fn read_limited_string<R: Read>(reader: &mut R, byte_limit: usize, field: &str) 
         .checked_add(1)
         .and_then(|limit| u64::try_from(limit).ok())
         .unwrap_or(u64::MAX);
-    let mut buffer = String::new();
-    reader.take(max_bytes).read_to_string(&mut buffer)?;
+    let mut buffer = Vec::new();
+    reader.take(max_bytes).read_to_end(&mut buffer)?;
     if buffer.len() > byte_limit {
         return Err(BeadsError::validation(
             field,
-            format!("stdin input exceeds maximum size of {byte_limit} bytes"),
+            format!("{field} input exceeds maximum size of {byte_limit} bytes"),
         ));
     }
-    Ok(buffer)
+    String::from_utf8(buffer).map_err(|err| {
+        BeadsError::validation(field, format!("{field} input must be valid UTF-8: {err}"))
+    })
 }
 
 fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
@@ -317,17 +434,8 @@ fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
             let mut stdin = std::io::stdin();
             return read_limited_string(&mut stdin, MAX_STDIN_COMMENT_BYTES, "text");
         }
-        let metadata = fs::metadata(path)?;
-        if metadata.len() > MAX_STDIN_COMMENT_BYTES as u64 {
-            return Err(BeadsError::validation(
-                "file",
-                format!(
-                    "file exceeds maximum comment size of {} bytes",
-                    MAX_STDIN_COMMENT_BYTES
-                ),
-            ));
-        }
-        return Ok(fs::read_to_string(path)?);
+        let mut file = fs::File::open(path)?;
+        return read_limited_string(&mut file, MAX_STDIN_COMMENT_BYTES, "file");
     }
     if let Some(message) = &args.message {
         return Ok(message.clone());
@@ -493,6 +601,27 @@ mod tests {
     }
 
     #[test]
+    fn test_read_comment_text_rejects_oversized_file() {
+        init_test_logging();
+        info!("test_read_comment_text_rejects_oversized_file: starting");
+        let mut file = NamedTempFile::new().unwrap();
+        let payload = vec![b'a'; MAX_STDIN_COMMENT_BYTES + 1];
+        file.write_all(&payload).unwrap();
+        file.flush().unwrap();
+
+        let args = CommentAddArgs {
+            id: "test-id".to_string(),
+            text: vec![],
+            file: Some(file.path().to_path_buf()),
+            author: None,
+            message: None,
+        };
+        let err = read_comment_text(&args).expect_err("oversized file");
+        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "file"));
+        info!("test_read_comment_text_rejects_oversized_file: assertions passed");
+    }
+
+    #[test]
     fn test_read_comment_text_file_takes_precedence() {
         init_test_logging();
         info!("test_read_comment_text_file_takes_precedence: starting");
@@ -549,5 +678,58 @@ mod tests {
         let err = read_limited_string(&mut reader, 32, "text").expect_err("oversized stdin");
         assert!(matches!(err, BeadsError::Validation { .. }));
         info!("test_read_limited_string_rejects_oversized_input: assertions passed");
+    }
+
+    #[test]
+    fn test_read_limited_string_checks_size_before_utf8_decode() {
+        init_test_logging();
+        info!("test_read_limited_string_checks_size_before_utf8_decode: starting");
+        let payload = "aaaaé";
+        let mut reader = payload.as_bytes();
+        let err = read_limited_string(&mut reader, 4, "text")
+            .expect_err("oversized input should be reported before UTF-8 decoding");
+        assert!(
+            matches!(&err, BeadsError::Validation { field, reason }
+                if field == "text" && reason.contains("exceeds maximum size")),
+            "unexpected error: {err:?}"
+        );
+        info!("test_read_limited_string_checks_size_before_utf8_decode: assertions passed");
+    }
+
+    #[test]
+    fn test_read_limited_string_rejects_invalid_utf8() {
+        init_test_logging();
+        info!("test_read_limited_string_rejects_invalid_utf8: starting");
+        let payload = [0xff];
+        let mut reader = payload.as_slice();
+        let err = read_limited_string(&mut reader, 4, "text")
+            .expect_err("invalid UTF-8 input should be rejected");
+        assert!(
+            matches!(&err, BeadsError::Validation { field, reason }
+                if field == "text" && reason.contains("valid UTF-8")),
+            "unexpected error: {err:?}"
+        );
+        info!("test_read_limited_string_rejects_invalid_utf8: assertions passed");
+    }
+
+    #[test]
+    fn comment_human_messages_sanitize_issue_id() {
+        init_test_logging();
+        info!("comment_human_messages_sanitize_issue_id: starting");
+        let issue_id = "bd-1\x1b]52;c;bad\x07\rreset";
+
+        let rendered = [
+            comment_added_message(issue_id),
+            comments_header(issue_id),
+            no_comments_message(issue_id),
+            comments_panel_title(issue_id, 2),
+        ]
+        .join("\n");
+
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\x07'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.contains("bd-1\\u{1b}]52;c;bad\\u{7}\\rreset"));
+        info!("comment_human_messages_sanitize_issue_id: assertions passed");
     }
 }

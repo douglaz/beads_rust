@@ -14,14 +14,14 @@
 //!
 //! ```ignore
 //! use beads_rust::format::markdown::render_markdown;
-//! use beads_rust::format::OutputContext;
+//! use beads_rust::output::OutputContext;
 //!
 //! let content = "# Heading\n\nThis is **bold** and *italic*.";
 //! let ctx = OutputContext::detect();
 //! let rendered = render_markdown(content, &ctx);
 //! ```
 
-use crate::format::context::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode};
 use rich_rust::color::ColorSystem;
 use rich_rust::renderables::markdown::Markdown;
 
@@ -51,7 +51,7 @@ use rich_rust::renderables::markdown::Markdown;
 pub fn render_markdown(content: &str, ctx: &OutputContext) -> String {
     match ctx.mode() {
         OutputMode::Quiet => String::new(),
-        OutputMode::Json => content.to_string(),
+        OutputMode::Json | OutputMode::Toon => content.to_string(),
         OutputMode::Plain => strip_markdown(content),
         OutputMode::Rich => render_rich_markdown(content, ctx.width()),
     }
@@ -383,26 +383,14 @@ pub fn escape_markdown(content: &str) -> String {
 mod tests {
     use super::*;
 
-    fn plain_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Plain)
-    }
-
-    fn json_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Json)
-    }
-
-    fn quiet_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Quiet)
-    }
-
-    fn rich_ctx() -> OutputContext {
-        OutputContext::with_mode(OutputMode::Rich)
+    fn ctx(mode: OutputMode) -> OutputContext {
+        OutputContext::with_mode(mode)
     }
 
     #[test]
     fn test_render_markdown_plain_strips_formatting() {
         let content = "# Heading\n\nThis is **bold** and *italic*.";
-        let result = render_markdown(content, &plain_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Plain));
         assert!(result.contains("Heading"));
         assert!(result.contains("bold"));
         assert!(result.contains("italic"));
@@ -413,21 +401,28 @@ mod tests {
     #[test]
     fn test_render_markdown_json_unchanged() {
         let content = "# Heading\n\n**bold** text";
-        let result = render_markdown(content, &json_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Json));
         assert_eq!(result, content);
     }
 
     #[test]
     fn test_render_markdown_quiet_empty() {
         let content = "# Heading\n\nSome content";
-        let result = render_markdown(content, &quiet_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Quiet));
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_render_markdown_toon_unchanged() {
+        let content = "# Heading\n\n**bold** text";
+        let result = render_markdown(content, &ctx(OutputMode::Toon));
+        assert_eq!(result, content);
     }
 
     #[test]
     fn test_render_markdown_rich_contains_content() {
         let content = "# Heading\n\nThis is **bold** text.";
-        let result = render_markdown(content, &rich_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Rich));
         assert!(result.contains("Heading"));
         assert!(result.contains("bold"));
         assert!(result.contains("text"));
@@ -543,7 +538,7 @@ mod tests {
     #[test]
     fn test_render_markdown_multiline() {
         let content = "# Title\n\nParagraph one.\n\nParagraph two.";
-        let result = render_markdown(content, &plain_ctx());
+        let result = render_markdown(content, &ctx(OutputMode::Plain));
         assert!(result.contains("Title"));
         assert!(result.contains("Paragraph one"));
         assert!(result.contains("Paragraph two"));

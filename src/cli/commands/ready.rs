@@ -3,16 +3,18 @@
 //! Shows issues ready to work on next: open, unblocked, not deferred, not pinned,
 //! not ephemeral.
 
-use super::resolve_issue_id;
+use super::{auto_import_external_projects_if_stale, resolve_issue_id};
 use crate::cli::{
     OutputFormat, ReadyArgs, SortPolicy, resolve_output_format_basic_with_outer_mode,
 };
 use crate::config;
 use crate::error::Result;
-use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_title};
+use crate::format::{
+    ReadyIssue, format_priority_badge, format_type_badge, terminal_width, truncate_title,
+};
 use crate::model::{IssueType, Priority};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
-use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -145,35 +147,29 @@ fn execute_inner(
 
     info!("Fetching ready issues");
 
-    // Optimization: if there are no external dependencies, we can apply the limit
-    // directly in the SQL query to avoid loading all candidate issues into memory.
-    let has_external = storage.has_external_dependencies(true)?;
-    let external_db_paths = if has_external {
-        Some(config::external_project_db_paths(
-            &load_config_layer()?,
-            beads_dir,
-        ))
-    } else {
-        None
-    };
     let mut filters = filters;
-    if !has_external && args.limit > 0 {
+    if args.limit > 0 {
         filters.limit = Some(args.limit);
     }
 
     debug!(filters = ?filters, sort = ?sort_policy, "Applied ready filters");
 
-    // Get ready issues from storage (blocked cache only) while avoiding
-    // heavyweight issue columns that never reach ready output.
-    let mut ready_issues = storage.get_ready_issues_for_command_output(&filters, sort_policy)?;
+    let mut ready_issues =
+        get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
 
-    if has_external {
-        let external_statuses = storage.resolve_external_dependency_statuses(
-            external_db_paths
-                .as_ref()
-                .expect("external dependency paths should be loaded"),
-            true,
-        )?;
+    if !ready_issues.is_empty() && storage.has_external_dependencies(true)? {
+        if args.limit > 0 {
+            // External filtering can remove early rows, so reload all local
+            // candidates before applying the final user-visible limit.
+            filters.limit = None;
+            ready_issues =
+                get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
+        }
+        let config_layer = load_config_layer()?;
+        auto_import_external_projects_if_stale(&config_layer, beads_dir, cli);
+        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
+        let external_statuses =
+            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
         let external_blockers = storage.external_blockers(&external_statuses)?;
         if !external_blockers.is_empty() {
             ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
@@ -195,9 +191,7 @@ fn execute_inner(
     }
     match output_format {
         OutputFormat::Json => {
-            let ready_output: Vec<ReadyIssue> =
-                ready_issues.into_iter().map(ReadyIssue::from).collect();
-            early_ctx.json_pretty(&ready_output);
+            early_ctx.json_array(ready_issues.into_iter().map(ReadyIssue::from));
         }
         OutputFormat::Toon => {
             let ready_output: Vec<ReadyIssue> =
@@ -256,18 +250,28 @@ fn execute_inner(
 }
 
 fn empty_ready_message(storage: &SqliteStorage) -> Result<&'static str> {
-    let has_non_closed_issues = !storage
-        .list_issues(&ListFilters {
-            include_deferred: true,
-            limit: Some(1),
-            ..Default::default()
-        })?
-        .is_empty();
+    let has_non_closed_issues = storage.has_active_issues()?;
     Ok(if has_non_closed_issues {
         "✨ No ready issues — all remaining work is blocked, deferred, or in progress"
     } else {
         "✨ All work complete — no issues to work on"
     })
+}
+
+fn get_ready_issues_for_output(
+    storage: &SqliteStorage,
+    filters: &ReadyFilters,
+    sort_policy: ReadySortPolicy,
+    output_format: OutputFormat,
+) -> Result<Vec<crate::model::Issue>> {
+    match output_format {
+        OutputFormat::Text | OutputFormat::Csv => {
+            storage.get_ready_summary_issues_for_command_output(filters, sort_policy)
+        }
+        OutputFormat::Json | OutputFormat::Toon => {
+            storage.get_ready_issues_for_command_output(filters, sort_policy)
+        }
+    }
 }
 
 fn format_ready_line(
@@ -279,16 +283,16 @@ fn format_ready_line(
 ) -> String {
     // Match bd format: {index}. [● P{n}] [{type}] {id}: {title}
     let priority_badge_plain = format!("[● {}]", crate::format::format_priority(&issue.priority));
-    let type_badge_plain = format!("[{}]", issue.issue_type.as_str());
+    let type_badge_plain = format_type_badge(&issue.issue_type);
     let prefix_plain = format!(
         "{index}. {priority_badge_plain} {type_badge_plain} {}: ",
         issue.id
     );
     let title = if wrap {
-        issue.title.clone()
+        crate::format::sanitize_terminal_inline(&issue.title).into_owned()
     } else {
         max_width.map_or_else(
-            || issue.title.clone(),
+            || crate::format::sanitize_terminal_inline(&issue.title).into_owned(),
             |width| {
                 let max_title = width.saturating_sub(UnicodeWidthStr::width(prefix_plain.as_str()));
                 truncate_title(&issue.title, max_title)

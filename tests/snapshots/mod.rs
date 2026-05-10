@@ -53,8 +53,9 @@ static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static DATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex"));
-static VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\((main|master|HEAD)@[a-f0-9]+\)").expect("version regex"));
+static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\((?:HEAD|[A-Za-z0-9._/-]+)@[a-f0-9]+\)").expect("version regex")
+});
 /// The build profile label embedded in `br --version` output, e.g., `(dev)`
 /// or `(release)`.  Snapshot tests may run under either profile depending on
 /// `cargo test` vs `cargo test --release`, so mask to a stable placeholder.
@@ -83,7 +84,8 @@ static HOME_PATH_RE: LazyLock<Regex> =
 static USERS_PATH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/Users/[a-zA-Z0-9_-]+").expect("users path regex"));
 static TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/tmp/\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+").expect("tmp path regex")
+    Regex::new(r"(?:/data)?/tmp/[A-Za-z0-9_-]*/?\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+")
+        .expect("tmp path regex")
 });
 /// Compact timestamp format used in backup filenames: `YYYYMMDD_HHMMSS_nano`.
 /// Produced by `sync::history` when writing rotation backups; differs run-to-run
@@ -664,8 +666,12 @@ pub fn normalize_jsonl(contents: &str) -> String {
 
 mod cli_output;
 mod error_messages;
+mod history_diff_output;
 mod json_output;
 mod jsonl_format;
+mod robot_output;
+mod schema_output;
+mod toon_output;
 
 // ============================================================================
 // Tests for Golden Text Snapshot System

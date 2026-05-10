@@ -35,7 +35,10 @@
 //! }
 //! ```
 
-use crate::format::text::{format_priority, format_status_icon, truncate_title};
+use crate::format::text::{
+    format_priority, format_status_icon, format_status_label, format_type_label,
+    sanitize_terminal_inline, sanitize_terminal_text, truncate_title,
+};
 use crate::model::{Issue, Status};
 use crate::output::Theme;
 use rich_rust::prelude::*;
@@ -93,9 +96,10 @@ impl<'a> RichIssueTable<'a> {
         for issue in self.issues {
             let status_icon = format_status_icon(&issue.status);
             let priority = format_priority(&issue.priority);
-            let title = self
-                .max_title_width
-                .map_or_else(|| issue.title.clone(), |w| truncate_title(&issue.title, w));
+            let title = self.max_title_width.map_or_else(
+                || sanitize_terminal_inline(&issue.title).into_owned(),
+                |w| truncate_title(&issue.title, w),
+            );
 
             let mut cells = Vec::new();
 
@@ -104,7 +108,10 @@ impl<'a> RichIssueTable<'a> {
             cells.push(Cell::new(status_icon).style(status_style.clone()));
 
             // Issue ID
-            cells.push(Cell::new(&*issue.id).style(self.theme.issue_id.clone()));
+            cells.push(
+                Cell::new(sanitize_terminal_inline(&issue.id).into_owned())
+                    .style(self.theme.issue_id.clone()),
+            );
 
             // Priority with color
             let priority_style = self.theme.priority_style(issue.priority);
@@ -112,13 +119,13 @@ impl<'a> RichIssueTable<'a> {
 
             // Type (if showing)
             if self.show_type {
-                let type_str = issue.issue_type.as_str();
+                let type_str = format_type_label(&issue.issue_type);
                 let type_style = self.theme.type_style(&issue.issue_type);
                 cells.push(Cell::new(type_str).style(type_style.clone()));
             }
 
             // Title
-            cells.push(Cell::new(title));
+            cells.push(Cell::new(sanitize_terminal_inline(&title).into_owned()));
 
             table = table.with_row(Row::new(cells));
         }
@@ -159,12 +166,16 @@ impl<'a> RichIssuePanel<'a> {
 
         // Header line: status icon + title
         let status_icon = format_status_icon(&self.issue.status);
-        content.push_str(&format!("{} {}\n", status_icon, self.issue.title));
+        content.push_str(&format!(
+            "{} {}\n",
+            status_icon,
+            sanitize_terminal_inline(&self.issue.title)
+        ));
 
         // Metadata line
         let priority = format_priority(&self.issue.priority);
-        let type_str = self.issue.issue_type.as_str();
-        let status_str = self.issue.status.as_str();
+        let type_str = format_type_label(&self.issue.issue_type);
+        let status_str = format_status_label(&self.issue.status, false);
         content.push_str(&format!("[{priority}] [{type_str}] {status_str}\n"));
 
         // Description if present and enabled
@@ -172,7 +183,7 @@ impl<'a> RichIssuePanel<'a> {
             && let Some(desc) = &self.issue.description
         {
             content.push('\n');
-            content.push_str(desc);
+            content.push_str(&sanitize_terminal_text(desc));
         }
 
         let status_style = self.theme.status_style(&self.issue.status);
@@ -184,7 +195,7 @@ impl<'a> RichIssuePanel<'a> {
             .collect();
 
         Panel::new(content_lines)
-            .title(self.issue.id.clone())
+            .title(sanitize_terminal_inline(&self.issue.id).into_owned())
             .border_style(status_style)
     }
 }
@@ -194,7 +205,6 @@ pub struct RichDependencyTree<'a> {
     root_issue: &'a Issue,
     dependencies: &'a [(String, String)], // (from_id, to_id)
     issues_by_id: &'a std::collections::HashMap<String, &'a Issue>,
-    #[allow(dead_code)] // Reserved for future styling
     theme: &'a Theme,
 }
 
@@ -218,34 +228,50 @@ impl<'a> RichDependencyTree<'a> {
     /// Build a rich_rust Tree from the dependencies.
     #[must_use]
     pub fn build_tree(&self) -> Tree {
-        let root_label = format!(
-            "{} {} - {}",
-            format_status_icon(&self.root_issue.status),
-            self.root_issue.id,
-            truncate_title(&self.root_issue.title, 40)
-        );
-
-        let mut root = TreeNode::new(root_label);
+        let mut root = TreeNode::new(self.issue_label(self.root_issue, 40));
 
         // Find direct dependencies of root
         for (from_id, to_id) in self.dependencies {
             if from_id == &self.root_issue.id {
                 if let Some(dep_issue) = self.issues_by_id.get(to_id) {
-                    let dep_label = format!(
-                        "{} {} - {}",
-                        format_status_icon(&dep_issue.status),
-                        dep_issue.id,
-                        truncate_title(&dep_issue.title, 35)
-                    );
-                    root = root.child(TreeNode::new(dep_label));
+                    root = root.child(TreeNode::new(self.issue_label(dep_issue, 35)));
                 } else {
-                    let dep_label = format!("? {} - (unknown)", to_id);
-                    root = root.child(TreeNode::new(dep_label));
+                    root = root.child(TreeNode::new(self.unknown_issue_label(to_id)));
                 }
             }
         }
 
-        Tree::new(root)
+        Tree::new(root).guide_style(self.theme.dimmed.clone())
+    }
+
+    fn issue_label(&self, issue: &Issue, title_width: usize) -> Text {
+        let status_icon = format_status_icon(&issue.status);
+        let title = truncate_title(&issue.title, title_width);
+        let mut label = Text::new("");
+        label.append_styled(status_icon, self.theme.status_style(&issue.status));
+        label.append(" ");
+        label.append_styled(
+            sanitize_terminal_inline(&issue.id).as_ref(),
+            self.theme.issue_id.clone(),
+        );
+        label.append_styled(" - ", self.theme.dimmed.clone());
+        label.append_styled(
+            sanitize_terminal_inline(&title).as_ref(),
+            self.theme.issue_title.clone(),
+        );
+        label
+    }
+
+    fn unknown_issue_label(&self, issue_id: &str) -> Text {
+        let mut label = Text::new("");
+        label.append_styled("?", self.theme.warning.clone());
+        label.append(" ");
+        label.append_styled(
+            sanitize_terminal_inline(issue_id).as_ref(),
+            self.theme.issue_id.clone(),
+        );
+        label.append_styled(" - (unknown)", self.theme.dimmed.clone());
+        label
     }
 }
 
@@ -253,7 +279,7 @@ impl<'a> RichDependencyTree<'a> {
 #[must_use]
 pub fn format_status_badge(status: &Status, theme: &Theme) -> Text {
     let icon = format_status_icon(status);
-    let label = status.as_str().to_uppercase();
+    let label = format_status_label(status, false).to_uppercase();
     let style = theme.status_style(status);
 
     let mut text = Text::new("");
@@ -376,7 +402,13 @@ mod tests {
         ];
         let theme = Theme::default();
         let table = RichIssueTable::new(&issues, &theme);
-        let _ = table.build_table();
+        let rendered = table.build_table().render_plain(120);
+
+        assert!(rendered.contains("test-1"));
+        assert!(rendered.contains("First issue"));
+        assert!(rendered.contains("test-2"));
+        assert!(rendered.contains("Second issue"));
+        assert!(rendered.contains("task"));
     }
 
     #[test]
@@ -384,26 +416,97 @@ mod tests {
         let issue = make_test_issue("test-1", "Test issue");
         let theme = Theme::default();
         let panel = RichIssuePanel::new(&issue, &theme);
-        let _ = panel.build_panel();
+        let rendered = panel.build_panel().render_plain(80);
+
+        assert!(rendered.contains("test-1"));
+        assert!(rendered.contains("Test issue"));
+        assert!(rendered.contains("Test description"));
+        assert!(rendered.contains("task"));
+        assert!(rendered.contains("open"));
+    }
+
+    #[test]
+    fn rich_table_and_panel_sanitize_custom_status_and_type() {
+        let mut issue = make_test_issue("test-1", "Test issue");
+        issue.id = "test-1\x1b]52;c;bad\x07".to_string();
+        issue.status = Status::Custom("state\x1b[2J".to_string());
+        issue.issue_type = IssueType::Custom("kind\x07bell".to_string());
+        let theme = Theme::default();
+
+        let table = RichIssueTable::new(std::slice::from_ref(&issue), &theme);
+        let table_output = table.build_table().render_plain(120);
+        let panel_output = RichIssuePanel::new(&issue, &theme)
+            .build_panel()
+            .render_plain(80);
+
+        for rendered in [table_output, panel_output] {
+            assert!(!rendered.contains('\x1b'));
+            assert!(!rendered.contains('\x07'));
+            assert!(rendered.contains("\\u{1b}]52;c;bad\\u{7}"));
+            assert!(rendered.contains("\\u{7}bell"));
+        }
+    }
+
+    #[test]
+    fn test_rich_dependency_tree_uses_theme_styles() {
+        let root_issue = make_test_issue("test-root", "Root issue");
+        let dep_issue = make_test_issue("test-child", "Child issue");
+        let dependencies = vec![
+            (root_issue.id.clone(), dep_issue.id.clone()),
+            (root_issue.id.clone(), "test-missing".to_string()),
+        ];
+        let issues_by_id = std::collections::HashMap::from([(dep_issue.id.clone(), &dep_issue)]);
+        let theme = Theme::default();
+        let tree =
+            RichDependencyTree::new(&root_issue, &dependencies, &issues_by_id, &theme).build_tree();
+
+        assert_eq!(
+            tree.render_plain(),
+            "○ test-root - Root issue\n├── ○ test-child - Child issue\n└── ? test-missing - (unknown)\n"
+        );
+
+        let segments = tree.render();
+        assert!(segments.iter().any(|segment| {
+            segment.text.as_ref() == "test-root" && segment.style == Some(theme.issue_id.clone())
+        }));
+        assert!(segments.iter().any(|segment| {
+            segment.text.as_ref() == "Root issue"
+                && segment.style == Some(theme.issue_title.clone())
+        }));
+        assert!(segments.iter().any(|segment| {
+            segment.text.as_ref() == "?" && segment.style == Some(theme.warning.clone())
+        }));
     }
 
     #[test]
     fn test_format_status_badge() {
         let theme = Theme::default();
-        let _ = format_status_badge(&Status::Open, &theme);
-        let _ = format_status_badge(&Status::Blocked, &theme);
+        let open = format_status_badge(&Status::Open, &theme);
+        let blocked = format_status_badge(&Status::Blocked, &theme);
+
+        assert!(open.plain().contains("OPEN"));
+        assert!(!open.spans().is_empty());
+        assert!(blocked.plain().contains("BLOCKED"));
+        assert!(!blocked.spans().is_empty());
     }
 
     #[test]
     fn test_format_count_badges() {
         let theme = Theme::default();
-        let _ = format_count_badges(5, 2, 1, 3, &theme);
+        let badges = format_count_badges(5, 2, 1, 3, &theme);
+
+        assert_eq!(badges.plain(), "5 open 2 in progress 1 blocked 3 closed");
+        assert_eq!(badges.spans().len(), 4);
     }
 
     #[test]
     fn test_build_completion_bar() {
         let theme = Theme::default();
-        let _ = build_completion_bar(7, 10, &theme);
+        let bar = build_completion_bar(7, 10, &theme);
+
+        assert!((bar.progress() - 0.7).abs() < f64::EPSILON);
+        assert!(!bar.is_finished());
+        assert!(!bar.render_plain(20).is_empty());
     }
 
     #[test]
@@ -411,7 +514,11 @@ mod tests {
         let issues = vec![make_test_issue("test-1", "Issue")];
         let theme = Theme::default();
         let table = RichIssueTable::new(&issues, &theme).show_type(false);
-        let _ = table.build_table();
+        let rendered = table.build_table().render_plain(80);
+
+        assert!(rendered.contains("test-1"));
+        assert!(rendered.contains("Issue"));
+        assert!(!rendered.contains("Type"));
     }
 
     #[test]
@@ -422,6 +529,10 @@ mod tests {
         )];
         let theme = Theme::default();
         let table = RichIssueTable::new(&issues, &theme).max_title_width(20);
-        let _ = table.build_table();
+        let rendered = table.build_table().render_plain(80);
+
+        assert!(rendered.contains("test-1"));
+        assert!(rendered.contains("A very long title..."));
+        assert!(!rendered.contains("A very long title that should be truncated"));
     }
 }

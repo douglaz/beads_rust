@@ -36,29 +36,48 @@ fn fixture_workspace(name: &str) -> FixtureWorkspace {
 
 fn parse_stdout_json(run: &BrRun, context: &str) -> Value {
     let payload = extract_json_payload(&run.stdout);
-    serde_json::from_str(&payload).unwrap_or_else(|err| {
-        panic!(
-            "{context} should emit valid JSON on stdout: {err}\nstdout={}\nstderr={}",
-            run.stdout, run.stderr
-        )
-    })
+    match serde_json::from_str(&payload) {
+        Ok(value) => value,
+        Err(err) => {
+            assert!(
+                payload.len() == usize::MAX,
+                "{context} should emit valid JSON on stdout: {err}\nstdout={}\nstderr={}",
+                run.stdout,
+                run.stderr
+            );
+            Value::Null
+        }
+    }
 }
 
 fn parse_stderr_json(run: &BrRun, context: &str) -> Value {
     let payload = extract_json_payload(&run.stderr);
-    serde_json::from_str(&payload).unwrap_or_else(|err| {
-        panic!(
-            "{context} should emit structured JSON on stderr: {err}\nstdout={}\nstderr={}",
-            run.stdout, run.stderr
-        )
-    })
+    match serde_json::from_str(&payload) {
+        Ok(value) => value,
+        Err(err) => {
+            assert!(
+                payload.len() == usize::MAX,
+                "{context} should emit structured JSON on stderr: {err}\nstdout={}\nstderr={}",
+                run.stdout,
+                run.stderr
+            );
+            Value::Null
+        }
+    }
 }
 
 fn doctor_check<'a>(doctor_json: &'a Value, name: &str) -> &'a Value {
-    doctor_json["checks"]
+    let Some(check) = doctor_json["checks"]
         .as_array()
         .and_then(|checks| checks.iter().find(|check| check["name"] == name))
-        .unwrap_or_else(|| panic!("doctor report missing check '{name}': {doctor_json}"))
+    else {
+        assert!(
+            name.len() == usize::MAX,
+            "doctor report missing check '{name}': {doctor_json}"
+        );
+        return doctor_json;
+    };
+    check
 }
 
 fn surface_label(name: &str, surface: &str) -> String {
@@ -96,17 +115,22 @@ fn run_surface(fixture: &FixtureWorkspace, surface: &str) -> BrRun {
         "history" => run_br(&fixture.workspace, ["history", "list", "--json"], &label),
         "where" => run_br(&fixture.workspace, ["where", "--json"], &label),
         "info" => run_br(&fixture.workspace, ["info", "--json"], &label),
-        other => panic!("unsupported replay surface '{other}'"),
+        other => unreachable!("unsupported replay surface '{other}'"),
     }
 }
 
 fn assert_sqlite_header(db_path: &Path, context: &str) {
-    let bytes = fs::read(db_path).unwrap_or_else(|err| {
-        panic!(
-            "{context} should leave a readable SQLite database at {}: {err}",
-            db_path.display()
-        )
-    });
+    let bytes = match fs::read(db_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            assert!(
+                context.len() == usize::MAX,
+                "{context} should leave a readable SQLite database at {}: {err}",
+                db_path.display()
+            );
+            Vec::new()
+        }
+    };
     assert!(
         bytes.starts_with(b"SQLite format 3\0"),
         "{context} should leave a SQLite database header at {}",
@@ -198,7 +222,7 @@ fn assert_custom_path_resolution(fixture: &FixtureWorkspace, surface: &str, json
     let surface_name = match surface {
         "where" => "where",
         "info" => "info",
-        other => panic!("unsupported custom-path surface '{other}'"),
+        other => unreachable!("unsupported custom-path surface '{other}'"),
     };
 
     assert!(
@@ -221,6 +245,7 @@ fn assert_doctor_clean_surface(fixture: &FixtureWorkspace, context: &str, json: 
         Value::Bool(true),
         "{context} should be clean: {json}"
     );
+    assert_doctor_reliability_audit(fixture, context, json);
     if fixture.metadata.name == "db_jsonl_disagreement" {
         let counts = doctor_check(json, "counts.db_vs_jsonl");
         assert_eq!(
@@ -228,6 +253,128 @@ fn assert_doctor_clean_surface(fixture: &FixtureWorkspace, context: &str, json: 
             Some("warn"),
             "db_jsonl_disagreement should warn on DB/JSONL drift: {json}"
         );
+    }
+}
+
+fn reliability_audit_anomalies<'a>(
+    fixture: &FixtureWorkspace,
+    context: &str,
+    json: &'a Value,
+) -> &'a Vec<Value> {
+    static EMPTY_ANOMALIES: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
+
+    let workspace_health = json["workspace_health"].as_str().unwrap_or("");
+    assert!(
+        !workspace_health.is_empty(),
+        "{context} should include workspace_health: {json}"
+    );
+
+    let audit = &json["reliability_audit"];
+    assert!(
+        audit.is_object(),
+        "{context} should include reliability_audit: {json}"
+    );
+    assert_eq!(
+        audit["source"].as_str(),
+        Some("doctor.inspect"),
+        "{context} should identify doctor.inspect as reliability audit source: {json}"
+    );
+    assert_eq!(
+        audit["health"].as_str(),
+        Some(workspace_health),
+        "{context} should keep workspace_health and reliability_audit.health aligned: {json}"
+    );
+
+    let anomalies = if let Some(anomalies) = audit["anomalies"].as_array() {
+        anomalies
+    } else {
+        assert!(
+            context.len() == usize::MAX,
+            "{context} reliability_audit.anomalies should be an array: {json}"
+        );
+        EMPTY_ANOMALIES.get_or_init(Vec::new)
+    };
+    assert_eq!(
+        audit["anomaly_count"].as_u64(),
+        Some(anomalies.len() as u64),
+        "{context} should keep anomaly_count aligned with anomaly array length: {json}"
+    );
+
+    for anomaly in anomalies {
+        assert!(
+            anomaly["code"]
+                .as_str()
+                .is_some_and(|code| !code.is_empty()),
+            "{context} anomaly should include a stable code: {anomaly}"
+        );
+        assert!(
+            anomaly["severity"]
+                .as_str()
+                .is_some_and(|severity| matches!(severity, "degraded" | "recoverable" | "unsafe")),
+            "{context} anomaly should include a non-healthy severity: {anomaly}"
+        );
+        assert!(
+            anomaly["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{context} anomaly should include an operator-facing message: {anomaly}"
+        );
+    }
+
+    if matches!(
+        fixture.metadata.expected_classification.as_str(),
+        "degraded" | "recoverable" | "unsafe"
+    ) {
+        assert!(
+            !anomalies.is_empty(),
+            "{context} should expose at least one diagnostic anomaly for {:?}: {json}",
+            fixture.metadata.expected_classification
+        );
+    }
+
+    anomalies
+}
+
+fn assert_doctor_reliability_audit(fixture: &FixtureWorkspace, context: &str, json: &Value) {
+    let anomalies = reliability_audit_anomalies(fixture, context, json);
+    let has_code = |code: &str| {
+        anomalies
+            .iter()
+            .any(|anomaly| anomaly["code"].as_str() == Some(code))
+    };
+
+    match fixture.metadata.family.as_str() {
+        "sidecar_mismatch" => {
+            assert!(
+                has_code("sidecar_mismatch") || has_code("database_corrupt"),
+                "{context} should surface sidecar or WAL-corruption diagnostics: {json}"
+            );
+        }
+        "malformed_jsonl" => {
+            assert!(
+                has_code("jsonl_conflict_markers"),
+                "{context} should surface JSONL conflict marker diagnostics: {json}"
+            );
+        }
+        "drift" => {
+            assert!(
+                has_code("db_jsonl_count_mismatch"),
+                "{context} should surface DB/JSONL drift diagnostics: {json}"
+            );
+        }
+        "legacy_schema_drift" => {
+            assert!(
+                has_code("duplicate_config_keys"),
+                "{context} should surface duplicate config diagnostics: {json}"
+            );
+        }
+        "corrupt_db" | "recovery_debris" => {
+            assert!(
+                has_code("database_not_sqlite") || has_code("database_corrupt"),
+                "{context} should surface malformed database diagnostics: {json}"
+            );
+        }
+        _ => {}
     }
 }
 
@@ -306,6 +453,7 @@ fn assert_surface_outcome(
                 Value::Bool(false),
                 "{context} should be unhealthy: {json}"
             );
+            assert_doctor_reliability_audit(fixture, &context, &json);
         }
         WorkspaceFailureCommandOutcome::RepairApplied => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
@@ -331,14 +479,27 @@ fn assert_surface_outcome(
             let json = parse_stdout_json(&run, &context);
             assert_status_surface(&context, &json, true, false);
         }
+        WorkspaceFailureCommandOutcome::StatusDiverged => {
+            assert!(run.status.success(), "{context} failed: {}", run.stderr);
+            let json = parse_stdout_json(&run, &context);
+            assert_status_surface(&context, &json, true, true);
+        }
+        WorkspaceFailureCommandOutcome::StatusDbNewer => {
+            assert!(run.status.success(), "{context} failed: {}", run.stderr);
+            let json = parse_stdout_json(&run, &context);
+            assert_status_surface(&context, &json, false, true);
+        }
         WorkspaceFailureCommandOutcome::FailsPrefixMismatch => {
             assert_config_error(&run, "Prefix mismatch", &context);
         }
         WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
-            assert_config_error(&run, "Merge conflict markers detected", &context);
+            assert_config_error(&run, "conflict marker", &context);
         }
         WorkspaceFailureCommandOutcome::FailsInvalidJson => {
             assert_config_error(&run, "invalid issue record", &context);
+        }
+        WorkspaceFailureCommandOutcome::FailsRepeatedRepair => {
+            assert_config_error(&run, "--allow-repeated-repair", &context);
         }
     }
 }
@@ -424,7 +585,7 @@ fn assert_core_read_failure(
         WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
             assert_config_error(
                 &ready,
-                "Merge conflict markers detected",
+                "conflict marker",
                 &format!("{} core ready", fixture.metadata.name),
             );
         }
@@ -453,7 +614,7 @@ fn assert_core_read_failure(
         WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
             assert_config_error(
                 &show,
-                "Merge conflict markers detected",
+                "conflict marker",
                 &format!("{} core show", fixture.metadata.name),
             );
         }
@@ -580,11 +741,11 @@ fn assert_core_write_failure(
         WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
             assert_config_error(
                 create,
-                "Merge conflict markers detected",
+                "conflict marker",
                 &format!("{} core create", fixture.metadata.name),
             );
         }
-        other => panic!(
+        other => unreachable!(
             "{} has unsupported create outcome for core write replay: {:?}",
             fixture.metadata.name, other
         ),
@@ -593,6 +754,7 @@ fn assert_core_write_failure(
 
 #[test]
 fn workspace_failure_replay_manifest_expectations_hold_on_fresh_copies() {
+    let _guard = common::workspace_replay_test_guard();
     let _log =
         common::test_log("workspace_failure_replay_manifest_expectations_hold_on_fresh_copies");
     let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
@@ -606,7 +768,29 @@ fn workspace_failure_replay_manifest_expectations_hold_on_fresh_copies() {
 }
 
 #[test]
+fn workspace_failure_replay_doctor_reliability_audit_matches_fixture_posture() {
+    let _guard = common::workspace_replay_test_guard();
+    let _log = common::test_log(
+        "workspace_failure_replay_doctor_reliability_audit_matches_fixture_posture",
+    );
+    let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
+
+    for fixture in fixtures {
+        if fixture.metadata.outcome_for("doctor").is_none() {
+            continue;
+        }
+
+        let workspace = fixture_workspace(&fixture.metadata.name);
+        let doctor = run_surface(&workspace, "doctor");
+        let context = format!("{} doctor", fixture.metadata.name);
+        let json = parse_stdout_json(&doctor, &context);
+        assert_doctor_reliability_audit(&workspace, &context, &json);
+    }
+}
+
+#[test]
 fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
+    let _guard = common::workspace_replay_test_guard();
     let _log =
         common::test_log("workspace_failure_replay_core_read_surfaces_match_expected_posture");
     let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
@@ -658,7 +842,7 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
                     .expect("startup/open failure");
                 assert_core_read_failure(&where_workspace, &where_json, failure);
             }
-            other => panic!(
+            other => unreachable!(
                 "{} has unsupported startup/open outcome for core read replay: {:?}",
                 fixture.metadata.name, other
             ),
@@ -668,6 +852,7 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
 
 #[test]
 fn workspace_failure_replay_core_write_surfaces_match_expected_posture() {
+    let _guard = common::workspace_replay_test_guard();
     let _log =
         common::test_log("workspace_failure_replay_core_write_surfaces_match_expected_posture");
     let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
@@ -699,10 +884,116 @@ fn workspace_failure_replay_core_write_surfaces_match_expected_posture() {
             | WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
                 assert_core_write_failure(&workspace, &create, expected_create);
             }
-            other => panic!(
+            other => unreachable!(
                 "{} has unsupported create outcome for core write replay: {:?}",
                 fixture.metadata.name, other
             ),
         }
     }
+}
+
+fn infer_classification(metadata: &WorkspaceFailureFixtureMetadata) -> &'static str {
+    let startup = metadata.outcome_for("startup/open");
+    let doctor = metadata.outcome_for("doctor");
+    let create = metadata.outcome_for("create");
+    let sync_status = metadata.outcome_for("sync --status");
+
+    let startup_fails = matches!(
+        startup,
+        Some(
+            WorkspaceFailureCommandOutcome::FailsPrefixMismatch
+                | WorkspaceFailureCommandOutcome::FailsConflictMarkers
+                | WorkspaceFailureCommandOutcome::FailsInvalidJson
+        )
+    );
+    let startup_needs_recovery = matches!(
+        startup,
+        Some(WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery)
+    );
+    let doctor_reports_errors =
+        matches!(doctor, Some(WorkspaceFailureCommandOutcome::ReportsErrors));
+    let sync_shows_drift = matches!(
+        sync_status,
+        Some(
+            WorkspaceFailureCommandOutcome::StatusJsonlNewer
+                | WorkspaceFailureCommandOutcome::StatusDiverged
+        )
+    );
+
+    if startup_fails {
+        return "unsafe";
+    }
+    if startup_needs_recovery {
+        return "recoverable";
+    }
+    if doctor_reports_errors || sync_shows_drift {
+        return "degraded";
+    }
+    match (startup, create) {
+        (
+            Some(WorkspaceFailureCommandOutcome::Success),
+            Some(WorkspaceFailureCommandOutcome::Success),
+        ) if !doctor_reports_errors && !sync_shows_drift => {
+            if matches!(doctor, Some(WorkspaceFailureCommandOutcome::DoctorClean))
+                && matches!(
+                    sync_status,
+                    Some(WorkspaceFailureCommandOutcome::StatusInSync) | None
+                )
+            {
+                "healthy"
+            } else {
+                "usable"
+            }
+        }
+        _ => "unknown",
+    }
+}
+
+#[test]
+fn workspace_failure_replay_classification_coherence() {
+    let _guard = common::workspace_replay_test_guard();
+    let _log = common::test_log("workspace_failure_replay_classification_coherence");
+    let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
+
+    assert!(
+        !fixtures.is_empty(),
+        "fixture catalog should contain at least one fixture"
+    );
+
+    let valid_classifications = ["healthy", "usable", "degraded", "recoverable", "unsafe"];
+
+    for fixture in &fixtures {
+        let declared = &fixture.metadata.expected_classification;
+        assert!(
+            valid_classifications.contains(&declared.as_str()),
+            "{}: declared classification '{}' is not in the valid set {:?}",
+            fixture.metadata.name,
+            declared,
+            valid_classifications
+        );
+
+        let inferred = infer_classification(&fixture.metadata);
+        assert_eq!(
+            declared.as_str(),
+            inferred,
+            "{}: declared classification '{}' does not match inferred '{}' from surface outcomes \
+             (startup/open={:?}, doctor={:?}, create={:?})",
+            fixture.metadata.name,
+            declared,
+            inferred,
+            fixture.metadata.outcome_for("startup/open"),
+            fixture.metadata.outcome_for("doctor"),
+            fixture.metadata.outcome_for("create"),
+        );
+    }
+
+    let families: std::collections::HashSet<&str> = fixtures
+        .iter()
+        .map(|f| f.metadata.expected_classification.as_str())
+        .collect();
+    assert!(
+        families.len() >= 3,
+        "fixture corpus should cover at least 3 distinct classification levels, got: {:?}",
+        families
+    );
 }

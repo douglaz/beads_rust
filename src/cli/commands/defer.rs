@@ -1,12 +1,14 @@
 //! Defer and Undefer command implementations.
 
 use crate::cli::commands::{
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_ids,
-    update_issue_with_recovery,
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    report_auto_flush_failure, resolve_issue_ids, update_issue_with_recovery,
 };
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
@@ -67,6 +69,18 @@ fn restored_status_after_undefer(issue: &Issue) -> Status {
     }
 }
 
+fn skipped_reason_text(reason: &str) -> String {
+    sanitize_terminal_inline(reason).into_owned()
+}
+
+fn issue_id_text(id: &str) -> String {
+    sanitize_terminal_inline(id).into_owned()
+}
+
+fn status_text(status: &str) -> String {
+    sanitize_terminal_inline(status).into_owned()
+}
+
 /// Execute the defer command.
 ///
 /// # Errors
@@ -110,8 +124,13 @@ pub fn execute_defer(
                 None
             };
 
-            let result =
-                execute_defer_route(&batch_args, &batch_cli, &batch.beads_dir, batch.is_external)?;
+            let result = execute_defer_route(
+                &batch_args,
+                &batch_cli,
+                ctx,
+                &batch.beads_dir,
+                batch.is_external,
+            )?;
             routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
         }
 
@@ -124,7 +143,7 @@ pub fn execute_defer(
             }
         }
     } else {
-        let result = execute_defer_route(args, cli, &beads_dir, false)?;
+        let result = execute_defer_route(args, cli, ctx, &beads_dir, false)?;
         deferred_issues = result.deferred;
         skipped_issues = result.skipped;
     }
@@ -146,23 +165,24 @@ fn render_defer_output(
 ) -> Result<()> {
     let use_structured_output = json || ctx.is_json() || ctx.is_toon() || args.robot;
     if use_structured_output {
-        if skipped_issues.is_empty() {
-            emit_structured_output(&deferred_issues.to_vec(), ctx)?;
-        } else {
-            let result = DeferResult {
-                deferred: deferred_issues.to_vec(),
-                skipped: skipped_issues.to_vec(),
-                ordered_outcomes: Vec::new(),
-            };
-            emit_structured_output(&result, ctx)?;
-        }
+        let result = DeferResult {
+            deferred: deferred_issues.to_vec(),
+            skipped: skipped_issues.to_vec(),
+            ordered_outcomes: Vec::new(),
+        };
+        emit_structured_output(&result, ctx)?;
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_defer_rich(deferred_issues, skipped_issues, ctx);
     } else {
         for deferred in deferred_issues {
-            print!("\u{23f1} Deferred {}: {}", deferred.id, deferred.title);
+            let id = issue_id_text(&deferred.id);
+            print!(
+                "\u{23f1} Deferred {}: {}",
+                id,
+                sanitize_terminal_inline(&deferred.title)
+            );
             if let Some(ref until) = deferred.defer_until {
                 println!(" (until {until})");
             } else {
@@ -170,7 +190,9 @@ fn render_defer_output(
             }
         }
         for skipped in skipped_issues {
-            println!("\u{2298} Skipped {}: {}", skipped.id, skipped.reason);
+            let id = issue_id_text(&skipped.id);
+            let reason = skipped_reason_text(&skipped.reason);
+            println!("\u{2298} Skipped {id}: {reason}");
         }
         if deferred_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to defer.");
@@ -184,10 +206,14 @@ fn render_defer_output(
 fn execute_defer_route(
     args: &DeferArgs,
     cli: &config::CliOverrides,
+    ctx: &OutputContext,
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<DeferResult> {
+    let _routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
@@ -294,10 +320,11 @@ fn execute_defer_route(
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 
@@ -354,6 +381,7 @@ pub fn execute_undefer(
             let result = execute_undefer_route(
                 &batch_args,
                 &batch_cli,
+                ctx,
                 &batch.beads_dir,
                 batch.is_external,
             )?;
@@ -372,7 +400,7 @@ pub fn execute_undefer(
             }
         }
     } else {
-        let result = execute_undefer_route(args, cli, &beads_dir, false)?;
+        let result = execute_undefer_route(args, cli, ctx, &beads_dir, false)?;
         undeferred_issues = result.undeferred;
         skipped_issues = result.skipped;
     }
@@ -394,29 +422,31 @@ fn render_undefer_output(
 ) -> Result<()> {
     let use_structured_output = json || ctx.is_json() || ctx.is_toon() || args.robot;
     if use_structured_output {
-        if skipped_issues.is_empty() {
-            emit_structured_output(&undeferred_issues.to_vec(), ctx)?;
-        } else {
-            let result = UndeferResult {
-                undeferred: undeferred_issues.to_vec(),
-                skipped: skipped_issues.to_vec(),
-                ordered_outcomes: Vec::new(),
-            };
-            emit_structured_output(&result, ctx)?;
-        }
+        let result = UndeferResult {
+            undeferred: undeferred_issues.to_vec(),
+            skipped: skipped_issues.to_vec(),
+            ordered_outcomes: Vec::new(),
+        };
+        emit_structured_output(&result, ctx)?;
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_undefer_rich(undeferred_issues, skipped_issues, ctx);
     } else {
         for undeferred in undeferred_issues {
+            let id = issue_id_text(&undeferred.id);
+            let status = status_text(&undeferred.status);
             println!(
                 "\u{2713} Undeferred {}: {} (now {})",
-                undeferred.id, undeferred.title, undeferred.status
+                id,
+                sanitize_terminal_inline(&undeferred.title),
+                status
             );
         }
         for skipped in skipped_issues {
-            println!("\u{2298} Skipped {}: {}", skipped.id, skipped.reason);
+            let id = issue_id_text(&skipped.id);
+            let reason = skipped_reason_text(&skipped.reason);
+            println!("\u{2298} Skipped {id}: {reason}");
         }
         if undeferred_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to undefer.");
@@ -430,10 +460,14 @@ fn render_undefer_output(
 fn execute_undefer_route(
     args: &UndeferArgs,
     cli: &config::CliOverrides,
+    ctx: &OutputContext,
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<UndeferResult> {
+    let _routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
@@ -471,6 +505,17 @@ fn execute_undefer_route(
             let skipped = SkippedIssue {
                 id: id.clone(),
                 reason: format!("not deferred (status: {})", issue.status.as_str()),
+            };
+            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
+            continue;
+        }
+
+        if issue.status.is_terminal() {
+            tracing::debug!(id = %id, status = ?issue.status, "Issue is terminal");
+            let skipped = SkippedIssue {
+                id: id.clone(),
+                reason: format!("cannot undefer {} issue", issue.status.as_str()),
             };
             ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
@@ -529,10 +574,11 @@ fn execute_undefer_route(
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 
@@ -571,7 +617,7 @@ fn reorder_routed_items_by_requested_inputs<T>(
     let mut ordered_items: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
     for (batch_inputs, batch_items) in routed_items {
         if batch_inputs.len() != batch_items.len() {
-            return Err(BeadsError::Config(format!(
+            return Err(BeadsError::internal(format!(
                 "{context} produced mismatched issue/result counts"
             )));
         }
@@ -581,11 +627,18 @@ fn reorder_routed_items_by_requested_inputs<T>(
                 .get_mut(input.as_str())
                 .and_then(VecDeque::pop_front)
             else {
-                return Err(BeadsError::Config(format!(
+                let input = issue_id_text(&input);
+                return Err(BeadsError::internal(format!(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
-            ordered_items[index] = Some(item);
+            let Some(slot) = ordered_items.get_mut(index) else {
+                let input = issue_id_text(&input);
+                return Err(BeadsError::internal(format!(
+                    "{context} returned out-of-range issue input {input}"
+                )));
+            };
+            *slot = Some(item);
         }
     }
 
@@ -594,10 +647,11 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .enumerate()
         .map(|(index, item)| {
             item.ok_or_else(|| {
-                BeadsError::Config(format!(
-                    "{context} did not produce a result for {}",
-                    requested_inputs[index]
-                ))
+                let input = requested_inputs
+                    .get(index)
+                    .map(|input| issue_id_text(input))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                BeadsError::internal(format!("{context} did not produce a result for {input}"))
             })
         })
         .collect()
@@ -619,14 +673,16 @@ fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: 
         content.append("No issues to defer.\n");
     } else {
         for item in deferred {
+            let id = issue_id_text(&item.id);
             content.append_styled("\u{23f1} ", theme.warning.clone());
             content.append_styled("Deferred ", theme.warning.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
-            content.append(&item.title);
+            content.append(sanitize_terminal_inline(&item.title).as_ref());
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
-            content.append_styled(&item.previous_status, theme.success.clone());
+            let previous_status = status_text(&item.previous_status);
+            content.append_styled(&previous_status, theme.success.clone());
             content.append(" \u{2192} ");
             content.append_styled("deferred", theme.warning.clone());
             content.append("\n");
@@ -640,11 +696,13 @@ fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: 
         }
 
         for item in skipped {
+            let id = issue_id_text(&item.id);
+            let reason = skipped_reason_text(&item.reason);
             content.append_styled("\u{2298} ", theme.dimmed.clone());
             content.append_styled("Skipped ", theme.dimmed.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
-            content.append_styled(&item.reason, theme.dimmed.clone());
+            content.append_styled(&reason, theme.dimmed.clone());
             content.append("\n");
         }
     }
@@ -678,29 +736,34 @@ fn render_undefer_rich(
         content.append("No issues to undefer.\n");
     } else {
         for item in undeferred {
+            let id = issue_id_text(&item.id);
             content.append_styled("\u{2713} ", theme.success.clone());
             content.append_styled("Undeferred ", theme.success.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
-            content.append(&item.title);
+            content.append(sanitize_terminal_inline(&item.title).as_ref());
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
-            content.append_styled(&item.previous_status, theme.warning.clone());
+            let previous_status = status_text(&item.previous_status);
+            let status = status_text(&item.status);
+            content.append_styled(&previous_status, theme.warning.clone());
             if item.previous_status == item.status {
                 content.append_styled(" (unchanged)", theme.dimmed.clone());
             } else {
                 content.append(" \u{2192} ");
-                content.append_styled(&item.status, theme.success.clone());
+                content.append_styled(&status, theme.success.clone());
             }
             content.append("\n");
         }
 
         for item in skipped {
+            let id = issue_id_text(&item.id);
+            let reason = skipped_reason_text(&item.reason);
             content.append_styled("\u{2298} ", theme.dimmed.clone());
             content.append_styled("Skipped ", theme.dimmed.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
-            content.append_styled(&item.reason, theme.dimmed.clone());
+            content.append_styled(&reason, theme.dimmed.clone());
             content.append("\n");
         }
     }
@@ -771,6 +834,157 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+        }
+    }
+
+    fn deferred_output_item(id: &str) -> DeferredIssue {
+        DeferredIssue {
+            id: id.to_string(),
+            title: "Deferred output".to_string(),
+            previous_status: "open".to_string(),
+            status: "deferred".to_string(),
+            defer_until: None,
+        }
+    }
+
+    #[test]
+    fn skipped_reason_text_sanitizes_terminal_controls() {
+        let reason = skipped_reason_text("bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!reason.chars().any(char::is_control));
+        assert!(reason.contains("\\u{1b}[2J"));
+        assert!(reason.contains("\\r"));
+        assert!(reason.contains("\\u{8}"));
+        assert!(reason.contains("\\n"));
+        assert!(reason.contains("\\u{7}"));
+        assert!(reason.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn issue_id_text_sanitizes_terminal_controls() {
+        let id = issue_id_text("bd-bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!id.chars().any(char::is_control));
+        assert!(id.contains("\\u{1b}[2J"));
+        assert!(id.contains("\\r"));
+        assert!(id.contains("\\u{8}"));
+        assert!(id.contains("\\n"));
+        assert!(id.contains("\\u{7}"));
+        assert!(id.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn status_text_sanitizes_terminal_controls() {
+        let status = status_text("qa\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!status.chars().any(char::is_control));
+        assert!(status.contains("\\u{1b}[2J"));
+        assert!(status.contains("\\r"));
+        assert!(status.contains("\\u{8}"));
+        assert!(status.contains("\\n"));
+        assert!(status.contains("\\u{7}"));
+        assert!(status.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn defer_result_serializes_as_object_without_skips() {
+        let result = DeferResult {
+            deferred: vec![deferred_output_item("bd-defer-1")],
+            skipped: Vec::new(),
+            ordered_outcomes: Vec::new(),
+        };
+
+        let value = serde_json::to_value(result).expect("serialize defer result");
+
+        assert!(value.is_object(), "defer result should be an object");
+        assert_eq!(value["deferred"][0]["id"], "bd-defer-1");
+        assert!(
+            value.get("skipped").is_none(),
+            "empty skipped list should stay omitted"
+        );
+    }
+
+    #[test]
+    fn undefer_result_serializes_as_object_without_skips() {
+        let result = UndeferResult {
+            undeferred: vec![DeferredIssue {
+                status: "open".to_string(),
+                ..deferred_output_item("bd-undefer-1")
+            }],
+            skipped: Vec::new(),
+            ordered_outcomes: Vec::new(),
+        };
+
+        let value = serde_json::to_value(result).expect("serialize undefer result");
+
+        assert!(value.is_object(), "undefer result should be an object");
+        assert_eq!(value["undeferred"][0]["id"], "bd-undefer-1");
+        assert!(
+            value.get("skipped").is_none(),
+            "empty skipped list should stay omitted"
+        );
+    }
+
+    #[test]
+    fn reorder_routed_items_preserves_duplicate_requested_inputs() -> Result<()> {
+        let requested = vec![
+            "bd-a".to_string(),
+            "bd-b".to_string(),
+            "bd-a".to_string(),
+            "bd-c".to_string(),
+        ];
+        let routed_items = vec![
+            (
+                vec!["bd-a".to_string(), "bd-a".to_string()],
+                vec!["first-a", "second-a"],
+            ),
+            (vec!["bd-b".to_string(), "bd-c".to_string()], vec!["b", "c"]),
+        ];
+
+        let ordered =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "test routing")?;
+
+        assert_eq!(ordered, vec!["first-a", "b", "second-a", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_missing_input_error() {
+        let requested = vec!["bd-a\x1b[2J\nbad".to_string(), "bd-b".to_string()];
+        let routed_items = vec![(vec!["bd-b".to_string()], vec!["b"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "test routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
+        }
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_unexpected_input_error() {
+        let requested = vec!["bd-a".to_string()];
+        let routed_items = vec![(vec!["bd-b\x1b[2J\nbad".to_string()], vec!["b"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "test routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
         }
     }
 
@@ -1029,5 +1243,49 @@ mod tests {
         let updated = storage.get_issue(&issue_id).expect("get").unwrap();
         assert_eq!(updated.status, Status::InProgress);
         assert!(updated.defer_until.is_none());
+    }
+
+    #[test]
+    fn execute_undefer_skips_terminal_issue_with_stale_defer_until() -> Result<()> {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new()?;
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx)?;
+
+        let beads_dir = temp.path().join(".beads");
+        let mut storage = SqliteStorage::open(&beads_dir.join("beads.db"))?;
+        let issue_id = format!(
+            "{}-terminal-defer-1",
+            storage
+                .get_config("issue_prefix")?
+                .ok_or_else(|| BeadsError::internal("workspace prefix missing"))?
+        );
+        let mut issue = make_issue(&issue_id, "Closed with stale defer date");
+        issue.status = Status::Closed;
+        issue.closed_at = Some(Utc::now());
+        issue.defer_until = Some(Utc::now() + Duration::days(1));
+        storage.create_issue(&issue, "tester")?;
+
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
+        let undefer_args = UndeferArgs {
+            ids: vec![issue_id.clone()],
+            robot: true,
+        };
+        execute_undefer(&undefer_args, true, &cli, &ctx)?;
+
+        let updated = storage
+            .get_issue(&issue_id)?
+            .ok_or_else(|| BeadsError::IssueNotFound {
+                id: issue_id.clone(),
+            })?;
+        assert_eq!(updated.status, Status::Closed);
+        assert!(updated.defer_until.is_some());
+
+        Ok(())
     }
 }

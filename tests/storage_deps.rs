@@ -550,6 +550,69 @@ fn detect_all_cycles_empty_when_no_cycles() {
     assert!(cycles.is_empty());
 }
 
+#[test]
+fn detect_all_cycles_finds_long_cycle_beyond_legacy_depth_cap() {
+    let mut storage = test_db();
+    let issues: Vec<_> = (0..25)
+        .map(|index| fixtures::issue(&format!("long cycle {index:02}")))
+        .collect();
+    let ids: Vec<_> = issues.iter().map(|issue| issue.id.clone()).collect();
+
+    for issue in &issues {
+        storage.create_issue(issue, "tester").unwrap();
+    }
+
+    for (index, id) in ids.iter().enumerate() {
+        let next = &ids[(index + 1) % ids.len()];
+        storage
+            .add_dependency(id, next, DependencyType::Related.as_str(), "tester")
+            .unwrap();
+    }
+
+    let cycles = storage.detect_all_cycles().unwrap();
+
+    assert_eq!(cycles.len(), 1);
+    assert_eq!(cycles[0].first(), cycles[0].last());
+    for id in &ids {
+        assert!(
+            cycles[0].contains(id),
+            "long cycle witness should include {id}"
+        );
+    }
+}
+
+#[test]
+fn detect_all_cycles_collapses_dense_component_to_witness() {
+    let mut storage = test_db();
+    let issues: Vec<_> = (0..8)
+        .map(|index| fixtures::issue(&format!("dense cycle {index}")))
+        .collect();
+    let ids: Vec<_> = issues.iter().map(|issue| issue.id.clone()).collect();
+
+    for issue in &issues {
+        storage.create_issue(issue, "tester").unwrap();
+    }
+
+    for from in &ids {
+        for to in &ids {
+            if from != to {
+                storage
+                    .add_dependency(from, to, DependencyType::Related.as_str(), "tester")
+                    .unwrap();
+            }
+        }
+    }
+
+    let cycles = storage.detect_all_cycles().unwrap();
+
+    assert_eq!(cycles.len(), 1);
+    assert_eq!(cycles[0].first(), cycles[0].last());
+    assert!(cycles[0].len() >= 3);
+    for id in &cycles[0] {
+        assert!(ids.contains(id));
+    }
+}
+
 // ============================================================================
 // DEEP HIERARCHY TESTS (5+ levels)
 // ============================================================================

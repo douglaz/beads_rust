@@ -14,7 +14,7 @@ pub mod markdown_import;
 pub mod progress;
 pub mod time;
 
-pub use hash::{ContentHashable, content_hash, content_hash_from_parts};
+pub use hash::{ContentHashable, content_hash, content_hash_from_parts, hex_encode};
 pub use id::{
     IdConfig, IdGenerator, IdResolver, MatchType, ParsedId, ResolvedId, ResolverConfig, child_id,
     find_matching_ids, generate_id, id_depth, is_child_id, is_valid_id_format, normalize_id,
@@ -23,10 +23,12 @@ pub use id::{
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const LAST_TOUCHED_FILE: &str = "last-touched";
+const MAX_LAST_TOUCHED_BYTES: usize = 4096;
+const MAX_LAST_TOUCHED_BYTES_U64: u64 = 4096;
 
 /// Environment variable for overriding the cache directory location.
 ///
@@ -109,21 +111,102 @@ pub fn set_last_touched_id(beads_dir: &Path, id: &str) {
 #[must_use]
 pub fn get_last_touched_id(beads_dir: &Path) -> String {
     let path = last_touched_path(beads_dir);
-    let mut contents = String::new();
+    let Ok(metadata) = fs::metadata(&path) else {
+        return String::new();
+    };
 
-    if let Ok(mut file) = fs::File::open(path)
-        && file.read_to_string(&mut contents).is_ok()
-    {
-        return contents.lines().next().unwrap_or("").trim().to_string();
+    read_last_touched_file_limited(&path, &metadata).unwrap_or_default()
+}
+
+fn read_last_touched_file_limited(path: &Path, metadata: &fs::Metadata) -> io::Result<String> {
+    if metadata.len() > MAX_LAST_TOUCHED_BYTES_U64 {
+        return Ok(String::new());
     }
 
-    String::new()
+    let file = fs::File::open(path)?;
+    let mut reader = file.take(MAX_LAST_TOUCHED_BYTES_U64.saturating_add(1));
+    let mut content = Vec::new();
+    reader.read_to_end(&mut content)?;
+    if content.len() > MAX_LAST_TOUCHED_BYTES {
+        return Ok(String::new());
+    }
+
+    let content =
+        String::from_utf8(content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(content
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string())
 }
 
 /// Best-effort delete of the last-touched file.
 pub fn clear_last_touched(beads_dir: &Path) {
     let path = last_touched_path(beads_dir);
     let _ = fs::remove_file(path);
+}
+
+/// Rename a staged file into place and fsync the affected parent directories.
+///
+/// Atomic `rename` protects readers from partial files, but on Unix the rename
+/// itself is not guaranteed durable across power loss until the containing
+/// directory is synced. On non-Unix targets Rust does not expose a portable
+/// directory fsync API, so this preserves the existing atomic rename behavior
+/// and returns success after the rename.
+pub fn durable_rename(from: &Path, to: &Path) -> io::Result<()> {
+    durable_rename_with_parent_sync(from, to, sync_directory)
+}
+
+fn durable_rename_with_parent_sync<F>(from: &Path, to: &Path, sync_dir: F) -> io::Result<()>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+{
+    fs::rename(from, to)?;
+    sync_rename_parent_directories_with(from, to, sync_dir)
+}
+
+fn sync_rename_parent_directories_with<F>(from: &Path, to: &Path, mut sync_dir: F) -> io::Result<()>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+{
+    let target_parent = parent_for_directory_sync(to);
+    sync_dir(target_parent)?;
+
+    let source_parent = parent_for_directory_sync(from);
+    if source_parent != target_parent {
+        sync_dir(source_parent)?;
+    }
+
+    Ok(())
+}
+
+/// Fsync the parent directory for a newly created or replaced path.
+///
+/// This is needed after creating files with `create_new` as well as after
+/// durable renames so the directory entry is durable, not just the file data.
+pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    sync_directory(parent_for_directory_sync(path))
+}
+
+fn parent_for_directory_sync(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    tracing::debug!(
+        path = %path.display(),
+        "Skipping parent directory fsync: no portable directory fsync on this target"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -182,5 +265,107 @@ mod tests {
         }
 
         assert!(cache_dir.exists(), "parent dir should be created");
+    }
+
+    #[test]
+    fn test_get_last_touched_ignores_oversized_cache_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir(&beads_dir).expect("create .beads");
+        let path = last_touched_path(&beads_dir);
+        fs::write(&path, "bd-abc123\n").expect("write last touched");
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open last touched");
+        file.set_len(MAX_LAST_TOUCHED_BYTES_U64 + 1)
+            .expect("extend last touched");
+
+        assert_eq!(get_last_touched_id(&beads_dir), "");
+    }
+
+    #[test]
+    fn test_read_last_touched_file_limited_checks_size_after_open() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join(LAST_TOUCHED_FILE);
+        fs::write(&path, "bd-abc123\n").expect("write last touched");
+        let metadata = fs::metadata(&path).expect("metadata");
+        fs::write(&path, vec![b'a'; MAX_LAST_TOUCHED_BYTES + 1]).expect("grow last touched");
+
+        let value = read_last_touched_file_limited(&path, &metadata).expect("read last touched");
+
+        assert_eq!(value, "");
+    }
+
+    #[test]
+    fn test_read_last_touched_file_limited_rejects_invalid_utf8() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join(LAST_TOUCHED_FILE);
+        fs::write(&path, [0xff]).expect("write invalid last touched");
+        let metadata = fs::metadata(&path).expect("metadata");
+
+        let err = read_last_touched_file_limited(&path, &metadata)
+            .expect_err("invalid UTF-8 should fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn durable_rename_syncs_parent_once_for_same_directory() {
+        let temp = TempDir::new().expect("temp dir");
+        let from = temp.path().join("staged");
+        let to = temp.path().join("target");
+        fs::write(&from, "new").expect("write staged file");
+
+        let mut synced = Vec::new();
+        durable_rename_with_parent_sync(&from, &to, |parent| {
+            synced.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("durable rename");
+
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(&to).expect("read target"), "new");
+        assert_eq!(synced, vec![temp.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn durable_rename_syncs_both_parents_for_cross_directory_rename() {
+        let temp = TempDir::new().expect("temp dir");
+        let source_dir = temp.path().join("source");
+        let target_dir = temp.path().join("target");
+        fs::create_dir_all(&source_dir).expect("source dir");
+        fs::create_dir_all(&target_dir).expect("target dir");
+        let from = source_dir.join("staged");
+        let to = target_dir.join("target");
+        fs::write(&from, "new").expect("write staged file");
+
+        let mut synced = Vec::new();
+        durable_rename_with_parent_sync(&from, &to, |parent| {
+            synced.push(parent.to_path_buf());
+            Ok(())
+        })
+        .expect("durable rename");
+
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(&to).expect("read target"), "new");
+        assert_eq!(synced, vec![target_dir, source_dir]);
+    }
+
+    #[test]
+    fn durable_rename_reports_parent_sync_failure_after_successful_rename() {
+        let temp = TempDir::new().expect("temp dir");
+        let from = temp.path().join("staged");
+        let to = temp.path().join("target");
+        fs::write(&from, "new").expect("write staged file");
+
+        let err = durable_rename_with_parent_sync(&from, &to, |_parent| {
+            Err(io::Error::other("forced parent fsync failure"))
+        })
+        .expect_err("parent fsync failure should surface");
+
+        assert_eq!(err.to_string(), "forced parent fsync failure");
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(&to).expect("read target"), "new");
     }
 }

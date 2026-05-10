@@ -11,7 +11,7 @@
 //!
 //! # Resolution Order
 //!
-//! 1. Extract prefix from issue ID (substring before first `-`, plus hyphen)
+//! 1. Extract prefix from issue ID (substring before final `-`, plus hyphen)
 //! 2. Search local `.beads/routes.jsonl`
 //! 3. Search town root `.beads/routes.jsonl` if different
 //! 4. If route found with `path == "."`, use town-level `.beads`
@@ -21,9 +21,12 @@
 use crate::error::{BeadsError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use tracing::{debug, trace, warn};
+
+const MAX_REDIRECT_BYTES: usize = 4096;
+const MAX_REDIRECT_BYTES_U64: u64 = 4096;
 
 /// A route entry from routes.jsonl.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,8 +85,10 @@ impl RoutingResult {
 
 /// Extract the prefix from an issue ID.
 ///
-/// The prefix is the substring before the first hyphen, plus the hyphen.
-/// For example, "bd-abc123" returns "bd-".
+/// The prefix is the substring before the final hyphen, plus the hyphen. This
+/// matches ID parsing for hyphenated prefixes.
+/// For example, "bd-abc123" returns "bd-" and
+/// "document-intelligence-0sa" returns "document-intelligence-".
 ///
 /// Returns `None` if the ID has no hyphen.
 #[must_use]
@@ -178,7 +183,8 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let content = fs::read_to_string(&redirect_path)?;
+    let metadata = fs::metadata(&redirect_path)?;
+    let content = read_redirect_file_limited(&redirect_path, &metadata)?;
     let target = content.trim();
 
     if target.is_empty() {
@@ -202,6 +208,33 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
     );
 
     Ok(Some(resolved))
+}
+
+fn read_redirect_file_limited(redirect_path: &Path, metadata: &fs::Metadata) -> Result<String> {
+    if metadata.len() > MAX_REDIRECT_BYTES_U64 {
+        return Err(BeadsError::Config(format!(
+            "Redirect file exceeds maximum size of {MAX_REDIRECT_BYTES} bytes: {}",
+            redirect_path.display()
+        )));
+    }
+
+    let file = File::open(redirect_path)?;
+    let mut reader = file.take(MAX_REDIRECT_BYTES_U64.saturating_add(1));
+    let mut content = Vec::new();
+    reader.read_to_end(&mut content)?;
+    if content.len() > MAX_REDIRECT_BYTES {
+        return Err(BeadsError::Config(format!(
+            "Redirect file exceeds maximum size of {MAX_REDIRECT_BYTES} bytes: {}",
+            redirect_path.display()
+        )));
+    }
+
+    String::from_utf8(content).map_err(|e| {
+        BeadsError::Config(format!(
+            "Redirect file must be valid UTF-8: {}: {e}",
+            redirect_path.display()
+        ))
+    })
 }
 
 /// Follow redirects until we reach a terminal beads directory.
@@ -517,6 +550,58 @@ mod tests {
     }
 
     #[test]
+    fn read_redirect_rejects_oversized_file() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let redirect_path = beads_dir.join("redirect");
+        fs::write(&redirect_path, ".").unwrap();
+        File::options()
+            .write(true)
+            .open(&redirect_path)
+            .unwrap()
+            .set_len(MAX_REDIRECT_BYTES_U64 + 1)
+            .unwrap();
+
+        let err = read_redirect(&beads_dir).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("maximum size")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_redirect_file_limited_checks_size_before_utf8_decode() {
+        let dir = TempDir::new().unwrap();
+        let redirect_path = dir.path().join("redirect");
+        fs::write(&redirect_path, ".").unwrap();
+        let metadata = fs::metadata(&redirect_path).unwrap();
+        let mut payload = vec![b'a'; MAX_REDIRECT_BYTES];
+        payload.push(0xc3);
+        fs::write(&redirect_path, payload).unwrap();
+
+        let err = read_redirect_file_limited(&redirect_path, &metadata).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("maximum size")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_redirect_rejects_invalid_utf8() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("redirect"), [0xff]).unwrap();
+
+        let err = read_redirect(&beads_dir).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(msg) if msg.contains("valid UTF-8")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn follow_redirects_rejects_non_beads_directory_target() {
         let dir = TempDir::new().unwrap();
         let beads_dir = dir.path().join(".beads");
@@ -525,14 +610,18 @@ mod tests {
         fs::write(beads_dir.join("redirect"), "..").unwrap();
 
         let err = follow_redirects(&beads_dir, 10).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => assert!(
-                msg.contains("must be a .beads directory")
-                    || msg.contains("must be a .beads or _beads directory"),
-                "unexpected config error: {msg}"
-            ),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(msg) = err else {
+            return;
+        };
+        assert!(
+            msg.contains("must be a .beads directory")
+                || msg.contains("must be a .beads or _beads directory"),
+            "unexpected config error: {msg}"
+        );
     }
 
     #[test]
@@ -550,10 +639,14 @@ mod tests {
         fs::write(second.join("redirect"), "../../third/.beads").unwrap();
 
         let err = follow_redirects(&first, 1).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => assert!(msg.contains("max depth")),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(msg) = err else {
+            return;
+        };
+        assert!(msg.contains("max depth"));
     }
 
     #[test]
@@ -581,10 +674,14 @@ mod tests {
         fs::write(second.join("redirect"), "../../first/./.beads").unwrap();
 
         let err = follow_redirects(&first, 10).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => assert!(msg.contains("loop detected")),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(msg) = err else {
+            return;
+        };
+        assert!(msg.contains("loop detected"));
     }
 
     #[test]

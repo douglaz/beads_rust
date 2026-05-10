@@ -2,22 +2,46 @@ use crate::cli::HistoryArgs;
 use crate::cli::HistoryCommands;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
 use crate::output::OutputContext;
 use crate::sync::history;
 use crate::sync::{require_safe_sync_overwrite_path, validate_temp_file_path};
 use rich_rust::prelude::*;
 use serde_json::json;
+use similar::TextDiff;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 /// Result type for diff status: (status_string, diff_available, optional_size_tuple).
 type DiffStatusResult = (&'static str, bool, Option<(u64, u64)>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffCommandStatus {
-    Identical,
-    Different,
+enum TextDiffFallbackReason {
+    NonUtf8,
+    TooLarge,
+}
+
+impl TextDiffFallbackReason {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::NonUtf8 => "one or both files are not valid UTF-8",
+            Self::TooLarge => "one or both files exceed the text diff size limit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextDiffFallback {
+    status: &'static str,
+    current_size: u64,
+    backup_size: u64,
+    reason: TextDiffFallbackReason,
+}
+
+enum HistoryFileDiff {
+    Text(String),
+    Fallback(TextDiffFallback),
 }
 
 struct TempRestoreGuard {
@@ -46,10 +70,79 @@ impl Drop for TempRestoreGuard {
     }
 }
 
+const MAX_HISTORY_RESTORE_TEMP_PATH_ATTEMPTS: u32 = 64;
 const MAX_RESTORE_ROLLBACK_PATH_ATTEMPTS: u64 = 1024;
+const MAX_HISTORY_TEXT_DIFF_BYTES: u64 = 8 * 1024 * 1024;
+const DIFF_COMPARE_BUFFER_SIZE: usize = 16 * 1024;
 const RESTORE_NOTE_DB_UNCHANGED: &str = "SQLite is unchanged until you run the import step.";
 const RESTORE_NOTE_TOMBSTONE_PROTECTION: &str =
     "Tombstone protection remains active; deleted issues are not resurrected by import.";
+
+fn history_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
+}
+
+fn history_display_path(path: &Path) -> String {
+    history_display_text(&path.display().to_string())
+}
+
+fn history_display_filename(path: &Path) -> String {
+    let filename = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    history_display_text(&filename)
+}
+
+fn restore_temp_path_for_attempt(target_path: &Path, attempt: u32) -> PathBuf {
+    let pid = std::process::id();
+    if attempt == 0 {
+        return target_path.with_extension(format!("jsonl.{pid}.tmp"));
+    }
+
+    let retry_suffix = u64::from(pid)
+        .saturating_mul(100)
+        .saturating_add(u64::from(attempt));
+    target_path.with_extension(format!("jsonl.{retry_suffix}.tmp"))
+}
+
+fn create_restore_temp_file(
+    target_path: &Path,
+    beads_dir: &Path,
+) -> Result<(PathBuf, File, TempRestoreGuard)> {
+    for attempt in 0..MAX_HISTORY_RESTORE_TEMP_PATH_ATTEMPTS {
+        let temp_path = restore_temp_path_for_attempt(target_path, attempt);
+        validate_temp_file_path(&temp_path, target_path, beads_dir, true)?;
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => {
+                let temp_guard = TempRestoreGuard::new(temp_path.clone());
+                return Ok((temp_path, file, temp_guard));
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&temp_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(BeadsError::Config(format!(
+                        "Temporary restore file already exists: {}",
+                        history_display_path(&temp_path)
+                    )));
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temporary restore file for '{}'",
+        history_display_path(target_path)
+    )))
+}
 
 fn create_restore_rollback_snapshot(
     target_path: &Path,
@@ -76,12 +169,13 @@ fn create_restore_rollback_snapshot(
         io::copy(&mut reader, &mut writer)?;
         writer.sync_all()?;
         drop(writer);
+        crate::util::sync_parent_directory(&rollback_guard.path)?;
         return Ok(rollback_guard);
     }
 
     Err(BeadsError::Config(format!(
         "Failed to allocate rollback snapshot path for '{}'",
-        target_path.display()
+        history_display_path(target_path)
     )))
 }
 
@@ -99,17 +193,17 @@ where
         Err(rename_err) => {
             if let Some(rollback_guard) = rollback_guard {
                 if !target_path.exists() {
-                    return match fs::rename(&rollback_guard.path, target_path) {
+                    return match crate::util::durable_rename(&rollback_guard.path, target_path) {
                         Ok(()) => Err(BeadsError::Config(format!(
                             "Failed to replace '{}' with the restored backup: {rename_err}. The original target was restored.",
-                            target_path.display()
+                            history_display_path(target_path)
                         ))),
                         Err(rollback_err) => {
                             rollback_guard.persist();
                             Err(BeadsError::Config(format!(
                                 "Failed to replace '{}' with the restored backup: {rename_err}. Restoring the original target from '{}' also failed: {rollback_err}",
-                                target_path.display(),
-                                rollback_guard.path.display()
+                                history_display_path(target_path),
+                                history_display_path(&rollback_guard.path)
                             )))
                         }
                     };
@@ -118,8 +212,8 @@ where
                 rollback_guard.persist();
                 return Err(BeadsError::Config(format!(
                     "Failed to replace '{}' with the restored backup: {rename_err}. The original target snapshot was preserved at '{}'.",
-                    target_path.display(),
-                    rollback_guard.path.display()
+                    history_display_path(target_path),
+                    history_display_path(&rollback_guard.path)
                 )));
             }
 
@@ -170,6 +264,9 @@ fn emit_restore_output(
 
     if ctx.is_rich() {
         let theme = ctx.theme();
+        let backup_name = history_display_text(backup_name);
+        let target_name = history_display_text(target_name);
+        let next_step = history_display_text(&next_step);
         let body = format!(
             "Restored {backup_name} to {target_name}.\n\
              Next: {next_step}\n\
@@ -182,8 +279,12 @@ fn emit_restore_output(
             .border_style(theme.panel_border.clone());
         ctx.render(&panel);
     } else {
-        println!("Restored {backup_name} to {target_name}");
-        println!("Next: {next_step}");
+        println!(
+            "Restored {} to {}",
+            history_display_text(backup_name),
+            history_display_text(target_name)
+        );
+        println!("Next: {}", history_display_text(&next_step));
         println!("Note: {RESTORE_NOTE_DB_UNCHANGED}");
         println!("Note: {RESTORE_NOTE_TOMBSTONE_PROTECTION}");
     }
@@ -195,18 +296,21 @@ fn ensure_regular_backup_file(backup_path: &Path, backup_name: &str) -> Result<(
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
                 return Err(BeadsError::Config(format!(
-                    "History backup '{backup_name}' must not be a symlink"
+                    "History backup '{}' must not be a symlink",
+                    history_display_text(backup_name)
                 )));
             }
             if !file_type.is_file() {
                 return Err(BeadsError::Config(format!(
-                    "History backup '{backup_name}' must be a regular file"
+                    "History backup '{}' must be a regular file",
+                    history_display_text(backup_name)
                 )));
             }
             Ok(())
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Err(BeadsError::Config(format!(
-            "Backup file not found: {backup_name}"
+            "Backup file not found: {}",
+            history_display_text(backup_name)
         ))),
         Err(err) => Err(err.into()),
     }
@@ -280,7 +384,7 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
                 .border_style(theme.panel_border.clone());
             ctx.render(&panel);
         } else {
-            println!("No backups found in {}", history_dir.display());
+            println!("No backups found in {}", history_display_path(history_dir));
         }
         return Ok(());
     }
@@ -299,13 +403,8 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
             .with_column(Column::new("Timestamp").min_width(20).max_width(26));
 
         for entry in backups {
-            let filename = entry
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let target = entry.target_path.display().to_string();
+            let filename = history_display_filename(&entry.path);
+            let target = history_display_path(&entry.target_path);
             let size = format_size(entry.size);
             let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string();
             let row = Row::new(vec![
@@ -319,7 +418,7 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
 
         ctx.render(&table);
     } else {
-        println!("Backups in {}:", history_dir.display());
+        println!("Backups in {}:", history_display_path(history_dir));
         println!(
             "{:<30} {:<36} {:<10} {:<20}",
             "FILENAME", "TARGET", "SIZE", "TIMESTAMP"
@@ -327,8 +426,8 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
         println!("{}", "-".repeat(100));
 
         for entry in backups {
-            let filename = entry.path.file_name().unwrap_or_default().to_string_lossy();
-            let target = entry.target_path.display();
+            let filename = history_display_filename(&entry.path);
+            let target = history_display_path(&entry.target_path);
             let size = format_size(entry.size);
             let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string();
             println!("{filename:<30} {target:<36} {size:<10} {timestamp:<20}");
@@ -388,7 +487,8 @@ fn diff_backup(
         .to_string();
     if !current_path.exists() {
         return Err(BeadsError::Config(format!(
-            "Current {current_name} not found"
+            "Current {} not found",
+            history_display_text(&current_name)
         )));
     }
 
@@ -430,58 +530,38 @@ fn diff_backup(
 
     if ctx.is_rich() {
         let theme = ctx.theme();
-        let header = format!("Current: {current_name}\nBackup: {filename}");
+        let header = format!(
+            "Current: {}\nBackup: {}",
+            history_display_text(&current_name),
+            history_display_text(&backup_name)
+        );
         let panel = Panel::from_text(&header)
             .title(Text::styled("History Diff", theme.panel_title.clone()))
             .box_style(theme.box_style)
             .border_style(theme.panel_border.clone());
         ctx.render(&panel);
     } else {
-        println!("Diffing current {current_name} vs {filename}...");
+        println!(
+            "Diffing current {} vs {}...",
+            history_display_text(&current_name),
+            history_display_text(&backup_name)
+        );
     }
 
-    // Let's shell out to `diff -u` for now as it's standard on linux/mac.
-    // Avoid GNU-only flags (like --color) to keep this portable.
-    let status = std::process::Command::new("diff")
-        .arg("-u")
-        .arg(&current_path)
-        .arg(&backup_path)
-        .status();
-
-    match status {
-        Ok(s) => match classify_diff_exit(s.success(), s.code())? {
-            DiffCommandStatus::Identical => {
+    match history_diff_for_files(&current_path, &backup_path)? {
+        HistoryFileDiff::Text(diff) => {
+            if diff.is_empty() {
                 if ctx.is_rich() {
                     ctx.success("Files are identical.");
                 } else {
                     println!("Files are identical.");
                 }
-            }
-            DiffCommandStatus::Different => {}
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let current_size = std::fs::metadata(&current_path)?.len();
-            let backup_size = std::fs::metadata(&backup_path)?.len();
-            let current_human = format_size(current_size);
-            let backup_human = format_size(backup_size);
-            if ctx.is_rich() {
-                let theme = ctx.theme();
-                let body = format!(
-                    "Diff tool not available; comparing sizes.\nCurrent: {current_human} ({current_size} bytes)\nBackup:  {backup_human} ({backup_size} bytes)"
-                );
-                let panel = Panel::from_text(&body)
-                    .title(Text::styled("History Diff", theme.panel_title.clone()))
-                    .box_style(theme.box_style)
-                    .border_style(theme.panel_border.clone());
-                ctx.render(&panel);
             } else {
-                println!("'diff' command not found. Comparing sizes:");
-                println!("Current: {current_size} bytes");
-                println!("Backup:  {backup_size} bytes");
+                print!("{diff}");
             }
         }
-        Err(err) => {
-            return Err(BeadsError::Config(format!("Failed to run diff: {err}")));
+        HistoryFileDiff::Fallback(fallback) => {
+            emit_diff_fallback(ctx, fallback);
         }
     }
 
@@ -510,32 +590,23 @@ fn restore_backup(
 
     if target_path.exists() && !force {
         return Err(BeadsError::Config(format!(
-            "Current {target_name} exists. Use --force to overwrite."
+            "Current {} exists. Use --force to overwrite.",
+            history_display_text(&target_name)
         )));
     }
 
+    validate_temp_file_path(
+        &restore_temp_path_for_attempt(&target_path, 0),
+        &target_path,
+        beads_dir,
+        true,
+    )?;
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let pid = std::process::id();
-    let temp_path = target_path.with_extension(format!("jsonl.{pid}.tmp"));
-    validate_temp_file_path(&temp_path, &target_path, beads_dir, true)?;
     let mut reader = File::open(&backup_path)?;
-    let mut writer = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary restore file already exists: {}",
-                    temp_path.display()
-                ))
-            } else {
-                err.into()
-            }
-        })?;
-    let mut temp_guard = TempRestoreGuard::new(temp_path.clone());
+    let (temp_path, mut writer, mut temp_guard) =
+        create_restore_temp_file(&target_path, beads_dir)?;
     io::copy(&mut reader, &mut writer)?;
     writer.sync_all()?;
     drop(writer);
@@ -548,17 +619,12 @@ fn restore_backup(
             "overwrite history restore target",
         )?;
         rollback_guard = Some(create_restore_rollback_snapshot(&target_path, beads_dir)?);
-        if let Err(err) = fs::remove_file(&target_path)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            return Err(err.into());
-        }
     }
     commit_restored_target_with_rollback(
         &temp_path,
         &target_path,
         rollback_guard.as_mut(),
-        |from, to| fs::rename(from, to),
+        crate::util::durable_rename,
     )?;
     temp_guard.persist();
     emit_restore_output(ctx, &backup_name, &target_path, &target_name, beads_dir);
@@ -623,39 +689,137 @@ fn prune_backups(
 }
 
 fn diff_status_for_json(current_path: &Path, backup_path: &Path) -> Result<DiffStatusResult> {
-    let output = std::process::Command::new("diff")
-        .arg("-u")
-        .arg(current_path)
-        .arg(backup_path)
-        .output();
-
-    match output {
-        Ok(out) => match classify_diff_exit(out.status.success(), out.status.code())? {
-            DiffCommandStatus::Identical => Ok(("identical", true, None)),
-            DiffCommandStatus::Different => Ok(("different", true, None)),
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let current_size = std::fs::metadata(current_path)?.len();
-            let backup_size = std::fs::metadata(backup_path)?.len();
-            Ok(("diff_unavailable", false, Some((current_size, backup_size))))
-        }
-        Err(err) => Err(BeadsError::Config(format!("Failed to run diff: {err}"))),
+    let summary = summarize_diff_files(current_path, backup_path)?;
+    if summary.diff_available {
+        Ok((summary.status, true, None))
+    } else {
+        Ok((
+            summary.status,
+            false,
+            Some((summary.current_size, summary.backup_size)),
+        ))
     }
 }
 
-fn classify_diff_exit(success: bool, code: Option<i32>) -> Result<DiffCommandStatus> {
-    if success {
-        return Ok(DiffCommandStatus::Identical);
-    }
-    if code == Some(1) {
-        return Ok(DiffCommandStatus::Different);
+#[derive(Debug, Clone, Copy)]
+struct DiffFileSummary {
+    status: &'static str,
+    diff_available: bool,
+    current_size: u64,
+    backup_size: u64,
+    fallback_reason: Option<TextDiffFallbackReason>,
+}
+
+fn summarize_diff_files(current_path: &Path, backup_path: &Path) -> Result<DiffFileSummary> {
+    let current_size = fs::metadata(current_path)?.len();
+    let backup_size = fs::metadata(backup_path)?.len();
+    let identical = files_are_byte_identical(current_path, backup_path, current_size, backup_size)?;
+    let status = if identical { "identical" } else { "different" };
+
+    if current_size > MAX_HISTORY_TEXT_DIFF_BYTES || backup_size > MAX_HISTORY_TEXT_DIFF_BYTES {
+        return Ok(DiffFileSummary {
+            status,
+            diff_available: false,
+            current_size,
+            backup_size,
+            fallback_reason: Some(TextDiffFallbackReason::TooLarge),
+        });
     }
 
-    let detail = code.map_or_else(
-        || "diff terminated without an exit code".to_string(),
-        |value| format!("diff exited with status {value}"),
+    let diff_available = file_is_utf8(current_path)? && file_is_utf8(backup_path)?;
+    Ok(DiffFileSummary {
+        status,
+        diff_available,
+        current_size,
+        backup_size,
+        fallback_reason: if diff_available {
+            None
+        } else {
+            Some(TextDiffFallbackReason::NonUtf8)
+        },
+    })
+}
+
+fn history_diff_for_files(current_path: &Path, backup_path: &Path) -> Result<HistoryFileDiff> {
+    let summary = summarize_diff_files(current_path, backup_path)?;
+    if let Some(reason) = summary.fallback_reason {
+        return Ok(HistoryFileDiff::Fallback(TextDiffFallback {
+            status: summary.status,
+            current_size: summary.current_size,
+            backup_size: summary.backup_size,
+            reason,
+        }));
+    }
+
+    unified_diff_for_files(current_path, backup_path).map(HistoryFileDiff::Text)
+}
+
+fn unified_diff_for_files(current_path: &Path, backup_path: &Path) -> Result<String> {
+    let current = fs::read_to_string(current_path)?;
+    let backup = fs::read_to_string(backup_path)?;
+    let diff = TextDiff::from_lines(&current, &backup);
+    let current_header = history_display_path(current_path);
+    let backup_header = history_display_path(backup_path);
+    let diff = diff
+        .unified_diff()
+        .header(&current_header, &backup_header)
+        .to_string();
+    Ok(sanitize_terminal_text(&diff).into_owned())
+}
+
+fn emit_diff_fallback(ctx: &OutputContext, fallback: TextDiffFallback) {
+    let prefix = if fallback.status == "identical" {
+        "Files are byte-identical."
+    } else {
+        "Files differ."
+    };
+    let message = format!(
+        "{prefix} Text diff unavailable: {}. Current size: {}; backup size: {}.",
+        fallback.reason.message(),
+        format_size(fallback.current_size),
+        format_size(fallback.backup_size)
     );
-    Err(BeadsError::Config(format!("Failed to run diff: {detail}")))
+
+    if ctx.is_rich() {
+        ctx.warning(&message);
+    } else {
+        println!("{message}");
+    }
+}
+
+fn file_is_utf8(path: &Path) -> Result<bool> {
+    let bytes = fs::read(path)?;
+    Ok(std::str::from_utf8(&bytes).is_ok())
+}
+
+fn files_are_byte_identical(
+    current_path: &Path,
+    backup_path: &Path,
+    current_size: u64,
+    backup_size: u64,
+) -> Result<bool> {
+    if current_size != backup_size {
+        return Ok(false);
+    }
+
+    let mut current = File::open(current_path)?;
+    let mut backup = File::open(backup_path)?;
+    let mut current_buf = [0_u8; DIFF_COMPARE_BUFFER_SIZE];
+    let mut backup_buf = [0_u8; DIFF_COMPARE_BUFFER_SIZE];
+
+    loop {
+        let current_read = current.read(&mut current_buf)?;
+        let backup_read = backup.read(&mut backup_buf)?;
+        if current_read != backup_read {
+            return Ok(false);
+        }
+        if current_read == 0 {
+            return Ok(true);
+        }
+        if current_buf.get(..current_read) != backup_buf.get(..backup_read) {
+            return Ok(false);
+        }
+    }
 }
 
 fn current_jsonl_path_for_backup(
@@ -684,7 +848,7 @@ fn current_jsonl_path_for_backup_with_cwd(
         let active_jsonl_path = active_jsonl_path.ok_or_else(|| {
             BeadsError::Config(format!(
                 "External backup target '{}' requires the current active JSONL path",
-                target_path.display()
+                history_display_path(&target_path)
             ))
         })?;
         let normalized_target = normalize_jsonl_match_path(&target_path, cwd);
@@ -696,8 +860,8 @@ fn current_jsonl_path_for_backup_with_cwd(
         if canonical_target != canonical_active {
             return Err(BeadsError::Config(format!(
                 "Backup target '{}' does not match the active JSONL path '{}'",
-                target_path.display(),
-                active_jsonl_path.display()
+                history_display_path(&target_path),
+                history_display_path(active_jsonl_path)
             )));
         }
     }
@@ -760,11 +924,15 @@ fn validated_backup_filename(filename: &str) -> Result<String> {
     match (components.next(), components.next()) {
         (Some(Component::Normal(name)), None) => {
             name.to_str().map(str::to_string).ok_or_else(|| {
-                BeadsError::Config(format!("Invalid backup filename format: {filename}"))
+                BeadsError::Config(format!(
+                    "Invalid backup filename format: {}",
+                    history_display_text(filename)
+                ))
             })
         }
         _ => Err(BeadsError::Config(format!(
-            "Invalid backup filename format: {filename}"
+            "Invalid backup filename format: {}",
+            history_display_text(filename)
         ))),
     }
 }
@@ -791,6 +959,54 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn history_display_text_sanitizes_terminal_controls() {
+        let rendered = history_display_text("issues\x1b[2J\rreset\x08\nnext\x07\u{9b}.jsonl");
+
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(rendered.contains("\\u{1b}[2J"));
+        assert!(rendered.contains("\\r"));
+        assert!(rendered.contains("\\u{8}"));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{7}"));
+        assert!(rendered.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn validated_backup_filename_errors_escape_terminal_controls() {
+        let err = validated_backup_filename("bad\x1b[2J/name").unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Config(message) = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+        }
+    }
+
+    #[test]
+    fn unified_diff_for_files_escapes_terminal_controls() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current\x1b[2J\nfake.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        fs::write(&current, "{\"title\":\"current\u{7}\"}\n").unwrap();
+        fs::write(&backup, "{\"title\":\"backup\u{8}\"}\n").unwrap();
+
+        let diff = unified_diff_for_files(&current, &backup).unwrap();
+
+        assert!(
+            !diff
+                .chars()
+                .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
+        );
+        assert!(diff.contains("\\u{1b}[2J"));
+        assert!(diff.contains("\\nfake.jsonl"));
+        assert!(diff.contains("\\u{7}"));
+        assert!(diff.contains("\\u{8}"));
+    }
+
+    #[test]
     fn test_current_jsonl_path_for_backup_rejects_missing_target_metadata() {
         let temp = TempDir::new().unwrap();
         let history_dir = temp.path().join(".br_history");
@@ -810,7 +1026,10 @@ mod tests {
                     "unexpected message: {msg}"
                 );
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
@@ -822,7 +1041,10 @@ mod tests {
 
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("Invalid backup filename format")),
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
@@ -835,18 +1057,103 @@ mod tests {
 
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("Invalid backup filename format")),
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
     #[test]
-    fn test_classify_diff_exit_rejects_real_diff_failures() {
-        let err = classify_diff_exit(false, Some(2)).unwrap_err();
+    fn test_unified_diff_for_files_reports_differences() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        fs::write(&current, "{\"id\":\"one\",\"title\":\"current\"}\n").unwrap();
+        fs::write(&backup, "{\"id\":\"one\",\"title\":\"backup\"}\n").unwrap();
 
-        match err {
-            BeadsError::Config(msg) => assert!(msg.contains("diff exited with status 2")),
-            other => panic!("unexpected error: {other:?}"),
+        let diff = unified_diff_for_files(&current, &backup).unwrap();
+
+        assert!(
+            diff.contains("--- ") && diff.contains("+++ ") && diff.contains("@@"),
+            "diff should include unified diff headers: {diff}"
+        );
+        assert!(
+            diff.contains("-{\"id\":\"one\",\"title\":\"current\"}")
+                && diff.contains("+{\"id\":\"one\",\"title\":\"backup\"}"),
+            "diff should include current and backup lines: {diff}"
+        );
+    }
+
+    #[test]
+    fn test_unified_diff_for_files_returns_empty_for_identical_files() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        fs::write(&current, "{\"id\":\"one\",\"title\":\"same\"}\n").unwrap();
+        fs::write(&backup, "{\"id\":\"one\",\"title\":\"same\"}\n").unwrap();
+
+        let diff = unified_diff_for_files(&current, &backup).unwrap();
+
+        assert!(
+            diff.is_empty(),
+            "identical files should not emit diff: {diff}"
+        );
+    }
+
+    #[test]
+    fn test_diff_status_for_json_falls_back_for_invalid_utf8() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        fs::write(&current, [0xff, b'{', b'}']).unwrap();
+        fs::write(&backup, [b'{', b'}']).unwrap();
+
+        let (status, diff_available, sizes) = diff_status_for_json(&current, &backup).unwrap();
+
+        assert_eq!(status, "different");
+        assert!(!diff_available, "invalid UTF-8 cannot produce text diff");
+        assert_eq!(sizes, Some((3, 2)));
+    }
+
+    #[test]
+    fn test_history_diff_for_files_reports_identical_non_utf8_without_text_diff() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        fs::write(&current, [0xff, 0x00, 0xfe]).unwrap();
+        fs::write(&backup, [0xff, 0x00, 0xfe]).unwrap();
+
+        let diff = history_diff_for_files(&current, &backup).unwrap();
+
+        assert!(
+            matches!(&diff, HistoryFileDiff::Fallback(_)),
+            "non-UTF-8 files should not produce text diff"
+        );
+        if let HistoryFileDiff::Fallback(fallback) = diff {
+            assert_eq!(fallback.status, "identical");
+            assert_eq!(fallback.current_size, 3);
+            assert_eq!(fallback.backup_size, 3);
+            assert_eq!(fallback.reason, TextDiffFallbackReason::NonUtf8);
         }
+    }
+
+    #[test]
+    fn test_diff_status_for_json_falls_back_for_large_inputs() {
+        let temp = TempDir::new().unwrap();
+        let current = temp.path().join("current.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+        let current_file = fs::File::create(&current).unwrap();
+        current_file
+            .set_len(MAX_HISTORY_TEXT_DIFF_BYTES + 1)
+            .unwrap();
+        fs::write(&backup, "small\n").unwrap();
+
+        let (status, diff_available, sizes) = diff_status_for_json(&current, &backup).unwrap();
+
+        assert_eq!(status, "different");
+        assert!(!diff_available, "large inputs should not build full diffs");
+        assert_eq!(sizes, Some((MAX_HISTORY_TEXT_DIFF_BYTES + 1, 6)));
     }
 
     #[test]
@@ -1059,6 +1366,49 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_backup_skips_stale_regular_temp_file() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::write(&target_path, "backup-state\n").unwrap();
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+        };
+        history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
+        fs::write(&target_path, "current-state\n").unwrap();
+
+        let stale_temp_path = restore_temp_path_for_attempt(&target_path, 0);
+        fs::write(&stale_temp_path, "stale temp\n").unwrap();
+
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        restore_backup(&beads_dir, &history_dir, &backup_name, true, None, &ctx).unwrap();
+
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "backup-state\n");
+        assert_eq!(
+            fs::read_to_string(&stale_temp_path).unwrap(),
+            "stale temp\n",
+            "restore should not overwrite or delete a stale regular temp file"
+        );
+    }
+
+    #[test]
     fn test_restore_backup_cleans_temp_file_when_rename_fails() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -1139,7 +1489,10 @@ mod tests {
                     "unexpected message: {message}"
                 );
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
         assert_eq!(
             fs::read_to_string(&target_path).unwrap(),
@@ -1184,7 +1537,10 @@ mod tests {
                     "unexpected message: {msg}"
                 );
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
@@ -1221,7 +1577,10 @@ mod tests {
 
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("Current custom.jsonl not found")),
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
     }
 
@@ -1247,7 +1606,139 @@ mod tests {
             restore_backup(&beads_dir, &history_dir, backup_name, true, None, &ctx).unwrap_err();
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("must not be a symlink")),
-            other => panic!("unexpected error: {other:?}"),
+            other => assert!(
+                matches!(other, BeadsError::Config(_)),
+                "unexpected error: {other:?}"
+            ),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_backup_rejects_internal_target_through_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&history_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, beads_dir.join("linked")).unwrap();
+
+        let backup_name = "issues.20260220_120000.jsonl";
+        let backup_path = history_dir.join(backup_name);
+        fs::write(&backup_path, "restored\n").unwrap();
+        fs::write(
+            backup_path.with_extension("jsonl.meta.json"),
+            serde_json::json!({
+                "target": {
+                    "kind": "relative",
+                    "path": "linked/issues.jsonl",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        let err =
+            restore_backup(&beads_dir, &history_dir, backup_name, true, None, &ctx).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !outside_dir.join("issues.jsonl").exists(),
+            "restore must not write through symlinked .beads parents"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_backup_rejects_missing_descendant_under_symlinked_parent_without_side_effects()
+    {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&history_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, beads_dir.join("linked")).unwrap();
+
+        let backup_name = "issues.20260220_120000.jsonl";
+        let backup_path = history_dir.join(backup_name);
+        fs::write(&backup_path, "restored\n").unwrap();
+        fs::write(
+            backup_path.with_extension("jsonl.meta.json"),
+            serde_json::json!({
+                "target": {
+                    "kind": "relative",
+                    "path": "linked/nested/issues.jsonl",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        let err =
+            restore_backup(&beads_dir, &history_dir, backup_name, true, None, &ctx).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !outside_dir.join("nested").exists(),
+            "restore must not create directories through symlinked .beads parents"
+        );
+    }
+
+    #[test]
+    fn commit_restored_target_replaces_existing_atomically() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let temp = dir.path().join("temp.jsonl");
+
+        fs::write(&target, "original content\n").unwrap();
+        fs::write(&temp, "restored content\n").unwrap();
+
+        let result =
+            commit_restored_target_with_rollback(&temp, &target, None, crate::util::durable_rename);
+        assert!(result.is_ok(), "rename over existing should succeed");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "restored content\n",
+            "target should have restored content"
+        );
+        assert!(!temp.exists(), "temp should be gone after rename");
+    }
+
+    #[test]
+    fn commit_restored_target_rollback_on_rename_failure() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let rollback_path = dir.path().join("rollback.jsonl");
+
+        fs::write(&target, "original\n").unwrap();
+        fs::write(&rollback_path, "original\n").unwrap();
+        let mut rollback_guard = TempRestoreGuard::new(rollback_path.clone());
+
+        let result = commit_restored_target_with_rollback(
+            &dir.path().join("nonexistent_temp.jsonl"),
+            &target,
+            Some(&mut rollback_guard),
+            |_from, _to| Err(io::Error::other("injected")),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "original\n",
+            "target should be unchanged after failed rename"
+        );
     }
 }

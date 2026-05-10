@@ -3,20 +3,23 @@
 //! Enables br to update itself to the latest version using the `self_update` crate.
 
 use crate::cli::UpgradeArgs;
+use crate::cli::commands::{
+    GITHUB_REPO_NAME, GITHUB_REPO_OWNER, github_raw_main_url, github_releases_url,
+};
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
+use crate::util::hex_encode;
 use rich_rust::prelude::*;
 use self_update::backends::github;
 use self_update::cargo_crate_version;
-use self_update::update::ReleaseUpdate;
+use self_update::update::{Release, ReleaseAsset, ReleaseUpdate};
+use self_update::{Download, Extract, Move, Status};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::env;
-
-/// Repo owner for GitHub releases.
-const REPO_OWNER: &str = "Dicklesworthstone";
-
-/// Repo name for GitHub releases.
-const REPO_NAME: &str = "beads_rust";
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
 
 /// Binary name.
 const BIN_NAME: &str = "br";
@@ -70,8 +73,8 @@ fn execute_check(current_version: &str, ctx: &OutputContext) -> Result<()> {
 
     let update_available = version_newer(latest_version, current_version);
 
-    // Get download URL from first asset if available
-    let download_url = latest.assets.first().map(|a| a.download_url.clone());
+    let download_url = release_binary_asset_for(&latest, asset_target_name(), None)
+        .map(|asset| asset.download_url.clone());
 
     let result = UpdateCheckResult {
         current_version: current_version.to_string(),
@@ -111,10 +114,7 @@ fn execute_dry_run(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     let install_version = target_version.unwrap_or(latest_version);
     let would_update = args.force || version_newer(install_version, current_version);
 
-    // Get download URL from first asset if available
-    let download_url = latest
-        .assets
-        .first()
+    let download_url = release_binary_asset_for(&latest, asset_target_name(), None)
         .map_or_else(|| "N/A".to_string(), |a| a.download_url.clone());
 
     if ctx.is_json() {
@@ -177,9 +177,18 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
         build_updater(current_version)?
     };
 
-    // Get latest release info first
-    let latest = updater.get_latest_release().map_err(map_update_error)?;
-    let latest_version = &latest.version;
+    let Some(release) = select_release_for_update(updater.as_ref(), current_version)? else {
+        render_not_updated(
+            current_version,
+            current_version,
+            ctx,
+            is_json,
+            is_quiet,
+            is_rich,
+        );
+        return Ok(());
+    };
+    let latest_version = &release.version;
 
     if !is_json && !is_quiet && !is_rich {
         println!("Latest version:  {latest_version}");
@@ -188,21 +197,14 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     let update_available = args.force || version_newer(latest_version, current_version);
 
     if !update_available {
-        let result = UpdateResult {
-            current_version: current_version.to_string(),
-            new_version: latest_version.clone(),
-            updated: false,
-            message: Some("Already up to date".to_string()),
-        };
-
-        if is_json {
-            ctx.json_pretty(&result);
-        } else if is_quiet {
-        } else if is_rich {
-            render_up_to_date_rich(current_version, latest_version, ctx);
-        } else {
-            println!("\n\u{2713} Already up to date");
-        }
+        render_not_updated(
+            current_version,
+            latest_version,
+            ctx,
+            is_json,
+            is_quiet,
+            is_rich,
+        );
         return Ok(());
     }
 
@@ -212,20 +214,14 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
         ctx.info(&format!("Downloading {latest_version}..."));
     }
 
-    // Perform the update
-    let status = updater.update().map_err(|e| {
+    // Perform the update only after the downloaded archive matches the release
+    // checksum asset. The upstream self_update 0.44 API has zipsign support but
+    // no SHA256 verification hook, so this command handles the release asset
+    // download/extract/replace sequence directly.
+    let status = update_with_checksum(updater.as_ref(), &release).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("archive-tar") || msg.contains("ArchiveNotEnabled") || msg.contains("tar") {
-            BeadsError::Other(anyhow::anyhow!(
-                "{msg}\n\n\
-                 This binary was built without archive support for the required format (e.g., .tar.gz).\n\
-                 This is a known issue in some older versions (e.g., 0.1.21 - 0.1.26). Version 0.1.27 and later include the correct 'archive-tar' linkage.\n\n\
-                 Please upgrade manually by running:\n\n  \
-                 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash\n\n\
-                 Or by downloading the release from:\n  \
-                 https://github.com/Dicklesworthstone/beads_rust/releases\n\n\
-                 After that, `br upgrade` will work correctly for future updates."
-            ))
+            BeadsError::upgrade(archive_support_error_message(&msg))
         } else {
             map_update_error(e)
         }
@@ -259,6 +255,46 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     Ok(())
 }
 
+fn archive_support_error_message(msg: &str) -> String {
+    let install_url = github_raw_main_url("install.sh");
+    let releases_url = github_releases_url();
+    format!(
+        "{msg}\n\n\
+         This binary was built without archive support for the required format (e.g., .tar.gz).\n\
+         This is a known issue in some older versions (e.g., 0.1.21 - 0.1.26). Version 0.1.27 and later include the correct 'archive-tar' linkage.\n\n\
+         Please upgrade manually by running:\n\n  \
+         curl -fsSL {install_url} | bash\n\n\
+         Or by downloading the release from:\n  \
+         {releases_url}\n\n\
+         After that, `br upgrade` will work correctly for future updates."
+    )
+}
+
+fn render_not_updated(
+    current_version: &str,
+    latest_version: &str,
+    ctx: &OutputContext,
+    is_json: bool,
+    is_quiet: bool,
+    is_rich: bool,
+) {
+    let result = UpdateResult {
+        current_version: current_version.to_string(),
+        new_version: latest_version.to_string(),
+        updated: false,
+        message: Some("Already up to date".to_string()),
+    };
+
+    if is_json {
+        ctx.json_pretty(&result);
+    } else if is_quiet {
+    } else if is_rich {
+        render_up_to_date_rich(current_version, latest_version, ctx);
+    } else {
+        println!("\n\u{2713} Already up to date");
+    }
+}
+
 /// Resolve a GitHub auth token from environment variables.
 ///
 /// Checks `GITHUB_TOKEN` first, then `GH_TOKEN`. Returns `None` if neither
@@ -289,12 +325,242 @@ fn asset_target_name() -> &'static str {
     }
 }
 
+fn is_archive_asset_name(name: &str) -> bool {
+    let path = Path::new(name);
+    if path.extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("sha256") || ext.eq_ignore_ascii_case("minisig")
+    }) {
+        return false;
+    }
+
+    has_tar_gz_extension(path)
+        || path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+}
+
+fn has_tar_gz_extension(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
+        && path
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
+}
+
+fn release_binary_asset_for<'a>(
+    release: &'a Release,
+    target: &str,
+    identifier: Option<&str>,
+) -> Option<&'a ReleaseAsset> {
+    release
+        .assets
+        .iter()
+        .find(|asset| {
+            is_archive_asset_name(&asset.name)
+                && asset.name.contains(target)
+                && identifier.is_none_or(|id| asset.name.contains(id))
+        })
+        .or_else(|| {
+            release.assets.iter().find(|asset| {
+                is_archive_asset_name(&asset.name)
+                    && identifier.is_none_or(|id| asset.name.contains(id))
+            })
+        })
+}
+
+fn checksum_asset_for<'a>(release: &'a Release, archive_name: &str) -> Option<&'a ReleaseAsset> {
+    let expected_name = format!("{archive_name}.sha256");
+    release
+        .assets
+        .iter()
+        .find(|asset| asset.name == expected_name)
+}
+
+fn select_release_for_update(
+    updater: &dyn ReleaseUpdate,
+    current_version: &str,
+) -> Result<Option<Release>> {
+    if let Some(target_version) = updater.target_version() {
+        return updater
+            .get_release_version(&target_version)
+            .map(Some)
+            .map_err(map_update_error);
+    }
+
+    let releases = updater
+        .get_latest_releases(current_version)
+        .map_err(map_update_error)?;
+    let compatible = releases
+        .iter()
+        .find(|release| {
+            self_update::version::bump_is_compatible(current_version, &release.version)
+                .unwrap_or(false)
+        })
+        .cloned();
+
+    Ok(compatible.or_else(|| releases.into_iter().next()))
+}
+
+fn update_with_checksum(updater: &dyn ReleaseUpdate, release: &Release) -> Result<Status> {
+    let target = updater.target();
+    let target_asset = release_binary_asset_for(release, &target, updater.identifier().as_deref())
+        .ok_or_else(|| {
+            BeadsError::upgrade(format!("No release archive found for target `{target}`"))
+        })?;
+    let checksum_asset = checksum_asset_for(release, &target_asset.name).ok_or_else(|| {
+        let expected_checksum_name = format!("{}.sha256", target_asset.name);
+        BeadsError::upgrade(format!(
+            "Missing SHA256 checksum asset `{}` for release archive `{}`",
+            expected_checksum_name, target_asset.name
+        ))
+    })?;
+
+    let tmp_archive_dir = tempfile::TempDir::new()
+        .map_err(|err| BeadsError::upgrade(format!("failed to create temp dir: {err}")))?;
+    let tmp_archive_path = tmp_archive_dir.path().join(&target_asset.name);
+    let mut tmp_archive = File::create(&tmp_archive_path)
+        .map_err(|err| BeadsError::upgrade(format!("failed to create temp archive: {err}")))?;
+
+    download_asset_to_writer(
+        &target_asset.download_url,
+        &mut tmp_archive,
+        updater.show_download_progress(),
+        updater.auth_token().as_deref(),
+    )?;
+    drop(tmp_archive);
+
+    let expected_sha256 = download_expected_sha256(
+        checksum_asset,
+        &target_asset.name,
+        updater.auth_token().as_deref(),
+    )?;
+    verify_sha256(&tmp_archive_path, &expected_sha256)?;
+
+    let bin_path_in_archive = updater.bin_path_in_archive();
+    Extract::from_source(&tmp_archive_path)
+        .extract_file(tmp_archive_dir.path(), &bin_path_in_archive)
+        .map_err(map_update_error)?;
+
+    let new_exe = tmp_archive_dir.path().join(&bin_path_in_archive);
+    let bin_install_path = updater.bin_install_path();
+    if bin_install_path
+        == env::current_exe().map_err(|err| {
+            BeadsError::upgrade(format!("failed to locate current executable: {err}"))
+        })?
+    {
+        self_update::self_replace::self_replace(new_exe)
+            .map_err(|err| BeadsError::upgrade(err.to_string()))?;
+    } else {
+        Move::from_source(new_exe.as_ref())
+            .to_dest(bin_install_path.as_ref())
+            .map_err(map_update_error)?;
+    }
+
+    Ok(Status::Updated(release.version.clone()))
+}
+
+fn download_expected_sha256(
+    checksum_asset: &ReleaseAsset,
+    archive_name: &str,
+    auth_token: Option<&str>,
+) -> Result<String> {
+    let mut bytes = Vec::new();
+    download_asset_to_writer(&checksum_asset.download_url, &mut bytes, false, auth_token)?;
+    let checksum_text = String::from_utf8(bytes)
+        .map_err(|err| BeadsError::upgrade(format!("checksum asset is not UTF-8: {err}")))?;
+    parse_sha256_checksum(&checksum_text, archive_name)
+}
+
+fn parse_sha256_checksum(checksum_text: &str, archive_name: &str) -> Result<String> {
+    for line in checksum_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let filename = parts.next();
+        if filename.is_some_and(|name| name != archive_name) {
+            continue;
+        }
+        if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(hash.to_ascii_lowercase());
+        }
+    }
+
+    Err(BeadsError::upgrade(format!(
+        "checksum asset did not contain a SHA256 entry for `{archive_name}`"
+    )))
+}
+
+fn verify_sha256(path: &Path, expected_sha256: &str) -> Result<()> {
+    let actual = sha256_file(path)?;
+    if actual.eq_ignore_ascii_case(expected_sha256) {
+        return Ok(());
+    }
+
+    Err(BeadsError::upgrade(format!(
+        "SHA256 verification failed for {}: expected {}, got {}",
+        path.display(),
+        expected_sha256,
+        actual
+    )))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)
+        .map_err(|err| BeadsError::upgrade(format!("failed to open downloaded archive: {err}")))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 8192];
+
+    loop {
+        let n = file.read(&mut buf).map_err(|err| {
+            BeadsError::upgrade(format!("failed to read downloaded archive: {err}"))
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn download_asset_to_writer(
+    url: &str,
+    writer: &mut impl Write,
+    show_progress: bool,
+    auth_token: Option<&str>,
+) -> Result<()> {
+    let mut download = Download::from_url(url);
+    download.show_progress(show_progress);
+    download.set_header(
+        "ACCEPT".parse().expect("valid HTTP header name"),
+        "application/octet-stream"
+            .parse()
+            .expect("valid HTTP header value"),
+    );
+    if let Some(token) = auth_token {
+        download.set_header(
+            "AUTHORIZATION".parse().expect("valid HTTP header name"),
+            format!("token {token}")
+                .parse()
+                .map_err(|err| BeadsError::upgrade(format!("invalid auth header: {err}")))?,
+        );
+    }
+
+    download.download_to(writer).map_err(map_update_error)
+}
+
 /// Build the self-update updater.
 fn build_updater(current_version: &str) -> Result<Box<dyn ReleaseUpdate>> {
     let mut builder = github::Update::configure();
     builder
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
+        .repo_owner(GITHUB_REPO_OWNER)
+        .repo_name(GITHUB_REPO_NAME)
         .bin_name(BIN_NAME)
         .target(asset_target_name())
         .show_download_progress(true)
@@ -317,8 +583,8 @@ fn build_updater_with_target(
 ) -> Result<Box<dyn ReleaseUpdate>> {
     let mut builder = github::Update::configure();
     builder
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
+        .repo_owner(GITHUB_REPO_OWNER)
+        .repo_name(GITHUB_REPO_NAME)
         .bin_name(BIN_NAME)
         .target(asset_target_name())
         .show_download_progress(show_progress)
@@ -336,7 +602,7 @@ fn build_updater_with_target(
 
 /// Map `self_update` errors to `BeadsError`.
 fn map_update_error<E: std::error::Error + Send + Sync + 'static>(err: E) -> BeadsError {
-    BeadsError::Other(anyhow::Error::from(err))
+    BeadsError::upgrade(err.to_string())
 }
 
 /// Compare versions to check if new is greater than current.
@@ -551,5 +817,75 @@ mod tests {
     fn test_version_more_parts() {
         assert!(version_newer("0.1.0.1", "0.1.0"));
         assert!(!version_newer("0.1.0", "0.1.0.1"));
+    }
+
+    #[test]
+    fn archive_support_error_message_uses_shared_repo_urls() {
+        let message = archive_support_error_message("archive-tar disabled");
+
+        assert!(message.contains(&github_raw_main_url("install.sh")));
+        assert!(message.contains(&github_releases_url()));
+    }
+
+    fn release_with_assets(names: &[&str]) -> Release {
+        Release {
+            name: "v1.2.3".to_string(),
+            version: "1.2.3".to_string(),
+            date: "2026-04-22T00:00:00Z".to_string(),
+            body: None,
+            assets: names
+                .iter()
+                .map(|name| ReleaseAsset {
+                    download_url: format!("https://api.github.com/assets/{name}"),
+                    name: (*name).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn release_binary_asset_ignores_checksum_and_signature_assets() {
+        let release = release_with_assets(&[
+            "br-v1.2.3-linux_amd64.tar.gz.sha256",
+            "br-v1.2.3-linux_amd64.tar.gz.minisig",
+            "br-v1.2.3-linux_amd64.tar.gz",
+        ]);
+
+        let asset = release_binary_asset_for(&release, "linux_amd64", None).unwrap();
+        assert_eq!(asset.name, "br-v1.2.3-linux_amd64.tar.gz");
+    }
+
+    #[test]
+    fn checksum_asset_matches_archive_name_exactly() {
+        let release = release_with_assets(&[
+            "br-v1.2.3-linux_arm64.tar.gz.sha256",
+            "br-v1.2.3-linux_amd64.tar.gz.sha256",
+            "br-v1.2.3-linux_amd64.tar.gz",
+        ]);
+
+        let asset = checksum_asset_for(&release, "br-v1.2.3-linux_amd64.tar.gz").unwrap();
+        assert_eq!(asset.name, "br-v1.2.3-linux_amd64.tar.gz.sha256");
+    }
+
+    #[test]
+    fn parse_sha256_checksum_accepts_standard_sha256sum_line() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let checksum = parse_sha256_checksum(
+            &format!("{hash}  br-v1.2.3-linux_amd64.tar.gz\n"),
+            "br-v1.2.3-linux_amd64.tar.gz",
+        )
+        .unwrap();
+        assert_eq!(checksum, hash);
+    }
+
+    #[test]
+    fn parse_sha256_checksum_rejects_wrong_archive_name() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let err = parse_sha256_checksum(
+            &format!("{hash}  br-v1.2.3-linux_arm64.tar.gz\n"),
+            "br-v1.2.3-linux_amd64.tar.gz",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("linux_amd64"));
     }
 }

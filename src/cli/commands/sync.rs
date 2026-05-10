@@ -3,27 +3,35 @@
 //! Provides explicit JSONL sync actions without git operations.
 //! Supports `--flush-only` (export) and `--import-only` (import).
 
-use crate::cli::SyncArgs;
+use crate::cli::{DEFAULT_WITNESS_PARALLELISM, SyncArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
+use crate::sync::witness::{
+    JsonlMerkleWitness, JsonlWitnessComparison, JsonlWitnessParallelWorkPlan,
+    JsonlWitnessReuseMaterialization, JsonlWitnessReusePlan, build_jsonl_merkle_witness_parallel,
+    compare_jsonl_merkle_witnesses, materialize_jsonl_witness_reuse_plan,
+    plan_jsonl_witness_parallel_work, plan_jsonl_witness_reuse,
+};
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
-    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, compute_staleness,
-    count_issues_in_jsonl, export_temp_path, export_to_jsonl_with_policy, finalize_export,
-    get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
-    require_safe_sync_overwrite_path, restore_tombstones_after_rebuild, save_base_snapshot,
+    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, analyze_jsonl, compute_jsonl_hash,
+    compute_staleness, export_temp_path, export_to_jsonl_with_policy, finalize_export,
+    get_issue_ids_from_jsonl, id_matches_expected_prefix, import_from_jsonl, load_base_snapshot,
+    read_issues_from_jsonl, require_safe_sync_overwrite_path, require_valid_sync_path,
+    restore_tombstones_after_rebuild, save_base_snapshot_from_jsonl,
     scan_jsonl_for_tombstone_filter, snapshot_tombstones, three_way_merge,
-    tombstones_missing_from_jsonl_tombstones, validate_sync_path_with_external,
+    tombstones_missing_from_jsonl_tombstones, validate_no_git_path,
+    validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, IsTerminal};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, IsTerminal};
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -69,6 +77,31 @@ pub struct SyncStatus {
     pub db_newer: bool,
 }
 
+/// JSONL witness command output.
+#[derive(Debug, Serialize)]
+pub struct SyncWitnessResult {
+    pub jsonl_path: String,
+    pub witness: JsonlMerkleWitness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_jsonl_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_comparison: Option<JsonlWitnessComparison>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_reuse_plan: Option<JsonlWitnessReusePlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_parallel_work_plan: Option<JsonlWitnessParallelWorkPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_reuse_materialization: Option<JsonlWitnessReuseMaterialization>,
+}
+
+struct BaseWitnessArtifacts {
+    jsonl_path: Option<String>,
+    comparison: Option<JsonlWitnessComparison>,
+    reuse_plan: Option<JsonlWitnessReusePlan>,
+    parallel_work_plan: Option<JsonlWitnessParallelWorkPlan>,
+    reuse_materialization: Option<JsonlWitnessReuseMaterialization>,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // Fields may be used in future sync enhancements
 struct SyncPathPolicy {
@@ -77,6 +110,29 @@ struct SyncPathPolicy {
     manifest_path: PathBuf,
     beads_dir: PathBuf,
     is_external: bool,
+    allow_external_jsonl: bool,
+}
+
+struct SyncStartupState {
+    beads_dir: PathBuf,
+    path_policy: SyncPathPolicy,
+    open_result: config::OpenStorageResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncOperation {
+    Status,
+    Witness,
+    Flush,
+    Merge,
+    Import,
+}
+
+struct SyncDispatchOptions {
+    db_path: PathBuf,
+    retention_days: Option<u64>,
+    use_json: bool,
+    show_progress: bool,
 }
 
 /// Execute the sync command.
@@ -89,37 +145,96 @@ pub fn execute(
     _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
+    startup_write_lock_held: bool,
 ) -> Result<()> {
     validate_sync_mode_args(args)?;
 
-    // Open storage. For `--rename-prefix` imports, defer any implicit JSONL
-    // recovery until the explicit import path below so the command's import
-    // semantics (ID rewrites and duplicate external_ref cleanup) are applied
-    // in the same invocation instead of being skipped by open-time recovery.
+    if args.witness {
+        let (_, _, path_policy) = resolve_sync_startup_paths(args, cli)?;
+        return execute_witness(&path_policy, args, ctx.is_json() || args.robot, ctx);
+    }
+
+    let mut startup = prepare_sync_startup(args, cli, startup_write_lock_held)?;
+
+    maybe_delegate_rebuild(args, &mut startup.open_result)?;
+
+    let command_result = dispatch_sync_subcommand(
+        args,
+        cli,
+        ctx,
+        &startup.beads_dir,
+        &startup.path_policy,
+        &mut startup.open_result,
+    );
+
+    finalize_sync_result(command_result, &mut startup.open_result)
+}
+
+/// Resolve path policy and open storage before dispatch. Keeping this separate
+/// from `execute` makes the command's startup phase distinct from the
+/// status/export/import/merge operation handlers below.
+fn prepare_sync_startup(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    startup_write_lock_held: bool,
+) -> Result<SyncStartupState> {
+    let (beads_dir, startup, path_policy) = resolve_sync_startup_paths(args, cli)?;
+    let allow_external_jsonl = path_policy.allow_external_jsonl;
+
+    let open_result = if startup_write_lock_held {
+        config::open_storage_with_startup_config_under_write_lock_and_jsonl_policy(
+            startup,
+            cli,
+            should_defer_jsonl_recovery(args),
+            allow_external_jsonl,
+        )?
+    } else {
+        config::open_storage_with_startup_config_and_jsonl_policy(
+            startup,
+            cli,
+            should_defer_jsonl_recovery(args),
+            allow_external_jsonl,
+        )?
+    };
+
+    Ok(SyncStartupState {
+        beads_dir,
+        path_policy,
+        open_result,
+    })
+}
+
+fn resolve_sync_startup_paths(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+) -> Result<(PathBuf, config::StartupConfig, SyncPathPolicy)> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
-    let path_policy = validate_sync_paths(
-        &beads_dir,
-        &startup.paths.jsonl_path,
-        args.allow_external_jsonl,
-    )?;
+    let allow_external_jsonl = args.allow_external_jsonl
+        || config::implicit_external_jsonl_allowed(
+            &startup.paths.beads_dir,
+            &startup.paths.db_path,
+            &startup.paths.jsonl_path,
+        );
+    let path_policy =
+        validate_sync_paths(&beads_dir, &startup.paths.jsonl_path, allow_external_jsonl)?;
     debug!(
         jsonl_path = %path_policy.jsonl_path.display(),
         manifest_path = %path_policy.manifest_path.display(),
         external_jsonl = path_policy.is_external,
+        allow_external_jsonl = path_policy.allow_external_jsonl,
         "Resolved sync path policy"
     );
-    let defer_jsonl_recovery =
-        !args.status && !args.flush_only && !args.merge && args.rename_prefix;
-    let mut open_result =
-        config::open_storage_with_startup_config(startup, cli, defer_jsonl_recovery)?;
 
-    maybe_delegate_rebuild(args, &mut open_result)?;
+    Ok((beads_dir, startup, path_policy))
+}
 
-    let command_result =
-        dispatch_sync_subcommand(args, cli, ctx, &beads_dir, &path_policy, &mut open_result);
-
-    finalize_sync_result(command_result, &mut open_result)
+/// For `--rename-prefix` imports, defer any implicit JSONL recovery until the
+/// explicit import path below so the command's import semantics (ID rewrites and
+/// duplicate external_ref cleanup) are applied in the same invocation instead
+/// of being skipped by open-time recovery.
+fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
+    !args.status && !args.witness && !args.flush_only && !args.merge && args.rename_prefix
 }
 
 /// Reject argument combinations that must fail BEFORE opening storage or
@@ -128,12 +243,43 @@ pub fn execute(
 /// touched the DB family — otherwise the validation message arrives after
 /// `recover_database_from_jsonl` has already moved the existing DB aside.
 fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
-    let mode_count = u8::from(args.flush_only) + u8::from(args.import_only) + u8::from(args.merge);
+    let mode_count = u8::from(args.flush_only)
+        + u8::from(args.import_only)
+        + u8::from(args.merge)
+        + u8::from(args.witness);
     if mode_count > 1 {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
-            reason: "Must specify exactly one of --flush-only, --import-only, or --merge"
-                .to_string(),
+            reason:
+                "Must specify exactly one of --flush-only, --import-only, --merge, or --witness"
+                    .to_string(),
+        });
+    }
+
+    if args.status && args.witness {
+        return Err(BeadsError::Validation {
+            field: "mode".to_string(),
+            reason: "--status cannot be combined with --witness".to_string(),
+        });
+    }
+
+    if args.witness && args.witness_chunk_lines == 0 {
+        return Err(BeadsError::Validation {
+            field: "witness_chunk_lines".to_string(),
+            reason: "--witness-chunk-lines must be greater than zero".to_string(),
+        });
+    }
+
+    if args.witness_parallelism == Some(0) {
+        return Err(BeadsError::Validation {
+            field: "witness_parallelism".to_string(),
+            reason: "--witness-parallelism must be greater than zero".to_string(),
+        });
+    }
+    if args.export_parallelism == Some(0) {
+        return Err(BeadsError::Validation {
+            field: "export_parallelism".to_string(),
+            reason: "--export-parallelism must be greater than zero".to_string(),
         });
     }
 
@@ -145,7 +291,49 @@ fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
                 .to_string(),
         });
     }
+
+    if (args.force_db || args.force_jsonl) && !args.merge {
+        return Err(BeadsError::Validation {
+            field: "merge-resolution".to_string(),
+            reason: "--force-db and --force-jsonl can only be used with --merge".to_string(),
+        });
+    }
+
+    if args.force_db && args.force_jsonl {
+        return Err(BeadsError::Validation {
+            field: "merge-resolution".to_string(),
+            reason: "--force-db conflicts with --force-jsonl; choose one merge winner".to_string(),
+        });
+    }
+
+    if args.force && (args.force_db || args.force_jsonl) {
+        return Err(BeadsError::Validation {
+            field: "force".to_string(),
+            reason: "--force conflicts with --force-db and --force-jsonl for --merge; choose one conflict resolution policy".to_string(),
+        });
+    }
     Ok(())
+}
+
+fn merge_conflict_resolution(args: &SyncArgs) -> ConflictResolution {
+    if args.force_db {
+        ConflictResolution::PreferLocal
+    } else if args.force_jsonl {
+        ConflictResolution::PreferExternal
+    } else if args.force {
+        ConflictResolution::PreferNewer
+    } else {
+        ConflictResolution::Manual
+    }
+}
+
+fn merge_conflict_resolution_label(strategy: ConflictResolution) -> &'static str {
+    match strategy {
+        ConflictResolution::PreferLocal => "force-db",
+        ConflictResolution::PreferExternal => "force-jsonl",
+        ConflictResolution::PreferNewer => "force-newer",
+        ConflictResolution::Manual => "manual",
+    }
 }
 
 /// When `--rebuild` is requested against an existing (non-auto-rebuilt)
@@ -254,53 +442,78 @@ fn dispatch_sync_subcommand(
     path_policy: &SyncPathPolicy,
     open_result: &mut config::OpenStorageResult,
 ) -> Result<()> {
-    let db_path = open_result.paths.db_path.clone();
-    let retention_days = open_result.paths.metadata.deletions_retention_days;
-    let use_json = ctx.is_json() || args.robot;
-    let quiet = cli.quiet.unwrap_or(false);
-    let show_progress = should_show_progress(use_json, quiet);
+    let options = sync_dispatch_options(args, cli, ctx, open_result);
 
-    if args.status {
-        return execute_status(&open_result.storage, path_policy, use_json, ctx);
-    }
-    if args.flush_only {
-        return execute_flush(
+    match sync_operation(args) {
+        SyncOperation::Status => {
+            execute_status(&open_result.storage, path_policy, options.use_json, ctx)
+        }
+        SyncOperation::Witness => execute_witness(path_policy, args, options.use_json, ctx),
+        SyncOperation::Flush => execute_flush(
             &mut open_result.storage,
             beads_dir,
             path_policy,
             args,
-            use_json,
-            show_progress,
-            retention_days,
+            options.use_json,
+            options.show_progress,
+            options.retention_days,
             ctx,
-        );
-    }
-    if args.merge {
-        return execute_merge(
+        ),
+        SyncOperation::Merge => execute_merge(
             &mut open_result.storage,
             path_policy,
             args,
-            use_json,
-            show_progress,
-            retention_days,
+            options.use_json,
+            options.show_progress,
+            options.retention_days,
             cli,
             ctx,
-        );
+        ),
+        // Default to import-only if no flag is specified (consistent with
+        // existing behavior) or explicitly `--import-only`.
+        SyncOperation::Import => execute_import(
+            &mut open_result.storage,
+            beads_dir,
+            cli,
+            path_policy,
+            args,
+            options.use_json,
+            options.show_progress,
+            open_result.auto_rebuilt,
+            &options.db_path,
+            ctx,
+        ),
     }
-    // Default to import-only if no flag is specified (consistent with
-    // existing behavior) or explicitly `--import-only`.
-    execute_import(
-        &mut open_result.storage,
-        beads_dir,
-        cli,
-        path_policy,
-        args,
+}
+
+fn sync_dispatch_options(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    open_result: &config::OpenStorageResult,
+) -> SyncDispatchOptions {
+    let use_json = ctx.is_json() || args.robot;
+    let quiet = cli.quiet.unwrap_or(false);
+    SyncDispatchOptions {
+        db_path: open_result.paths.db_path.clone(),
+        retention_days: open_result.paths.metadata.deletions_retention_days,
         use_json,
-        show_progress,
-        open_result.auto_rebuilt,
-        &db_path,
-        ctx,
-    )
+        show_progress: should_show_progress(use_json, quiet),
+    }
+}
+
+fn sync_operation(args: &SyncArgs) -> SyncOperation {
+    if args.witness {
+        SyncOperation::Witness
+    } else if args.status {
+        SyncOperation::Status
+    } else if args.flush_only {
+        SyncOperation::Flush
+    } else if args.merge {
+        SyncOperation::Merge
+    } else {
+        SyncOperation::Import
+    }
 }
 
 /// Fold the subcommand result into the final command outcome, restoring
@@ -341,8 +554,9 @@ fn finalize_sync_result(
     }
 }
 
-fn suppress_human_sync_output(ctx: &OutputContext, use_json: bool) -> bool {
-    ctx.is_quiet() && !use_json
+fn should_render_human_sync_output(ctx: &OutputContext, use_json: bool) -> bool {
+    // Keep JSON/robot output paths alive even when quiet suppresses human text.
+    !ctx.is_quiet() || use_json
 }
 
 fn validate_sync_paths(
@@ -356,6 +570,8 @@ fn validate_sync_paths(
         allow_external_jsonl,
         "Validating sync paths"
     );
+    validate_operator_requested_sync_path(beads_dir, jsonl_path)?;
+
     let canonical_beads = dunce::canonicalize(beads_dir).map_err(|e| {
         BeadsError::Config(format!(
             "Failed to resolve .beads directory {}: {e}",
@@ -424,7 +640,80 @@ fn validate_sync_paths(
         manifest_path,
         beads_dir: canonical_beads,
         is_external,
+        allow_external_jsonl,
     })
+}
+
+fn validate_operator_requested_sync_path(beads_dir: &Path, jsonl_path: &Path) -> Result<()> {
+    let git_check = validate_no_git_path(jsonl_path);
+    if !git_check.is_allowed() {
+        return Err(BeadsError::Config(
+            git_check
+                .rejection_reason()
+                .unwrap_or_else(|| "Git path access denied".to_string()),
+        ));
+    }
+
+    let canonical_beads = dunce::canonicalize(beads_dir).map_err(|e| {
+        BeadsError::Config(format!(
+            "Failed to resolve .beads directory {}: {e}",
+            beads_dir.display()
+        ))
+    })?;
+
+    let operator_path = if jsonl_path.is_absolute() {
+        jsonl_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(jsonl_path))
+            .map_err(|e| {
+                BeadsError::Config(format!(
+                    "Failed to resolve current directory for JSONL path {}: {e}",
+                    jsonl_path.display()
+                ))
+            })?
+    };
+
+    if !operator_path.starts_with(beads_dir) && !operator_path.starts_with(&canonical_beads) {
+        return Ok(());
+    }
+
+    let mut candidate = PathBuf::new();
+    for component in operator_path.components() {
+        candidate.push(component.as_os_str());
+        let Ok(metadata) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let target = fs::read_link(&candidate).map_err(|e| {
+            BeadsError::Config(format!(
+                "Failed to inspect symlinked JSONL path component {}: {e}",
+                candidate.display()
+            ))
+        })?;
+        let absolute_target = if target.is_absolute() {
+            target
+        } else {
+            candidate
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(target)
+        };
+        let canonical_target =
+            dunce::canonicalize(&absolute_target).unwrap_or_else(|_| absolute_target.clone());
+        if !canonical_target.starts_with(&canonical_beads) {
+            return Err(BeadsError::Config(format!(
+                "Refusing to use JSONL path through symlink escaping .beads: {} -> {}",
+                candidate.display(),
+                canonical_target.display()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_requested_sync_path(jsonl_path: &Path) -> Result<PathBuf> {
@@ -510,7 +799,7 @@ fn execute_status(
         "Computed sync staleness"
     );
 
-    if suppress_human_sync_output(ctx, use_json) {
+    if !should_render_human_sync_output(ctx, use_json) {
         return Ok(());
     }
 
@@ -624,6 +913,223 @@ fn render_status_rich(status: &SyncStatus, ctx: &OutputContext) {
     ctx.render(&panel);
 }
 
+/// Execute the --witness operation.
+fn execute_witness(
+    path_policy: &SyncPathPolicy,
+    args: &SyncArgs,
+    use_json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let jsonl_path = &path_policy.jsonl_path;
+    if !jsonl_path.is_file() {
+        return Err(BeadsError::Config(format!(
+            "JSONL file not found: {}",
+            jsonl_path.display()
+        )));
+    }
+
+    let witness_parallelism = effective_witness_parallelism(args);
+    let witness =
+        build_witness_for_path(jsonl_path, args.witness_chunk_lines, witness_parallelism)?;
+    let base_artifacts = build_base_witness_artifacts(
+        path_policy,
+        args.witness_chunk_lines,
+        witness_parallelism,
+        &witness,
+    )?;
+    let result = SyncWitnessResult {
+        jsonl_path: jsonl_path.display().to_string(),
+        witness,
+        base_jsonl_path: base_artifacts.jsonl_path,
+        base_comparison: base_artifacts.comparison,
+        base_reuse_plan: base_artifacts.reuse_plan,
+        base_parallel_work_plan: base_artifacts.parallel_work_plan,
+        base_reuse_materialization: base_artifacts.reuse_materialization,
+    };
+
+    if !should_render_human_sync_output(ctx, use_json) {
+        return Ok(());
+    }
+
+    if use_json {
+        ctx.json_pretty(&result);
+    } else {
+        render_witness_text(&result);
+    }
+
+    Ok(())
+}
+
+fn effective_witness_parallelism(args: &SyncArgs) -> usize {
+    args.witness_parallelism
+        .unwrap_or(DEFAULT_WITNESS_PARALLELISM)
+}
+
+fn build_witness_for_path(
+    jsonl_path: &Path,
+    chunk_size_lines: usize,
+    max_parallelism: usize,
+) -> Result<JsonlMerkleWitness> {
+    crate::sync::ensure_no_conflict_markers(jsonl_path)?;
+    let file = File::open(jsonl_path).map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to open JSONL file for witness {}: {err}",
+            jsonl_path.display()
+        ))
+    })?;
+    build_jsonl_merkle_witness_parallel(BufReader::new(file), chunk_size_lines, max_parallelism)
+        .map_err(|err| {
+            BeadsError::Config(format!(
+                "Failed to build JSONL witness for {}: {err}",
+                jsonl_path.display()
+            ))
+        })
+}
+
+fn build_base_witness_artifacts(
+    path_policy: &SyncPathPolicy,
+    chunk_size_lines: usize,
+    max_parallelism: usize,
+    current_witness: &JsonlMerkleWitness,
+) -> Result<BaseWitnessArtifacts> {
+    let base_jsonl_path = path_policy.beads_dir.join("beads.base.jsonl");
+    match fs::symlink_metadata(&base_jsonl_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(BeadsError::Config(format!(
+                "Base JSONL snapshot '{}' must not be a symlink",
+                base_jsonl_path.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(BeadsError::Config(format!(
+                "Base JSONL snapshot '{}' must be a regular file",
+                base_jsonl_path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BaseWitnessArtifacts {
+                jsonl_path: None,
+                comparison: None,
+                reuse_plan: None,
+                parallel_work_plan: None,
+                reuse_materialization: None,
+            });
+        }
+        Err(err) => {
+            return Err(BeadsError::Config(format!(
+                "Failed to inspect base JSONL snapshot '{}': {err}",
+                base_jsonl_path.display()
+            )));
+        }
+    }
+
+    require_valid_sync_path(&base_jsonl_path, &path_policy.beads_dir)?;
+
+    let base_witness = build_witness_for_path(&base_jsonl_path, chunk_size_lines, max_parallelism)?;
+    let comparison = compare_jsonl_merkle_witnesses(&base_witness, current_witness);
+    let reuse_plan = plan_jsonl_witness_reuse(&base_witness, current_witness);
+    let parallel_work_plan = plan_jsonl_witness_parallel_work(&reuse_plan, max_parallelism)
+        .map_err(|err| BeadsError::Config(format!("Failed to plan JSONL witness work: {err}")))?;
+    let reuse_materialization = materialize_base_reuse_plan(
+        &base_jsonl_path,
+        &path_policy.jsonl_path,
+        &base_witness,
+        current_witness,
+        &reuse_plan,
+    )?;
+
+    Ok(BaseWitnessArtifacts {
+        jsonl_path: Some(base_jsonl_path.display().to_string()),
+        comparison: Some(comparison),
+        reuse_plan: Some(reuse_plan),
+        parallel_work_plan: Some(parallel_work_plan),
+        reuse_materialization: Some(reuse_materialization),
+    })
+}
+
+fn materialize_base_reuse_plan(
+    base_jsonl_path: &Path,
+    current_jsonl_path: &Path,
+    base_witness: &JsonlMerkleWitness,
+    current_witness: &JsonlMerkleWitness,
+    reuse_plan: &JsonlWitnessReusePlan,
+) -> Result<JsonlWitnessReuseMaterialization> {
+    let mut base_file = File::open(base_jsonl_path).map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to open base JSONL file for reuse materialization {}: {err}",
+            base_jsonl_path.display()
+        ))
+    })?;
+    let mut current_file = File::open(current_jsonl_path).map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to open current JSONL file for reuse materialization {}: {err}",
+            current_jsonl_path.display()
+        ))
+    })?;
+    let mut sink = std::io::sink();
+
+    materialize_jsonl_witness_reuse_plan(
+        &mut base_file,
+        &mut current_file,
+        &mut sink,
+        base_witness,
+        current_witness,
+        reuse_plan,
+    )
+    .map_err(|err| BeadsError::Config(format!("Failed to materialize JSONL reuse plan: {err}")))
+}
+
+fn render_witness_text(result: &SyncWitnessResult) {
+    let witness = &result.witness;
+    println!("JSONL Witness:");
+    println!("  Path: {}", result.jsonl_path);
+    println!("  Schema: {}", witness.schema_version);
+    println!("  Lines: {}", witness.line_count);
+    println!("  Bytes: {}", witness.byte_count);
+    println!("  Chunk size: {} lines", witness.chunk_size_lines);
+    println!("  Chunks: {}", witness.chunks.len());
+    println!("  Root hash: {}", witness.root_hash);
+
+    if let Some(comparison) = &result.base_comparison {
+        if let Some(base_path) = &result.base_jsonl_path {
+            println!("  Base path: {base_path}");
+        }
+        println!(
+            "  Base comparison: drift={}, unchanged_chunks={}, changed_chunks={}, added_chunks={}, removed_chunks={}, safe_prefix_chunks={}",
+            comparison.drift_detected,
+            comparison.unchanged_chunks,
+            comparison.changed_chunks,
+            comparison.added_chunks,
+            comparison.removed_chunks,
+            comparison.safe_reuse_prefix_chunks
+        );
+        if let Some(index) = comparison.first_changed_chunk_index {
+            println!("  First changed chunk: {index}");
+        }
+    }
+
+    if let Some(plan) = &result.base_reuse_plan {
+        println!("  Reuse plan actions: {}", plan.actions.len());
+    }
+    if let Some(plan) = &result.base_parallel_work_plan {
+        println!(
+            "  Parallel work batches: {} (max_parallelism={})",
+            plan.total_batches, plan.max_parallelism
+        );
+    }
+    if let Some(materialization) = &result.base_reuse_materialization {
+        println!(
+            "  Reuse materialization: output_bytes={}, reused_chunks={}, rebuilt_chunks={}, read_added_chunks={}, dropped_chunks={}",
+            materialization.output_byte_count,
+            materialization.reused_chunks,
+            materialization.rebuilt_chunks,
+            materialization.read_added_chunks,
+            materialization.dropped_chunks
+        );
+    }
+}
+
 /// Execute the --flush-only (export) operation.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_flush(
@@ -668,11 +1174,12 @@ fn execute_flush(
     // If no dirty issues and no force, report nothing to do
     if dirty_ids.is_empty() && !needs_flush && jsonl_exists && !args.force {
         // `ensure_no_conflict_markers` ran above before we got here, so
-        // `count_issues_in_jsonl` / `get_issue_ids_from_jsonl` below won't
-        // trip over unresolved `<<<<<<<` / `=======` / `>>>>>>>` lines.
+        // `analyze_jsonl` below won't trip over unresolved `<<<<<<<` /
+        // `=======` / `>>>>>>>` lines.
 
-        // Guard against empty DB overwriting a non-empty JSONL.
-        let existing_count = count_issues_in_jsonl(jsonl_path)?;
+        // Guard against stale DB state without parsing the JSONL twice for count
+        // and IDs.
+        let (existing_count, jsonl_ids) = analyze_jsonl(jsonl_path)?;
         if existing_count > 0 && db_issue_count == 0 {
             warn!(
                 jsonl_count = existing_count,
@@ -686,7 +1193,6 @@ fn execute_flush(
             )));
         }
 
-        let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
         if !jsonl_ids.is_empty() {
             let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
             let mut missing_list = jsonl_ids.difference(&db_ids).cloned().collect::<Vec<_>>();
@@ -734,7 +1240,7 @@ fn execute_flush(
                 manifest_path: None,
             };
             ctx.json_pretty(&result);
-        } else if !suppress_human_sync_output(ctx, use_json) {
+        } else if should_render_human_sync_output(ctx, use_json) {
             println!("Nothing to export (no dirty issues)");
         }
         return Ok(());
@@ -747,9 +1253,10 @@ fn execute_flush(
         error_policy: export_policy,
         retention_days,
         beads_dir: Some(path_policy.beads_dir.clone()),
-        allow_external_jsonl: args.allow_external_jsonl,
+        allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
         history: HistoryConfig::default(),
+        max_parallel_workers: args.export_parallelism.unwrap_or(0),
     };
 
     // Execute export
@@ -778,7 +1285,7 @@ fn execute_flush(
     )?;
     info!("Export complete, cleared dirty flags");
 
-    // Write manifest if requested
+    // Write manifest if requested (atomic: temp + fsync + durable_rename)
     let manifest_path = if args.manifest {
         let manifest = serde_json::json!({
             "export_time": chrono::Utc::now().to_rfc3339(),
@@ -792,10 +1299,10 @@ fn execute_flush(
         require_safe_sync_overwrite_path(
             &manifest_file,
             &path_policy.beads_dir,
-            args.allow_external_jsonl,
+            path_policy.allow_external_jsonl,
             "write manifest",
         )?;
-        fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
+        write_manifest_atomically(&manifest_file, &manifest)?;
         Some(manifest_file.to_string_lossy().to_string())
     } else {
         None
@@ -818,7 +1325,7 @@ fn execute_flush(
 
     if use_json {
         ctx.json_pretty(&result);
-    } else if suppress_human_sync_output(ctx, use_json) {
+    } else if !should_render_human_sync_output(ctx, use_json) {
         return Ok(());
     } else if ctx.is_rich() {
         render_flush_result_rich(&result, &report.errors, ctx);
@@ -877,6 +1384,77 @@ fn execute_flush(
             }
         }
     }
+
+    Ok(())
+}
+
+fn create_temp_manifest_file(manifest_path: &Path) -> Result<(PathBuf, File)> {
+    let pid = std::process::id();
+
+    for attempt in 0..64_u32 {
+        let extension = if attempt == 0 {
+            format!("json.{pid}.tmp")
+        } else {
+            format!("json.{pid}.{attempt}.tmp")
+        };
+        let temp_path = manifest_path.with_extension(extension);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&temp_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(BeadsError::Config(format!(
+                        "failed to create temp manifest file {}: {error}",
+                        temp_path.display()
+                    )));
+                }
+            }
+            Err(error) => {
+                return Err(BeadsError::Config(format!(
+                    "failed to create temp manifest file {}: {error}",
+                    temp_path.display()
+                )));
+            }
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "failed to allocate temp manifest file for {}",
+        manifest_path.display()
+    )))
+}
+
+fn write_manifest_atomically(manifest_path: &Path, manifest: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+
+    let content = serde_json::to_string_pretty(manifest)?;
+
+    let cleanup = |path: &Path| {
+        let _ = fs::remove_file(path);
+    };
+
+    let (temp_path, mut file) = create_temp_manifest_file(manifest_path)?;
+
+    // write_all / sync_all / durable_rename all must clean up the temp
+    // file on failure; otherwise a torn manifest.json.<pid>.tmp can
+    // accumulate on disk or, worse, confuse a concurrent attempt that
+    // reuses the same PID-derived path after wraparound.
+    file.write_all(content.as_bytes()).inspect_err(|_| {
+        cleanup(&temp_path);
+    })?;
+    file.sync_all().inspect_err(|_| {
+        cleanup(&temp_path);
+    })?;
+    drop(file);
+
+    crate::util::durable_rename(&temp_path, manifest_path).inspect_err(|_| {
+        cleanup(&temp_path);
+    })?;
 
     Ok(())
 }
@@ -1055,6 +1633,109 @@ fn push_cli_rerun_overrides(rerun: &mut Vec<String>, cli: &config::CliOverrides)
     }
 }
 
+fn integrity_check_is_clean(messages: &[String]) -> bool {
+    matches!(messages, [message] if message.trim().eq_ignore_ascii_case("ok"))
+}
+
+fn fresh_force_import_maintenance_gate_applies(
+    args: &SyncArgs,
+    force_import_target_was_empty: bool,
+    import_rewrote_storage: bool,
+) -> bool {
+    args.force
+        && !args.rebuild
+        && !args.rename_prefix
+        && force_import_target_was_empty
+        && import_rewrote_storage
+}
+
+fn repair_import_integrity_if_needed(
+    storage: &mut crate::storage::SqliteStorage,
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    jsonl_path: &Path,
+    db_path: &Path,
+    show_progress: bool,
+    allow_external_jsonl: bool,
+) -> Result<()> {
+    let messages = storage.integrity_check_messages()?;
+    if integrity_check_is_clean(&messages) {
+        return Ok(());
+    }
+
+    warn!(
+        db_path = %db_path.display(),
+        integrity_messages = ?messages,
+        "Post-import maintenance left SQLite integrity warnings; rebuilding DB from JSONL"
+    );
+
+    let jsonl_filter = scan_jsonl_for_tombstone_filter(jsonl_path)?;
+    let preserved_tombstones =
+        tombstones_missing_from_jsonl_tombstones(snapshot_tombstones(storage), &jsonl_filter);
+
+    // Close the dirty connection before rebuilding the same file path.
+    let placeholder = crate::storage::SqliteStorage::open_memory()?;
+    let dirty_storage = std::mem::replace(storage, placeholder);
+    drop(dirty_storage);
+
+    let startup = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    let (mut rebuilt_storage, _, _) = config::repair_database_from_jsonl(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        cli.lock_timeout,
+        &startup.merged_config,
+        show_progress,
+        allow_external_jsonl,
+    )?;
+    restore_tombstones_after_rebuild(&mut rebuilt_storage, &preserved_tombstones)?;
+    *storage = rebuilt_storage;
+    Ok(())
+}
+
+fn repair_import_integrity_with_import_config(
+    storage: &mut crate::storage::SqliteStorage,
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    jsonl_path: &Path,
+    db_path: &Path,
+    show_progress: bool,
+    import_config: &ImportConfig,
+) -> Result<()> {
+    let messages = storage.integrity_check_messages()?;
+    if integrity_check_is_clean(&messages) {
+        return Ok(());
+    }
+
+    warn!(
+        db_path = %db_path.display(),
+        integrity_messages = ?messages,
+        "Post-import maintenance left SQLite integrity warnings; rebuilding DB from JSONL with original import semantics"
+    );
+
+    let jsonl_filter = scan_jsonl_for_tombstone_filter(jsonl_path)?;
+    let preserved_tombstones =
+        tombstones_missing_from_jsonl_tombstones(snapshot_tombstones(storage), &jsonl_filter);
+
+    let placeholder = crate::storage::SqliteStorage::open_memory()?;
+    let dirty_storage = std::mem::replace(storage, placeholder);
+    drop(dirty_storage);
+
+    let startup = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    let (mut rebuilt_storage, _, _) = config::repair_database_from_jsonl_with_import_config(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        cli.lock_timeout,
+        &startup.merged_config,
+        show_progress,
+        import_config.clone(),
+    )?;
+    restore_tombstones_after_rebuild(&mut rebuilt_storage, &preserved_tombstones)?;
+    *storage = rebuilt_storage;
+    Ok(())
+}
+
 fn auto_rebuild_semantic_flag_conflict_reason(
     args: &SyncArgs,
     cli: &config::CliOverrides,
@@ -1100,14 +1781,12 @@ fn auto_rebuild_semantic_conflict_field(args: &SyncArgs) -> &'static str {
 }
 
 fn jsonl_contains_prefix_mismatch(jsonl_path: &Path, expected_prefix: &str) -> Result<bool> {
-    let expected_prefix = expected_prefix.trim_end_matches('-');
     for issue in read_issues_from_jsonl(jsonl_path)? {
         if issue.status == crate::model::Status::Tombstone {
             continue;
         }
-        match split_prefix_remainder(&issue.id) {
-            Some((prefix, _)) if prefix == expected_prefix => {}
-            _ => return Ok(true),
+        if !id_matches_expected_prefix(&issue.id, expected_prefix) {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -1141,7 +1820,7 @@ fn emit_auto_rebuild_import_result(
     };
     if use_json {
         ctx.json_pretty(&result);
-    } else if !suppress_human_sync_output(ctx, use_json) {
+    } else if should_render_human_sync_output(ctx, use_json) {
         if ctx.is_rich() {
             render_import_result_rich(&result, ctx);
         } else {
@@ -1188,14 +1867,19 @@ fn execute_import(
     // invariant. Only compute an expected prefix when the caller explicitly
     // asked to rename imported IDs into the configured prefix.
     let target_prefix = if args.rename_prefix {
-        let layer = config::load_config(beads_dir, Some(storage), cli)?;
+        let layer = config::load_config_with_external_jsonl_policy(
+            beads_dir,
+            Some(storage),
+            cli,
+            path_policy.allow_external_jsonl,
+        )?;
         let id_cfg = config::id_config_from_layer(&layer);
         Some(if id_cfg.prefix == "br" {
             // Prefix is still the default — check if we should auto-detect from JSONL
             let db_prefix = storage.get_config("issue_prefix")?;
             if let Some(p) = db_prefix {
                 p
-            } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
+            } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path)? {
                 info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
                 // Persist the detected prefix to config for future operations
                 storage.set_config("issue_prefix", &detected)?;
@@ -1259,7 +1943,7 @@ fn execute_import(
                 blocked_cache_rebuilt: false,
             };
             ctx.json_pretty(&result);
-        } else if !suppress_human_sync_output(ctx, use_json) {
+        } else if should_render_human_sync_output(ctx, use_json) {
             println!("No JSONL file found at {}", jsonl_path.display());
         }
         return Ok(());
@@ -1290,7 +1974,7 @@ fn execute_import(
                         blocked_cache_rebuilt: false,
                     };
                     ctx.json_pretty(&result);
-                } else if !suppress_human_sync_output(ctx, use_json) {
+                } else if should_render_human_sync_output(ctx, use_json) {
                     println!("JSONL is current (hash unchanged since last import)");
                 }
                 return Ok(());
@@ -1324,7 +2008,7 @@ fn execute_import(
         orphan_mode,
         force_upsert: args.force,
         beads_dir: Some(path_policy.beads_dir.clone()),
-        allow_external_jsonl: args.allow_external_jsonl,
+        allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
     };
 
@@ -1361,6 +2045,16 @@ fn execute_import(
     } else {
         Vec::new()
     };
+    let preserved_resurrection_attempts = jsonl_filter.as_ref().map_or(0, |filter| {
+        preserved_tombstones
+            .iter()
+            .filter(|tombstone| {
+                filter
+                    .non_tombstone_updated_at
+                    .contains_key(&tombstone.issue.id)
+            })
+            .count()
+    });
 
     // For force imports and rebuilds, drop and recreate data tables to avoid
     // fsqlite btree cursor bugs on DELETE operations in large tables.
@@ -1373,12 +2067,13 @@ fn execute_import(
     // reclaim, which C sqlite3's integrity_check then flags as corruption
     // (issue #248). When the target is already empty, we can INSERT directly
     // and skip the leak entirely.
-    if args.force || args.rebuild {
+    let force_import_target_was_empty = if args.force || args.rebuild {
         let existing_issue_count = storage.count_all_issues()?;
         if existing_issue_count == 0 && preserved_tombstones.is_empty() {
             debug!(
                 "Force/rebuild import: target DB already empty, skipping reset_data_tables to avoid fsqlite freelist leak"
             );
+            true
         } else {
             debug!(
                 existing_issue_count,
@@ -1386,8 +2081,11 @@ fn execute_import(
                 "Force/rebuild import: resetting data tables to avoid btree DELETE bugs; preserved tombstones will be restored atomically after import"
             );
             storage.reset_data_tables()?;
+            false
         }
-    }
+    } else {
+        false
+    };
 
     // Execute import
     info!(path = %jsonl_path.display(), "Importing from JSONL");
@@ -1463,42 +2161,74 @@ fn execute_import(
 
     if args.force || args.rebuild {
         restore_tombstones_after_rebuild(storage, &preserved_tombstones)?;
+        import_result.tombstone_skipped += preserved_resurrection_attempts;
     }
 
-    // Post-rebuild VACUUM + REINDEX to eliminate B-tree/index corruption
-    // artifacts that frankensqlite's bulk-insert path can leave behind after
-    // `reset_data_tables()` + bulk import.  This mirrors what
-    // `rebuild_database_family` (used by `br doctor --repair` and auto
-    // recovery) does at the equivalent chokepoint.
+    // Update the source JSONL content hash before post-import maintenance.
+    // Metadata table/index writes are part of the same B-tree surface that
+    // triggered frankentorch-dbp, so compaction must be the final storage
+    // mutation in this path.
+    let content_hash = compute_jsonl_hash(jsonl_path)?;
+    storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &content_hash)?;
+
+    // Post-import VACUUM + REINDEX to eliminate B-tree/index corruption
+    // artifacts that frankensqlite's bulk-insert and metadata-update paths
+    // can leave behind.  This mirrors what `rebuild_database_family` (used
+    // by `br doctor --repair` and auto recovery) does at the equivalent
+    // chokepoint.
     //
-    // Without this, `br sync --import-only --force` / `--rebuild` can produce
-    // a DB where C sqlite3's `PRAGMA integrity_check` reports
-    // "database disk image is malformed" and where later write-transaction
-    // reads (inside `update_issue`) silently return zero rows for an ID that
-    // `br show` can still find — leading to the "Issue not found" error and
-    // secondary on-disk corruption seen in issue #248.
-    //
-    // The non-force import path does not drop/recreate tables, so it does
-    // not need this hardening.  Keeping the VACUUM/REINDEX scoped to the
-    // force/rebuild branch avoids paying the cost on every `br sync` run.
-    if args.force || args.rebuild {
+    // Without this, large `br sync --import-only` runs can produce a DB
+    // where C sqlite3's `PRAGMA integrity_check` reports free-space or
+    // index-entry corruption.  Force/rebuild imports hit this through
+    // `reset_data_tables()` + bulk import (issue #248); the FrankenTorch
+    // current-JSONL reproducer hit the plain import path through metadata
+    // table/index churn after importing hundreds of rows.
+    let import_rewrote_storage = import_result.imported_count > 0
+        || import_result.blocked_cache_entries > 0
+        || import_result.child_counter_entries > 0;
+    let skip_heavy_import_maintenance = if fresh_force_import_maintenance_gate_applies(
+        args,
+        force_import_target_was_empty,
+        import_rewrote_storage,
+    ) {
+        let messages = storage.integrity_check_messages()?;
+        let clean = integrity_check_is_clean(&messages);
+        if clean {
+            debug!(
+                db_path = %db_path.display(),
+                "Skipping post-import VACUUM/REINDEX: fresh force import already passed integrity_check"
+            );
+        } else {
+            warn!(
+                db_path = %db_path.display(),
+                integrity_messages = ?messages,
+                "Fresh force import reported integrity warnings; running full post-import maintenance"
+            );
+        }
+        clean
+    } else {
+        false
+    };
+
+    if (args.force || args.rebuild || import_rewrote_storage) && !skip_heavy_import_maintenance {
         // Drain the WAL before VACUUM/REINDEX so the snapshot they operate
         // on matches what's actually on disk. Without this, fsqlite's
         // post-import MVCC state lags behind and VACUUM fails silently with
         // "database is busy (snapshot conflict on pages)", leaving the
-        // free-space / partial-index corruption that triggered issue #248.
+        // free-space / partial-index corruption that triggered issue #248
+        // and frankentorch-dbp.
         if let Err(e) = storage.checkpoint_full() {
             warn!(
                 error = %e,
                 db_path = %db_path.display(),
-                "Full WAL checkpoint after force/rebuild import failed (non-fatal)"
+                "Full WAL checkpoint after JSONL import failed (non-fatal)"
             );
         }
         if let Err(e) = storage.execute_raw("VACUUM") {
-            warn!(error = %e, "VACUUM after force/rebuild import failed (non-fatal); DB may still contain free-space corruption");
+            warn!(error = %e, "VACUUM after JSONL import failed (non-fatal); DB may still contain free-space corruption");
         }
         if let Err(e) = storage.execute_raw("REINDEX") {
-            warn!(error = %e, "REINDEX after force/rebuild import failed (non-fatal); partial-index entries may be inconsistent");
+            warn!(error = %e, "REINDEX after JSONL import failed (non-fatal); partial-index entries may be inconsistent");
         }
         // Final compaction via `VACUUM INTO` + atomic rename. fsqlite's
         // in-place VACUUM does not truncate the trailing pages that its
@@ -1509,15 +2239,48 @@ fn execute_import(
         // page count and layout matching what `sqlite3 "VACUUM INTO"`
         // would produce. The helper runs its own pre-VACUUM-INTO WAL
         // checkpoint to drain the frames the VACUUM/REINDEX above just
-        // wrote. Best-effort: on any failure the helper leaves
-        // `*storage` in the best working state it can recover, and we
-        // only miss the cosmetic compaction — never correctness.
-        config::compact_database_via_vacuum_into_in_place(storage, db_path, cli.lock_timeout);
+        // wrote. Once it closes the old handle, reopen failures must abort
+        // this import rather than letting subsequent metadata updates run
+        // against a throwaway placeholder.
+        let placeholder = crate::storage::SqliteStorage::open_memory()?;
+        let original_storage = std::mem::replace(storage, placeholder);
+        match config::compact_database_via_vacuum_into_in_place(
+            original_storage,
+            db_path,
+            cli.lock_timeout,
+        ) {
+            Ok(compacted_storage) => *storage = compacted_storage,
+            Err(err) => {
+                if let Ok(reopened) =
+                    crate::storage::SqliteStorage::open_with_timeout(db_path, cli.lock_timeout)
+                {
+                    *storage = reopened;
+                }
+                return Err(err);
+            }
+        }
+        if args.rename_prefix {
+            repair_import_integrity_with_import_config(
+                storage,
+                beads_dir,
+                cli,
+                jsonl_path,
+                db_path,
+                show_progress,
+                &import_config,
+            )?;
+        } else {
+            repair_import_integrity_if_needed(
+                storage,
+                beads_dir,
+                cli,
+                jsonl_path,
+                db_path,
+                show_progress,
+                path_policy.allow_external_jsonl,
+            )?;
+        }
     }
-
-    // Update content hash
-    let content_hash = compute_jsonl_hash(jsonl_path)?;
-    storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &content_hash)?;
 
     // Output result
     let result = ImportResultOutput {
@@ -1531,7 +2294,7 @@ fn execute_import(
 
     if use_json {
         ctx.json_pretty(&result);
-    } else if suppress_human_sync_output(ctx, use_json) {
+    } else if !should_render_human_sync_output(ctx, use_json) {
         return Ok(());
     } else if ctx.is_rich() {
         render_import_result_rich(&result, ctx);
@@ -1628,44 +2391,20 @@ fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
 ///
 /// Returns `None` if the file is empty or contains no issues with a recognizable prefix.
 /// Supports hyphenated prefixes such as `document-intelligence-0sa`.
-fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
-    #[derive(Deserialize)]
-    struct PrefixProbe {
-        id: String,
-        status: Option<String>,
-    }
+fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
+    let issues = read_issues_from_jsonl(jsonl_path)?;
 
-    let file = File::open(jsonl_path).ok()?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        // Skip lines that fail to read (IO errors)
-        let Ok(line) = line else {
-            continue;
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for issue in issues {
+        if issue.status == crate::model::Status::Tombstone {
             continue;
         }
 
-        // Parse as JSON to get the issue ID (skip malformed lines)
-        let Ok(probe) = serde_json::from_str::<PrefixProbe>(trimmed) else {
-            continue;
-        };
-
-        // Skip tombstones (deleted issues)
-        if let Some(status) = probe.status
-            && status == "tombstone"
-        {
-            continue;
-        }
-
-        if let Some((prefix, _)) = split_prefix_remainder(&probe.id) {
-            return Some(prefix.to_string());
+        if let Some((prefix, _)) = split_prefix_remainder(&issue.id) {
+            return Ok(Some(prefix.to_string()));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Execute the --merge operation.
@@ -1730,10 +2469,19 @@ fn execute_merge(
 
     // 4. Perform Merge
     let context = MergeContext::new(base, left, right);
-    // Keep the current merge behavior explicit until the CLI surface for
-    // configurable conflict resolution is wired through end-to-end.
-    let strategy = ConflictResolution::PreferNewer;
-    let tombstones = None;
+    let strategy = merge_conflict_resolution(args);
+    let resolution = merge_conflict_resolution_label(strategy);
+    let local_tombstones: HashSet<String> = context
+        .left
+        .values()
+        .filter(|issue| issue.status == crate::model::Status::Tombstone)
+        .map(|issue| issue.id.clone())
+        .collect();
+    let tombstones = if local_tombstones.is_empty() {
+        None
+    } else {
+        Some(&local_tombstones)
+    };
 
     let report = three_way_merge(&context, strategy, tombstones);
 
@@ -1742,11 +2490,12 @@ fn execute_merge(
         kept = report.kept.len(),
         deleted = report.deleted.len(),
         conflicts = report.conflicts.len(),
+        resolution,
         "Merge calculated"
     );
 
     if report.has_conflicts() {
-        // For now, fail on conflicts. Future: interactive resolution or force flags.
+        // Require an explicit merge winner instead of guessing when both sides changed.
         if ctx.is_rich() {
             render_merge_conflicts_rich(&report.conflicts, ctx);
         }
@@ -1755,6 +2504,7 @@ fn execute_merge(
             use std::fmt::Write;
             let _ = writeln!(msg, "  - {id}: {kind:?}");
         }
+        msg.push_str("\nUse --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
         return Err(BeadsError::Config(msg));
     }
 
@@ -1802,14 +2552,6 @@ fn execute_merge(
     // the next child-ID allocation trusts them.
     storage.rebuild_child_counters_in_tx()?;
 
-    // Save Base Snapshot
-    let new_base: HashMap<_, _> = report
-        .kept
-        .iter()
-        .map(|i| (i.id.clone(), i.clone()))
-        .collect();
-    save_base_snapshot(&new_base, beads_dir)?;
-
     // Force Export to update JSONL (ensure sync)
     info!(path = %jsonl_path.display(), "Writing merged issues.jsonl");
     let export_config = ExportConfig {
@@ -1818,9 +2560,10 @@ fn execute_merge(
         error_policy: ExportErrorPolicy::Strict,
         retention_days,
         beads_dir: Some(path_policy.beads_dir.clone()),
-        allow_external_jsonl: args.allow_external_jsonl,
+        allow_external_jsonl: path_policy.allow_external_jsonl,
         show_progress,
         history: HistoryConfig::default(),
+        max_parallel_workers: args.export_parallelism.unwrap_or(0),
     };
 
     let (export_result, _) = export_to_jsonl_with_policy(storage, jsonl_path, &export_config)?;
@@ -1830,6 +2573,7 @@ fn execute_merge(
         Some(&export_result.issue_hashes),
         jsonl_path,
     )?;
+    save_base_snapshot_from_jsonl(jsonl_path, beads_dir)?;
 
     // Output success message
     if use_json {
@@ -1838,10 +2582,11 @@ fn execute_merge(
             "merged_issues": report.kept.len(),
             "deleted_issues": report.deleted.len(),
             "conflicts": report.conflicts.len(),
+            "resolution": resolution,
             "notes": report.notes,
         });
         ctx.json_pretty(&output);
-    } else if suppress_human_sync_output(ctx, use_json) {
+    } else if !should_render_human_sync_output(ctx, use_json) {
         return Ok(());
     } else if ctx.is_rich() {
         render_merge_result_rich(&report, ctx);
@@ -1893,7 +2638,7 @@ fn render_merge_conflicts_rich(
 
     text.append("\n");
     text.append_styled("Hint: ", theme.dimmed.clone());
-    text.append("Use --force to override or resolve manually.");
+    text.append("Use --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
 
     let panel = Panel::from_rich_text(&text, ctx.width())
         .title(Text::new("Merge Conflicts"))
@@ -1964,18 +2709,24 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_rebuild_semantic_conflict_field, auto_rebuild_semantic_flag_conflict_reason,
-        detect_prefix_from_jsonl, jsonl_contains_duplicate_external_refs,
-        jsonl_contains_prefix_mismatch, validate_sync_paths,
+        SyncOperation, SyncPathPolicy, auto_rebuild_semantic_conflict_field,
+        auto_rebuild_semantic_flag_conflict_reason, build_base_witness_artifacts,
+        detect_prefix_from_jsonl, fresh_force_import_maintenance_gate_applies,
+        jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
+        merge_conflict_resolution, prepare_sync_startup, should_defer_jsonl_recovery,
+        should_render_human_sync_output, sync_operation, validate_operator_requested_sync_path,
+        validate_sync_mode_args, validate_sync_paths, write_manifest_atomically,
     };
     use crate::cli::SyncArgs;
-    use crate::config::CliOverrides;
+    use crate::config::{self, CliOverrides};
     use crate::error::BeadsError;
     use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
     use crate::sync::{
-        PreservedTombstone, restore_tombstones, scan_jsonl_for_tombstone_filter,
-        snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+        ConflictResolution, PreservedTombstone, restore_tombstones,
+        scan_jsonl_for_tombstone_filter, snapshot_tombstones,
+        tombstones_missing_from_jsonl_tombstones,
     };
     use chrono::Utc;
     use std::collections::HashSet;
@@ -2025,6 +2776,403 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_manifest_atomically_rejects_existing_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let manifest_path = beads_dir.join(".manifest.json");
+        let temp_path = manifest_path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let outside_target = temp.path().join("outside.json");
+        fs::write(&outside_target, "preserve").unwrap();
+        symlink(&outside_target, &temp_path).unwrap();
+
+        let err = write_manifest_atomically(&manifest_path, &serde_json::json!({ "ok": true }))
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains("failed to create temp manifest file"),
+            "unexpected message: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_target).unwrap(),
+            "preserve",
+            "manifest temp symlink target must not receive manifest bytes"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "failed manifest write must not install a manifest"
+        );
+        assert!(
+            fs::symlink_metadata(&temp_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected pre-existing temp symlink should be left untouched"
+        );
+    }
+
+    #[test]
+    fn test_write_manifest_atomically_skips_stale_regular_temp_file() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let manifest_path = beads_dir.join(".manifest.json");
+        let stale_temp_path =
+            manifest_path.with_extension(format!("json.{}.tmp", std::process::id()));
+        fs::write(&stale_temp_path, "stale temp").unwrap();
+
+        write_manifest_atomically(&manifest_path, &serde_json::json!({ "ok": true })).unwrap();
+
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            manifest.contains("\"ok\": true"),
+            "manifest should be written through a collision-free temp path"
+        );
+        assert_eq!(
+            fs::read_to_string(&stale_temp_path).unwrap(),
+            "stale temp",
+            "stale temp collision should be left untouched"
+        );
+    }
+
+    #[test]
+    fn should_render_human_sync_output_preserves_quiet_json_semantics() {
+        let quiet_ctx = OutputContext::from_flags(false, true, true);
+        let plain_ctx = OutputContext::from_flags(false, false, true);
+
+        assert!(!should_render_human_sync_output(&quiet_ctx, false));
+        assert!(should_render_human_sync_output(&quiet_ctx, true));
+        assert!(should_render_human_sync_output(&plain_ctx, false));
+        assert!(should_render_human_sync_output(&plain_ctx, true));
+    }
+
+    #[test]
+    fn fresh_force_import_maintenance_gate_only_applies_to_clean_empty_force_loads() {
+        let force_import = SyncArgs {
+            force: true,
+            ..SyncArgs::default()
+        };
+        assert!(fresh_force_import_maintenance_gate_applies(
+            &force_import,
+            true,
+            true
+        ));
+        assert!(!fresh_force_import_maintenance_gate_applies(
+            &force_import,
+            false,
+            true
+        ));
+        assert!(!fresh_force_import_maintenance_gate_applies(
+            &force_import,
+            true,
+            false
+        ));
+
+        let rebuild = SyncArgs {
+            force: true,
+            rebuild: true,
+            ..SyncArgs::default()
+        };
+        assert!(!fresh_force_import_maintenance_gate_applies(
+            &rebuild, true, true
+        ));
+
+        let rename_prefix = SyncArgs {
+            force: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(!fresh_force_import_maintenance_gate_applies(
+            &rename_prefix,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn sync_operation_witness_is_explicit_read_only_mode() {
+        let args = SyncArgs {
+            witness: true,
+            witness_chunk_lines: 2,
+            ..SyncArgs::default()
+        };
+
+        assert_eq!(sync_operation(&args), SyncOperation::Witness);
+        assert!(!should_defer_jsonl_recovery(&args));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_base_witness_artifacts_rejects_symlinked_base_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let current_jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&current_jsonl_path, "current\n").unwrap();
+        let outside_base_path = outside_dir.join("beads.base.jsonl");
+        fs::write(&outside_base_path, "outside\n").unwrap();
+        symlink(&outside_base_path, beads_dir.join("beads.base.jsonl")).unwrap();
+
+        let path_policy = SyncPathPolicy {
+            jsonl_path: current_jsonl_path.clone(),
+            jsonl_temp_path: current_jsonl_path.with_extension("jsonl.tmp"),
+            manifest_path: beads_dir.join(".manifest.json"),
+            beads_dir,
+            is_external: false,
+            allow_external_jsonl: false,
+        };
+        let current_witness = super::build_witness_for_path(&current_jsonl_path, 1, 1)
+            .expect("current witness should build");
+
+        let result = build_base_witness_artifacts(&path_policy, 1, 1, &current_witness);
+        assert!(
+            result.is_err(),
+            "base witness should reject symlinked base snapshot"
+        );
+        let err = result.err().expect("checked error result");
+
+        assert!(
+            matches!(&err, BeadsError::Config(message) if message.contains("must not be a symlink")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rejects_witness_mode_conflicts() {
+        let status_conflict = SyncArgs {
+            status: true,
+            witness: true,
+            witness_chunk_lines: 2,
+            ..SyncArgs::default()
+        };
+        let err = validate_sync_mode_args(&status_conflict)
+            .expect_err("status and witness should conflict");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+
+        let merge_conflict = SyncArgs {
+            merge: true,
+            witness: true,
+            witness_chunk_lines: 2,
+            ..SyncArgs::default()
+        };
+        let err = validate_sync_mode_args(&merge_conflict)
+            .expect_err("merge and witness should conflict");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rejects_zero_witness_chunk_lines() {
+        let args = SyncArgs {
+            witness: true,
+            witness_chunk_lines: 0,
+            ..SyncArgs::default()
+        };
+
+        let err = validate_sync_mode_args(&args).expect_err("zero witness chunk size should fail");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rejects_zero_witness_parallelism() {
+        let args = SyncArgs {
+            witness: true,
+            witness_chunk_lines: 2,
+            witness_parallelism: Some(0),
+            ..SyncArgs::default()
+        };
+
+        let err = validate_sync_mode_args(&args).expect_err("zero witness parallelism should fail");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rejects_zero_export_parallelism() {
+        let args = SyncArgs {
+            flush_only: true,
+            export_parallelism: Some(0),
+            ..SyncArgs::default()
+        };
+
+        let err = validate_sync_mode_args(&args).expect_err("zero export parallelism should fail");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn test_merge_conflict_resolution_defaults_to_manual() {
+        let args = SyncArgs {
+            merge: true,
+            ..SyncArgs::default()
+        };
+
+        assert_eq!(merge_conflict_resolution(&args), ConflictResolution::Manual);
+    }
+
+    #[test]
+    fn test_merge_conflict_resolution_supports_explicit_winners() {
+        let force_db = SyncArgs {
+            merge: true,
+            force_db: true,
+            ..SyncArgs::default()
+        };
+        let force_jsonl = SyncArgs {
+            merge: true,
+            force_jsonl: true,
+            ..SyncArgs::default()
+        };
+        let force_newer = SyncArgs {
+            merge: true,
+            force: true,
+            ..SyncArgs::default()
+        };
+
+        assert_eq!(
+            merge_conflict_resolution(&force_db),
+            ConflictResolution::PreferLocal
+        );
+        assert_eq!(
+            merge_conflict_resolution(&force_jsonl),
+            ConflictResolution::PreferExternal
+        );
+        assert_eq!(
+            merge_conflict_resolution(&force_newer),
+            ConflictResolution::PreferNewer
+        );
+    }
+
+    #[test]
+    fn test_merge_resolution_flags_require_merge_mode() {
+        let args = SyncArgs {
+            force_db: true,
+            ..SyncArgs::default()
+        };
+
+        let err = validate_sync_mode_args(&args).expect_err("force-db should require merge");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+        assert!(err.to_string().contains("--merge"));
+    }
+
+    #[test]
+    fn test_sync_operation_selects_default_and_explicit_modes() {
+        assert_eq!(sync_operation(&SyncArgs::default()), SyncOperation::Import);
+
+        let flush = SyncArgs {
+            flush_only: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(sync_operation(&flush), SyncOperation::Flush);
+
+        let merge = SyncArgs {
+            merge: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(sync_operation(&merge), SyncOperation::Merge);
+
+        let import = SyncArgs {
+            import_only: true,
+            ..SyncArgs::default()
+        };
+        assert_eq!(sync_operation(&import), SyncOperation::Import);
+    }
+
+    #[test]
+    fn test_sync_operation_status_takes_precedence_over_work_modes() {
+        let args = SyncArgs {
+            status: true,
+            flush_only: true,
+            ..SyncArgs::default()
+        };
+
+        assert_eq!(sync_operation(&args), SyncOperation::Status);
+    }
+
+    #[test]
+    fn test_should_defer_jsonl_recovery_only_for_rename_prefix_import() {
+        let rename_import = SyncArgs {
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(should_defer_jsonl_recovery(&rename_import));
+
+        let status = SyncArgs {
+            status: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(!should_defer_jsonl_recovery(&status));
+
+        let flush = SyncArgs {
+            flush_only: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(!should_defer_jsonl_recovery(&flush));
+
+        let merge = SyncArgs {
+            merge: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(!should_defer_jsonl_recovery(&merge));
+    }
+
+    #[test]
+    fn sync_status_fast_open_miss_reuses_caller_write_lock_for_rebuild() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let issue = make_test_issue("bd-sync-selflock", "Recovered while caller holds lock");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+        let _held_lock = crate::sync::blocking_write_lock(&beads_dir).unwrap();
+        let args = SyncArgs {
+            status: true,
+            ..SyncArgs::default()
+        };
+        let cli = CliOverrides {
+            db: Some(db_path.clone()),
+            lock_timeout: Some(1),
+            read_only_fast_open: true,
+            ..CliOverrides::default()
+        };
+
+        let startup = prepare_sync_startup(&args, &cli, true)
+            .expect("caller-held write lock should not be reacquired on fast-open miss");
+
+        assert!(db_path.is_file(), "missing DB should rebuild from JSONL");
+        assert!(
+            startup
+                .open_result
+                .storage
+                .id_exists("bd-sync-selflock")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2206,12 +3354,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tombstones_missing_from_jsonl_tombstones_respects_timestamps() {
+    fn test_tombstones_missing_from_jsonl_tombstones_blocks_resurrection() {
         // Regression: when the JSONL has an ID as a *non*-tombstone, the
-        // preserved tombstone should only overwrite the imported open row
-        // if the local deletion is actually newer than the JSONL state.
-        // Otherwise a stale local delete would silently clobber a pulled
-        // update from another contributor.
+        // preserved tombstone must still overwrite the imported open row.
+        // Timestamp ordering cannot resurrect a tombstone; that requires
+        // an explicit reopen operation.
         use crate::model::Status;
         use chrono::{Duration, Utc};
 
@@ -2250,10 +3397,13 @@ mod tests {
             &filter,
         );
 
-        // Only the newer local tombstone survives: the older one lost to
-        // the JSONL's non-tombstone state (import wins).
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].issue.id, "bd-contested-newer");
+        assert_eq!(filtered.len(), 2);
+        let filtered_ids: HashSet<_> = filtered
+            .iter()
+            .map(|tombstone| tombstone.issue.id.as_str())
+            .collect();
+        assert!(filtered_ids.contains("bd-contested-older"));
+        assert!(filtered_ids.contains("bd-contested-newer"));
     }
 
     #[test]
@@ -2271,15 +3421,14 @@ mod tests {
         std::fs::write(&jsonl_path, content).unwrap();
 
         let err = scan_jsonl_for_tombstone_filter(&jsonl_path).unwrap_err();
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("Duplicate issue id 'bd-dup'"),
-                    "unexpected duplicate-id error: {message}"
-                );
-            }
-            other => panic!("expected duplicate-id config error, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Duplicate issue id 'bd-dup'")
+            ),
+            "expected duplicate-id config error, got {err:?}"
+        );
     }
 
     #[test]
@@ -2354,6 +3503,7 @@ mod tests {
 
         assert_eq!(policy.jsonl_path, jsonl_path);
         assert!(!policy.is_external);
+        assert!(!policy.allow_external_jsonl);
     }
 
     #[test]
@@ -2371,6 +3521,141 @@ mod tests {
 
         assert_eq!(policy.jsonl_path, jsonl_path);
         assert!(policy.is_external);
+        assert!(policy.allow_external_jsonl);
+    }
+
+    #[test]
+    fn test_validate_sync_paths_allows_external_db_family_effective_policy() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let db_path = external_dir.join("beads.db");
+        let jsonl_path = external_dir.join("issues.jsonl");
+        let allow_external_jsonl =
+            config::implicit_external_jsonl_allowed(&beads_dir, &db_path, &jsonl_path);
+        assert!(allow_external_jsonl);
+
+        let policy = validate_sync_paths(&beads_dir, &jsonl_path, allow_external_jsonl)
+            .expect("path policy");
+
+        assert_eq!(policy.jsonl_path, jsonl_path);
+        assert!(policy.is_external);
+        assert!(policy.allow_external_jsonl);
+    }
+
+    #[test]
+    fn test_validate_sync_paths_rejects_external_path_without_effective_policy() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let jsonl_path = external_dir.join("issues.jsonl");
+        let err = validate_sync_paths(&beads_dir, &jsonl_path, false).unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains("--allow-external-jsonl"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn test_validate_operator_requested_sync_path_rejects_git_before_resolution() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let err =
+            validate_operator_requested_sync_path(&beads_dir, Path::new(".git/../issues.jsonl"))
+                .unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains(".git") || message.contains("git"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_paths_rejects_internal_parent_symlink_escape_with_opt_in() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let symlink_parent = beads_dir.join("external-link");
+        symlink(&external_dir, &symlink_parent).unwrap();
+
+        let jsonl_path = symlink_parent.join("issues.jsonl");
+        let err = validate_sync_paths(&beads_dir, &jsonl_path, true).unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(message.contains("symlink"), "unexpected message: {message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_paths_rejects_symlinked_git_parent_with_opt_in() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let git_dir = temp.path().join(".git");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&git_dir).unwrap();
+
+        let git_link = temp.path().join("git-link");
+        symlink(&git_dir, &git_link).unwrap();
+
+        let jsonl_path = git_link.join("issues.jsonl");
+        let err = validate_sync_paths(&beads_dir, &jsonl_path, true).unwrap_err();
+
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = if let BeadsError::Config(message) = &err {
+            message.as_str()
+        } else {
+            ""
+        };
+        assert!(
+            message.contains(".git") || message.contains("git"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
@@ -2472,8 +3757,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            detect_prefix_from_jsonl(&jsonl_path),
+            detect_prefix_from_jsonl(&jsonl_path).unwrap(),
             Some("document-intelligence".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_prefix_from_jsonl_rejects_malformed_before_prefix() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let issue = make_test_issue("foreign-0sa", "Foreign Prefix");
+        fs::write(
+            &jsonl_path,
+            format!("{{not-json\n{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let err = detect_prefix_from_jsonl(&jsonl_path).unwrap_err();
+        assert!(
+            matches!(err, BeadsError::Config(ref message) if message.contains("Invalid JSON at line 1")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_prefix_from_jsonl_validates_entire_file_before_returning_prefix() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let issue = make_test_issue("foreign-0sa", "Foreign Prefix");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n{{not-json\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let err = detect_prefix_from_jsonl(&jsonl_path).unwrap_err();
+        assert!(
+            matches!(err, BeadsError::Config(ref message) if message.contains("Invalid JSON at line 2")),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -2653,6 +3974,18 @@ mod tests {
         .unwrap();
 
         assert!(!jsonl_contains_prefix_mismatch(&jsonl_path, "bd").unwrap());
+
+        let slugged = make_test_issue("bd-survey-my-thing-abc123", "Slugged");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&slugged).unwrap()),
+        )
+        .unwrap();
+
+        assert!(
+            !jsonl_contains_prefix_mismatch(&jsonl_path, "bd").unwrap(),
+            "slugged IDs generated from prefix bd should not be treated as mismatches"
+        );
 
         let mismatch = make_test_issue("other-gamma", "Mismatch");
         fs::write(

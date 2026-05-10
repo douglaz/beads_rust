@@ -7,6 +7,7 @@ Comprehensive reference for all `br` (beads_rust) commands.
 ## Table of Contents
 
 - [Global Options](#global-options)
+- [Cross-Project Routing](#cross-project-routing)
 - [Core Commands](#core-commands)
   - [init](#init)
   - [create](#create)
@@ -25,6 +26,7 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [stale](#stale)
 - [Organization Commands](#organization-commands)
   - [dep](#dep)
+  - [graph](#graph)
   - [label](#label)
   - [epic](#epic)
   - [comments](#comments)
@@ -35,9 +37,17 @@ Comprehensive reference for all `br` (beads_rust) commands.
 - [Sync & Config](#sync--config)
   - [sync](#sync)
   - [config](#config)
+- [Agent Integration](#agent-integration)
+  - [capabilities](#capabilities)
+  - [robot-docs](#robot-docs)
+  - [serve](#serve)
 - [Diagnostics & Info](#diagnostics--info)
+  - [agents](#agents)
   - [stats / status](#stats--status)
   - [doctor](#doctor)
+  - [info](#info)
+  - [where](#where)
+  - [schema](#schema)
   - [version](#version)
   - [audit](#audit)
   - [history](#history)
@@ -65,13 +75,61 @@ These options apply to all commands:
 | `--no-auto-flush` | Skip automatic JSONL export after mutations |
 | `--no-auto-import` | Skip automatic import check |
 | `--allow-stale` | Allow stale DB (bypass freshness check warning) |
-| `--lock-timeout <MS>` | SQLite busy timeout in milliseconds |
+| `--lock-timeout <LOCK_TIMEOUT>` | SQLite busy/write-lock timeout in milliseconds |
 | `--no-db` | JSONL-only mode (no DB connection) |
 | `-v, --verbose` | Increase logging verbosity (-v, -vv) |
 | `-q, --quiet` | Quiet mode (errors only) |
 | `--no-color` | Disable colored output |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
+
+By default, successful mutating commands auto-flush SQLite changes to
+`.beads/issues.jsonl`, so the JSONL file is normally ready to stage after the
+command completes. Use `--no-auto-flush` to skip that export for a single
+command. `br sync --flush-only` remains useful as an idempotent final export
+check before committing, after `--no-auto-flush`, after disabling auto-flush in
+config, or during recovery.
+
+---
+
+## Cross-Project Routing
+
+`br` can route explicit issue IDs to another workspace when their prefix matches
+`.beads/routes.jsonl`. This is useful for town or multi-repository setups where
+one project needs to inspect or update an issue owned by another project.
+
+Each route is one JSON object per line:
+
+```jsonl
+{"prefix":"api-","path":"../api"}
+{"prefix":"ops-","path":"/srv/projects/ops/.beads"}
+```
+
+Route resolution:
+
+1. Extract the issue prefix before the final hyphen, including the hyphen, so
+   hyphenated prefixes such as `document-intelligence-` route correctly.
+2. Search the local `.beads/routes.jsonl`.
+3. If a parent town root with `mayor/town.json` exists, search its
+   `.beads/routes.jsonl`.
+4. Resolve `path` as a project root or a direct `.beads`/`_beads` directory.
+5. Follow a target `.beads/redirect` file when present.
+
+Current route-aware commands include common issue-ID operations such as `show`,
+`update`, `close`, `reopen`, `delete`, `defer`, `comments`, `label`, `dep`,
+`graph`, `audit`, and `lint`. Routed write operations acquire the target
+workspace's `.write.lock` and mutate the target workspace, not the caller's
+local database.
+
+Safety boundaries:
+
+- Routing never runs git, copies repositories, or performs network sync.
+- Routing is not real-time collaboration; each affected repository still needs
+  its own normal `br sync --flush-only`/VCS commit flow.
+- Routes are prefix dispatch rules. They do not import external issues into the
+  local database.
+- Cross-project dependency status checks use explicit IDs such as
+  `external:api:api-123` plus config keys like `external_projects.api=../api`.
 
 ---
 
@@ -90,6 +148,7 @@ br init [OPTIONS]
 |--------|-------------|
 | `--prefix <PREFIX>` | Issue ID prefix (e.g., "bd", "proj") |
 | `--force` | Overwrite existing database |
+| `--backend <BACKEND>` | Backend type placeholder; currently ignored and always uses SQLite |
 
 **Examples:**
 ```bash
@@ -132,6 +191,7 @@ br create [OPTIONS] [TITLE]
 | `--defer <DATE>` | Defer until date |
 | `--external-ref <REF>` | External reference (e.g., `gh-123`) |
 | `--ephemeral` | Mark as ephemeral (not exported to JSONL) |
+| `-s, --status <STATUS>` | Initial status (`open`, `deferred`, `in_progress`, `closed`) |
 | `--dry-run` | Preview without creating |
 | `--silent` | Output only issue ID |
 | `-f, --file <PATH>` | Create issues from markdown file (bulk import) |
@@ -198,6 +258,7 @@ br list [OPTIONS]
 | `--priority-max <N>` | Filter by maximum priority |
 | `--title-contains <TEXT>` | Title contains substring |
 | `--desc-contains <TEXT>` | Description contains substring |
+| `--notes-contains <TEXT>` | Notes contains substring |
 | `-a, --all` | Include closed issues |
 | `--deferred` | Include deferred issues |
 | `--overdue` | Filter for overdue issues |
@@ -210,7 +271,9 @@ br list [OPTIONS]
 | `-r, --reverse` | Reverse sort order |
 | `--long` | Long output format |
 | `--pretty` | Tree/pretty output format |
-| `--format <FMT>` | Output format: text, json, csv |
+| `--wrap` | Wrap long lines instead of truncating in text output |
+| `--format <FMT>` | Output format: text, json, csv, toon |
+| `--stats` | Show token savings stats when using TOON output |
 | `--fields <FIELDS>` | CSV fields (comma-separated) |
 
 **Examples:**
@@ -240,6 +303,13 @@ Show detailed issue information.
 ```bash
 br show [IDS]...
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Output format: text, json, toon |
+| `--wrap` | Wrap long lines instead of truncating in text output |
+| `--stats` | Show token savings stats when using TOON output |
 
 **Examples:**
 ```bash
@@ -277,6 +347,7 @@ br update [OPTIONS] [IDS]...
 | `--assignee <NAME>` | Assign (empty string clears) |
 | `--owner <EMAIL>` | Set owner (empty string clears) |
 | `--claim` | Atomic claim (assignee=actor + status=in_progress) |
+| `--force` | Force update even if issue is blocked |
 | `--due <DATE>` | Set due date (empty string clears) |
 | `--defer <DATE>` | Set defer date (empty string clears) |
 | `--estimate <MINUTES>` | Set time estimate |
@@ -285,6 +356,7 @@ br update [OPTIONS] [IDS]...
 | `--set-labels <LABELS>` | Replace all labels |
 | `--parent <ID>` | Reparent (empty string removes) |
 | `--external-ref <REF>` | Set external reference |
+| `--session <ID>` | Set `closed_by_session` when closing |
 
 **Examples:**
 ```bash
@@ -342,8 +414,14 @@ br close bd-abc123 --suggest-next --json
 Reopen a closed issue.
 
 ```bash
-br reopen <IDS>...
+br reopen [OPTIONS] [IDS]...
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-r, --reason <TEXT>` | Reason for reopening, stored as a comment |
+| `--robot` | Machine-readable output |
 
 ---
 
@@ -358,8 +436,12 @@ br delete [OPTIONS] <IDS>...
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `-r, --reason <TEXT>` | Deletion reason |
-| `-f, --force` | Skip confirmation |
+| `--reason <TEXT>` | Delete reason (default: `delete`) |
+| `--from-file <PATH>` | Read IDs from file (one per line, `#` comments ignored) |
+| `--cascade` | Delete dependents recursively |
+| `--force` | Bypass dependent checks, orphaning dependents |
+| `--hard` | Prune tombstones from JSONL immediately |
+| `--dry-run` | Preview only, no changes |
 
 ---
 
@@ -385,6 +467,11 @@ br ready [OPTIONS]
 | `-p, --priority <N>` | Filter by priority |
 | `--sort <POLICY>` | Sort: hybrid (default), priority, oldest |
 | `--include-deferred` | Include deferred issues |
+| `--parent <ID>` | Filter to children of a parent issue |
+| `-r, --recursive` | Include all descendants with `--parent` |
+| `--wrap` | Wrap long lines instead of truncating in text output |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
 | `--robot` | Machine-readable output |
 
 **Examples:**
@@ -401,6 +488,99 @@ br ready --json --limit 10
 
 ---
 
+### scheduler
+
+Rank ready work for agent swarms with explainable evidence.
+
+```bash
+br scheduler [OPTIONS]
+br schedule [OPTIONS]   # alias
+```
+
+`scheduler` starts from the same ready-work definition as `ready`, then scores a
+bounded candidate set with deterministic evidence terms for priority,
+dependency impact, stale claims, fairness, and domain contention. JSON and TOON
+output include `schema: "br.scheduler.v1"` plus a fallback policy so agents can
+parse the result safely and preserve conservative ordering when evidence ties.
+The `evidence.stale_claim` object uses the shared coordination policy with
+`reservation_status: "no_snapshot"` because `scheduler` does not parse Agent
+Mail snapshots. A stale assigned row can therefore recommend `inspect_mail`, but
+it is not proof that the claim is abandoned; run `br coordination status` with
+reservation evidence before reclaiming ownership.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--limit <N>` | Maximum recommendations (default: 20, 0=unlimited) |
+| `--candidate-limit <N>` | Maximum ready candidates to score (default: 512, 0=unlimited) |
+| `--stale-claim-hours <N>` | Non-negative claim age threshold for stale-claim evidence (default: 2) |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
+
+**Examples:**
+```bash
+# Top swarm recommendations with evidence
+br scheduler --json --limit 10
+
+# Token-efficient parseable output
+br scheduler --format toon --stats
+```
+
+---
+
+### coordination status
+
+Diagnose hidden `in_progress` claims without mutating ownership.
+
+```bash
+br coordination status [OPTIONS]
+```
+
+`coordination status` emits the `br.coordination.v1` evidence envelope used to
+spot stale claims, missing Agent Mail evidence, and active reservation matches.
+The command is read-only: it never calls Agent Mail directly and never changes
+issue status or assignee.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--owner-kind <KIND>` | Fallback ownership policy: swarm-agent, human, or unknown |
+| `--comments <N>` | Latest comments to include per claim (default: 2) |
+| `--reservations <PATH>` | Offline Agent Mail reservation snapshot (JSON array, wrapper object, or JSONL) |
+| `--agents <PATH>` | Offline Agent Mail agent snapshot (JSON array, wrapper object, or JSONL) |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
+
+JSON/TOON claim rows include advisory fields:
+`reclaim_allowed_by_policy`, `required_human_confirmation`,
+`evidence_summary`, and `suggested_commands`. Suggested commands are emitted
+only when the policy has enough evidence to propose the documented audit-comment
+plus `br update --claim` sequence. Fresh claims, active reservations, missing or
+invalid snapshots, and human/unknown ownership do not emit reclaim commands.
+
+**Examples:**
+```bash
+# Inspect current in-progress claims
+br coordination status --json
+
+# Queue-dry diagnosis: ready work may be hidden behind old claims
+br ready --json
+bv --robot-next
+br list --status in_progress --json
+br coordination status --json
+
+# Use offline Agent Mail snapshots without requiring a live MCP service
+br coordination status --reservations reservations.json --agents agents.jsonl --json
+
+# Review advisory reclaim output before copying any suggested command
+br coordination status --reservations reservations.json --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
+```
+
+---
+
 ### blocked
 
 List blocked issues.
@@ -410,6 +590,19 @@ br blocked [OPTIONS]
 ```
 
 Shows issues that are blocked by other open issues.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--limit <N>` | Maximum results (default: 50, 0=unlimited) |
+| `--detailed` | Include full blocker details in text output |
+| `--wrap` | Wrap long lines instead of truncating in text output |
+| `-t, --type <TYPE>` | Filter by type |
+| `-p, --priority <N>` | Filter by priority |
+| `-l, --label <LABEL>` | Filter by label |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
 
 ---
 
@@ -446,6 +639,19 @@ br count [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--by <FIELD>` | Group by: status, type, priority, assignee, label |
+| `--by-status` | Group by status |
+| `--by-priority` | Group by priority |
+| `--by-type` | Group by issue type |
+| `--by-assignee` | Group by assignee |
+| `--by-label` | Group by label |
+| `--status <STATUS>` | Filter by status (repeatable or comma-separated) |
+| `--type <TYPE>` | Filter by issue type (repeatable or comma-separated) |
+| `--priority <PRIORITY>` | Filter by priority (repeatable or comma-separated) |
+| `--assignee <NAME>` | Filter by assignee |
+| `--unassigned` | Only include unassigned issues |
+| `--include-closed` | Include closed issues; use `--status tombstone` for tombstones |
+| `--include-templates` | Include template issues |
+| `--title-contains <TEXT>` | Title contains substring |
 
 **Examples:**
 ```bash
@@ -472,7 +678,38 @@ br stale [OPTIONS]
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--days <N>` | Issues not updated in N days (default: 14) |
+| `--days <N>` | Issues not updated in N days (default: 30) |
+| `--status <STATUS>` | Filter by status (repeatable or comma-separated) |
+
+**Abandoned in-progress claims:**
+
+`br ready` does not show `in_progress` issues. To audit hidden work, combine
+`stale` with an explicit in-progress listing and inspect the claim evidence:
+
+```bash
+br stale --days 1 --json
+br list --status in_progress --json
+br show <id> --json
+br comments list <id> --json
+```
+
+An `in_progress` issue is a reclaim candidate when `updated_at` is old, the
+assignee or session metadata no longer points to an active worker, and recent
+comments or Agent Mail reservations do not show live work. Default thresholds
+are two hours for automated swarm claims and one business day for human or
+unclear claims.
+
+Before reclaiming, add an audit comment with the evidence, then claim:
+
+```bash
+br comments add <id> --author "$BD_ACTOR" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+There is not a separate reclaim command; the audit comment plus `update --claim`
+is the documented recovery workflow.
 
 ---
 
@@ -518,6 +755,23 @@ br dep cycles
 
 ---
 
+### graph
+
+Visualize the dependency graph for one issue or for all active connected
+components.
+
+```bash
+br graph [OPTIONS] [ISSUE]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--all` | Show graph for all open, in-progress, and blocked issues |
+| `--compact` | Print one line per issue |
+
+---
+
 ### label
 
 Manage labels on issues.
@@ -529,9 +783,11 @@ br label <COMMAND>
 **Subcommands:**
 | Command | Description |
 |---------|-------------|
-| `add <ID> <LABELS>` | Add labels to issue |
-| `remove <ID> <LABELS>` | Remove labels from issue |
+| `add [ISSUES]... --label <LABEL>` | Add a label to one or more issues |
+| `remove [ISSUES]... --label <LABEL>` | Remove a label from one or more issues |
 | `list [ID]` | List labels (optionally for specific issue) |
+| `list-all` | List all unique labels with counts |
+| `rename <OLD_NAME> <NEW_NAME>` | Rename a label across all issues |
 
 ---
 
@@ -546,8 +802,8 @@ br epic <COMMAND>
 **Subcommands:**
 | Command | Description |
 |---------|-------------|
-| `status <ID>` | Show epic status with child progress |
-| `close-eligible <ID>` | Check if epic can be closed |
+| `status [--eligible-only]` | Show epic status with child progress and eligibility |
+| `close-eligible [--dry-run]` | Close epics that are eligible because all children are closed |
 
 ---
 
@@ -562,8 +818,17 @@ br comments <COMMAND>
 **Subcommands:**
 | Command | Description |
 |---------|-------------|
-| `add <ID> <BODY>` | Add comment |
+| `add <ID> [TEXT]...` | Add a comment |
 | `list <ID>` | List comments |
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--wrap` | Wrap long comment lines when listing |
+| `add -f, --file <PATH>` | Read comment text from file |
+| `add --author <NAME>` | Override the default author |
+| `add --message <TEXT>` | Comment text as an alternative flag |
+| `list --wrap` | Wrap long comment lines |
 
 ---
 
@@ -575,13 +840,14 @@ Defer or undefer issues.
 
 ```bash
 br defer <IDS>... [OPTIONS]
-br undefer <IDS>...
+br undefer <IDS>... [OPTIONS]
 ```
 
 **Options:**
 | Option | Description |
 |--------|-------------|
 | `--until <DATE>` | Defer until date |
+| `--robot` | Machine-readable output |
 
 ---
 
@@ -592,6 +858,13 @@ List orphan issues (referenced in commits but still open).
 ```bash
 br orphans [OPTIONS]
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--details` | Show detailed commit information |
+| `--fix` | Prompt to fix orphans |
+| `--robot` | Machine-readable output |
 
 ---
 
@@ -606,10 +879,13 @@ br query <COMMAND>
 **Subcommands:**
 | Command | Description |
 |---------|-------------|
-| `save <NAME> <QUERY>` | Save a query |
-| `run <NAME>` | Run a saved query |
+| `save <NAME> [FILTERS...]` | Save the current list-style filter set as a named query |
+| `run <NAME> [FILTERS...]` | Run a saved query, merging any additional filters from the CLI |
 | `list` | List saved queries |
 | `delete <NAME>` | Delete a saved query |
+
+`query save` and `query run` use the same filter flags as `br list`; there is
+no free-form query string argument.
 
 ---
 
@@ -625,7 +901,7 @@ br sync [OPTIONS]
 
 **SAFETY GUARANTEES:**
 - NEVER executes git commands or auto-commits
-- NEVER modifies files outside `.beads/` (unless `--allow-external-jsonl`)
+- NEVER modifies files outside the selected workspace's `.beads/` (unless `--allow-external-jsonl`)
 - Uses atomic temp-file-then-rename pattern
 - Safety guards prevent accidental data loss
 
@@ -634,25 +910,57 @@ br sync [OPTIONS]
 |--------|-------------|
 | `--flush-only` | Export database to JSONL |
 | `--import-only` | Import JSONL into database |
+| `--merge` | Three-way merge `.beads/beads.base.jsonl`, SQLite, and JSONL |
 | `--status` | Show sync status (read-only) |
 
 **Options:**
 | Option | Description |
 |--------|-------------|
 | `-f, --force` | Override safety guards (use with caution) |
+| `--force-db` | With `--merge`, resolve conflicts by keeping the local SQLite version |
+| `--force-jsonl` | With `--merge`, resolve conflicts by keeping the JSONL version |
 | `--allow-external-jsonl` | Allow JSONL path outside `.beads/` |
 | `--manifest` | Write manifest file with export summary |
 | `--error-policy <POLICY>` | Export error handling: strict, best-effort, partial, required-core |
 | `--orphans <MODE>` | Orphan handling: strict, resurrect, skip, allow |
+| `--rename-prefix` | During import, rewrite mismatched issue IDs into the configured default prefix |
+| `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
 | `--robot` | Machine-readable output |
+
+**Merge semantics:**
+- `--merge` uses `.beads/beads.base.jsonl` as the common ancestor and compares it with the local SQLite database and current JSONL file.
+- Without an explicit conflict policy, semantic conflicts stop the command. This covers both-modified, delete-vs-modify, and convergent same-ID creation conflicts.
+- `--force-db` keeps local SQLite changes for conflicts, `--force-jsonl` keeps JSONL changes for conflicts, and `--force` chooses the side with the newer timestamp.
+- `--force-db`, `--force-jsonl`, and `--force` are mutually exclusive for `--merge`.
+
+**Rebuild semantics:**
+- `--rebuild` is valid only with import mode: `br sync --rebuild` or `br sync --import-only --rebuild`.
+- JSONL is authoritative. After import, entries present only in SQLite are removed; deletion tombstones are preserved when applicable.
+- `--rebuild` is rejected with `--flush-only` and `--merge`.
+- Recovery artifacts are preserved under `.beads/.br_recovery/` when br has to move aside a damaged SQLite family before rebuilding.
+- If open-time recovery rebuilt the database before a semantic import flag such as `--rename-prefix` could apply, br prints a rerun command that includes the needed flags.
 
 **Examples:**
 ```bash
-# Export to JSONL
+# Export to JSONL explicitly; useful as a final check before committing .beads/
 br sync --flush-only
 
 # Import from JSONL
 br sync --import-only
+
+# Merge DB and JSONL after both changed
+br sync --merge
+
+# Resolve semantic merge conflicts explicitly
+br sync --merge --force-db
+br sync --merge --force-jsonl
+br sync --merge --force
+
+# Rebuild SQLite from authoritative JSONL
+br sync --import-only --rebuild
+
+# Rebuild while rewriting imported IDs to the configured prefix
+br sync --import-only --rebuild --rename-prefix
 
 # Check sync status
 br sync --status
@@ -668,20 +976,18 @@ br sync --flush-only -v
 Configuration management.
 
 ```bash
-br config [OPTIONS]
+br config <COMMAND>
 ```
 
-**Options:**
-| Option | Description |
-|--------|-------------|
-| `-l, --list` | List all config options with descriptions |
-| `-g, --get <KEY>` | Get a specific config value |
-| `-s, --set <KEY=VALUE>` | Set a config value |
-| `-d, --delete <KEY>` | Delete a config value |
-| `-e, --edit` | Open config in `$EDITOR` |
-| `-p, --path` | Show config file paths |
-| `--project` | Show only project config |
-| `--user` | Show only user config |
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `list [--project | --user]` | List available config options |
+| `get <KEY>` | Get a specific config value |
+| `set <KEY=VALUE>` or `set <KEY> <VALUE>` | Set a config value |
+| `delete <KEY>` | Delete a config value; `unset` is an alias |
+| `edit` | Open the user config file in `$EDITOR` |
+| `path` | Show config file paths |
 
 **Examples:**
 ```bash
@@ -693,6 +999,7 @@ br config get id.prefix
 
 # Set value
 br config set id.prefix=myproj
+br config set id.prefix myproj
 
 # Edit in editor
 br config edit
@@ -700,28 +1007,196 @@ br config edit
 
 ---
 
+## Agent Integration
+
+### capabilities
+
+Describe br's machine-readable command contracts, safety guarantees, supported
+output formats, exit-code categories, and environment variables.
+
+```bash
+br capabilities [OPTIONS]
+```
+
+Use this as the first discovery call in automation:
+
+```bash
+br capabilities --format json
+br capabilities --format json --command "create"
+br capabilities --format json --command "comments add"
+br capabilities --format json --command "dep add"
+br capabilities --format json --command "query save"
+br capabilities --format json --command "update"
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--command <COMMAND_PATH>` | Include detailed metadata for one command path, e.g. `create` or `comments add` |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+
+JSON and TOON output include `contract_version`,
+`recommended_entrypoints`, `features`, `commands`, `global_flags`,
+`exit_codes`, `env_vars`, and `safety`. When `--command` is supplied, output
+also includes `command_detail` with canonical path, aliases, subcommands,
+positionals, options, defaults, possible values, examples, command-specific
+safety notes, and workspace/safety contract metadata.
+
+---
+
+### robot-docs
+
+Print concise in-tool documentation for automation agents.
+
+```bash
+br robot-docs guide [OPTIONS]
+```
+
+Text mode prints a short handbook under 80 lines. JSON and TOON modes wrap the
+same guide with `contract_version`, `line_count`, and canonical commands.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+
+**Example:**
+
+```bash
+br robot-docs guide
+br robot-docs guide --format json
+```
+
+---
+
+### serve
+
+Start an MCP (Model Context Protocol) server on stdio.
+
+```bash
+br serve [OPTIONS]
+```
+
+`serve` is only available in binaries built with the optional `mcp` feature:
+
+```bash
+cargo build --release --features mcp
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--actor <NAME>` | Actor name recorded for mutations (default: `mcp`) |
+
+**Transport:** stdio. An MCP client launches `br serve`; `br` does not open a
+network listener.
+
+**Tools:** `list_issues`, `show_issue`, `create_issue`, `update_issue`,
+`close_issue`, `manage_dependencies`, `project_overview`.
+
+**Resources:** `beads://project/info`, `beads://issues/{id}`,
+`beads://schema`, `beads://labels`, `beads://issues/ready`,
+`beads://issues/blocked`, `beads://issues/in_progress`,
+`beads://coordination/status`, `beads://issues/deferred`,
+`beads://issues/bottlenecks`, `beads://graph/health`,
+`beads://events/recent`.
+
+**Prompts:** `triage`, `status_report`, `plan_next_work`, `polish_backlog`.
+
+**Safety:** MCP mutations use the same local storage, audit trail, `.write.lock`,
+and JSONL auto-flush behavior as CLI mutations. The server never runs git and
+does not synchronize repositories. `beads://coordination/status` is read-only
+and does not call Agent Mail; use `br coordination status --reservations
+<PATH> --agents <PATH> --json` when reservation evidence is required.
+
+**Example MCP client entry:**
+
+```json
+{
+  "mcpServers": {
+    "br": {
+      "command": "br",
+      "args": ["serve", "--actor", "codex"],
+      "env": {
+        "RUST_LOG": "error"
+      }
+    }
+  }
+}
+```
+
+Use `serve` when an MCP-native agent benefits from tool/resource discovery and
+structured recovery hints. Use `br --json ...` when a shell pipeline or `jq`
+script is simpler.
+
+---
+
 ## Diagnostics & Info
+
+### agents
+
+Manage the Beads workflow section in an `AGENTS.md` file.
+
+```bash
+br agents [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--add` | Add beads workflow instructions to `AGENTS.md` |
+| `--remove` | Remove beads workflow instructions from `AGENTS.md` |
+| `--update` | Update beads workflow instructions to the latest version |
+| `--check` | Check status only (default behavior) |
+| `--dry-run` | Preview changes without modifying files |
+| `-f, --force` | Skip confirmation prompts |
+
+---
 
 ### stats / status
 
 Show project statistics.
 
 ```bash
-br stats
-br status  # alias
+br stats [OPTIONS]
+br status [OPTIONS]  # alias
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--by-type` | Show breakdown by issue type |
+| `--by-priority` | Show breakdown by priority |
+| `--by-assignee` | Show breakdown by assignee |
+| `--by-label` | Show breakdown by label |
+| `--activity` | Include recent activity stats explicitly |
+| `--no-activity` | Skip recent activity stats |
+| `--activity-hours <HOURS>` | Activity window in hours (default: 24) |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
 
 ---
 
 ### doctor
 
-Run read-only diagnostics.
+Run diagnostics and optionally repair issues.
 
 ```bash
-br doctor
+br doctor [OPTIONS]
 ```
 
 Checks database integrity, schema compatibility, and configuration.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--repair` | Attempt to repair detected issues by rebuilding DB from JSONL |
+| `--allow-repeated-repair` | Allow another JSONL rebuild after prior failed recovery evidence |
 
 ---
 
@@ -745,6 +1220,26 @@ br where
 
 ---
 
+### schema
+
+Emit JSON Schemas for agent/tooling integrations.
+
+```bash
+br schema [TARGET] [OPTIONS]
+```
+
+**Targets:** `all`, `issue`, `issue-with-counts`, `issue-details`,
+`ready-issue`, `stale-issue`, `blocked-issue`, `tree-node`, `statistics`,
+`error`.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+
+---
+
 ### version
 
 Show version information.
@@ -764,6 +1259,44 @@ br audit [OPTIONS]
 ```
 
 Appends to `.beads/interactions.jsonl`.
+
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `record` | Append one interaction entry |
+| `coordination` | Record coordination status rows as audit interactions |
+| `label` | Label a prior interaction entry |
+| `log` | View audit entries for an issue |
+| `summary` | Summarize interaction counts |
+
+#### audit coordination
+
+`audit coordination` turns a `br coordination status` snapshot into durable
+`coordination_incident` rows in the existing `.beads/interactions.jsonl` audit
+log. It does not create a second coordination datastore.
+
+```bash
+br coordination status --json \
+  | br audit coordination --stdin --command "br coordination status --json" --json
+```
+
+Input may be a `br.coordination.v1` status object with `claims`, a JSON array,
+or JSONL rows where each row is either a claim or a wrapper with `claims`.
+Each recorded row stores bounded normalized fields in `extra`: `command`,
+`issue_id`, `classification`, `evidence_summary`, `snapshot_hash`, and
+`suggested_action`. The snapshot hash is computed from stable JSON with object
+keys normalized, so equivalent key order produces the same hash.
+
+The text output prints one interaction id per recorded claim. JSON and TOON
+output return:
+
+```json
+{
+  "recorded": 1,
+  "snapshot_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "ids": ["int-..."]
+}
+```
 
 ---
 

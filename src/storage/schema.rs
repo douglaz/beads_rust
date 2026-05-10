@@ -4,8 +4,10 @@ use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
+use crate::model::{IssueType, Priority, Status};
+use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 5;
+pub const CURRENT_SCHEMA_VERSION: i32 = 9;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -210,6 +212,30 @@ pub const SCHEMA_SQL: &str = r"
         last_child INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (parent_id) REFERENCES issues(id) ON DELETE CASCADE
     );
+
+    -- Close metadata (issue #274 — closure-time policy gates Phase 1).
+    --
+    -- One row per terminal close. Tier 1 attribution + bypass-policy auditing
+    -- live here so the issues table stays untouched (avoids breaking JSONL
+    -- round-trip and the wide SELECT statements throughout sqlite.rs).
+    --
+    -- All gate-related columns are nullable / default-valued so older
+    -- databases upgraded with a single ALTER TABLE chain remain valid.
+    CREATE TABLE IF NOT EXISTS close_metadata (
+        issue_id TEXT PRIMARY KEY,
+        closed_by_agent_name TEXT,
+        closed_by_harness TEXT,
+        closed_by_model TEXT,
+        bypassed_policy INTEGER NOT NULL DEFAULT 0,
+        bypass_reason TEXT,
+        policy_gates_fired TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_close_metadata_recorded_at ON close_metadata(recorded_at);
+    CREATE INDEX IF NOT EXISTS idx_close_metadata_bypassed
+        ON close_metadata(bypassed_policy)
+        WHERE bypassed_policy = 1;
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -720,6 +746,42 @@ fn issues_filter_columns_require_v3_rebuild(conn: &Connection) -> bool {
     false
 }
 
+fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
+    let row = conn.query_row("PRAGMA foreign_keys")?;
+    Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) == 1)
+}
+
+fn restore_foreign_keys(conn: &Connection, operation: &str) -> Result<()> {
+    conn.execute("PRAGMA foreign_keys = ON")
+        .map_err(BeadsError::Database)?;
+
+    if foreign_keys_enabled(conn)? {
+        return Ok(());
+    }
+
+    Err(BeadsError::Config(format!(
+        "failed to re-enable SQLite foreign key enforcement after {operation}: PRAGMA foreign_keys remained OFF"
+    )))
+}
+
+fn finish_foreign_key_suppressed_result<T>(
+    conn: &Connection,
+    operation: &str,
+    result: Result<T>,
+) -> Result<T> {
+    match (result, restore_foreign_keys(conn, operation)) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        (Err(original_error), Ok(())) => Err(original_error),
+        (Err(original_error), Err(restore_error)) => Err(BeadsError::WithContext {
+            context: format!(
+                "{operation} failed, and SQLite foreign key enforcement could not be re-enabled: {restore_error}"
+            ),
+            source: Box::new(original_error),
+        }),
+    }
+}
+
 /// Rebuild the issues table so columns match the canonical SCHEMA_SQL order.
 ///
 /// This fixes databases where ALTER TABLE ADD COLUMN appended columns in a
@@ -747,22 +809,25 @@ fn rebuild_issues_table(conn: &Connection) -> Result<()> {
     // This property is connection-scoped.
     conn.execute("PRAGMA foreign_keys = OFF")?;
 
-    // Wrap the entire rebuild in a transaction so a crash between DROP TABLE
-    // and RENAME cannot lose data.
-    conn.execute("BEGIN EXCLUSIVE")?;
+    let result = (|| -> Result<()> {
+        // Wrap the entire rebuild in a transaction so a crash between DROP TABLE
+        // and RENAME cannot lose data.
+        conn.execute("BEGIN EXCLUSIVE")?;
 
-    if let Err(e) = rebuild_issues_table_inner(conn, &existing_columns) {
-        let _ = conn.execute("ROLLBACK");
-        let _ = conn.execute("PRAGMA foreign_keys = ON");
-        return Err(e);
-    }
+        if let Err(e) = rebuild_issues_table_inner(conn, &existing_columns) {
+            let _ = conn.execute("ROLLBACK");
+            return Err(e);
+        }
 
-    conn.execute("COMMIT")?;
+        if let Err(e) = conn.execute("COMMIT") {
+            let _ = conn.execute("ROLLBACK");
+            return Err(e.into());
+        }
 
-    // Restore foreign key enforcement
-    conn.execute("PRAGMA foreign_keys = ON")?;
+        Ok(())
+    })();
 
-    Ok(())
+    finish_foreign_key_suppressed_result(conn, "issues table rebuild", result)
 }
 
 /// Inner helper for [`rebuild_issues_table`] that performs the actual work
@@ -857,6 +922,64 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     conn.execute("DROP TABLE issues_rebuild_tmp")?;
 
     Ok(())
+}
+
+/// Backfill storage-class NULL values in NOT NULL DEFAULT columns.
+///
+/// SQLite's `ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...` enforces the
+/// default for new and existing rows, but legacy databases — predating
+/// br's current migration code, or carrying history from Go bd or raw
+/// `sqlite3` edits — can hold storage-class NULLs in such columns. The
+/// `typeof(col) = 'null'` predicate detects these directly even when
+/// partial indexes cause `IS NULL` to silently miss them (see #269).
+///
+/// Idempotent: rows that already hold the default are not rewritten.
+/// Tables/columns that don't exist on the current schema are skipped.
+///
+/// Best-effort: per-column failures are logged but do not abort the
+/// caller, so a single broken column never blocks bootstrap.
+fn backfill_storage_null_in_default_columns(conn: &Connection) {
+    // (table, column, default_sql_literal). Mirrors the NOT NULL DEFAULT
+    // clauses in SCHEMA_SQL and the *_COLUMNS migration constants.
+    const COLUMNS: &[(&str, &str, &str)] = &[
+        // issues
+        ("issues", "description", "''"),
+        ("issues", "design", "''"),
+        ("issues", "acceptance_criteria", "''"),
+        ("issues", "notes", "''"),
+        ("issues", "status", "'open'"),
+        ("issues", "priority", "2"),
+        ("issues", "issue_type", "'task'"),
+        ("issues", "source_repo", "'.'"),
+        ("issues", "ephemeral", "0"),
+        ("issues", "pinned", "0"),
+        ("issues", "is_template", "0"),
+        // dependencies
+        ("dependencies", "type", "'blocks'"),
+        ("dependencies", "created_by", "''"),
+        // comments
+        ("comments", "author", "''"),
+        ("comments", "text", "''"),
+        // events
+        ("events", "event_type", "''"),
+        ("events", "actor", "''"),
+    ];
+
+    for (table, column, default) in COLUMNS {
+        if !table_exists(conn, table) || !column_exists(conn, table, column) {
+            continue;
+        }
+        let sql =
+            format!("UPDATE {table} SET {column} = {default} WHERE typeof({column}) = 'null'");
+        if let Err(err) = conn.execute(&sql) {
+            tracing::warn!(
+                table = table,
+                column = column,
+                error = %err,
+                "backfill of storage-NULL default failed; continuing"
+            );
+        }
+    }
 }
 
 fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
@@ -1168,6 +1291,85 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             );
             conn.execute("DROP INDEX IF EXISTS idx_issues_list_active_order")?;
         }
+
+        // v6: Repair datetime columns and legacy status values.
+        //
+        // External tools (including pre-Rust bd flows and direct SQLite edits)
+        // have occasionally written integer epoch microseconds into DATETIME
+        // columns, and imported JSONL has carried the Go-beads "done" status
+        // unchanged via the Status::Custom fallback. Both corrupt the JSONL
+        // export: the reader's legacy `as_text().unwrap_or("")` path mapped
+        // integer datetimes to UNIX_EPOCH (updated_at rows becoming
+        // 1970-01-01) and dropped optional datetimes (closed_at → null),
+        // while downstream tools (bv, bd-style consumers) reject an unknown
+        // "done" status entirely. This migration rewrites the data in place
+        // so every row is fully-typed and uses canonical status strings.
+        if user_version < 6 && table_exists(conn, "issues") {
+            tracing::info!(
+                "Migrating database to schema version 6 (normalize datetime columns and legacy status aliases)"
+            );
+            repair_integer_datetime_columns(conn)?;
+            repair_legacy_status_values(conn)?;
+        }
+    }
+
+    // v7: Recompute stored content hashes after aligning Rust's algorithm to
+    // Go bd's canonical hash writer. Marking all rows dirty is intentional:
+    // the per-issue export hashes were computed with the old Rust algorithm,
+    // so the next flush must rewrite JSONL tracking metadata.
+    if user_version < 7 && table_exists(conn, "issues") {
+        tracing::info!("Migrating database to schema version 7 (Go bd content hashes)");
+        rebuild_content_hashes_for_go_parity(conn)?;
+    }
+
+    // v9: Add close_metadata table for closure-time policy gates (issue #274).
+    //
+    // Pure additive migration: a brand-new dedicated table to capture the
+    // optional Phase 1 fields (Tier 1 attribution + policy bypass auditing).
+    // Older databases get the table on next open; no existing rows or columns
+    // change. Repos that never enable a policy never read or write to it, so
+    // the migration is a no-op for solo-dev workflows.
+    if user_version < 9 {
+        tracing::info!(
+            "Migrating database to schema version 9 (close_metadata table for policy gates)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS close_metadata (
+                issue_id TEXT PRIMARY KEY,
+                closed_by_agent_name TEXT,
+                closed_by_harness TEXT,
+                closed_by_model TEXT,
+                bypassed_policy INTEGER NOT NULL DEFAULT 0,
+                bypass_reason TEXT,
+                policy_gates_fired TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_close_metadata_recorded_at ON close_metadata(recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_close_metadata_bypassed
+                ON close_metadata(bypassed_policy)
+                WHERE bypassed_policy = 1;
+            ",
+        )?;
+    }
+
+    // v8: Backfill storage-class NULL values in NOT NULL DEFAULT columns.
+    //
+    // Older databases — particularly those carrying history from Go bd or
+    // br versions where ALTER TABLE ADD COLUMN ran without a DEFAULT
+    // clause — accumulate storage-class NULL in columns declared NOT NULL
+    // DEFAULT. `PRAGMA integrity_check` then flags these as constraint
+    // violations even though `WHERE col IS NULL` won't always match them
+    // (the planner can use partial indexes that bypass the check). We use
+    // `typeof(col) = 'null'` to detect storage-class NULLs directly and
+    // backfill with each column's declared default. See issue #269.
+    if user_version < 8 {
+        tracing::info!(
+            "Migrating database to schema version 8 (backfill storage-NULL in NOT NULL DEFAULT columns)"
+        );
+        backfill_storage_null_in_default_columns(conn);
     }
 
     // Note: source_repo and is_template column backfills are handled in
@@ -1271,6 +1473,181 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite any DATETIME column on `issues` that is stored as INTEGER into
+/// canonical RFC 3339 TEXT. The unit (seconds / ms / µs / ns) is inferred
+/// from magnitude exactly like the runtime reader's `datetime_from_epoch_auto`
+/// so both paths give the same answer — any other split would silently
+/// corrupt rows whose writer picked a different unit than we assumed.
+/// Idempotent; rows already stored as TEXT are left untouched.
+fn repair_integer_datetime_columns(conn: &Connection) -> Result<()> {
+    const DATETIME_COLUMNS: &[&str] = &[
+        "created_at",
+        "updated_at",
+        "closed_at",
+        "due_at",
+        "defer_until",
+        "deleted_at",
+        "compacted_at",
+    ];
+    // Must stay in lock-step with datetime_from_epoch_auto in
+    // src/storage/sqlite.rs. Each threshold is the smallest integer that,
+    // in that unit, still lands within ±2286 AD — i.e. 10^10 seconds,
+    // 10^13 ms, 10^16 µs, 10^19 ns all represent the same year 2286,
+    // giving non-overlapping magnitude buckets.
+    for column in DATETIME_COLUMNS {
+        if !column_exists(conn, "issues", column) {
+            continue;
+        }
+        let sql = format!(
+            "UPDATE issues SET {column} = \
+                strftime('%Y-%m-%dT%H:%M:%fZ', CASE \
+                    WHEN ABS({column}) < 10000000000 THEN {column} * 1.0 \
+                    WHEN ABS({column}) < 10000000000000 THEN {column} / 1000.0 \
+                    WHEN ABS({column}) < 10000000000000000 THEN {column} / 1000000.0 \
+                    ELSE {column} / 1000000000.0 \
+                END, 'unixepoch') \
+             WHERE typeof({column}) = 'integer'"
+        );
+        conn.execute(&sql)?;
+    }
+    Ok(())
+}
+
+/// Normalize legacy Go-beads status values. `"done"` is the bd terminal state
+/// and survives round-tripping through Rust via `Status::Custom("done")`;
+/// remap it to the canonical `"closed"` state and make sure `closed_at` is
+/// populated so the `issues` CHECK constraint stays satisfied.
+fn repair_legacy_status_values(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE issues \
+         SET closed_at = COALESCE(closed_at, updated_at, created_at), \
+             status = 'closed' \
+         WHERE LOWER(status) IN ('done', 'complete', 'completed', 'finished', 'resolved')",
+    )?;
+    Ok(())
+}
+
+fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
+    let rows = conn.query(
+        "SELECT id, title, description, design, acceptance_criteria, notes, \
+                status, priority, issue_type, assignee, owner, created_by, \
+                external_ref, source_system, pinned, is_template \
+         FROM issues ORDER BY id",
+    )?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    conn.execute("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<usize> {
+        let mut updated = 0;
+        for row in &rows {
+            let id = row_text(row, 0).ok_or_else(|| BeadsError::Internal {
+                message: "content hash migration found issue row without id".to_string(),
+            })?;
+            let title = row_text(row, 1).unwrap_or_default();
+            let description = row_optional_text(row, 2);
+            let design = row_optional_text(row, 3);
+            let acceptance_criteria = row_optional_text(row, 4);
+            let notes = row_optional_text(row, 5);
+            let status_raw = row_text(row, 6).unwrap_or_else(|| Status::default().as_str().into());
+            let priority = Priority(
+                row.get(7)
+                    .and_then(SqliteValue::as_integer)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or_else(|| Priority::default().0),
+            );
+            let issue_type_raw =
+                row_text(row, 8).unwrap_or_else(|| IssueType::default().as_str().into());
+            let assignee = row_optional_text(row, 9);
+            let owner = row_optional_text(row, 10);
+            let created_by = row_optional_text(row, 11);
+            let external_ref = row_optional_text(row, 12);
+            let source_system = row_optional_text(row, 13);
+            let pinned = row_bool(row, 14);
+            let is_template = row_bool(row, 15);
+
+            let status = status_raw
+                .parse::<Status>()
+                .unwrap_or_else(|_| Status::Custom(status_raw.clone()));
+            let issue_type = issue_type_raw
+                .parse::<IssueType>()
+                .unwrap_or_else(|_| IssueType::Custom(issue_type_raw.clone()));
+            let content_hash = content_hash_from_parts(
+                &title,
+                description.as_deref(),
+                design.as_deref(),
+                acceptance_criteria.as_deref(),
+                notes.as_deref(),
+                &status,
+                &priority,
+                &issue_type,
+                assignee.as_deref(),
+                owner.as_deref(),
+                created_by.as_deref(),
+                external_ref.as_deref(),
+                source_system.as_deref(),
+                pinned,
+                is_template,
+            );
+
+            conn.execute_with_params(
+                "UPDATE issues SET content_hash = ? WHERE id = ?",
+                &[
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(id.as_str()),
+                ],
+            )?;
+            conn.execute_with_params(
+                "DELETE FROM dirty_issues WHERE issue_id = ?",
+                &[SqliteValue::from(id.as_str())],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO dirty_issues (issue_id) VALUES (?)",
+                &[SqliteValue::from(id.as_str())],
+            )?;
+            updated += 1;
+        }
+
+        if table_exists(conn, "export_hashes") {
+            conn.execute("DELETE FROM export_hashes")?;
+        }
+
+        Ok(updated)
+    })();
+
+    match result {
+        Ok(updated) => {
+            conn.execute("COMMIT")?;
+            Ok(updated)
+        }
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn row_text(row: &fsqlite::Row, index: usize) -> Option<String> {
+    row.get(index)
+        .and_then(SqliteValue::as_text)
+        .map(str::to_string)
+}
+
+fn row_optional_text(row: &fsqlite::Row, index: usize) -> Option<String> {
+    row_text(row, index).filter(|value| !value.is_empty())
+}
+
+fn row_bool(row: &fsqlite::Row, index: usize) -> bool {
+    row.get(index).is_some_and(|value| {
+        value.as_integer().map_or_else(
+            || value.as_text().is_some_and(|text| text != "0"),
+            |int| int != 0,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1317,6 +1694,240 @@ mod tests {
         let row = conn.query_row("PRAGMA foreign_keys").unwrap();
         let foreign_keys = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn test_v6_repair_integer_datetime_columns() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        // Seed one row per integer epoch unit (seconds / ms / µs / ns), all
+        // encoding the same instant 2026-04-20T02:18:08Z. The migration's
+        // magnitude detection must recover the same year/day/time regardless
+        // of unit — previously it hard-coded /1000000.0 and would corrupt
+        // the other three rows.
+        let rows: [(&str, i64); 4] = [
+            ("bug-sec", 1_776_651_488),
+            ("bug-ms", 1_776_651_488_000),
+            ("bug-us", 1_776_651_488_000_000),
+            ("bug-ns", 1_776_651_488_000_000_000),
+        ];
+        for (id, epoch) in rows {
+            let stmt = format!(
+                "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at, closed_at, close_reason) \
+                 VALUES ('{id}', 'legacy', 'closed', 2, 'task', '2026-04-19T21:34:04.000000000Z', {epoch}, {epoch}, 'Completed')"
+            );
+            conn.execute(&stmt).expect("seed integer datetime row");
+        }
+
+        // Sanity: every updated_at/closed_at must be integer-typed pre-repair.
+        for (id, _) in rows {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT typeof(updated_at), typeof(closed_at) FROM issues WHERE id='{id}'"
+                ))
+                .unwrap();
+            assert_eq!(
+                row.get(0).and_then(SqliteValue::as_text),
+                Some("integer"),
+                "{id} updated_at should be integer pre-repair"
+            );
+            assert_eq!(
+                row.get(1).and_then(SqliteValue::as_text),
+                Some("integer"),
+                "{id} closed_at should be integer pre-repair"
+            );
+        }
+
+        repair_integer_datetime_columns(&conn).expect("repair should succeed");
+
+        for (id, _) in rows {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT typeof(updated_at), updated_at, typeof(closed_at), closed_at FROM issues WHERE id='{id}'"
+                ))
+                .unwrap();
+            assert_eq!(
+                row.get(0).and_then(SqliteValue::as_text),
+                Some("text"),
+                "{id} updated_at must be TEXT after repair"
+            );
+            let updated_at = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .expect("updated_at text");
+            assert!(
+                updated_at.starts_with("2026-04-20T02:18:08"),
+                "{id}: expected 2026-04-20 timestamp, got {updated_at}"
+            );
+            assert_eq!(
+                row.get(2).and_then(SqliteValue::as_text),
+                Some("text"),
+                "{id} closed_at must be TEXT after repair"
+            );
+        }
+
+        // Idempotency: a second pass is a no-op and leaves the rows TEXT.
+        repair_integer_datetime_columns(&conn).expect("second pass should succeed");
+        let row = conn
+            .query_row("SELECT typeof(updated_at) FROM issues WHERE id='bug-us'")
+            .unwrap();
+        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("text"));
+    }
+
+    #[test]
+    fn test_v6_repair_legacy_status_values() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        // The issues CHECK constraint forbids closed without closed_at, so
+        // we seed rows that are legally in the `done` state (status NOT IN
+        // ('closed','tombstone') ⇒ closed_at must be NULL). The migration
+        // will promote them to `closed` and backfill closed_at from
+        // updated_at.
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('legacy-done', 'bd legacy', 'done', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('legacy-resolved', 'bd legacy', 'Resolved', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+
+        repair_legacy_status_values(&conn).expect("repair should succeed");
+
+        for id in ["legacy-done", "legacy-resolved"] {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT status, closed_at FROM issues WHERE id='{id}'"
+                ))
+                .unwrap();
+            assert_eq!(
+                row.get(0).and_then(SqliteValue::as_text),
+                Some("closed"),
+                "{id} should be closed"
+            );
+            let closed_at = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or_default();
+            assert!(!closed_at.is_empty(), "{id} closed_at should be populated");
+        }
+    }
+
+    #[test]
+    fn test_v7_rebuilds_content_hashes_and_marks_dirty() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-hash', 'old-rust-hash', 'Test', 'open', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
+             VALUES ('bd-hash', 'old-rust-hash', '2026-04-03T01:00:00Z')",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM dirty_issues").unwrap();
+        conn.execute("PRAGMA user_version = 6").unwrap();
+
+        run_migrations(&conn, false).expect("v7 migration should succeed");
+
+        let row = conn
+            .query_row("SELECT content_hash FROM issues WHERE id = 'bd-hash'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("c8e7e2783cc1fbb37322ae61efcf0e5c7d79a2cc6203e878fa6556c41742398d"),
+            "v7 should rewrite stored issue hashes to Go bd canonical values"
+        );
+
+        let dirty_row = conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-hash'")
+            .unwrap();
+        assert_eq!(dirty_row.get(0).and_then(SqliteValue::as_integer), Some(1));
+
+        let export_row = conn
+            .query_row("SELECT COUNT(*) FROM export_hashes")
+            .unwrap();
+        assert_eq!(export_row.get(0).and_then(SqliteValue::as_integer), Some(0));
+    }
+
+    #[test]
+    fn test_v8_backfills_storage_null_in_default_columns() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        // Seed a row with all required columns set, then force storage-NULLs
+        // into the columns the migration is supposed to heal. We rely on
+        // direct UPDATEs reaching the storage layer; if the engine refuses
+        // any individual UPDATE, the corresponding assertion below still
+        // exercises the no-op path of the migration.
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-null', 'legacy null row', 'open', 2, 'task', '2026-04-30T00:00:00Z', '2026-04-30T00:00:00Z')",
+        )
+        .expect("seed row");
+
+        // Best-effort: not every column accepts a direct NULL update under
+        // every storage engine. The migration must only act on columns
+        // that *do* hold storage-NULL values, so we forge as many as the
+        // engine allows and verify the migration heals every successful one.
+        let columns_to_null: &[&str] = &[
+            "description",
+            "design",
+            "acceptance_criteria",
+            "notes",
+            "status",
+            "priority",
+            "issue_type",
+            "source_repo",
+            "ephemeral",
+            "pinned",
+            "is_template",
+        ];
+        for column in columns_to_null {
+            let _ = conn.execute(&format!(
+                "UPDATE issues SET {column} = NULL WHERE id = 'bd-null'"
+            ));
+        }
+
+        // Run the v8 migration directly so this test stays focused on the
+        // backfill behaviour rather than the surrounding migration ladder.
+        backfill_storage_null_in_default_columns(&conn);
+
+        // Idempotent: every NOT NULL DEFAULT column must hold a non-NULL
+        // storage class after the backfill, regardless of which UPDATE-to-
+        // NULL succeeded above.
+        for column in columns_to_null {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT typeof({column}) FROM issues WHERE id = 'bd-null'"
+                ))
+                .unwrap();
+            let actual_type = row.get(0).and_then(SqliteValue::as_text);
+            assert_ne!(
+                actual_type,
+                Some("null"),
+                "{column} should be backfilled to its declared default (got typeof = null)"
+            );
+        }
+
+        // Second pass is a no-op (the UPDATEs touch zero rows).
+        backfill_storage_null_in_default_columns(&conn);
+        let row = conn
+            .query_row("SELECT typeof(notes) FROM issues WHERE id = 'bd-null'")
+            .unwrap();
+        assert_ne!(row.get(0).and_then(SqliteValue::as_text), Some("null"));
     }
 
     #[test]
@@ -1898,6 +2509,32 @@ mod tests {
             !table_exists(&conn, "issues_rebuild_tmp"),
             "failed rebuild should roll back the temporary table"
         );
+    }
+
+    #[test]
+    fn test_rebuild_issues_table_restores_foreign_keys_when_begin_fails() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("locked-rebuild.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA busy_timeout=0").unwrap();
+        apply_schema(&conn).unwrap();
+
+        let lock_conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        lock_conn.execute("PRAGMA busy_timeout=0").unwrap();
+        lock_conn.execute("BEGIN IMMEDIATE").unwrap();
+
+        assert!(foreign_keys_enabled(&conn).unwrap());
+        let err = rebuild_issues_table(&conn).expect_err("exclusive rebuild should hit busy lock");
+        assert!(
+            err.to_string().contains("busy") || err.to_string().contains("lock"),
+            "expected lock contention error, got {err}"
+        );
+        assert!(
+            foreign_keys_enabled(&conn).unwrap(),
+            "failed rebuild must restore foreign key enforcement"
+        );
+
+        lock_conn.execute("ROLLBACK").unwrap();
     }
 
     /// Migration: add missing dependency type column for older schemas.

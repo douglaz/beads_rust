@@ -2,20 +2,20 @@
 
 This file shows small, copy/pasteable flows. For machine-readable examples, also see:
 
-- `ROBOT_MODE_EXAMPLES.jsonl`
+- `../../agent_baseline/examples/robot_mode_examples.jsonl`
 - `agent_baseline/examples/`
 - `scripts/agent_smoke_test.sh`
 
 ## List work (TOON -> JSON)
 
 ```bash
-br ready --format toon --limit 10 | tru --decode | jq '.[0]'
+br ready --format toon --limit 10 | tru --decode --expand-paths safe | jq '.[0]'
 ```
 
 ## Update status (JSON)
 
 ```bash
-br update bd-abc123 --status in_progress --format json | jq .
+br --json update br-abc123 --status in_progress | jq .
 ```
 
 ## Determinism smoke check

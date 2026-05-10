@@ -1,11 +1,23 @@
 //! Content hashing for issue deduplication and sync.
 //!
 //! Uses SHA256 over stable ordered fields with null separators.
-//! Matches classic bd behavior for export/import compatibility.
+//! Matches classic Go bd behavior for export/import compatibility.
 
 use sha2::{Digest, Sha256};
 
 use crate::model::{Issue, IssueType, Priority, Status};
+
+/// Lowercase hex encoding for digest outputs (sha2 0.11 no longer impls `LowerHex`
+/// on `Array<u8, _>`, so we format bytes directly).
+#[must_use]
+pub fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(&mut s, "{b:02x}").expect("writing to String never fails");
+    }
+    s
+}
 
 /// Trait for types that can produce a deterministic content hash.
 pub trait ContentHashable {
@@ -27,6 +39,7 @@ impl ContentHashable for Issue {
 /// - assignee, owner, `created_by`
 /// - `external_ref`, `source_system`
 /// - pinned, `is_template`
+/// - empty/default placeholders for Go bd fields not represented in Rust
 ///
 /// Fields excluded:
 /// - id, `content_hash` (circular)
@@ -84,15 +97,36 @@ pub fn content_hash_from_parts(
     writer.field_opt(acceptance_criteria);
     writer.field_opt(notes);
     writer.field(status.as_str());
-    writer.field(&format!("P{}", priority.0));
+    writer.field(&priority.0.to_string());
     writer.field(issue_type.as_str());
     writer.field_opt(assignee);
     writer.field_opt(owner);
     writer.field_opt(created_by);
     writer.field_opt(external_ref);
     writer.field_opt(source_system);
-    writer.field_bool(pinned);
-    writer.field_bool(is_template);
+    writer.field_flag(pinned, "pinned");
+    writer.field_flag(is_template, "template");
+
+    // Go bd hashes several newer fields that Rust does not model yet. Hash
+    // their Go zero values so Rust remains byte-for-byte compatible for every
+    // field in the shared schema.
+    writer.field(""); // quality_score nil
+    writer.field_flag(false, "crystallizes");
+    writer.field(""); // await_type
+    writer.field(""); // await_id
+    writer.field("0"); // timeout duration
+    writer.field(""); // holder
+    writer.field(""); // hook_bead
+    writer.field(""); // role_bead
+    writer.field(""); // agent_state
+    writer.field(""); // role_type
+    writer.field(""); // rig
+    writer.field(""); // mol_type
+    writer.field(""); // work_type
+    writer.field(""); // event_kind
+    writer.field(""); // actor
+    writer.field(""); // target
+    writer.field(""); // payload
 
     writer.finalize()
 }
@@ -109,21 +143,7 @@ impl HashFieldWriter {
     }
 
     fn field(&mut self, value: &str) {
-        if !value.contains('\0') {
-            self.hasher.update(value.as_bytes());
-            self.hasher.update(b"\x00");
-            return;
-        }
-
-        let mut last_idx = 0;
-        for (i, b) in value.bytes().enumerate() {
-            if b == b'\0' {
-                self.hasher.update(&value.as_bytes()[last_idx..i]);
-                self.hasher.update(b" ");
-                last_idx = i + 1;
-            }
-        }
-        self.hasher.update(&value.as_bytes()[last_idx..]);
+        self.hasher.update(value.as_bytes());
         self.hasher.update(b"\x00");
     }
 
@@ -131,12 +151,12 @@ impl HashFieldWriter {
         self.field(value.unwrap_or(""));
     }
 
-    fn field_bool(&mut self, value: bool) {
-        self.field(if value { "true" } else { "false" });
+    fn field_flag(&mut self, value: bool, label: &str) {
+        self.field(if value { label } else { "" });
     }
 
     fn finalize(self) -> String {
-        format!("{:x}", self.hasher.finalize())
+        hex_encode(&self.hasher.finalize())
     }
 }
 
@@ -281,5 +301,103 @@ mod tests {
             issue.is_template,
         );
         assert_eq!(direct, from_parts);
+    }
+
+    #[test]
+    fn test_hex_encode_empty() {
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn test_hex_encode_single_byte() {
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0x0a]), "0a");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+        assert_eq!(hex_encode(&[0x80]), "80");
+        assert_eq!(hex_encode(&[0x7f]), "7f");
+        assert_eq!(hex_encode(&[0x01]), "01");
+    }
+
+    #[test]
+    fn test_hex_encode_length_invariant() {
+        for len in [0, 1, 2, 16, 32, 64, 128, 255] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|i: u32| u8::try_from(i).unwrap_or(0))
+                .collect();
+            let hex = hex_encode(&bytes);
+            assert_eq!(
+                hex.len(),
+                bytes.len() * 2,
+                "hex_encode output length should be 2*input for {} bytes",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn test_hex_encode_32_bytes_sha256_width() {
+        let bytes: Vec<u8> = (0..32).collect();
+        let hex = hex_encode(&bytes);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(
+            hex,
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+    }
+
+    #[test]
+    fn test_hex_encode_high_bit_bytes() {
+        assert_eq!(hex_encode(&[0x80, 0xff, 0xfe, 0x7f]), "80fffe7f");
+    }
+
+    #[test]
+    fn test_hex_encode_is_lowercase() {
+        let bytes: Vec<u8> = (0xa0..=0xaf).collect();
+        let hex = hex_encode(&bytes);
+        assert!(hex.chars().all(|c| !c.is_ascii_uppercase()));
+        assert_eq!(hex, "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf");
+    }
+
+    #[test]
+    fn test_hex_encode_all_zeros_32_bytes() {
+        let bytes = [0u8; 32];
+        let hex = hex_encode(&bytes);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(hex, "0".repeat(64));
+    }
+
+    #[test]
+    fn test_hex_encode_all_ff_32_bytes() {
+        let bytes = [0xffu8; 32];
+        let hex = hex_encode(&bytes);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(hex, "f".repeat(64));
+    }
+
+    #[test]
+    fn test_hex_encode_all_256_byte_values() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let hex = hex_encode(&bytes);
+        assert_eq!(hex.len(), 512);
+        let reference: String = bytes.iter().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write;
+            write!(acc, "{b:02x}").unwrap();
+            acc
+        });
+        assert_eq!(hex, reference);
+    }
+
+    #[test]
+    fn test_hex_encode_matches_sha256_digest() {
+        let mut hasher = Sha256::new();
+        hasher.update(b"hello world");
+        let digest = hasher.finalize();
+        let hex = hex_encode(&digest);
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            hex,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
     }
 }

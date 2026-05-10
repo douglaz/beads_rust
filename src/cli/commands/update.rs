@@ -1,14 +1,16 @@
 //! Update command implementation.
 
 use super::{
+    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
-    preserve_blocked_cache_on_error, resolve_issue_id, resolve_issue_ids,
-    retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+    preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_id,
+    resolve_issue_ids, retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
 };
 use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::{Issue, Status};
+use crate::format::{format_status_label, format_type_label, sanitize_terminal_inline};
+use crate::model::{Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
@@ -41,13 +43,75 @@ impl From<&Issue> for UpdatedIssueOutput {
     }
 }
 
+/// Snapshot of which fields the caller explicitly requested to change and
+/// the post-mutation values they produced, captured directly from the
+/// validated pre-mutation `issue_before` + the `IssueUpdate` struct that was
+/// applied.
+///
+/// We deliberately do NOT derive the post-mutation values from a second
+/// `get_issue(id)` read after the write transaction commits.  Doing so has
+/// surfaced as an "unrelated bead's fields leak into the diff" bug in the
+/// wild (see issue #256): a rare, yet-to-be-fully-root-caused read-path
+/// inconsistency (e.g. fsqlite prepared-statement / pager cache edge case,
+/// or a concurrent external writer touching the JSONL between the two
+/// reads) can cause the post-update `get_issue` to return data that belongs
+/// to a different row while the on-disk write is still correct.
+///
+/// By pairing the pre-mutation snapshot (whose `id` is guarded by
+/// `get_issue_from_conn`'s post-condition check to match the requested id)
+/// with the exact `IssueUpdate` struct the user passed, the rendered diff
+/// is guaranteed to reference only the target bead and only the fields the
+/// user explicitly asked to change.  Ghost fields like `status: open →
+/// closed` can no longer appear on a `--priority 1` no-op.
+#[derive(Debug, Default, Clone)]
+struct UpdateDiff {
+    status: Option<(Status, Status)>,
+    priority: Option<(Priority, Priority)>,
+    issue_type: Option<(IssueType, IssueType)>,
+    assignee: Option<(Option<String>, Option<String>)>,
+    owner: Option<(Option<String>, Option<String>)>,
+}
+
+impl UpdateDiff {
+    fn from_before_and_update(before: &Issue, update: &IssueUpdate) -> Self {
+        let mut diff = Self::default();
+        if let Some(ref new_status) = update.status
+            && before.status != *new_status
+        {
+            diff.status = Some((before.status.clone(), new_status.clone()));
+        }
+        if let Some(new_priority) = update.priority
+            && before.priority != new_priority
+        {
+            diff.priority = Some((before.priority, new_priority));
+        }
+        if let Some(ref new_type) = update.issue_type
+            && before.issue_type != *new_type
+        {
+            diff.issue_type = Some((before.issue_type.clone(), new_type.clone()));
+        }
+        if let Some(ref new_assignee_opt) = update.assignee {
+            let before_assignee = before.assignee.clone();
+            if before_assignee != *new_assignee_opt {
+                diff.assignee = Some((before_assignee, new_assignee_opt.clone()));
+            }
+        }
+        if let Some(ref new_owner_opt) = update.owner {
+            let before_owner = before.owner.clone();
+            if before_owner != *new_owner_opt {
+                diff.owner = Some((before_owner, new_owner_opt.clone()));
+            }
+        }
+        diff
+    }
+}
+
 #[derive(Debug)]
 enum UpdateRenderItem {
     Summary {
         id: String,
         title: String,
-        before: Box<Option<Issue>>,
-        after: Box<Issue>,
+        diff: Box<UpdateDiff>,
     },
     NoUpdates {
         id: String,
@@ -79,6 +143,7 @@ struct PreparedUpdateRoute {
     valid_set_labels: Vec<String>,
     resolved_parent: ParentUpdatePlan,
     auto_flush_external: bool,
+    _routed_write_lock: RoutedWorkspaceWriteLock,
 }
 
 /// Execute the update command.
@@ -139,18 +204,21 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
             .collect::<Vec<_>>();
         validate_multi_issue_external_ref_update(args.external_ref.as_deref(), &all_resolved_ids)?;
 
+        let use_machine_output = update_uses_machine_output(ctx);
+        let use_human_output = update_uses_human_output(ctx);
+
         for (issue_inputs, prepared_route) in prepared_routes {
             let route_output = execute_prepared_route(prepared_route, ctx)?;
 
-            if ctx.is_json() || ctx.is_toon() {
+            if use_machine_output {
                 routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
-            } else if !ctx.is_quiet() {
+            } else if use_human_output {
                 routed_render_items.push((issue_inputs.clone(), route_output.render_items));
             }
             routed_resolved_ids.push((issue_inputs, route_output.resolved_ids));
         }
 
-        let updated_issues = if ctx.is_json() || ctx.is_toon() {
+        let updated_issues = if use_machine_output {
             reorder_routed_items_by_requested_inputs(
                 &target_inputs,
                 routed_updated_issues,
@@ -159,7 +227,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         } else {
             Vec::new()
         };
-        let render_items = if !ctx.is_quiet() && !ctx.is_json() && !ctx.is_toon() {
+        let render_items = if use_human_output {
             reorder_routed_items_by_requested_inputs(
                 &target_inputs,
                 routed_render_items,
@@ -206,6 +274,8 @@ fn prepare_single_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<PreparedUpdateRoute> {
+    let routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
@@ -226,6 +296,9 @@ fn prepare_single_route(
 
     // Validate labels before making any database changes
     for label in &args.add_label {
+        LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
+    }
+    for label in &args.remove_label {
         LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
     }
 
@@ -261,6 +334,7 @@ fn prepare_single_route(
         valid_set_labels,
         resolved_parent,
         auto_flush_external,
+        _routed_write_lock: routed_write_lock,
     })
 }
 
@@ -272,6 +346,8 @@ fn execute_prepared_route(
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
     let mut render_items = Vec::new();
     let resolved_ids = prepared.resolved_ids.clone();
+    let use_machine_output = update_uses_machine_output(ctx);
+    let use_human_output = update_uses_human_output(ctx);
     let mut route_has_mutated = false;
     let mut blocked_cache_dirty = false;
     let defer_blocked_cache_rebuild = prepared.update.status.is_some()
@@ -382,7 +458,11 @@ fn execute_prepared_route(
             blocked_cache_dirty = true;
         }
 
-        // Get issue after update for output
+        // Re-read post-mutation state for JSON/TOON machine output only.
+        // For human-readable diff rendering we synthesize the diff from
+        // `(issue_before, update)` below instead of trusting a second read,
+        // to defend against the "unrelated bead's fields leak into diff"
+        // regression reported in issue #256.
         let issue_after_result = prepared.storage_ctx.storage.get_issue(id);
         let issue_after = preserve_blocked_cache_on_error(
             &mut prepared.storage_ctx.storage,
@@ -391,20 +471,38 @@ fn execute_prepared_route(
             issue_after_result,
         )?;
 
-        if let Some(issue) = issue_after {
-            if ctx.is_json() || ctx.is_toon() {
-                updated_issues.push(UpdatedIssueOutput::from(&issue));
-            } else if ctx.is_quiet() {
-            } else if prepared.has_updates {
-                render_items.push(UpdateRenderItem::Summary {
-                    id: id.clone(),
-                    title: issue.title.clone(),
-                    before: Box::new(issue_before),
-                    after: Box::new(issue),
-                });
-            } else {
-                render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
+        if use_machine_output {
+            if let Some(ref issue) = issue_after {
+                updated_issues.push(UpdatedIssueOutput::from(issue));
             }
+        } else if use_human_output && prepared.has_updates {
+            // Derive the rendered title and diff from the validated
+            // pre-mutation snapshot + the user's requested update.  If a
+            // title change was requested use the requested new title, else
+            // fall back to the authoritative `issue_before.title` (whose
+            // row id has been post-condition-checked to equal `id`).  Only
+            // if we have no `issue_before` at all (it was deleted / did
+            // not exist before our write, which should not happen on the
+            // `update` command path) do we fall back to the post-read.
+            let title = prepared
+                .update
+                .title
+                .clone()
+                .or_else(|| issue_before.as_ref().map(|b| b.title.clone()))
+                .or_else(|| issue_after.as_ref().map(|i| i.title.clone()))
+                .unwrap_or_default();
+            let diff = issue_before
+                .as_ref()
+                .map_or_else(UpdateDiff::default, |before| {
+                    UpdateDiff::from_before_and_update(before, &prepared.update)
+                });
+            render_items.push(UpdateRenderItem::Summary {
+                id: id.clone(),
+                title,
+                diff: Box::new(diff),
+            });
+        } else if use_human_output {
+            render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
         }
     }
 
@@ -420,10 +518,11 @@ fn execute_prepared_route(
     if prepared.auto_flush_external
         && let Err(error) = prepared.storage_ctx.auto_flush_if_enabled()
     {
-        tracing::debug!(
-            beads_dir = %prepared.storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &prepared.storage_ctx.paths.beads_dir,
+            &prepared.storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 
@@ -432,6 +531,14 @@ fn execute_prepared_route(
         render_items,
         resolved_ids,
     })
+}
+
+fn update_uses_machine_output(ctx: &OutputContext) -> bool {
+    ctx.is_json() || ctx.is_toon()
+}
+
+fn update_uses_human_output(ctx: &OutputContext) -> bool {
+    !ctx.is_quiet() && !update_uses_machine_output(ctx)
 }
 
 fn validate_multi_issue_external_ref_update(
@@ -543,55 +650,73 @@ fn validate_transition_to_in_progress(
 }
 
 /// Print a summary of what changed for the issue.
-fn print_update_summary(id: &str, title: &str, before: Option<&Issue>, after: &Issue) {
-    println!("Updated {id}: {title}");
+fn print_update_summary(id: &str, title: &str, diff: &UpdateDiff) {
+    println!("{}", updated_issue_human_line(id, title));
 
-    if let Some(before) = before {
-        // Status change
-        if before.status != after.status {
-            println!(
-                "  status: {} → {}",
-                before.status.as_str(),
-                after.status.as_str()
-            );
-        }
-        // Priority change
-        if before.priority != after.priority {
-            println!("  priority: P{} → P{}", before.priority.0, after.priority.0);
-        }
-        // Type change
-        if before.issue_type != after.issue_type {
-            println!(
-                "  type: {} → {}",
-                before.issue_type.as_str(),
-                after.issue_type.as_str()
-            );
-        }
-        // Assignee change
-        if before.assignee != after.assignee {
-            let before_assignee = before.assignee.as_deref().unwrap_or("(none)");
-            let after_assignee = after.assignee.as_deref().unwrap_or("(none)");
-            println!("  assignee: {before_assignee} → {after_assignee}");
-        }
-        // Owner change
-        if before.owner != after.owner {
-            let before_owner = before.owner.as_deref().unwrap_or("(none)");
-            let after_owner = after.owner.as_deref().unwrap_or("(none)");
-            println!("  owner: {before_owner} → {after_owner}");
-        }
+    if let Some((old_status, new_status)) = &diff.status {
+        println!(
+            "  status: {} → {}",
+            format_status_label(old_status, false),
+            format_status_label(new_status, false)
+        );
     }
+    if let Some((old_priority, new_priority)) = &diff.priority {
+        println!("  priority: P{} → P{}", old_priority.0, new_priority.0);
+    }
+    if let Some((old_type, new_type)) = &diff.issue_type {
+        println!(
+            "  type: {} → {}",
+            format_type_label(old_type),
+            format_type_label(new_type)
+        );
+    }
+    if let Some((old_assignee, new_assignee)) = &diff.assignee {
+        let before_assignee = old_assignee.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        let after_assignee = new_assignee.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        println!("  assignee: {before_assignee} → {after_assignee}");
+    }
+    if let Some((old_owner, new_owner)) = &diff.owner {
+        let before_owner = old_owner.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        let after_owner = new_owner.as_deref().map_or_else(
+            || "(none)".to_string(),
+            |value| sanitize_terminal_inline(value).into_owned(),
+        );
+        println!("  owner: {before_owner} → {after_owner}");
+    }
+}
+
+fn updated_issue_human_line(id: &str, title: &str) -> String {
+    format!(
+        "Updated {}: {}",
+        sanitize_terminal_inline(id),
+        sanitize_terminal_inline(title)
+    )
+}
+
+fn no_updates_human_line(id: &str) -> String {
+    format!("No updates specified for {}", sanitize_terminal_inline(id))
+}
+
+fn issue_input_text(input: &str) -> String {
+    sanitize_terminal_inline(input).into_owned()
 }
 
 fn print_render_items(render_items: &[UpdateRenderItem]) {
     for item in render_items {
         match item {
-            UpdateRenderItem::Summary {
-                id,
-                title,
-                before,
-                after,
-            } => print_update_summary(id, title, before.as_ref().as_ref(), after.as_ref()),
-            UpdateRenderItem::NoUpdates { id } => println!("No updates specified for {id}"),
+            UpdateRenderItem::Summary { id, title, diff } => {
+                print_update_summary(id, title, diff.as_ref());
+            }
+            UpdateRenderItem::NoUpdates { id } => println!("{}", no_updates_human_line(id)),
         }
     }
 }
@@ -622,11 +747,18 @@ fn reorder_routed_items_by_requested_inputs<T>(
                 .get_mut(input.as_str())
                 .and_then(VecDeque::pop_front)
             else {
+                let input = issue_input_text(&input);
                 return Err(BeadsError::Config(format!(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
-            ordered_items[index] = Some(item);
+            let Some(slot) = ordered_items.get_mut(index) else {
+                let input = issue_input_text(&input);
+                return Err(BeadsError::Config(format!(
+                    "{context} returned out-of-range issue input {input}"
+                )));
+            };
+            *slot = Some(item);
         }
     }
 
@@ -635,10 +767,11 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .enumerate()
         .map(|(index, item)| {
             item.ok_or_else(|| {
-                BeadsError::Config(format!(
-                    "{context} did not produce a result for {}",
-                    requested_inputs[index]
-                ))
+                let input = requested_inputs
+                    .get(index)
+                    .map(|input| issue_input_text(input))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                BeadsError::Config(format!("{context} did not produce a result for {input}"))
             })
         })
         .collect()
@@ -716,10 +849,16 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
     let due_at = optional_date_field(args.due.as_deref())?;
     let defer_until = optional_date_field(args.defer.as_deref())?;
 
-    let closed_at = match &status {
-        Some(Status::Closed) => Some(Some(Utc::now())),
-        Some(_) => Some(None),
-        None => None,
+    if args.session.is_some() && !matches!(status, Some(Status::Closed)) {
+        return Err(BeadsError::validation(
+            "session",
+            "--session can only be used when closing with --status closed",
+        ));
+    }
+    let (closed_at, close_reason, closed_by_session) = match &status {
+        Some(Status::Closed) => (Some(Some(Utc::now())), None, args.session.clone().map(Some)),
+        Some(_) => (Some(None), Some(None), Some(None)),
+        None => (None, None, None),
     };
 
     // Build update struct
@@ -739,8 +878,8 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         defer_until,
         external_ref: optional_string_field(args.external_ref.as_deref()),
         closed_at,
-        close_reason: None,
-        closed_by_session: args.session.clone().map(Some),
+        close_reason,
+        closed_by_session,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -863,7 +1002,7 @@ mod tests {
     use crate::config::CliOverrides;
     use crate::logging::init_test_logging;
     use crate::model::{Issue, IssueType, Priority, Status};
-    use crate::output::OutputContext;
+    use crate::output::{OutputContext, OutputMode};
     use crate::storage::SqliteStorage;
     use chrono::{Datelike, Timelike};
     use std::fs;
@@ -1004,12 +1143,17 @@ mod tests {
         info!("test_build_update_with_status: starting");
         let args = UpdateArgs {
             status: Some("closed".to_string()),
+            session: Some("session-123".to_string()),
             ..Default::default()
         };
         let update = build_update(&args, "test_actor", false).unwrap();
         assert_eq!(update.status, Some(Status::Closed));
         // closed_at should be set
         assert!(update.closed_at.is_some());
+        assert_eq!(
+            update.closed_by_session,
+            Some(Some("session-123".to_string()))
+        );
 
         let args_blocked = UpdateArgs {
             status: Some("blocked".to_string()),
@@ -1017,9 +1161,29 @@ mod tests {
         };
         let update_blocked = build_update(&args_blocked, "test_actor", false).unwrap();
         assert_eq!(update_blocked.status, Some(Status::Blocked));
-        // closed_at should be explicitly cleared for non-terminal statuses
+        // Close metadata should be explicitly cleared for non-terminal statuses.
         assert_eq!(update_blocked.closed_at, Some(None));
+        assert_eq!(update_blocked.close_reason, Some(None));
+        assert_eq!(update_blocked.closed_by_session, Some(None));
         info!("test_build_update_with_status: assertions passed");
+    }
+
+    #[test]
+    fn test_build_update_rejects_session_without_closing() {
+        let args = UpdateArgs {
+            session: Some("session-123".to_string()),
+            ..Default::default()
+        };
+        let err = build_update(&args, "test_actor", false).unwrap_err();
+        assert!(err.to_string().contains("--session can only be used"));
+
+        let args_open = UpdateArgs {
+            status: Some("open".to_string()),
+            session: Some("session-123".to_string()),
+            ..Default::default()
+        };
+        let err = build_update(&args_open, "test_actor", false).unwrap_err();
+        assert!(err.to_string().contains("--session can only be used"));
     }
 
     #[test]
@@ -1046,6 +1210,77 @@ mod tests {
     }
 
     #[test]
+    fn test_update_output_partition_matches_previous_mode_checks() {
+        let cases = [
+            (OutputMode::Json, true, false),
+            (OutputMode::Toon, true, false),
+            (OutputMode::Quiet, false, false),
+            (OutputMode::Rich, false, true),
+            (OutputMode::Plain, false, true),
+        ];
+
+        for (mode, expected_machine, expected_human) in cases {
+            let ctx = OutputContext::with_mode(mode);
+
+            assert_eq!(update_uses_machine_output(&ctx), expected_machine);
+            assert_eq!(update_uses_human_output(&ctx), expected_human);
+        }
+    }
+
+    #[test]
+    fn update_human_lines_sanitize_issue_ids_and_titles() {
+        let updated = updated_issue_human_line("bd-1\x1b]52;c;bad\x07", "Title\x1b[2J\nnext");
+        let no_updates = no_updates_human_line("bd-2\x07");
+
+        assert!(!updated.contains('\x1b'));
+        assert!(!updated.contains('\x07'));
+        assert!(!no_updates.contains('\x07'));
+        assert_eq!(
+            updated,
+            "Updated bd-1\\u{1b}]52;c;bad\\u{7}: Title\\u{1b}[2J\\nnext"
+        );
+        assert_eq!(no_updates, "No updates specified for bd-2\\u{7}");
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_missing_input_error() {
+        let requested = vec!["bd-update\x1b[2J\nbad".to_string(), "bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-ok".to_string()], vec!["ok"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "update routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.contains("\\u{1b}[2J"));
+        assert!(message.contains("\\n"));
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_unexpected_input_error() {
+        let requested = vec!["bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-update\x1b[2J\nbad".to_string()], vec!["bad"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "update routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.contains("\\u{1b}[2J"));
+        assert!(message.contains("\\n"));
+    }
+
+    #[test]
     fn test_validate_mutable_target_issues_rejects_tombstone() {
         init_test_logging();
         info!("test_validate_mutable_target_issues_rejects_tombstone: starting");
@@ -1069,13 +1304,15 @@ mod tests {
         let err = validate_mutable_target_issues(&storage, &["bd-tombstone".to_string()], true)
             .unwrap_err();
 
-        match err {
-            BeadsError::Validation { field, reason } => {
-                assert_eq!(field, "issue");
-                assert!(reason.contains("cannot update tombstone issue"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(err, BeadsError::Validation { .. }),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Validation { field, reason } = err else {
+            return;
+        };
+        assert_eq!(field, "issue");
+        assert!(reason.contains("cannot update tombstone issue"));
 
         info!("test_validate_mutable_target_issues_rejects_tombstone: assertions passed");
     }
@@ -1162,6 +1399,48 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_single_route_rejects_invalid_remove_label() {
+        init_test_logging();
+        info!("test_prepare_single_route_rejects_invalid_remove_label: starting");
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        {
+            let mut storage_ctx =
+                config::open_storage_with_cli(&beads_dir, &CliOverrides::default())
+                    .expect("storage");
+            let issue = Issue {
+                id: "bd-label".to_string(),
+                title: "Label target".to_string(),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                ..Issue::default()
+            };
+            storage_ctx
+                .storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+        }
+
+        let args = UpdateArgs {
+            ids: vec!["bd-label".to_string()],
+            remove_label: vec!["has space".to_string()],
+            ..Default::default()
+        };
+        let result = prepare_single_route(&args, &CliOverrides::default(), &beads_dir, false);
+        assert!(result.is_err(), "invalid remove label should fail");
+        if let Err(err) = result {
+            assert!(err.to_string().contains("invalid characters"));
+        }
+        info!("test_prepare_single_route_rejects_invalid_remove_label: assertions passed");
+    }
+
+    #[test]
     fn test_execute_prepared_route_repairs_blocked_cache_after_late_update_error() {
         init_test_logging();
         info!(
@@ -1237,6 +1516,7 @@ mod tests {
             valid_set_labels: Vec::new(),
             resolved_parent: ParentUpdatePlan::Unchanged,
             auto_flush_external: false,
+            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
         };
 
         let ctx = OutputContext::from_flags(false, false, true);

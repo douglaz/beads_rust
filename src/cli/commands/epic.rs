@@ -3,6 +3,7 @@
 use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
 use crate::error::Result;
+use crate::format::sanitize_terminal_inline;
 use crate::model::{EpicStatus, EventType, IssueType};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -29,6 +30,28 @@ pub fn execute(
     }
 }
 
+/// Execute a read-only epic command using storage that was already opened by the caller.
+///
+/// Returns `Ok(false)` when the command needs the normal mutating path.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub fn execute_with_storage_ctx(
+    command: &EpicCommands,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    match command {
+        EpicCommands::Status(args) => {
+            execute_status_with_storage_ctx(args, cli, ctx, storage_ctx)?;
+            Ok(true)
+        }
+        EpicCommands::CloseEligible(_) => Ok(false),
+    }
+}
+
 fn execute_status(
     args: &EpicStatusArgs,
     _json: bool,
@@ -37,11 +60,19 @@ fn execute_status(
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let storage = &storage_ctx.storage;
+    execute_status_with_storage_ctx(args, cli, ctx, &storage_ctx)
+}
+
+fn execute_status_with_storage_ctx(
+    args: &EpicStatusArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
     let config_layer = storage_ctx.load_config(cli)?;
     let use_color = config::should_use_color(&config_layer);
 
-    let mut epics = load_epic_statuses(storage)?;
+    let mut epics = load_epic_statuses(&storage_ctx.storage)?;
     if args.eligible_only {
         epics.retain(|e| e.eligible_for_close);
     }
@@ -113,7 +144,9 @@ fn execute_close_eligible(
         } else {
             println!("Would close {} epic(s):", epics.len());
             for epic_status in &epics {
-                println!("  - {}: {}", epic_status.epic.id, epic_status.epic.title);
+                let id = format_epic_id(&epic_status.epic.id, false);
+                let title = format_epic_title(&epic_status.epic.title, false);
+                println!("  - {id}: {title}");
             }
         }
         return Ok(());
@@ -193,7 +226,7 @@ fn execute_close_eligible(
     } else {
         println!("✓ Closed {} epic(s)", closed_ids.len());
         for id in &closed_ids {
-            println!("  - {id}");
+            println!("  - {}", format_epic_id(id, false));
         }
     }
     Ok(())
@@ -207,6 +240,10 @@ fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
         ..Default::default()
     };
     let epics = storage.list_issues(&filters)?;
+    if epics.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let counts = storage.get_epic_counts()?;
 
     let mut statuses = Vec::new();
@@ -228,20 +265,11 @@ fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
 fn render_epic_status(epic_status: &EpicStatus, use_color: bool) {
     let total = epic_status.total_children;
     let closed = epic_status.closed_children;
-    let percentage = (closed * 100).checked_div(total).unwrap_or(0);
+    let percentage = completion_percentage(closed, total);
     let status_icon = render_status_icon(epic_status.eligible_for_close, percentage, use_color);
 
-    let id = if use_color {
-        epic_status.epic.id.clone().cyan().to_string()
-    } else {
-        epic_status.epic.id.clone()
-    };
-
-    let title = if use_color {
-        epic_status.epic.title.clone().bold().to_string()
-    } else {
-        epic_status.epic.title.clone()
-    };
+    let id = format_epic_id(&epic_status.epic.id, use_color);
+    let title = format_epic_title(&epic_status.epic.title, use_color);
 
     println!("{status_icon} {id} {title}");
     println!("   Progress: {closed}/{total} children closed ({percentage}%)");
@@ -274,6 +302,24 @@ fn render_status_icon(eligible: bool, percentage: usize, use_color: bool) -> Str
     }
 }
 
+fn format_epic_id(id: &str, use_color: bool) -> String {
+    let id = sanitize_terminal_inline(id);
+    if use_color {
+        id.as_ref().cyan().to_string()
+    } else {
+        id.into_owned()
+    }
+}
+
+fn format_epic_title(title: &str, use_color: bool) -> String {
+    let title = sanitize_terminal_inline(title);
+    if use_color {
+        title.as_ref().bold().to_string()
+    } else {
+        title.into_owned()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Rich Output Rendering
 // ─────────────────────────────────────────────────────────────
@@ -293,7 +339,7 @@ fn render_epic_status_list_rich(epics: &[EpicStatus], ctx: &OutputContext) {
 
         let total = epic_status.total_children;
         let closed = epic_status.closed_children;
-        let percentage = (closed * 100).checked_div(total).unwrap_or(0);
+        let percentage = completion_percentage(closed, total);
 
         // Status icon
         if epic_status.eligible_for_close {
@@ -305,9 +351,15 @@ fn render_epic_status_list_rich(epics: &[EpicStatus], ctx: &OutputContext) {
         }
 
         // ID and title
-        content.append_styled(&epic_status.epic.id, theme.issue_id.clone());
+        content.append_styled(
+            sanitize_terminal_inline(&epic_status.epic.id).as_ref(),
+            theme.issue_id.clone(),
+        );
         content.append(" ");
-        content.append_styled(&epic_status.epic.title, theme.emphasis.clone());
+        content.append_styled(
+            sanitize_terminal_inline(&epic_status.epic.title).as_ref(),
+            theme.emphasis.clone(),
+        );
         content.append("\n");
 
         // Progress bar
@@ -339,7 +391,7 @@ fn render_progress_bar(
     theme: &crate::output::Theme,
 ) {
     let bar_width = 20;
-    let filled = (closed * bar_width).checked_div(total).unwrap_or(0);
+    let filled = completion_bar_filled_width(closed, total, bar_width);
     let empty = bar_width - filled;
 
     content.append_styled("[", theme.dimmed.clone());
@@ -353,6 +405,27 @@ fn render_progress_bar(
 
     content.append(&format!("{closed}/{total} "));
     content.append_styled(&format!("({percentage}%)"), theme.dimmed.clone());
+}
+
+fn completion_percentage(closed: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+
+    let closed = closed.min(total) as u128;
+    let total = total as u128;
+    usize::try_from((closed * 100) / total).unwrap_or(100)
+}
+
+fn completion_bar_filled_width(closed: usize, total: usize, bar_width: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+
+    let closed = closed.min(total) as u128;
+    let total = total as u128;
+    let bar_width = bar_width as u128;
+    usize::try_from((closed * bar_width) / total).unwrap_or(usize::MAX)
 }
 
 /// Render empty epics message with rich formatting.
@@ -408,9 +481,12 @@ fn render_dry_run_rich(epics: &[EpicStatus], ctx: &OutputContext) {
 
     for epic_status in epics {
         content.append_styled("  • ", theme.dimmed.clone());
-        content.append_styled(&epic_status.epic.id, theme.issue_id.clone());
+        content.append_styled(
+            sanitize_terminal_inline(&epic_status.epic.id).as_ref(),
+            theme.issue_id.clone(),
+        );
         content.append(" ");
-        content.append(&epic_status.epic.title);
+        content.append(sanitize_terminal_inline(&epic_status.epic.title).as_ref());
         content.append("\n");
     }
 
@@ -446,7 +522,10 @@ fn render_close_result_rich(closed_ids: &[String], ctx: &OutputContext) {
         content.append("\n");
         for id in closed_ids {
             content.append_styled("  • ", theme.dimmed.clone());
-            content.append_styled(id, theme.issue_id.clone());
+            content.append_styled(
+                sanitize_terminal_inline(id).as_ref(),
+                theme.issue_id.clone(),
+            );
             content.append("\n");
         }
     }
@@ -592,5 +671,44 @@ mod tests {
         assert_eq!(epic_status.total_children, 0);
         assert_eq!(epic_status.closed_children, 0);
         assert!(!epic_status.eligible_for_close);
+    }
+
+    #[test]
+    fn epic_display_fields_sanitize_terminal_controls() {
+        let id = format_epic_id("bd-epic\x1b]52;c;bad\x07", false);
+        let title = format_epic_title("Title\x1b[2J\rreset", false);
+
+        assert!(!id.contains('\x1b'));
+        assert!(!id.contains('\x07'));
+        assert!(!title.contains('\x1b'));
+        assert!(!title.contains('\r'));
+        assert_eq!(id, "bd-epic\\u{1b}]52;c;bad\\u{7}");
+        assert_eq!(title, "Title\\u{1b}[2J\\rreset");
+    }
+
+    #[test]
+    fn epic_completion_helpers_handle_zero_and_inconsistent_counts() {
+        assert_eq!(completion_percentage(0, 0), 0);
+        assert_eq!(completion_percentage(2, 4), 50);
+        assert_eq!(completion_percentage(usize::MAX, 2), 100);
+        assert_eq!(completion_percentage(usize::MAX, usize::MAX), 100);
+
+        assert_eq!(completion_bar_filled_width(0, 0, 20), 0);
+        assert_eq!(completion_bar_filled_width(1, 4, 20), 5);
+        assert_eq!(completion_bar_filled_width(usize::MAX, 2, 20), 20);
+        assert_eq!(completion_bar_filled_width(usize::MAX, usize::MAX, 20), 20);
+    }
+
+    #[test]
+    fn epic_progress_bar_clamps_inconsistent_closed_counts() {
+        let theme = crate::output::Theme::default();
+        let mut content = Text::new("");
+
+        render_progress_bar(&mut content, 3, 2, completion_percentage(3, 2), &theme);
+
+        let rendered = content.plain();
+        assert_eq!(rendered.matches('█').count(), 20);
+        assert!(!rendered.contains('░'));
+        assert!(rendered.contains("3/2 (100%)"));
     }
 }

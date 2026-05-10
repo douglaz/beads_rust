@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 /// Configuration for history backups.
@@ -99,10 +99,25 @@ impl BackupTarget {
         }
     }
 
-    fn resolve_path(&self, beads_dir: &Path) -> PathBuf {
+    fn resolve_path(&self, beads_dir: &Path) -> Result<PathBuf> {
         match self {
-            Self::Relative { path } => beads_dir.join(path),
-            Self::Absolute { path } => PathBuf::from(path),
+            Self::Relative { path } => {
+                let relative_path = Path::new(path);
+                if relative_path.is_absolute()
+                    || relative_path.components().any(|component| {
+                        matches!(
+                            component,
+                            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+                        )
+                    })
+                {
+                    return Err(BeadsError::Config(format!(
+                        "Invalid relative backup target metadata path: {path}"
+                    )));
+                }
+                Ok(beads_dir.join(relative_path))
+            }
+            Self::Absolute { path } => Ok(PathBuf::from(path)),
         }
     }
 
@@ -160,6 +175,14 @@ pub(crate) fn parse_backup_filename(filename: &str) -> Option<(String, DateTime<
 fn create_backup_file(history_dir: &Path, file_stem: &str) -> Result<(PathBuf, File)> {
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
 
+    create_backup_file_for_timestamp(history_dir, file_stem, &timestamp)
+}
+
+fn create_backup_file_for_timestamp(
+    history_dir: &Path,
+    file_stem: &str,
+    timestamp: &str,
+) -> Result<(PathBuf, File)> {
     for collision_idx in 0..1024_u32 {
         let backup_name = if collision_idx == 0 {
             format!("{file_stem}.{timestamp}.jsonl")
@@ -167,6 +190,12 @@ fn create_backup_file(history_dir: &Path, file_stem: &str) -> Result<(PathBuf, F
             format!("{file_stem}.{timestamp}.{collision_idx}.jsonl")
         };
         let backup_path = history_dir.join(backup_name);
+        if history_artifact_metadata(&backup_metadata_path(&backup_path), "backup metadata")?
+            .is_some()
+        {
+            continue;
+        }
+
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -329,6 +358,8 @@ fn write_backup_metadata(beads_dir: &Path, target_path: &Path, backup_path: &Pat
         return Err(err);
     }
 
+    crate::util::sync_parent_directory(&metadata_path).map_err(BeadsError::Io)?;
+
     Ok(())
 }
 
@@ -357,10 +388,20 @@ fn backup_target_details(
     };
 
     match read_backup_metadata(backup_path) {
-        Ok(Some(metadata)) => {
-            let target_path = metadata.target.resolve_path(beads_dir);
-            (target_path, metadata.target.key())
-        }
+        Ok(Some(metadata)) => match metadata.target.resolve_path(beads_dir) {
+            Ok(target_path) => (target_path, metadata.target.key()),
+            Err(err) => {
+                tracing::warn!(
+                    backup = %backup_path.display(),
+                    error = %err,
+                    "Ignoring invalid history backup metadata during history rotation/listing"
+                );
+                (
+                    invalid_metadata_target_path(backup_name),
+                    format!("invalid-metadata:{backup_name}"),
+                )
+            }
+        },
         Ok(None) => legacy_backup_target_path(beads_dir, backup_name).map_or_else(
             |_| {
                 let fallback = PathBuf::from(backup_name);
@@ -413,7 +454,7 @@ pub(crate) fn resolve_backup_target_path(beads_dir: &Path, backup_path: &Path) -
             "History backup '{backup_name}' is missing target metadata and cannot be safely restored or diffed"
         ))
     })?;
-    let target_path = metadata.target.resolve_path(beads_dir);
+    let target_path = metadata.target.resolve_path(beads_dir)?;
 
     validate_sync_path_with_external(&target_path, beads_dir, true)?;
     Ok(target_path)
@@ -435,7 +476,7 @@ pub fn backup_before_export(
 
     let history_dir = beads_dir.join(".br_history");
 
-    if !target_path.exists() {
+    if history_artifact_metadata(target_path, "backup source")?.is_none() {
         return Ok(());
     }
 
@@ -468,6 +509,7 @@ pub fn backup_before_export(
     let mut source = File::open(target_path).map_err(BeadsError::Io)?;
     io::copy(&mut source, &mut backup_file).map_err(BeadsError::Io)?;
     backup_file.sync_all().map_err(BeadsError::Io)?;
+    crate::util::sync_parent_directory(&backup_path).map_err(BeadsError::Io)?;
     write_backup_metadata(beads_dir, target_path, &backup_path)?;
     backup_guard.persist();
     tracing::debug!("Created backup: {}", backup_path.display());
@@ -806,6 +848,96 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_before_export_rejects_symlinked_source_target() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let outside_target = outside_dir.join("issues.jsonl");
+        fs::write(&outside_target, "outside\n").unwrap();
+        let target_path = beads_dir.join("issues.jsonl");
+        symlink(&outside_target, &target_path).unwrap();
+
+        let err =
+            backup_before_export(&beads_dir, &HistoryConfig::default(), &target_path).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("backup source") && message.contains("must not be a symlink"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !beads_dir.join(".br_history").exists(),
+            "rejected symlinked source must not create history state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_before_export_rejects_broken_symlink_source_target() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        symlink(temp.path().join("missing.jsonl"), &target_path).unwrap();
+
+        let err =
+            backup_before_export(&beads_dir, &HistoryConfig::default(), &target_path).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("backup source") && message.contains("must not be a symlink"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !beads_dir.join(".br_history").exists(),
+            "rejected broken symlink source must not create history state"
+        );
+    }
+
+    #[test]
+    fn test_backup_before_export_rejects_directory_source_target() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::create_dir(&target_path).unwrap();
+
+        let err =
+            backup_before_export(&beads_dir, &HistoryConfig::default(), &target_path).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("backup source") && message.contains("must be a regular file"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            !beads_dir.join(".br_history").exists(),
+            "rejected directory source must not create history state"
+        );
+    }
+
     #[test]
     fn test_prune_backups_removes_metadata_sidecars() {
         let temp = TempDir::new().unwrap();
@@ -1010,15 +1142,17 @@ mod tests {
         symlink(&outside_dir, &history_dir).unwrap();
 
         let err = list_backups(&history_dir, None).unwrap_err();
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("must not be a symlink"),
-                    "unexpected message: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("must not be a symlink"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
@@ -1039,15 +1173,17 @@ mod tests {
         fs::create_dir(backup_metadata_path(&backup_path)).unwrap();
 
         let err = prune_backups(&history_dir, 0, None).unwrap_err();
-        match err {
-            BeadsError::Config(msg) => {
-                assert!(
-                    msg.contains("Failed to delete backup"),
-                    "unexpected message: {msg}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("Failed to delete backup"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
@@ -1068,6 +1204,109 @@ mod tests {
         assert_eq!(
             backups[0].target_path,
             invalid_metadata_target_path(backup_name)
+        );
+    }
+
+    #[test]
+    fn test_list_backups_marks_invalid_relative_metadata_without_guessing_target() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+        let cases = [
+            (
+                "issues.20260307_120000.jsonl",
+                temp.path().join("escape.jsonl").display().to_string(),
+            ),
+            (
+                "labels.20260307_120001.jsonl",
+                "../escape.jsonl".to_string(),
+            ),
+        ];
+
+        for (backup_name, metadata_path) in cases {
+            let backup_path = history_dir.join(backup_name);
+            fs::write(&backup_path, "backup\n").unwrap();
+            fs::write(
+                backup_metadata_path(&backup_path),
+                serde_json::json!({
+                    "target": {
+                        "kind": "relative",
+                        "path": metadata_path,
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let backups = list_backups(history_dir, None).unwrap();
+        assert_eq!(backups.len(), 2);
+        for backup in backups {
+            let backup_name = backup
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap();
+            assert_eq!(backup.target_key, format!("invalid-metadata:{backup_name}"));
+            assert_eq!(
+                backup.target_path,
+                invalid_metadata_target_path(backup_name)
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_backup_target_path_rejects_invalid_relative_metadata() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+
+        let backup_path = history_dir.join("issues.20260307_120000.jsonl");
+        fs::write(&backup_path, "backup\n").unwrap();
+        fs::write(
+            backup_metadata_path(&backup_path),
+            serde_json::json!({
+                "target": {
+                    "kind": "relative",
+                    "path": temp.path().join("escape.jsonl").display().to_string(),
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = resolve_backup_target_path(&beads_dir, &backup_path).unwrap_err();
+        assert!(
+            matches!(&err, BeadsError::Config(message) if message.contains("Invalid relative backup target metadata path")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_backup_file_skips_stale_metadata_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+        let timestamp = "20260307_120000_000000";
+        let first_backup_path = history_dir.join(format!("issues.{timestamp}.jsonl"));
+        let stale_metadata_path = backup_metadata_path(&first_backup_path);
+        fs::write(&stale_metadata_path, "stale metadata\n").unwrap();
+
+        let (backup_path, file) =
+            create_backup_file_for_timestamp(history_dir, "issues", timestamp).unwrap();
+        drop(file);
+
+        assert_eq!(
+            backup_path.file_name().and_then(|name| name.to_str()),
+            Some("issues.20260307_120000_000000.1.jsonl")
+        );
+        assert!(
+            !first_backup_path.exists(),
+            "allocator should not create a backup next to stale metadata"
+        );
+        assert_eq!(
+            fs::read_to_string(&stale_metadata_path).unwrap(),
+            "stale metadata\n",
+            "stale metadata sidecar should be left untouched"
         );
     }
 
@@ -1116,15 +1355,17 @@ mod tests {
 
         let err =
             backup_before_export(&beads_dir, &HistoryConfig::default(), &target_path).unwrap_err();
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("must not be a symlink"),
-                    "unexpected message: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(&err, BeadsError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        let BeadsError::Config(message) = err else {
+            return;
+        };
+        assert!(
+            message.contains("must not be a symlink"),
+            "unexpected message: {message}"
+        );
 
         assert!(
             fs::read_dir(&outside_dir).unwrap().next().is_none(),

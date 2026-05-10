@@ -8,6 +8,7 @@
 
 use crate::model::{Issue, IssueType, Priority, Status};
 use crossterm::style::Stylize;
+use std::borrow::Cow;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Status icon characters.
@@ -28,6 +29,56 @@ pub mod icons {
     pub const PINNED: &str = "📌";
     /// Unknown status.
     pub const UNKNOWN: &str = "?";
+}
+
+/// Escape terminal control characters before rendering untrusted text.
+///
+/// This preserves ordinary printable text while making ANSI/OSC/C0/C1 controls
+/// visible as Rust-style escapes such as `\u{1b}`. Use the inline variant for
+/// titles, labels, authors, and other single-line fields.
+#[must_use]
+pub fn sanitize_terminal_inline(text: &str) -> Cow<'_, str> {
+    sanitize_terminal_controls(text, false)
+}
+
+/// Escape terminal control characters before rendering trusted line structure.
+///
+/// This preserves `\n` and `\t` for multi-line descriptions and comments, but
+/// still escapes carriage returns, backspaces, ESC, BEL, DEL, and C1 controls.
+#[must_use]
+pub fn sanitize_terminal_text(text: &str) -> Cow<'_, str> {
+    sanitize_terminal_controls(text, true)
+}
+
+fn sanitize_terminal_controls(text: &str, preserve_layout_controls: bool) -> Cow<'_, str> {
+    let mut escaped = String::new();
+    let mut changed = false;
+
+    for (idx, ch) in text.char_indices() {
+        let allowed_layout = preserve_layout_controls && matches!(ch, '\n' | '\t');
+        if allowed_layout || !ch.is_control() {
+            if changed {
+                escaped.push(ch);
+            }
+            continue;
+        }
+
+        if !changed {
+            escaped.reserve(text.len());
+            escaped.push_str(&text[..idx]);
+            changed = true;
+        }
+
+        for escaped_char in ch.escape_default() {
+            escaped.push(escaped_char);
+        }
+    }
+
+    if changed {
+        Cow::Owned(escaped)
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 /// Formatting options for text output.
@@ -73,7 +124,8 @@ pub fn format_priority(priority: &Priority) -> String {
 /// Format status label with optional color.
 #[must_use]
 pub fn format_status_label(status: &Status, use_color: bool) -> String {
-    let label = status.as_str();
+    let label = sanitize_terminal_inline(status.as_str());
+    let label = label.as_ref();
     if !use_color {
         return label.to_string();
     }
@@ -136,24 +188,30 @@ pub fn format_priority_badge(priority: &Priority, use_color: bool) -> String {
 /// Format issue type as a bracketed badge.
 #[must_use]
 pub fn format_type_badge(issue_type: &IssueType) -> String {
-    format!("[{}]", issue_type.as_str())
+    format!("[{}]", format_type_label(issue_type))
+}
+
+/// Format issue type text for display.
+#[must_use]
+pub fn format_type_label(issue_type: &IssueType) -> String {
+    sanitize_terminal_inline(issue_type.as_str()).into_owned()
 }
 
 /// Format issue type badge with optional color.
 #[must_use]
 pub fn format_type_badge_colored(issue_type: &IssueType, use_color: bool) -> String {
-    let label = issue_type.as_str();
+    let label = format_type_label(issue_type);
     if !use_color {
         return format!("[{label}]");
     }
 
     let colored = match issue_type {
-        IssueType::Bug => label.red().to_string(),
-        IssueType::Feature => label.cyan().to_string(),
-        IssueType::Task | IssueType::Custom(_) => label.to_string(),
-        IssueType::Epic => label.magenta().bold().to_string(),
-        IssueType::Docs | IssueType::Question => label.blue().to_string(),
-        IssueType::Chore => label.grey().to_string(),
+        IssueType::Bug => label.as_str().red().to_string(),
+        IssueType::Feature => label.as_str().cyan().to_string(),
+        IssueType::Task | IssueType::Custom(_) => label,
+        IssueType::Epic => label.as_str().magenta().bold().to_string(),
+        IssueType::Docs | IssueType::Question => label.as_str().blue().to_string(),
+        IssueType::Chore => label.as_str().grey().to_string(),
     };
 
     format!("[{colored}]")
@@ -190,6 +248,9 @@ pub fn terminal_width() -> usize {
 /// Handles wide characters (emojis, CJK) correctly using `unicode-width`.
 #[must_use]
 pub fn truncate_title(title: &str, max_len: usize) -> String {
+    let title = sanitize_terminal_inline(title);
+    let title = title.as_ref();
+
     if max_len == 0 {
         return String::new();
     }
@@ -242,24 +303,25 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
     // Account for the bullet in priority badge: [● P2]
     let priority_badge_plain = format!("[● {}]", format_priority(&issue.priority));
     let type_badge_plain = format_type_badge(&issue.issue_type);
+    let issue_id = sanitize_terminal_inline(&issue.id);
 
     // Add 3 for " - " separator between type badge and title
     let prefix_len = visible_len(status_icon_plain)
         + 1
-        + visible_len(&issue.id)
+        + visible_len(issue_id.as_ref())
         + 1
         + visible_len(&priority_badge_plain)
         + 1
         + visible_len(&type_badge_plain)
         + 3; // " - " separator
 
+    let sanitized_title = sanitize_terminal_inline(&issue.title);
     let title = if options.wrap {
-        issue.title.clone()
+        sanitized_title.into_owned()
+    } else if let Some(width) = options.max_width {
+        truncate_title(&issue.title, width.saturating_sub(prefix_len))
     } else {
-        options.max_width.map_or_else(
-            || issue.title.clone(),
-            |width| truncate_title(&issue.title, width.saturating_sub(prefix_len)),
-        )
+        sanitized_title.into_owned()
     };
 
     let status_icon = format_status_icon_colored(&issue.status, options.use_color);
@@ -267,8 +329,8 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
     let type_badge = format_type_badge_colored(&issue.issue_type, options.use_color);
 
     format!(
-        "{status_icon} {} {priority_badge} {type_badge} - {title}",
-        issue.id
+        "{status_icon} {issue_id} {priority_badge} {type_badge} - {title}",
+        issue_id = issue_id.as_ref()
     )
 }
 
@@ -281,24 +343,29 @@ pub fn format_issue_line(issue: &Issue) -> String {
 }
 
 fn issue_detail_lines(issue: &Issue, include_extended: bool) -> Vec<String> {
+    let labels = issue
+        .labels
+        .iter()
+        .map(|label| sanitize_terminal_inline(label).into_owned())
+        .collect::<Vec<_>>();
     let mut details = vec![
-        format!("Status: {}", issue.status),
+        format!("Status: {}", format_status_label(&issue.status, false)),
         format!("Priority: {}", format_priority(&issue.priority)),
-        format!("Type: {}", issue.issue_type),
+        format!("Type: {}", format_type_label(&issue.issue_type)),
     ];
 
     if let Some(assignee) = issue.assignee.as_deref()
         && !assignee.is_empty()
     {
-        details.push(format!("Assignee: {assignee}"));
+        details.push(format!("Assignee: {}", sanitize_terminal_inline(assignee)));
     }
     if let Some(owner) = issue.owner.as_deref()
         && !owner.is_empty()
     {
-        details.push(format!("Owner: {owner}"));
+        details.push(format!("Owner: {}", sanitize_terminal_inline(owner)));
     }
-    if !issue.labels.is_empty() {
-        details.push(format!("Labels: {}", issue.labels.join(", ")));
+    if !labels.is_empty() {
+        details.push(format!("Labels: {}", labels.join(", ")));
     }
     if let Some(due_at) = issue.due_at {
         details.push(format!("Due: {}", due_at.format("%Y-%m-%d")));
@@ -442,6 +509,17 @@ mod tests {
     }
 
     #[test]
+    fn status_and_type_labels_escape_terminal_controls() {
+        let status = format_status_label(&Status::Custom("bad\x1b[2J".to_string()), false);
+        let issue_type = format_type_badge(&IssueType::Custom("kind\x07bell".to_string()));
+
+        assert!(!status.chars().any(char::is_control));
+        assert!(status.contains("\\u{1b}[2J"));
+        assert!(!issue_type.chars().any(char::is_control));
+        assert!(issue_type.contains("\\u{7}bell"));
+    }
+
+    #[test]
     fn test_format_issue_line_open() {
         let issue = make_test_issue();
         let line = format_issue_line(&issue);
@@ -554,6 +632,22 @@ mod tests {
     }
 
     #[test]
+    fn test_format_issue_long_with_sanitizes_custom_status_and_type() {
+        let mut issue = make_test_issue();
+        issue.id = "bd-test\x1b]52;c;bad\x07".to_string();
+        issue.status = Status::Custom("state\x1b[31m".to_string());
+        issue.issue_type = IssueType::Custom("kind\x07alert".to_string());
+
+        let output = format_issue_long_with(&issue, TextFormatOptions::plain());
+
+        assert!(!output.contains('\x1b'));
+        assert!(!output.contains('\x07'));
+        assert!(output.contains("bd-test\\u{1b}]52;c;bad\\u{7}"));
+        assert!(output.contains("Status: state\\u{1b}[31m"));
+        assert!(output.contains("Type: kind\\u{7}alert"));
+    }
+
+    #[test]
     fn test_format_issue_pretty_with_uses_tree_connectors() {
         let mut issue = make_test_issue();
         issue.assignee = Some("alice".to_string());
@@ -564,5 +658,31 @@ mod tests {
         assert!(output.contains("├── Priority: P2"));
         assert!(output.contains("└── Assignee: alice"));
         assert!(!output.contains("Created: "));
+    }
+
+    #[test]
+    fn terminal_inline_escapes_control_sequences() {
+        let sanitized = sanitize_terminal_inline("bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!sanitized.chars().any(char::is_control));
+        assert!(sanitized.contains("\\u{1b}[2J"));
+        assert!(sanitized.contains("\\r"));
+        assert!(sanitized.contains("\\u{8}"));
+        assert!(sanitized.contains("\\n"));
+        assert!(sanitized.contains("\\u{7}"));
+        assert!(sanitized.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn terminal_text_preserves_layout_but_escapes_controls() {
+        let sanitized = sanitize_terminal_text("line one\n\tline two\x1b]52;c;bad\x07\r");
+
+        assert!(sanitized.contains("line one\n\tline two"));
+        assert!(sanitized.contains("\\u{1b}]52"));
+        assert!(sanitized.contains("\\u{7}"));
+        assert!(sanitized.contains("\\r"));
+        assert!(!sanitized.contains('\x1b'));
+        assert!(!sanitized.contains('\x07'));
+        assert!(!sanitized.contains('\r'));
     }
 }

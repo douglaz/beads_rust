@@ -17,6 +17,12 @@ use crate::model::{Comment, Dependency, Issue, Priority, Status};
 use crate::util::id::MAX_ID_LENGTH;
 use std::path::Path;
 
+const TITLE_MAX_CHARS: usize = 500;
+const LONG_TEXT_MAX_BYTES: usize = 102_400;
+const ACTOR_MAX_CHARS: usize = 200;
+const CUSTOM_VARIANT_MAX_CHARS: usize = 50;
+pub(crate) const ISSUE_LABEL_MAX_COUNT: usize = 64;
+
 /// Validates issue fields and invariants.
 pub struct IssueValidator;
 
@@ -46,20 +52,7 @@ impl IssueValidator {
             ));
         }
 
-        // Title: Required, max 500 chars.
-        if issue.title.trim().is_empty() {
-            errors.push(ValidationError::new("title", "cannot be empty"));
-        }
-        if issue.title.len() > 500 {
-            errors.push(ValidationError::new("title", "exceeds 500 characters"));
-        }
-
-        // Description: Optional, max 100KB.
-        if let Some(description) = issue.description.as_ref()
-            && description.len() > 102_400
-        {
-            errors.push(ValidationError::new("description", "exceeds 100KB"));
-        }
+        validate_issue_text_fields(issue, &mut errors);
 
         // Priority: 0-4 range.
         if issue.priority.0 < Priority::CRITICAL.0 || issue.priority.0 > Priority::BACKLOG.0 {
@@ -115,26 +108,176 @@ impl IssueValidator {
             ));
         }
 
-        // External reference: Optional, max 200 chars, no whitespace.
-        if let Some(external_ref) = issue.external_ref.as_ref() {
-            if external_ref.len() > 200 {
-                errors.push(ValidationError::new(
-                    "external_ref",
-                    "exceeds 200 characters",
-                ));
-            }
-            if external_ref.chars().any(char::is_whitespace) {
-                errors.push(ValidationError::new(
-                    "external_ref",
-                    "cannot contain whitespace",
-                ));
-            }
-        }
-
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+}
+
+fn validate_issue_text_fields(issue: &Issue, errors: &mut Vec<ValidationError>) {
+    // Title: Required, max 500 chars.
+    if issue.title.trim().is_empty() {
+        errors.push(ValidationError::new("title", "cannot be empty"));
+    }
+    if issue.title.chars().count() > TITLE_MAX_CHARS {
+        errors.push(ValidationError::new("title", "exceeds 500 characters"));
+    }
+    reject_nul("title", &issue.title, errors);
+
+    // Description: Optional, max 100KB.
+    reject_bounded_bytes_opt(
+        "description",
+        issue.description.as_deref(),
+        LONG_TEXT_MAX_BYTES,
+        "exceeds 100KB",
+        errors,
+    );
+
+    reject_bounded_bytes_opt(
+        "design",
+        issue.design.as_deref(),
+        LONG_TEXT_MAX_BYTES,
+        "exceeds 100KB",
+        errors,
+    );
+    reject_bounded_bytes_opt(
+        "acceptance_criteria",
+        issue.acceptance_criteria.as_deref(),
+        LONG_TEXT_MAX_BYTES,
+        "exceeds 100KB",
+        errors,
+    );
+    reject_bounded_bytes_opt(
+        "notes",
+        issue.notes.as_deref(),
+        LONG_TEXT_MAX_BYTES,
+        "exceeds 100KB",
+        errors,
+    );
+    reject_nul("status", issue.status.as_str(), errors);
+    validate_custom_status(&issue.status, errors);
+    reject_nul("issue_type", issue.issue_type.as_str(), errors);
+    validate_custom_issue_type(&issue.issue_type, errors);
+    reject_bounded_chars_opt(
+        "assignee",
+        issue.assignee.as_deref(),
+        ACTOR_MAX_CHARS,
+        errors,
+    );
+    reject_bounded_chars_opt("owner", issue.owner.as_deref(), ACTOR_MAX_CHARS, errors);
+    reject_bounded_chars_opt(
+        "created_by",
+        issue.created_by.as_deref(),
+        ACTOR_MAX_CHARS,
+        errors,
+    );
+    validate_external_ref(issue.external_ref.as_deref(), errors);
+    reject_bounded_chars_opt(
+        "source_system",
+        issue.source_system.as_deref(),
+        ACTOR_MAX_CHARS,
+        errors,
+    );
+    validate_issue_labels(issue, errors);
+}
+
+fn validate_external_ref(external_ref: Option<&str>, errors: &mut Vec<ValidationError>) {
+    if let Some(external_ref) = external_ref {
+        reject_nul("external_ref", external_ref, errors);
+        if external_ref.len() > 200 {
+            errors.push(ValidationError::new(
+                "external_ref",
+                "exceeds 200 characters",
+            ));
+        }
+        if external_ref.chars().any(char::is_whitespace) {
+            errors.push(ValidationError::new(
+                "external_ref",
+                "cannot contain whitespace",
+            ));
+        }
+    }
+}
+
+fn reject_nul(field: &str, value: &str, errors: &mut Vec<ValidationError>) {
+    if value.contains('\0') {
+        errors.push(ValidationError::new(field, "cannot contain NUL bytes"));
+    }
+}
+
+fn reject_bounded_bytes_opt(
+    field: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+    message: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(value) = value {
+        reject_nul(field, value, errors);
+        if value.len() > max_bytes {
+            errors.push(ValidationError::new(field, message));
+        }
+    }
+}
+
+fn reject_bounded_chars_opt(
+    field: &str,
+    value: Option<&str>,
+    max_chars: usize,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(value) = value {
+        reject_nul(field, value, errors);
+        if value.chars().count() > max_chars {
+            errors.push(ValidationError::new(
+                field,
+                format!("exceeds {max_chars} characters"),
+            ));
+        }
+    }
+}
+
+fn validate_custom_status(status: &Status, errors: &mut Vec<ValidationError>) {
+    if let Status::Custom(value) = status
+        && value.chars().count() > CUSTOM_VARIANT_MAX_CHARS
+    {
+        errors.push(ValidationError::new(
+            "status",
+            "custom status exceeds 50 characters",
+        ));
+    }
+}
+
+fn validate_custom_issue_type(
+    issue_type: &crate::model::IssueType,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let crate::model::IssueType::Custom(value) = issue_type
+        && value.chars().count() > CUSTOM_VARIANT_MAX_CHARS
+    {
+        errors.push(ValidationError::new(
+            "issue_type",
+            "custom issue type exceeds 50 characters",
+        ));
+    }
+}
+
+fn validate_issue_labels(issue: &Issue, errors: &mut Vec<ValidationError>) {
+    if issue.labels.len() > ISSUE_LABEL_MAX_COUNT {
+        errors.push(ValidationError::new(
+            "labels",
+            format!("exceeds {ISSUE_LABEL_MAX_COUNT} labels"),
+        ));
+    }
+
+    for (idx, label) in issue.labels.iter().enumerate() {
+        if let Err(err) = LabelValidator::validate(label) {
+            errors.push(ValidationError::new(
+                "labels",
+                format!("label at index {idx}: {}", err.message),
+            ));
         }
     }
 }
@@ -474,6 +617,53 @@ mod tests {
     }
 
     #[test]
+    fn issue_validation_counts_title_limit_in_chars_not_utf8_bytes() {
+        let mut issue = base_issue();
+        issue.title = "\u{1f980}".repeat(500);
+        assert!(IssueValidator::validate(&issue).is_ok());
+
+        issue.title = "\u{1f980}".repeat(501);
+        let errors = IssueValidator::validate(&issue).unwrap_err();
+        assert!(errors.iter().any(|err| err.field == "title"));
+    }
+
+    #[test]
+    fn issue_validation_rejects_nul_in_content_hash_fields() {
+        let mut issue = base_issue();
+        issue.title = "nul\0title".to_string();
+        issue.description = Some("nul\0description".to_string());
+        issue.design = Some("nul\0design".to_string());
+        issue.acceptance_criteria = Some("nul\0acceptance".to_string());
+        issue.notes = Some("nul\0notes".to_string());
+        issue.status = Status::Custom("nul\0status".to_string());
+        issue.issue_type = IssueType::Custom("nul\0type".to_string());
+        issue.assignee = Some("nul\0assignee".to_string());
+        issue.owner = Some("nul\0owner".to_string());
+        issue.created_by = Some("nul\0creator".to_string());
+        issue.external_ref = Some("nul\0external".to_string());
+        issue.source_system = Some("nul\0source".to_string());
+
+        let errors = IssueValidator::validate(&issue).unwrap_err();
+        let fields: Vec<_> = errors.iter().map(|err| err.field.as_str()).collect();
+        for field in [
+            "title",
+            "description",
+            "design",
+            "acceptance_criteria",
+            "notes",
+            "status",
+            "issue_type",
+            "assignee",
+            "owner",
+            "created_by",
+            "external_ref",
+            "source_system",
+        ] {
+            assert!(fields.contains(&field), "missing NUL rejection for {field}");
+        }
+    }
+
+    #[test]
     fn issue_validation_rejects_invalid_id() {
         let mut issue = base_issue();
         issue.id = "invalid".to_string();
@@ -530,6 +720,9 @@ mod tests {
     fn label_validation_rejects_invalid_characters() {
         let err = LabelValidator::validate("bad label").unwrap_err();
         assert_eq!(err.field, "label");
+
+        let err = LabelValidator::validate("has/slash").unwrap_err();
+        assert_eq!(err.field, "label");
     }
 
     #[test]
@@ -541,6 +734,12 @@ mod tests {
     #[test]
     fn label_validation_allows_namespaced_labels() {
         assert!(LabelValidator::validate("team:backend").is_ok());
+    }
+
+    #[test]
+    fn label_validation_rejects_path_style_labels() {
+        let err = LabelValidator::validate("sys/stat").unwrap_err();
+        assert_eq!(err.field, "label");
     }
 
     #[test]

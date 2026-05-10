@@ -2,12 +2,14 @@
 
 use crate::cli::ReopenArgs;
 use crate::cli::commands::{
-    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
-    preserve_blocked_cache_on_error, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    report_auto_flush_failure, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
     update_issue_with_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::Status;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
@@ -101,8 +103,13 @@ pub fn execute(
                 None
             };
 
-            let result =
-                execute_route(&batch_args, &batch_cli, &batch.beads_dir, batch.is_external)?;
+            let result = execute_route(
+                &batch_args,
+                &batch_cli,
+                ctx,
+                &batch.beads_dir,
+                batch.is_external,
+            )?;
             routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
         }
 
@@ -120,7 +127,7 @@ pub fn execute(
     } else {
         let mut local_args = args.clone();
         local_args.ids = target_inputs;
-        let result = execute_route(&local_args, cli, &beads_dir, false)?;
+        let result = execute_route(&local_args, cli, ctx, &beads_dir, false)?;
         reopened_issues = result.reopened;
         skipped_issues = result.skipped;
     }
@@ -152,15 +159,25 @@ pub fn execute(
         );
     } else {
         for reopened in &reopened_issues {
-            print!("\u{2713} Reopened {}: {}", reopened.id, reopened.title);
+            let id = reopen_issue_id_text(&reopened.id);
+            print!(
+                "\u{2713} Reopened {}: {}",
+                id,
+                sanitize_terminal_inline(&reopened.title)
+            );
             if let Some(ref reason) = args.reason {
-                println!(" ({reason})");
+                println!("{}", reopen_reason_suffix(reason));
             } else {
                 println!();
             }
         }
         for skipped in &skipped_issues {
-            println!("\u{2298} Skipped {}: {}", skipped.id, skipped.reason);
+            let id = reopen_issue_id_text(&skipped.id);
+            println!(
+                "\u{2298} Skipped {}: {}",
+                id,
+                sanitize_terminal_inline(&skipped.reason)
+            );
         }
         if reopened_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to reopen.");
@@ -173,9 +190,12 @@ pub fn execute(
 fn execute_route(
     args: &ReopenArgs,
     cli: &config::CliOverrides,
+    ctx: &OutputContext,
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<ReopenResult> {
+    let _routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
@@ -302,10 +322,11 @@ fn execute_route(
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 
@@ -321,6 +342,10 @@ fn reorder_routed_items_by_requested_inputs<T>(
     routed_items: Vec<(Vec<String>, Vec<T>)>,
     context: &str,
 ) -> Result<Vec<T>> {
+    fn issue_input_text(input: &str) -> String {
+        sanitize_terminal_inline(input).into_owned()
+    }
+
     let mut positions_by_input: HashMap<&str, VecDeque<usize>> = HashMap::new();
     for (index, input) in requested_inputs.iter().enumerate() {
         positions_by_input
@@ -332,7 +357,7 @@ fn reorder_routed_items_by_requested_inputs<T>(
     let mut ordered_items: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
     for (batch_inputs, batch_items) in routed_items {
         if batch_inputs.len() != batch_items.len() {
-            return Err(BeadsError::Config(format!(
+            return Err(BeadsError::internal(format!(
                 "{context} produced mismatched issue/result counts"
             )));
         }
@@ -342,11 +367,18 @@ fn reorder_routed_items_by_requested_inputs<T>(
                 .get_mut(input.as_str())
                 .and_then(VecDeque::pop_front)
             else {
-                return Err(BeadsError::Config(format!(
+                let input = issue_input_text(&input);
+                return Err(BeadsError::internal(format!(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
-            ordered_items[index] = Some(item);
+            let Some(slot) = ordered_items.get_mut(index) else {
+                let input = issue_input_text(&input);
+                return Err(BeadsError::internal(format!(
+                    "{context} returned out-of-range issue input {input}"
+                )));
+            };
+            *slot = Some(item);
         }
     }
 
@@ -355,13 +387,22 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .enumerate()
         .map(|(index, item)| {
             item.ok_or_else(|| {
-                BeadsError::Config(format!(
-                    "{context} did not produce a result for {}",
-                    requested_inputs[index]
-                ))
+                let input = requested_inputs
+                    .get(index)
+                    .map(|input| issue_input_text(input))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                BeadsError::internal(format!("{context} did not produce a result for {input}"))
             })
         })
         .collect()
+}
+
+fn reopen_reason_suffix(reason: &str) -> String {
+    format!(" ({})", sanitize_terminal_inline(reason))
+}
+
+fn reopen_issue_id_text(id: &str) -> String {
+    sanitize_terminal_inline(id).into_owned()
 }
 
 /// Render reopen results with rich formatting.
@@ -381,13 +422,14 @@ fn render_reopen_rich(
         content.append("No issues to reopen.\n");
     } else {
         for item in reopened {
+            let id = reopen_issue_id_text(&item.id);
             content.append_styled("\u{2713} ", theme.success.clone());
             content.append_styled("Reopened ", theme.success.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
-            content.append(&item.title);
+            content.append(sanitize_terminal_inline(&item.title).as_ref());
             if let Some(r) = reason {
-                content.append_styled(&format!(" ({r})"), theme.dimmed.clone());
+                content.append_styled(&reopen_reason_suffix(r), theme.dimmed.clone());
             }
             content.append("\n");
             content.append_styled("  Status: ", theme.dimmed.clone());
@@ -398,11 +440,15 @@ fn render_reopen_rich(
         }
 
         for item in skipped {
+            let id = reopen_issue_id_text(&item.id);
             content.append_styled("\u{2298} ", theme.warning.clone());
             content.append_styled("Skipped ", theme.warning.clone());
-            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append_styled(&id, theme.emphasis.clone());
             content.append(": ");
-            content.append_styled(&item.reason, theme.dimmed.clone());
+            content.append_styled(
+                sanitize_terminal_inline(&item.reason).as_ref(),
+                theme.dimmed.clone(),
+            );
             content.append("\n");
         }
     }
@@ -544,5 +590,73 @@ mod tests {
 
         assert_eq!(issue.status, Status::Tombstone);
         assert!(issue.deleted_at.is_some());
+    }
+
+    #[test]
+    fn reopen_reason_suffix_sanitizes_terminal_controls() {
+        let suffix = reopen_reason_suffix("bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(suffix.starts_with(" (bad"));
+        assert!(suffix.ends_with(')'));
+        assert!(!suffix.chars().any(char::is_control));
+        assert!(suffix.contains("\\u{1b}[2J"));
+        assert!(suffix.contains("\\r"));
+        assert!(suffix.contains("\\u{8}"));
+        assert!(suffix.contains("\\n"));
+        assert!(suffix.contains("\\u{7}"));
+        assert!(suffix.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn reopen_issue_id_text_sanitizes_terminal_controls() {
+        let id = reopen_issue_id_text("bd-bad\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!id.chars().any(char::is_control));
+        assert!(id.contains("\\u{1b}[2J"));
+        assert!(id.contains("\\r"));
+        assert!(id.contains("\\u{8}"));
+        assert!(id.contains("\\n"));
+        assert!(id.contains("\\u{7}"));
+        assert!(id.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_missing_input_error() {
+        let requested = vec!["bd-reopen\x1b[2J\nbad".to_string(), "bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-ok".to_string()], vec!["ok"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "reopen routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
+        }
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_unexpected_input_error() {
+        let requested = vec!["bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-reopen\x1b[2J\nbad".to_string()], vec!["bad"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "reopen routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
+        }
     }
 }

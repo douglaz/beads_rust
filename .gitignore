@@ -1,9 +1,24 @@
 # Build artifacts (all target directories)
 target/
 target*/
+.rch-target/
 
-# Cargo lock for library crates (keep for binary crates)
-# Cargo.lock
+# Cargo.lock IS tracked — beads_rust is a binary CLI, so a committed
+# lockfile gives reproducible builds for `nix build`, `cargo install --git`,
+# and the flake input path used by Home Manager / NixOS configs.
+#
+# Dev-local workflow (sibling-path patching via
+# scripts/dev-local-frankensqlite.toml) rewrites Cargo.lock on every cargo
+# invocation by stripping registry source/checksum lines from patched
+# crates. To avoid accidentally committing that dev-local pollution, run
+# `scripts/activate-dev-local-patch.sh` (sets git skip-worktree on
+# Cargo.lock) before applying the patch and
+# `scripts/deactivate-dev-local-patch.sh` afterwards.
+
+# Fuzz harness lockfile — the fuzz/ workspace is opt-in tooling, not
+# part of the published binary. Keep it untracked so libfuzzer/cargo-fuzz
+# version churn doesn't show up in `git status`.
+fuzz/Cargo.lock
 
 # IDE
 .idea/
@@ -28,6 +43,11 @@ Thumbs.db
 .beads/last-touched
 .beads/.bv.lock
 .beads/*.lock
+.beads/.br_history/
+
+# Multi-agent swarm coordination scratch state
+.swarm/
+.swarm_marching_orders.md
 
 # Coverage reports
 /coverage/
@@ -39,13 +59,16 @@ a.out
 # Temp directories and crash reports
 temp_test*/
 rustc-ice-*.txt
+fuzz/artifacts/
 
 # Profiling data
 perf.data
 perf.data.old
 
-# Large source images (webp versions are committed)
+# Generated screenshots and scratch images stay ignored. The curated social
+# preview image is intentionally tracked under docs/assets/.
 *.png
+!docs/assets/gh_og_share_image.png
 
 # Claude Code temp files
 claude-upgrade-progress.json
@@ -56,6 +79,11 @@ claude-upgrade-progress.json
 # Local scratch SQLite DBs (never tracked)
 storage.sqlite3
 storage.sqlite3-*
+/*.db
+/*.db-wal
+/*.db-shm
+/*.sqlite
+/*.sqlite3
 
 # Local Cargo and Rustup caches (agent workspace artifacts)
 .cargo/
@@ -64,6 +92,9 @@ storage.sqlite3-*
 # Ephemeral/temporary files (agent workflow artifacts)
 RESEARCH_FINDINGS.md
 TOON_INTEGRATION_BRIEF.md
+/.skill-loop-progress.md
+/CLI_SCHEMA.json
+/ROBOT_MODE_EXAMPLES.jsonl
 cov_*.out
 rustc-ice-*.txt
 *.snap.new
@@ -147,3 +178,41 @@ report.json
 .codex-local-check/
 .codex-bench/
 .codex-tmp/
+
+# Claude Code runtime lockfile for the /schedule skill
+.claude/scheduled_tasks.lock
+
+# NTM agent pane runtime logs (also covered globally in ~/.gitignore,
+# but repeat here so they stay ignored on fresh clones or machines
+# without the global entry).
+.ntm/logs/*.log
+
+# Skill-loop / refactor-pass run artifacts that should NOT be tracked.
+# Each pass's directory under refactor/artifacts/ legitimately contains
+# small markdown ledgers, scoring files, and golden replay JSON which
+# are tracked. The patterns below cover the consistently-large or
+# obviously-runtime entries that don't belong in git:
+#  - ast_grep_functions.json: 9.6MB+ AST function dumps used as scan
+#    input for one pass; trivially regeneratable via ast-grep.
+#  - tests_before.txt / tests_current.txt: raw `cargo test` output
+#    captures (1.1MB+ each); the LEDGER and verify_report markdown
+#    summarize them.
+#  - golden_workspace/: a live `br` workspace (beads.db, .br_history,
+#    .sync.lock, .write.lock, last-touched) used to record golden
+#    replays, regenerated each pass.
+refactor/artifacts/*/ast_grep_functions.json
+refactor/artifacts/*/tests_before.txt
+refactor/artifacts/*/tests_current.txt
+refactor/artifacts/*/golden_workspace/
+
+# Per-run perf profiling capture tree (2GB+ of perf.data, beads.db
+# workspaces per scenario, criterion-style throughput dumps). The
+# LEDGER and bench-summary markdown files are written elsewhere by
+# the perf scripts; this tree is purely raw data.
+tests/artifacts/perf/
+tests/artifacts/perf/**/perf.data
+tests/artifacts/perf/**/*.beads/
+*.perf.data
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/

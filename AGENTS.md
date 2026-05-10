@@ -45,6 +45,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## CI/Release Workflow Supply-Chain Policy
+
+For any `.github/workflows/` edit, use
+[`docs/CI_SUPPLY_CHAIN.md`](docs/CI_SUPPLY_CHAIN.md) as the canonical policy.
+It defines the immutable external GitHub Action pin inventory, upstream update
+audit, workflow-fragment harnesses, branch-trigger expectations, and proof
+commands for workflow changes.
+
+Important boundaries:
+
+- `br` never performs workflow git operations, releases, pull requests, network
+  dispatches, or upstream lookups automatically.
+- Agents run workflow proof Cargo targets directly through RCH; local shell
+  verifier scripts are operator shortcuts and may call Cargo internally.
+- Whole-crate `cargo check --all-targets` and
+  `cargo clippy --all-targets -- -D warnings` are required when Rust code
+  changes, and must be offloaded through RCH in agent sessions.
+- Run `git diff --check`, `actionlint` when available, the relevant workflow
+  harnesses, and `ubs` on changed workflow-related files before committing.
+
+---
+
 ## Toolchain: Rust & Cargo
 
 We only use **Cargo** in this project, NEVER any other package manager.
@@ -345,7 +367,7 @@ self_update = ["dep:self_update"]   # Self-update from GitHub releases (rustls T
 | `BeadsError` | Unified error enum (thiserror-derived) with structured variants |
 | `ErrorCode` | Deterministic exit code mapping (e.g., `IssueNotFound` = exit 3) |
 | `StructuredError` | JSON-serializable error with code, message, context |
-| `OutputMode` | Enum: `Rich`, `Plain`, `Json`, `Quiet` — auto-detected from terminal state |
+| `OutputMode` | Enum: `Rich`, `Plain`, `Json`, `Toon`, `Quiet` — auto-detected from flags, env, and terminal state |
 
 ### Key Design Decisions
 
@@ -392,6 +414,7 @@ br supports multiple output modes for different use cases:
 | **Rich** | TTY with colors | Colored panels, tables, styled text |
 | **Plain** | `NO_COLOR` env or `--no-color` | Text output without ANSI codes |
 | **JSON** | `--json` or `--robot` | Machine-readable structured output |
+| **Toon** | `--format toon`, `BR_OUTPUT_FORMAT=toon`, or `TOON_DEFAULT_FORMAT=toon` | Token-efficient structured output |
 | **Quiet** | `--quiet` or `-q` | Minimal output |
 
 ### Mode Detection
@@ -400,9 +423,13 @@ The output mode is automatically detected:
 
 1. `--json` or `--robot` flags → **JSON mode**
 2. `--quiet` flag → **Quiet mode**
-3. `NO_COLOR` env var or `--no-color` → **Plain mode**
-4. Non-TTY stdout (piped output) → **Plain mode**
-5. Otherwise → **Rich mode** (default for interactive terminals)
+3. `BR_OUTPUT_FORMAT` env var or `TOON_DEFAULT_FORMAT` fallback env var can force **JSON** or **Toon** mode
+4. `NO_COLOR` env var or `--no-color` → **Plain mode**
+5. Non-TTY stdout (piped output) → **Plain mode**
+6. Otherwise → **Rich mode** (default for interactive terminals)
+
+See [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md) for agent-oriented
+format defaults and `TOON_DEFAULT_FORMAT` examples.
 
 ### For Coding Agents
 
@@ -426,6 +453,36 @@ JSON mode guarantees:
 Schema discovery:
 - `br schema all --format json` emits JSON Schema documents for the main robot outputs
 - `br schema issue-details --format toon` for token-efficient schema viewing
+
+### MCP Serve for Agents
+
+`br serve` exposes the same issue tracker as an MCP server for agents that can
+use MCP tools/resources/prompts instead of shelling out. It is optional and only
+exists in binaries built with the `mcp` feature:
+
+```bash
+MCP_TARGET="${TMPDIR:-/tmp}/rch_target_beads_rust_${AGENT_NAME:-agent}"
+rch exec -- env CARGO_TARGET_DIR="$MCP_TARGET" cargo build --release --features mcp
+RUST_LOG=error "$MCP_TARGET/release/br" serve --actor "${AGENT_NAME:-mcp}"
+```
+
+Transport is stdio. Configure the MCP client to launch `br serve`; do not expect
+a TCP port or background daemon. Available tools are `list_issues`, `show_issue`,
+`create_issue`, `update_issue`, `close_issue`, `manage_dependencies`, and
+`project_overview`. Resources include `beads://project/info`,
+`beads://issues/{id}`, `beads://schema`, `beads://labels`,
+`beads://issues/ready`, `beads://issues/blocked`,
+`beads://issues/in_progress`, `beads://issues/deferred`,
+`beads://issues/bottlenecks`, `beads://graph/health`, and
+`beads://events/recent`. Guided prompts are `triage`, `status_report`,
+`plan_next_work`, and `polish_backlog`.
+
+Safety model: MCP serve uses the same local SQLite/JSONL workspace as the CLI,
+never runs git, and does not listen on the network. Mutating tools acquire the
+workspace `.write.lock`, record audit events with `--actor`, and attempt the
+normal JSONL auto-flush after successful writes. Agent Mail is still the
+reservation and swarm-coordination layer; MCP serve is a br API surface, not a
+replacement for file reservations.
 
 ---
 
@@ -470,6 +527,78 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
    ```
    Final Mail reply: `[br-123] Completed` with summary
 
+### Degraded Coordination When Agent Mail Is Unavailable
+
+Agent Mail reservations are the normal collision-avoidance mechanism. If Agent
+Mail is red or unreachable, keep moving but make the weaker coordination state
+visible in `br` before touching code:
+
+1. **Claim with an explicit actor:**
+   ```bash
+   br update <id> --status in_progress --assignee "$AGENT_NAME" --json
+   ```
+
+2. **Record intended file scope in the issue thread:**
+   ```bash
+   br comments add <id> --author "$AGENT_NAME" \
+     --message "degraded-coordination: Agent Mail unavailable; files: src/foo.rs, docs/bar.md" \
+     --json
+   ```
+
+3. **Check for collisions before editing:** inspect `git status --short`,
+   `br list --status in_progress --json`, and recent comments on the bead. If
+   another active agent names the same files, pick different work or narrow the
+   scope before editing.
+
+4. **Keep the fallback advisory:** this is not a lock. Use the smallest possible
+   file set, avoid broad globs, and update the comment if the edit surface
+   expands.
+
+5. **Finish normally:** close the bead, run `br sync --flush-only`, commit the
+   code and `.beads/` changes together, and mention in the close reason that the
+   work used degraded coordination. There is no Mail reservation to release.
+
+### Stale Claims and Reclaiming Abandoned Work
+
+`br ready` excludes `in_progress` beads, so a crashed or abandoned session can
+hide work indefinitely. Do not treat every old claim as free work. Reclaim only
+after you have evidence from the bead metadata and coordination trail.
+
+Use this rule of thumb:
+
+- Agent swarm claim: stale candidate after two hours without an `updated_at`
+  change, unless the human operator explicitly says the pane/session is dead.
+- Human or unclear claim: stale candidate after one business day.
+- Any claim with live Agent Mail reservations, recent comments, or visible dirty
+  work in the same files is not abandoned.
+
+Before reclaiming, inspect:
+
+```bash
+br show <id> --json
+br comments list <id> --json
+br list --status in_progress --json
+git status --short
+```
+
+If Agent Mail is healthy, also inspect the issue thread and active file
+reservations. Use `updated_at`, `assignee`, any session/pane/agent identity in
+comments, and named file scopes as evidence. If the previous owner may still be
+working, choose another ready bead or ask the human operator.
+
+When reclaiming, leave an audit comment first, then claim:
+
+```bash
+br comments add <id> --author "$AGENT_NAME" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+If Agent Mail is unavailable, add or include the degraded-coordination intended
+file scope before editing. The newest assignee owns the claim, but if the old
+owner returns, coordinate in the bead thread instead of overwriting their work.
+
 ### Mapping Cheat Sheet
 
 | Concept | Value |
@@ -485,7 +614,7 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 bv is a graph-aware triage engine for Beads projects (`.beads/beads.jsonl`). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
 
-**Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail.
+**Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail. If Agent Mail is unavailable, use the degraded `br` comment protocol above until Mail is healthy again.
 
 **CRITICAL: Use ONLY `--robot-*` flags. Bare `bv` launches an interactive TUI that blocks your session.**
 

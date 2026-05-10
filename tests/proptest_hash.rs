@@ -8,6 +8,7 @@
 
 use chrono::Utc;
 use proptest::prelude::*;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tracing::info;
 
@@ -65,6 +66,73 @@ fn make_issue(title: &str, description: Option<&str>) -> Issue {
         dependencies: vec![],
         comments: vec![],
     }
+}
+
+fn status_strategy() -> impl Strategy<Value = Status> {
+    prop_oneof![
+        Just(Status::Open),
+        Just(Status::InProgress),
+        Just(Status::Blocked),
+        Just(Status::Deferred),
+        Just(Status::Draft),
+        Just(Status::Closed),
+        Just(Status::Tombstone),
+        Just(Status::Pinned),
+        "[a-z][a-z0-9_-]{0,16}".prop_map(Status::Custom),
+    ]
+}
+
+fn issue_type_strategy() -> impl Strategy<Value = IssueType> {
+    prop_oneof![
+        Just(IssueType::Task),
+        Just(IssueType::Bug),
+        Just(IssueType::Feature),
+        Just(IssueType::Epic),
+        Just(IssueType::Chore),
+        Just(IssueType::Docs),
+        Just(IssueType::Question),
+        "[a-z][a-z0-9_-]{0,16}".prop_map(IssueType::Custom),
+    ]
+}
+
+fn optional_text_strategy() -> impl Strategy<Value = Option<String>> {
+    proptest::option::of("\\PC{0,80}")
+}
+
+fn go_bd_reference_content_hash(issue: &Issue) -> String {
+    let mut hasher = Sha256::new();
+    push_go_field(&mut hasher, &issue.title);
+    push_go_field(&mut hasher, issue.description.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, issue.design.as_deref().unwrap_or(""));
+    push_go_field(
+        &mut hasher,
+        issue.acceptance_criteria.as_deref().unwrap_or(""),
+    );
+    push_go_field(&mut hasher, issue.notes.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, issue.status.as_str());
+    push_go_field(&mut hasher, &issue.priority.0.to_string());
+    push_go_field(&mut hasher, issue.issue_type.as_str());
+    push_go_field(&mut hasher, issue.assignee.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, issue.owner.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, issue.created_by.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, issue.external_ref.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, issue.source_system.as_deref().unwrap_or(""));
+    push_go_field(&mut hasher, if issue.pinned { "pinned" } else { "" });
+    push_go_field(&mut hasher, if issue.is_template { "template" } else { "" });
+    push_go_field(&mut hasher, ""); // quality_score nil
+    push_go_field(&mut hasher, ""); // crystallizes false
+    push_go_field(&mut hasher, ""); // await_type
+    push_go_field(&mut hasher, ""); // await_id
+    push_go_field(&mut hasher, "0"); // timeout duration
+    for _ in 0..12 {
+        push_go_field(&mut hasher, "");
+    }
+    beads_rust::util::hex_encode(&hasher.finalize())
+}
+
+fn push_go_field(hasher: &mut Sha256, value: &str) {
+    hasher.update(value.as_bytes());
+    hasher.update(b"\x00");
 }
 
 proptest! {
@@ -241,6 +309,49 @@ proptest! {
 
         prop_assert_eq!(hash1, hash2, "Timestamp changes should not affect hash");
     }
+
+    /// Property: Rust content_hash stays byte-compatible with Go bd for all shared fields.
+    #[test]
+    fn hash_matches_go_bd_reference_for_shared_fields(
+        title in "\\PC{1,80}",
+        description in optional_text_strategy(),
+        design in optional_text_strategy(),
+        acceptance_criteria in optional_text_strategy(),
+        notes in optional_text_strategy(),
+        status in status_strategy(),
+        priority in 0i32..=4,
+        issue_type in issue_type_strategy(),
+        assignee in optional_text_strategy(),
+        owner in optional_text_strategy(),
+        created_by in optional_text_strategy(),
+        external_ref in optional_text_strategy(),
+        source_system in optional_text_strategy(),
+        pinned in any::<bool>(),
+        is_template in any::<bool>(),
+    ) {
+        init_test_logging();
+
+        let mut issue = make_issue(&title, description.as_deref());
+        issue.design = design;
+        issue.acceptance_criteria = acceptance_criteria;
+        issue.notes = notes;
+        issue.status = status;
+        issue.priority = Priority(priority);
+        issue.issue_type = issue_type;
+        issue.assignee = assignee;
+        issue.owner = owner;
+        issue.created_by = created_by;
+        issue.external_ref = external_ref;
+        issue.source_system = source_system;
+        issue.pinned = pinned;
+        issue.is_template = is_template;
+
+        prop_assert_eq!(
+            content_hash(&issue),
+            go_bd_reference_content_hash(&issue),
+            "Rust hash must match Go bd canonical field writer"
+        );
+    }
 }
 
 /// Property: Low collision rate in batch hashing
@@ -291,4 +402,33 @@ fn hash_changes_with_issue_type() {
     assert_ne!(hash_bug, hash_feature, "Bug vs Feature should differ");
 
     info!("proptest_hash_type: PASS - different types produce different hashes");
+}
+
+mod hex_encode_fuzz {
+    use beads_rust::util::hex_encode;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn hex_encode_roundtrip(bytes in proptest::collection::vec(any::<u8>(), 0..=256)) {
+            let hex = hex_encode(&bytes);
+
+            prop_assert_eq!(
+                hex.len(), bytes.len() * 2,
+                "output length must be exactly 2 * input length for {} bytes",
+                bytes.len()
+            );
+            prop_assert!(
+                hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "output must be lowercase hex: {hex}"
+            );
+
+            let decoded: Vec<u8> = (0..bytes.len())
+                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+                .collect();
+            prop_assert_eq!(&decoded, &bytes, "roundtrip decode must match original bytes");
+        }
+    }
 }

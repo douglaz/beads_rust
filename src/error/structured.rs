@@ -19,10 +19,23 @@
 #![allow(clippy::option_if_let_else, clippy::manual_map, clippy::manual_find)]
 
 use crate::error::BeadsError;
+use crate::format::sanitize_terminal_text;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::LazyLock;
+
+const PRIORITY_DETAIL_HINT: &str =
+    "Priority must be 0-4 (or P0-P4): 0=critical, 1=high, 2=medium, 3=low, 4=backlog";
+const PRIORITY_SHORT_HINT: &str = "Priority must be 0-4 (0=critical, 4=backlog).";
+const VALID_STATUS_HINT: &str =
+    "Valid statuses: open, in_progress, blocked, deferred, draft, closed, tombstone, pinned";
+const VALID_TYPE_HINT: &str = "Valid types: task, bug, feature, epic, chore, docs, question";
+
+#[must_use]
+fn flag_value_hint(flag: &str, detected: &str) -> String {
+    format!("Did you mean --{flag} {detected}?")
+}
 
 /// Machine-readable error codes.
 ///
@@ -112,6 +125,10 @@ pub enum ErrorCode {
     /// All requested items were skipped; nothing to do
     NothingToDo,
 
+    // === Policy Errors (exit code 4) ===
+    /// Closure-time policy gate fired (issue #274)
+    PolicyViolation,
+
     // === Internal Errors (exit code 1) ===
     /// Unexpected internal error
     InternalError,
@@ -163,6 +180,8 @@ impl ErrorCode {
             Self::YamlError => "YAML_ERROR",
             // Operational
             Self::NothingToDo => "NOTHING_TO_DO",
+            // Policy
+            Self::PolicyViolation => "POLICY_VIOLATION",
             // Internal
             Self::InternalError => "INTERNAL_ERROR",
         }
@@ -219,7 +238,8 @@ impl ErrorCode {
             | Self::InvalidStatus
             | Self::InvalidType
             | Self::InvalidPriority
-            | Self::RequiredField => 4,
+            | Self::RequiredField
+            | Self::PolicyViolation => 4,
             // Dependency (5)
             Self::CycleDetected
             | Self::DependencyNotFound
@@ -399,16 +419,10 @@ impl StructuredError {
     /// Create a structured error for invalid priority.
     #[must_use]
     pub fn invalid_priority(provided: &str) -> Self {
-        let hint = if let Some(detected) = detect_priority_intent(provided) {
-            Some(format!(
-                "Did you mean --priority {detected}? Priority must be 0-4 (or P0-P4): 0=critical, 1=high, 2=medium, 3=low, 4=backlog"
-            ))
-        } else {
-            Some(
-                "Priority must be 0-4 (or P0-P4): 0=critical, 1=high, 2=medium, 3=low, 4=backlog"
-                    .to_string(),
-            )
-        };
+        let hint = Some(detect_priority_intent(provided).map_or_else(
+            || PRIORITY_DETAIL_HINT.to_string(),
+            |detected| format!("Did you mean --priority {detected}? {PRIORITY_DETAIL_HINT}"),
+        ));
 
         let context = json!({
             "provided": provided,
@@ -434,14 +448,10 @@ impl StructuredError {
     /// Create a structured error for invalid status.
     #[must_use]
     pub fn invalid_status(provided: &str) -> Self {
-        let hint = if let Some(detected) = detect_status_intent(provided) {
-            Some(format!("Did you mean --status {detected}?"))
-        } else {
-            Some(
-                "Valid statuses: open, in_progress, blocked, deferred, draft, closed, tombstone, pinned"
-                    .to_string(),
-            )
-        };
+        let hint = Some(detect_status_intent(provided).map_or_else(
+            || VALID_STATUS_HINT.to_string(),
+            |detected| flag_value_hint("status", detected),
+        ));
 
         let context = json!({
             "provided": provided,
@@ -460,11 +470,10 @@ impl StructuredError {
     /// Create a structured error for invalid issue type.
     #[must_use]
     pub fn invalid_type(provided: &str) -> Self {
-        let hint = if let Some(detected) = detect_type_intent(provided) {
-            Some(format!("Did you mean --type {detected}?"))
-        } else {
-            Some("Valid types: task, bug, feature, epic, chore, docs, question".to_string())
-        };
+        let hint = Some(detect_type_intent(provided).map_or_else(
+            || VALID_TYPE_HINT.to_string(),
+            |detected| flag_value_hint("type", detected),
+        ));
 
         let context = json!({
             "provided": provided,
@@ -506,7 +515,7 @@ impl StructuredError {
             output.push_str("Error: ");
         }
 
-        output.push_str(&self.message);
+        output.push_str(&sanitize_terminal_text(&self.message));
 
         if let Some(hint) = &self.hint {
             output.push('\n');
@@ -516,7 +525,7 @@ impl StructuredError {
             } else {
                 output.push_str("Hint: ");
             }
-            output.push_str(hint);
+            output.push_str(&sanitize_terminal_text(hint));
         }
 
         output
@@ -567,7 +576,7 @@ impl StructuredError {
             ),
             BeadsError::InvalidStatus { status } => {
                 let hint = detect_status_intent(status)
-                    .map(|detected| format!("Did you mean --status {detected}?"));
+                    .map(|detected| flag_value_hint("status", detected));
 
                 (
                     ErrorCode::InvalidStatus,
@@ -579,7 +588,7 @@ impl StructuredError {
             }
             BeadsError::InvalidType { issue_type } => {
                 let hint = detect_type_intent(issue_type)
-                    .map(|detected| format!("Did you mean --type {detected}?"));
+                    .map(|detected| flag_value_hint("type", detected));
 
                 (
                     ErrorCode::InvalidType,
@@ -590,10 +599,10 @@ impl StructuredError {
                 )
             }
             BeadsError::InvalidPriority { priority } => {
-                let hint = detect_priority_intent(priority).map_or_else(
-                    || Some("Priority must be 0-4 (0=critical, 4=backlog).".to_string()),
-                    |detected| Some(format!("Did you mean --priority {detected}?")),
-                );
+                let hint = Some(detect_priority_intent(priority).map_or_else(
+                    || PRIORITY_SHORT_HINT.to_string(),
+                    |detected| flag_value_hint("priority", detected),
+                ));
 
                 (
                     ErrorCode::InvalidPriority,
@@ -638,7 +647,30 @@ impl StructuredError {
             BeadsError::NothingToDo { reason } => {
                 (ErrorCode::NothingToDo, Some(json!({"reason": reason})))
             }
+            BeadsError::PolicyViolation {
+                issue_id,
+                summary,
+                violations,
+            } => (
+                ErrorCode::PolicyViolation,
+                Some(json!({
+                    "issue_id": issue_id,
+                    "summary": summary,
+                    "violations": violations,
+                })),
+            ),
             BeadsError::Config(_) => (ErrorCode::ConfigError, None),
+            BeadsError::ExternalCommand { command, reason } => (
+                ErrorCode::IoError,
+                Some(json!({"command": command, "reason": reason})),
+            ),
+            BeadsError::Upgrade { reason } => (
+                ErrorCode::IoError,
+                Some(json!({"operation": "upgrade", "reason": reason})),
+            ),
+            BeadsError::Internal { message } => {
+                (ErrorCode::InternalError, Some(json!({"message": message})))
+            }
             BeadsError::Io(_) => (ErrorCode::IoError, None),
             BeadsError::Json(_) => (ErrorCode::JsonError, None),
             BeadsError::Yaml(_) => (ErrorCode::YamlError, None),
@@ -671,7 +703,6 @@ impl StructuredError {
                     )
                 }
             }
-            BeadsError::Other(_) => (ErrorCode::InternalError, None),
         }
     }
 
@@ -688,25 +719,16 @@ impl StructuredError {
                 Some("Run 'br list' to see available issues.".to_string())
             }
             BeadsError::InvalidPriority { priority } => {
-                if let Some(detected) = detect_priority_intent(priority) {
-                    Some(format!("Did you mean --priority {detected}?"))
-                } else {
-                    Some("Priority must be 0-4 (0=critical, 4=backlog).".to_string())
-                }
+                Some(detect_priority_intent(priority).map_or_else(
+                    || PRIORITY_SHORT_HINT.to_string(),
+                    |detected| flag_value_hint("priority", detected),
+                ))
             }
             BeadsError::InvalidStatus { status } => {
-                if let Some(detected) = detect_status_intent(status) {
-                    Some(format!("Did you mean --status {detected}?"))
-                } else {
-                    None
-                }
+                detect_status_intent(status).map(|detected| flag_value_hint("status", detected))
             }
             BeadsError::InvalidType { issue_type } => {
-                if let Some(detected) = detect_type_intent(issue_type) {
-                    Some(format!("Did you mean --type {detected}?"))
-                } else {
-                    None
-                }
+                detect_type_intent(issue_type).map(|detected| flag_value_hint("type", detected))
             }
             BeadsError::HasDependents { id, .. } => {
                 if let Some(ctx) = context
@@ -889,28 +911,28 @@ fn detect_priority_intent(input: &str) -> Option<&'static str> {
 
     // Already valid
     if ["0", "1", "2", "3", "4"].contains(&lower.as_str()) {
-        return Some(match lower.as_str() {
-            "0" => "0",
-            "1" => "1",
-            "2" => "2",
-            "3" => "3",
-            "4" => "4",
-            _ => unreachable!(),
-        });
+        return match lower.as_str() {
+            "0" => Some("0"),
+            "1" => Some("1"),
+            "2" => Some("2"),
+            "3" => Some("3"),
+            "4" => Some("4"),
+            _ => None,
+        };
     }
 
     // P0-P4 format
     if lower.starts_with('p') && lower.len() == 2 {
         let digit = lower.chars().nth(1)?;
         if digit.is_ascii_digit() && digit <= '4' {
-            return Some(match digit {
-                '0' => "0",
-                '1' => "1",
-                '2' => "2",
-                '3' => "3",
-                '4' => "4",
-                _ => unreachable!(),
-            });
+            return match digit {
+                '0' => Some("0"),
+                '1' => Some("1"),
+                '2' => Some("2"),
+                '3' => Some("3"),
+                '4' => Some("4"),
+                _ => None,
+            };
         }
     }
 
@@ -1083,6 +1105,48 @@ mod tests {
         assert_eq!(detect_priority_intent("p3"), Some("3"));
         assert_eq!(detect_priority_intent("2"), Some("2"));
         assert_eq!(detect_priority_intent("xyz"), None);
+    }
+
+    #[test]
+    fn test_detect_priority_intent_all_digits() {
+        for (digit, expected) in [("0", "0"), ("1", "1"), ("2", "2"), ("3", "3"), ("4", "4")] {
+            assert_eq!(detect_priority_intent(digit), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_detect_priority_intent_all_p_prefixed() {
+        for (input, expected) in [
+            ("p0", "0"),
+            ("P0", "0"),
+            ("p1", "1"),
+            ("P1", "1"),
+            ("p2", "2"),
+            ("P2", "2"),
+            ("p3", "3"),
+            ("P3", "3"),
+            ("p4", "4"),
+            ("P4", "4"),
+        ] {
+            assert_eq!(
+                detect_priority_intent(input),
+                Some(expected),
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_priority_intent_rejects_malformed() {
+        assert_eq!(detect_priority_intent("p5"), None);
+        assert_eq!(detect_priority_intent("P5"), None);
+        assert_eq!(detect_priority_intent("px"), None);
+        assert_eq!(detect_priority_intent("p10"), None);
+        assert_eq!(detect_priority_intent("5"), None);
+        assert_eq!(detect_priority_intent("9"), None);
+        assert_eq!(detect_priority_intent(""), None);
+        assert_eq!(detect_priority_intent("p"), None);
+        assert_eq!(detect_priority_intent("P"), None);
     }
 
     #[test]

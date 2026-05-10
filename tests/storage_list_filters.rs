@@ -233,7 +233,6 @@ fn filter_by_all_priority_levels() {
     storage.create_issue(&p0, "tester").unwrap();
     storage.create_issue(&p4, "tester").unwrap();
 
-    // All priority levels should work
     for prio in [
         Priority::CRITICAL,
         Priority::HIGH,
@@ -245,8 +244,20 @@ fn filter_by_all_priority_levels() {
             priorities: Some(vec![prio]),
             ..Default::default()
         };
-        // Just verify no error - not all priorities have issues
-        let _ = storage.list_issues(&filters).unwrap();
+        let results = storage.list_issues(&filters).unwrap();
+        assert!(
+            results.iter().all(|issue| issue.priority == prio),
+            "priority filter {prio:?} returned non-matching issues: {results:?}"
+        );
+
+        let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
+        if prio == Priority::CRITICAL {
+            assert_eq!(ids, vec![p0.id.as_str()]);
+        } else if prio == Priority::BACKLOG {
+            assert_eq!(ids, vec![p4.id.as_str()]);
+        } else {
+            assert!(ids.is_empty(), "unexpected issues for {prio:?}: {ids:?}");
+        }
     }
 }
 
@@ -327,7 +338,6 @@ fn filter_by_all_issue_types() {
         .build();
     storage.create_issue(&task, "tester").unwrap();
 
-    // All issue types should work without error
     for issue_type in [
         IssueType::Task,
         IssueType::Bug,
@@ -338,10 +348,24 @@ fn filter_by_all_issue_types() {
         IssueType::Docs,
     ] {
         let filters = ListFilters {
-            types: Some(vec![issue_type]),
+            types: Some(vec![issue_type.clone()]),
             ..Default::default()
         };
-        let _ = storage.list_issues(&filters).unwrap();
+        let results = storage.list_issues(&filters).unwrap();
+        assert!(
+            results.iter().all(|issue| issue.issue_type == issue_type),
+            "type filter {issue_type:?} returned non-matching issues: {results:?}"
+        );
+
+        let ids: Vec<_> = results.iter().map(|issue| issue.id.as_str()).collect();
+        if issue_type == IssueType::Task {
+            assert_eq!(ids, vec![task.id.as_str()]);
+        } else {
+            assert!(
+                ids.is_empty(),
+                "unexpected issues for {issue_type:?}: {ids:?}"
+            );
+        }
     }
 }
 
@@ -538,6 +562,41 @@ fn filter_with_limit_zero_returns_all() {
 
     let results = storage.list_issues(&filters).unwrap();
     assert_eq!(results.len(), 3);
+}
+
+#[test]
+fn filter_with_limit_zero_still_applies_offset() {
+    let mut storage = test_db();
+
+    for i in 0..5 {
+        let issue = IssueBuilder::new(&format!("limit-zero-offset-{i}")).build();
+        storage.create_issue(&issue, "tester").unwrap();
+    }
+
+    let all_results = storage
+        .list_issues(&ListFilters {
+            limit: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+    let offset_results = storage
+        .list_issues(&ListFilters {
+            limit: Some(0),
+            offset: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let all_ids = all_results
+        .iter()
+        .map(|issue| &issue.id)
+        .collect::<Vec<_>>();
+    let offset_ids = offset_results
+        .iter()
+        .map(|issue| &issue.id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(offset_ids, all_ids[2..]);
 }
 
 #[test]

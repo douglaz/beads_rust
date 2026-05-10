@@ -1,7 +1,7 @@
 # br - Beads Rust
 
 <div align="center">
-  <img src="br_illustration.webp" alt="br - Fast, non-invasive issue tracker for git repositories" width="600">
+  <img src="docs/assets/br_illustration.webp" alt="br - Fast, non-invasive issue tracker for git repositories" width="600">
 </div>
 
 <div align="center">
@@ -24,6 +24,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/
 ```
 
 <p><em>Works on Linux, macOS, and Windows (WSL). Auto-detects your platform and downloads the right binary.</em></p>
+
+<p><em>Useful install flags: <code>--skip-skills</code> to skip all Claude Code / Codex skills, or <code>--no-migration-skill</code> to skip just the bd-to-br-migration skill (handy for clean agent sandboxes where you're only using <code>br</code>).</em></p>
 </div>
 
 ---
@@ -51,14 +53,15 @@ You need to track issues for your project, but:
 
 ### The Solution
 
-**br** is a local-first issue tracker that stores issues in SQLite with JSONL export for git-friendly collaboration. It's **20K lines of Rust** focused on one thing: tracking issues without getting in your way.
+**br** is a local-first issue tracker that stores issues in SQLite with JSONL export for git-friendly collaboration. It provides dependency-aware issue tracking, machine-readable output, sync/recovery tooling, and agent-friendly workflows without leaving your repository.
 
 ```bash
 br init                              # Initialize in your repo
 br create "Fix login timeout" -p 1   # Create high-priority issue
 br ready                             # See what's actionable
-br close bd-abc123                   # Close when done
-br sync --flush-only                 # Export for git commit
+br coordination status --json        # Inspect hidden in-progress claims
+br close br-abc123                   # Close when done; JSONL auto-flushes by default
+br sync --flush-only                 # Optional final export check before git commit
 ```
 
 ### Why br?
@@ -89,27 +92,27 @@ br agents --add --force
 
 # Create issues with priority (0=critical, 4=backlog)
 br create "Implement user auth" --type feature --priority 1
-# Created: bd-7f3a2c
+# Created: br-7f3a2c
 
 br create "Set up database schema" --type task --priority 1
-# Created: bd-e9b1d4
+# Created: br-e9b1d4
 
 # Auth depends on database schema
-br dep add bd-7f3a2c bd-e9b1d4
+br dep add br-7f3a2c br-e9b1d4
 
 # See what's ready to work on (not blocked)
 br ready
-# bd-e9b1d4  P1  task     Set up database schema
+# br-e9b1d4  P1  task     Set up database schema
 
 # Claim and complete work
-br update bd-e9b1d4 --status in_progress
-br close bd-e9b1d4 --reason "Schema implemented"
+br update br-e9b1d4 --status in_progress
+br close br-e9b1d4 --reason "Schema implemented"
 
 # Now auth is unblocked
 br ready
-# bd-7f3a2c  P1  feature  Implement user auth
+# br-7f3a2c  P1  feature  Implement user auth
 
-# Export to JSONL for git commit
+# Mutations auto-flushed JSONL by default; run an idempotent final export check
 br sync --flush-only
 git add .beads/ && git commit -m "Update issues"
 ```
@@ -120,10 +123,19 @@ git add .beads/ && git commit -m "Update issues"
 
 ### 1. Non-Invasive by Default
 
-br **never** touches your source code or runs git commands automatically. Other tools might auto-commit or install hooks without asking. br doesn't.
+For normal issue tracking and sync, br keeps its state in `.beads/` and leaves
+git handoff to you. It never commits, pushes, pulls, installs hooks, or runs as a
+background service.
+
+Some explicit commands intentionally step outside that default storage boundary:
+`br agents` edits requested agent-instruction files, `br doctor --repair` can fix
+the project `.gitignore`, `br config edit/set` updates config files,
+`br completions -o` writes shell completion files, `br upgrade` updates the
+installed binary, and git-reporting commands such as `br changelog`, `br
+orphans`, and commit-activity `br stats` inspect git history.
 
 ```bash
-# br only touches .beads/ directory
+# Normal issue state lives under .beads/
 ls -la .beads/
 # beads.db       # SQLite database
 # issues.jsonl   # Git-friendly export
@@ -140,19 +152,31 @@ br list --priority 0-1 --status open --assignee alice
 
 # Collaboration: JSONL merges cleanly in git
 git diff .beads/issues.jsonl
-# +{"id":"bd-abc123","title":"New feature",...}
+# +{"id":"br-abc123","title":"New feature",...}
 ```
 
 ### 3. Explicit Over Implicit
 
-Every operation is explicit. No magic, no surprises.
+State changes are explicit. Successful mutating commands update SQLite and
+auto-flush JSONL by default, but `br` still never commits, pushes, pulls, or
+imports remote changes without a command. Git-inspection behavior is limited to
+explicit reporting commands and reads history only.
 
 ```bash
-# Export is explicit (not automatic)
+# Mutations auto-flush .beads/issues.jsonl by default
+br close br-abc123 --reason "Done"
+
+# Re-run export after --no-auto-flush/config changes, recovery, or as a final check
 br sync --flush-only
 
 # Import is explicit (not automatic)
 br sync --import-only
+
+# Merge divergent DB and JSONL edits using the saved base snapshot
+br sync --merge
+
+# Rebuild SQLite from authoritative JSONL after recovery/corruption
+br sync --import-only --rebuild
 
 # Git operations are YOUR responsibility
 git add .beads/ && git commit -m "..."
@@ -165,7 +189,10 @@ Every command supports `--json` for AI coding agents:
 ```bash
 br list --json | jq '.issues[] | select(.priority <= 1)'
 br ready --json  # Structured output for agents
-br show bd-abc123 --json
+br show br-abc123 --json
+br capabilities --format json
+br capabilities --format json --command "create"
+br robot-docs guide
 ```
 
 For routine operator or agent use, prefer `RUST_LOG=error br ...` to suppress internal Rust dependency logs while preserving normal stdout/JSON output:
@@ -182,7 +209,7 @@ Interactive terminals get enhanced visual output:
 ```bash
 # Rich mode (default in TTY)
 br list           # Formatted tables with colors
-br show bd-abc    # Styled panels with metadata
+br show br-abc    # Styled panels with metadata
 
 # Plain mode (piped or --no-color)
 br list | cat     # Clean text, no ANSI codes
@@ -197,9 +224,12 @@ Output mode is auto-detected:
 - **JSON**: Machine-readable (`--json` flag)
 - **Quiet**: Minimal output (`--quiet` flag)
 
-### 6. Minimal Footprint
+### 6. Focused Local Scope
 
-~20K lines of Rust vs ~276K lines in the original Go beads. Faster compilation, smaller binary, fewer moving parts.
+br has grown into a full CLI surface for local issue tracking: routing, recovery,
+TOON/JSON schemas, MCP support, conformance checks, and sync safety tools are
+all part of the current scope. The focus is still local-first operation, explicit
+git/VCS handoff, and no background services installed behind your back.
 
 ---
 
@@ -209,15 +239,14 @@ Output mode is auto-detected:
 
 | Aspect | br (Rust) | beads (Go) |
 |--------|-----------|------------|
-| Lines of code | ~20,000 | ~276,000 |
-| Git operations | **Never** (explicit) | Auto-commit, hooks |
+| Git operations | **No automatic commits/pushes/pulls**; reporting commands can inspect git history | Auto-commit, hooks |
 | Storage | SQLite + JSONL | Dolt/SQLite |
 | Background daemon | **No** | Yes |
 | Hook installation | **Manual** | Automatic |
 | Binary size | ~5-8 MB | ~30+ MB |
-| Complexity | Focused | Feature-rich |
+| Scope | Local CLI, sync, recovery, and agent workflows | Feature-rich ecosystem |
 
-**When to use br:** You want a stable, minimal issue tracker that stays out of your way.
+**When to use br:** You want a stable, local-first issue tracker with explicit sync, dependency-aware planning, and machine-readable output.
 
 **When to use beads:** You want advanced features like Linear/Jira sync, RPC daemon, automatic hooks.
 
@@ -283,11 +312,40 @@ cargo build --release --no-default-features
 cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --no-default-features
 ```
 
+### Enable MCP Server Support
+
+`br serve` is optional and is not built by the default feature set. Build with
+the `mcp` feature when you want an AI agent to talk to `br` over the Model
+Context Protocol instead of shelling out to CLI commands.
+
+```bash
+cargo build --release --features mcp
+
+# Or install globally with MCP support
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+```
+
+Run it from an initialized beads workspace:
+
+```bash
+RUST_LOG=error br serve --actor codex
+```
+
+The server uses MCP over stdio. It is launched by an MCP client, does not listen
+on a network port, and uses the same SQLite database, JSONL export path, write
+locks, audit events, and sync safety model as the normal CLI. It does not run
+git. Use shell/JSON
+commands for simple scripts; use MCP when an agent benefits from discoverable
+tools, resources, prompts, and structured recovery hints. MCP clients can read
+`beads://coordination/status` for the same `br.coordination.v1` stale-claim
+evidence shape as `br coordination status --json`; use the CLI snapshot flags
+when Agent Mail reservation or liveness evidence is required.
+
 ### Verify Installation
 
 ```bash
 br --version
-# br 0.1.0 (rustc 1.85.0-nightly)
+# br 0.1.45
 ```
 
 ---
@@ -309,13 +367,13 @@ br create "Fix login timeout bug" \
   --type bug \
   --priority 1 \
   --description "Users report login times out after 30 seconds"
-# Created: bd-a1b2c3
+# Created: br-a1b2c3
 ```
 
 ### 3. Add Labels
 
 ```bash
-br label add bd-a1b2c3 backend auth
+br label add br-a1b2c3 backend auth
 ```
 
 ### 4. Check Ready Work
@@ -328,21 +386,21 @@ br ready
 ### 5. Claim and Work
 
 ```bash
-br update bd-a1b2c3 --status in_progress --assignee "$(git config user.email)"
+br update br-a1b2c3 --status in_progress --assignee "$(git config user.email)"
 ```
 
 ### 6. Close When Done
 
 ```bash
-br close bd-a1b2c3 --reason "Increased timeout to 60s, added retry logic"
+br close br-a1b2c3 --reason "Increased timeout to 60s, added retry logic"
 ```
 
 ### 7. Sync to Git
 
 ```bash
-br sync --flush-only        # Export DB to JSONL
+br sync --flush-only        # Idempotent final JSONL export check
 git add .beads/             # Stage changes
-git commit -m "Fix: login timeout (bd-a1b2c3)"
+git commit -m "Fix: login timeout (br-a1b2c3)"
 ```
 
 ---
@@ -356,11 +414,13 @@ git commit -m "Fix: login timeout (bd-a1b2c3)"
 | `init` | Initialize workspace | `br init` |
 | `create` | Create issue | `br create "Title" -p 1 --type bug` |
 | `q` | Quick capture (ID only) | `br q "Fix typo"` |
-| `show` | Show issue details | `br show bd-abc123` |
-| `update` | Update issue | `br update bd-abc123 --priority 0` |
-| `close` | Close issue | `br close bd-abc123 --reason "Done"` |
-| `reopen` | Reopen closed issue | `br reopen bd-abc123` |
-| `delete` | Delete issue (tombstone) | `br delete bd-abc123` |
+| `show` | Show issue details | `br show br-abc123` |
+| `update` | Update issue | `br update br-abc123 --priority 0` |
+| `close` | Close issue | `br close br-abc123 --reason "Done"` |
+| `reopen` | Reopen closed issue | `br reopen br-abc123` |
+| `delete` | Delete issue (tombstone) | `br delete br-abc123` |
+| `defer` | Schedule issue for later | `br defer br-abc123 --until tomorrow` |
+| `undefer` | Make deferred issue ready again | `br undefer br-abc123` |
 
 ### Querying
 
@@ -371,33 +431,60 @@ git commit -m "Fix: login timeout (bd-a1b2c3)"
 | `blocked` | Blocked issues | `br blocked` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
+| `coordination status` | Hidden in-progress claim diagnosis | `br coordination status --json` |
 | `count` | Count with grouping | `br count --by status` |
+| `query` | Manage saved queries | `br query save mine --status open --assignee alice` |
 
 ### Dependencies
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `dep add` | Add dependency | `br dep add bd-child bd-parent` |
-| `dep remove` | Remove dependency | `br dep remove bd-child bd-parent` |
-| `dep list` | List dependencies | `br dep list bd-abc123` |
-| `dep tree` | Dependency tree | `br dep tree bd-abc123` |
+| `dep add` | Add dependency | `br dep add br-child br-parent` |
+| `dep remove` | Remove dependency | `br dep remove br-child br-parent` |
+| `dep list` | List dependencies | `br dep list br-abc123` |
+| `dep tree` | Dependency tree | `br dep tree br-abc123` |
 | `dep cycles` | Find cycles | `br dep cycles` |
 
 ### Labels
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `label add` | Add labels | `br label add bd-abc123 backend urgent` |
-| `label remove` | Remove label | `br label remove bd-abc123 urgent` |
-| `label list` | List issue labels | `br label list bd-abc123` |
+| `label add` | Add labels | `br label add br-abc123 backend urgent` |
+| `label remove` | Remove label | `br label remove br-abc123 urgent` |
+| `label list` | List issue labels | `br label list br-abc123` |
 | `label list-all` | All labels in project | `br label list-all` |
 
 ### Comments
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `comments add` | Add comment | `br comments add bd-abc123 "Found root cause"` |
-| `comments list` | List comments | `br comments list bd-abc123` |
+| `comments add` | Add comment | `br comments add br-abc123 "Found root cause"` |
+| `comments list` | List comments | `br comments list br-abc123` |
+
+### Planning & Reporting
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `epic` | Manage epic rollups | `br epic status --eligible-only` |
+| `graph` | Visualize dependency graph | `br graph br-abc123` |
+| `lint` | Check issues for missing template sections | `br lint --status all` |
+| `orphans` | List open issues referenced in commits | `br orphans` |
+| `changelog` | Generate changelog from closed issues | `br changelog --since-tag v0.1.44` |
+| `history` | Manage local history backups | `br history list` |
+| `status` | Alias for project statistics | `br status` |
+
+### Agents & Tooling
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `agents` | Manage AGENTS.md workflow instructions | `br agents --add --force` |
+| `audit` | Record and label agent interactions | `br audit record --kind note` |
+| `capabilities` | Describe machine-readable contracts and safety guarantees | `br capabilities --format json` |
+| `completions` | Generate shell completions | `br completions zsh` |
+| `info` | Show workspace diagnostics | `br info` |
+| `robot-docs` | Print concise docs for automation agents | `br robot-docs guide` |
+| `schema` | Emit JSON Schemas for outputs | `br schema all --format json` |
+| `where` | Show active `.beads` directory | `br where` |
 
 ### Sync & System
 
@@ -540,12 +627,12 @@ Pull from git       ──►      git pull         ──►    JSONL updated
 
 ### Safety Model
 
-br is designed to be **provably safe**:
+`br sync` is designed to be **provably safe**:
 
 | Guarantee | Implementation |
 |-----------|----------------|
-| Never executes git | No `Command::new("git")` calls in sync code |
-| Only touches `.beads/` | Path validation before all writes |
+| Sync never executes git | No runtime `Command::new("git")` calls in `src/sync/` or `src/cli/commands/sync.rs` |
+| Sync uses an allowlist for writes | Default writes stay in `.beads/`; external JSONL paths require `--allow-external-jsonl` or an explicit external DB/JSONL family and `.git/` paths are still rejected |
 | Atomic writes | Write to temp file, then rename |
 | No data loss | Guards prevent overwriting non-empty JSONL with empty DB |
 
@@ -571,7 +658,7 @@ br sync --status  # Safe read-only check
 
 ```bash
 # Check if issue exists
-br list --json | jq '.issues[] | select(.id == "bd-abc123")'
+br list --json | jq '.issues[] | select(.id == "br-abc123")'
 
 # Check for similar IDs
 br list | grep -i "abc"
@@ -602,7 +689,14 @@ br sync --status
 
 # Force import (may lose local changes)
 br sync --import-only --force
+
+# If JSONL is authoritative, rebuild SQLite to match it exactly
+br sync --import-only --rebuild
 ```
+
+`--rebuild` is an import-mode operation. It is not valid with `--flush-only` or
+`--merge`; after import it removes database entries that are absent from JSONL,
+while preserving deletion tombstones used by sync.
 
 ### Sync Issues After Git Merge
 
@@ -613,9 +707,17 @@ git status .beads/
 # 2. If conflicts, resolve manually then:
 br sync --import-only
 
-# 3. If database seems stale:
+# 3. If both SQLite and JSONL changed cleanly, run a three-way merge:
+br sync --merge
+
+# 4. If database seems stale:
 br doctor
 ```
+
+`br sync --merge` uses `.beads/beads.base.jsonl` as the common ancestor. If the
+same issue changed on both sides, br stops and asks for an explicit policy:
+`--force-db` keeps the local SQLite version, `--force-jsonl` keeps the JSONL
+version, and `--force` keeps the newer timestamp.
 
 ### Command Output is Garbled
 
@@ -641,7 +743,7 @@ br intentionally does **not** support:
 | **Dolt backend** | SQLite + JSONL only |
 | **Linear/Jira sync** | Focused scope |
 | **Web UI** | CLI-first (see beads_viewer for TUI) |
-| **Multi-repo sync** | Single repo per workspace |
+| **Automatic multi-repo sync** | Route-aware commands can target configured workspaces, but git/VCS sync remains explicit per repo |
 | **Real-time collaboration** | Git-based async collaboration |
 
 ---
@@ -668,11 +770,20 @@ Yes! br is designed for AI agent integration:
 # Agents can use --json for structured output
 br list --json
 br ready --json
-br show bd-abc123 --json
+br show br-abc123 --json
+br coordination status --json
+br capabilities --format json
+br capabilities --format json --command "comments add"
+br robot-docs guide
 
 # Create issues programmatically
 br create "Title" --json  # Returns created issue as JSON
 ```
+
+When `br ready --json` is empty but `bv --robot-next` or a human operator
+suspects work is hidden behind old claims, use `br coordination status --json`
+alongside Agent Mail reservations. The command is read-only: it does not call
+Agent Mail, does not run git, and never auto-reclaims a bead.
 
 See [AGENTS.md](AGENTS.md) for the complete agent integration guide.
 
@@ -692,23 +803,23 @@ br sync --import-only
 
 - **Smaller binary:** ~5-8 MB vs ~30+ MB
 - **Memory safety:** No runtime garbage collection
-- **Stability:** Fewer moving parts = fewer things to break
+- **Operational fit:** The CLI, release pipeline, and agent tooling are already Rust-based
 - **Personal preference:** The author's flywheel tooling is Rust-based
 
 ### Q: How do dependencies work?
 
 ```bash
 # Issue A depends on Issue B (A is blocked until B is closed)
-br dep add bd-A bd-B
+br dep add br-A br-B
 
-# Now bd-A won't appear in `br ready` until bd-B is closed
-br ready  # Only shows bd-B
+# Now br-A won't appear in `br ready` until br-B is closed
+br ready  # Only shows br-B
 
 # Close the blocker
-br close bd-B
+br close br-B
 
-# Now bd-A is ready
-br ready  # Shows bd-A
+# Now br-A is ready
+br ready  # Shows br-A
 ```
 
 ### Q: How do I handle merge conflicts in JSONL?
@@ -725,6 +836,18 @@ vim .beads/issues.jsonl
 # Mark resolved and import
 git add .beads/issues.jsonl
 br sync --import-only
+```
+
+If git merged `.beads/issues.jsonl` without textual conflict markers but both
+SQLite and JSONL have independent br changes, use the sync merge path instead:
+
+```bash
+br sync --merge
+
+# If br reports semantic conflicts, choose one resolution policy:
+br sync --merge --force-db     # keep local SQLite changes
+br sync --merge --force-jsonl  # keep JSONL changes
+br sync --merge --force        # keep the newer timestamp
 ```
 
 ### Q: Can I customize the issue ID prefix?
@@ -746,8 +869,41 @@ the default for newly created issues, not a restriction on existing IDs.
 ├── beads.db        # SQLite database (primary storage)
 ├── issues.jsonl    # JSONL export (for git)
 ├── config.yaml     # Project configuration
+├── routes.jsonl    # Optional cross-project prefix routes
 └── metadata.json   # Workspace metadata
 ```
+
+### Q: Can one workspace refer to issues in another workspace?
+
+Yes, with explicit cross-project routing. Add one JSON object per line to
+`.beads/routes.jsonl`:
+
+```jsonl
+{"prefix":"api-","path":"../api"}
+{"prefix":"ops-","path":"/srv/projects/ops/.beads"}
+```
+
+When an issue ID starts with a routed prefix, route-aware commands resolve that
+ID against the target workspace's `.beads` directory. The path can point at a
+project root or directly at a `.beads`/`_beads` directory; relative paths are
+resolved from the workspace root, and town-level routing can also be discovered
+from a parent with `mayor/town.json`.
+
+Common route-aware operations include `show`, `update`, `close`, `reopen`,
+`delete`, `defer`, `comments`, `label`, `dep`, `graph`, `audit`, and `lint`.
+Routed mutations acquire the target workspace write lock and update the target
+workspace's storage, not the caller's local database.
+
+This is not automatic multi-repo synchronization. Routed issue operations still
+do not push or pull remote repositories, copy issues between repositories, or
+provide real-time collaboration. Routes are a local dispatch table for explicit
+cross-workspace operations. Commit and synchronize each affected repository's
+`.beads/` files through your normal VCS workflow.
+
+External dependency status checks use explicit dependency IDs such as
+`external:api:api-123` together with configured `external_projects.<name>` paths.
+They let `ready`, `blocked`, `show`, `dep`, and `stats` account for blockers in
+other workspaces without importing those issues into the local database.
 
 ---
 
@@ -758,8 +914,14 @@ br is designed for AI coding agents. See [AGENTS.md](AGENTS.md) for:
 - JSON output schemas
 - Workflow patterns
 - Integration with MCP Agent Mail
+- Degraded coordination when Agent Mail is unavailable
 - Robot mode flags
 - Best practices
+
+For CI and release workflow edits, use
+[CI_SUPPLY_CHAIN.md](docs/CI_SUPPLY_CHAIN.md) as the canonical maintenance
+policy for immutable GitHub Action pins, workflow fragment harnesses, update
+audits, and required proof commands.
 
 You can also emit machine-readable JSON Schema documents directly:
 
@@ -772,7 +934,7 @@ br schema issue-details --format toon
 
 ## VCS Integration
 
-Using non-git version control? See [VCS_INTEGRATION.md](VCS_INTEGRATION.md) for
+Using non-git version control? See [VCS_INTEGRATION.md](docs/VCS_INTEGRATION.md) for
 equivalent commands and workflows.
 
 Quick example:
@@ -780,10 +942,10 @@ Quick example:
 ```bash
 # Agent workflow
 br ready --json | jq '.[0]'           # Get top priority
-br update bd-abc --status in_progress # Claim work
+br update br-abc --status in_progress # Claim work
 # ... do work ...
-br close bd-abc --reason "Completed"  # Done
-br sync --flush-only                  # Export for git
+br close br-abc --reason "Completed"  # Done; JSONL auto-flushes by default
+br sync --flush-only                  # Final export check before staging .beads/
 ```
 
 ---

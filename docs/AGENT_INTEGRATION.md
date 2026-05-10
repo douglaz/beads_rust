@@ -12,7 +12,10 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 - [Workflow Patterns](#workflow-patterns)
 - [Parsing JSON Output](#parsing-json-output)
 - [Error Handling](#error-handling)
+- [MCP Server](#mcp-server)
 - [Robot Mode Flags](#robot-mode-flags)
+- [Degraded Coordination Without Agent Mail](#degraded-coordination-without-agent-mail)
+- [Swarm-Scale Tuning](#swarm-scale-tuning)
 - [Agent-Specific Configuration](#agent-specific-configuration)
 - [Best Practices](#best-practices)
 
@@ -34,7 +37,7 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 2. **Check exit codes** for success/failure
 3. **Parse structured errors** for recovery hints
 4. **Use `br ready`** to find actionable work
-5. **Sync at session end** with `br sync --flush-only`
+5. **Run a final export check** with `br sync --flush-only` before committing `.beads/`
 
 ---
 
@@ -42,20 +45,20 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 
 ```bash
 # Initialize (if needed)
-br init --prefix myproj
+br init
 
 # Find work
 br ready --json --limit 5
 
 # Claim and work
-br update bd-123 --claim --json
+br update br-123 --claim --json
 # ... do the work ...
-br close bd-123 --reason "Implemented feature X" --json
+br close br-123 --reason "Implemented feature X" --json
 
 # Create discovered work
-br create "Found bug during implementation" -t bug -p 1 --deps discovered-from:bd-123 --json
+br create "Found bug during implementation" -t bug -p 1 --deps discovered-from:br-123 --json
 
-# Session end
+# Session end: mutations auto-flush by default, but this is an idempotent final check
 br sync --flush-only
 ```
 
@@ -68,7 +71,7 @@ br sync --flush-only
 ```bash
 # Flag on any command
 br list --json
-br show bd-123 --json
+br show br-123 --json
 br create "Title" --json
 
 # Equivalent (when the command supports --format)
@@ -77,7 +80,7 @@ br ready --format json
 
 # Robot mode alias (same as --json)
 br ready --robot
-br close bd-123 --robot
+br close br-123 --robot
 ```
 
 ### TOON Output (Token-Efficient)
@@ -86,13 +89,13 @@ Many read-style commands support TOON output via `--format toon`:
 
 ```bash
 br ready --format toon --limit 10
-br show bd-123 --format toon
+br show br-123 --format toon
 ```
 
 Decode TOON to JSON when you need to pipe into JSON tools:
 
 ```bash
-br ready --format toon --limit 10 | tru --decode | jq '.[0]'
+br ready --format toon --limit 10 | tru --decode --expand-paths safe | jq '.[0]'
 ```
 
 ### Environment Defaults
@@ -127,7 +130,7 @@ $ br ready --json --limit 2
 ```json
 [
   {
-    "id": "bd-abc123",
+    "id": "br-abc123",
     "title": "Implement user auth",
     "status": "open",
     "priority": 1,
@@ -137,7 +140,7 @@ $ br ready --json --limit 2
     "dependent_count": 2
   },
   {
-    "id": "bd-def456",
+    "id": "br-def456",
     "title": "Fix login bug",
     "status": "open",
     "priority": 0,
@@ -182,9 +185,9 @@ $ br ready --json --limit 2
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
-│  5. SYNC (at session end)                                   │
+│  5. FINAL EXPORT CHECK (at session end)                     │
 │     br sync --flush-only                                    │
-│     → Export to JSONL for git collaboration                 │
+│     → Confirm JSONL is current before committing .beads/    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -192,11 +195,138 @@ $ br ready --json --limit 2
 
 ```bash
 # Atomic claim (recommended)
-br update bd-123 --claim --json
+br update br-123 --claim --json
 
 # Manual claim (equivalent)
-br update bd-123 --status in_progress --assignee "$BD_ACTOR" --json
+br update br-123 --status in_progress --assignee "$BD_ACTOR" --json
 ```
+
+### Stale Claims and Abandoned Work
+
+`br ready` intentionally hides `in_progress` issues. That keeps agents from
+stealing active work, but it also means a crashed session can hide an otherwise
+ready issue. Treat an `in_progress` issue as an abandoned-claim candidate only
+after checking `updated_at`, the assignee, and the coordination trail.
+
+A claim is normally fresh if it was updated recently or the assignee is still
+reachable. In swarm sessions, wait at least two hours since `updated_at` unless
+the human operator explicitly says the pane is dead. For human-owned or unclear
+claims, use one business day as the default threshold.
+
+Before reclaiming:
+
+```bash
+br show <id> --json
+br comments list <id> --json
+git status --short
+```
+
+If Agent Mail is healthy, also check the thread and file reservations for the
+issue ID. If the stale owner left session metadata, pane IDs, intended files, or
+an Agent Mail name in comments, use that evidence when deciding whether the work
+is abandoned. Do not reclaim when the old claim is fresh, the owner is actively
+editing the same files, or the dirty tree contains unclear overlapping changes.
+
+When reclaiming abandoned work, leave an audit comment before touching files:
+
+```bash
+br comments add <id> --author "$BD_ACTOR" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+If Agent Mail is down, include the intended file scope in the same comment or a
+follow-up degraded-coordination comment. The newest assignee owns the claim, but
+the old owner can still return; in that case, coordinate in the bead thread and
+split or hand off the work instead of silently overwriting each other.
+
+`br scheduler --json` uses the same coordination age policy for its
+`evidence.stale_claim` object, but it deliberately assumes
+`reservation_status: "no_snapshot"`. Treat `classification: "no_mail_snapshot"`
+and `recommended_action: "inspect_mail"` as a prompt to gather Agent Mail
+evidence, not as permission to reclaim the bead.
+
+For a read-only preflight, use coordination status with an explicit reservation
+snapshot when available:
+
+```bash
+br coordination status --reservations reservations.json --agents agents.jsonl --json
+```
+
+MCP-capable agents can read `beads://coordination/status` for the same
+`br.coordination.v1` evidence envelope without shelling out. The MCP resource is
+read-only and does not call Agent Mail, so it reports
+`reservation.state == "no_snapshot"` unless you use the CLI command above with
+offline reservation and agent snapshots.
+
+Operator runbook for a queue that appears dry:
+
+```bash
+# 1. Confirm actionable work and graph-priority output agree
+br ready --json
+bv --robot-next
+
+# 2. Inspect hidden in-progress claims without mutating them
+br list --status in_progress --json
+br coordination status --json
+
+# 3. If a claim looks stale, inspect the local issue trail
+br show <id> --json
+br comments list <id> --json
+git status --short
+```
+
+If Agent Mail is healthy, add reservation and liveness snapshots before making
+any ownership decision. `br` consumes those snapshots offline; it does not call
+Agent Mail itself:
+
+```bash
+br coordination status \
+  --reservations reservations.jsonl \
+  --agents agents.jsonl \
+  --json
+```
+
+Safe reclaim is still a manual, auditable sequence. Review
+`required_human_confirmation`, `reclaim_allowed_by_policy`, and
+`suggested_commands` first:
+
+```bash
+br coordination status --reservations reservations.jsonl --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, action: .assessment.recommended_action, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
+
+br comments add <id> --author "$BD_ACTOR" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+Only run the final two commands when the advisory output and human policy allow
+it. `br coordination status` never auto-reclaims, never runs git, and never
+creates or releases Agent Mail reservations.
+
+The output is advisory only. `reclaim_allowed_by_policy=true` means the local
+policy and supplied snapshot evidence allow the documented audit-comment plus
+claim sequence. `suggested_commands` is empty for fresh claims, active
+reservations, missing or malformed snapshots, and human or unknown owners.
+`required_human_confirmation=true` means ask the owner or operator instead of
+copying a claim command.
+
+When a coordination snapshot matters for a handoff or review, record it through
+the audit log before taking follow-up action:
+
+```bash
+br coordination status --json \
+  | br audit coordination --stdin --command "br coordination status --json" --json
+```
+
+This appends one `coordination_incident` interaction per claim to the existing
+`.beads/interactions.jsonl` flight recorder. The recorded fields are bounded and
+normalized: `issue_id`, `classification`, `recommended_action` as
+`suggested_action`, `evidence_summary`, the producing `command`, and a stable
+`snapshot_hash`. After a human or agent reviews the evidence, label the
+interaction with `br audit label <interaction-id> --label reviewed --json`.
 
 ### Creating Related Issues
 
@@ -205,13 +335,13 @@ br update bd-123 --status in_progress --assignee "$BD_ACTOR" --json
 br create "Edge case causes crash" \
   -t bug \
   -p 1 \
-  --deps discovered-from:bd-123 \
+  --deps discovered-from:br-123 \
   --json
 
 # Subtask for epic
 br create "Implement auth middleware" \
   -t task \
-  --parent bd-epic-456 \
+  --parent br-epic-456 \
   --json
 ```
 
@@ -219,16 +349,69 @@ br create "Implement auth middleware" \
 
 ```bash
 # Close and get next unblocked work
-br close bd-123 --suggest-next --json
+br close br-123 --suggest-next --json
 ```
 
 Returns:
 ```json
 {
-  "closed": "bd-123",
-  "unblocked": ["bd-456", "bd-789"]
+  "closed": "br-123",
+  "unblocked": ["br-456", "br-789"]
 }
 ```
+
+### Degraded Coordination Without Agent Mail
+
+The normal swarm workflow uses MCP Agent Mail for file reservations and
+threaded coordination. If Mail is unavailable, `br` still provides enough
+advisory state to avoid silent overlap. This fallback is intentionally weaker
+than Mail reservations, so keep scopes narrow and prefer another ready issue if
+there is any sign of collision.
+
+1. Confirm the coordination channel is actually degraded. For agents, that
+   usually means the Agent Mail health check or reservation call failed. Record
+   the failure in the bead, not just in the terminal transcript.
+
+2. Claim the bead with an actor or session identity:
+
+   ```bash
+   export AGENT_NAME="${AGENT_NAME:-codex-agent}"
+   br update <id> --status in_progress --assignee "$AGENT_NAME" --json
+   ```
+
+3. Add an issue comment naming the intended files before editing:
+
+   ```bash
+   br comments add <id> --author "$AGENT_NAME" \
+     --message "degraded-coordination: Agent Mail unavailable; files: src/foo.rs, tests/foo.rs" \
+     --json
+   ```
+
+4. Check the local collision surface:
+
+   ```bash
+   git status --short
+   br list --status in_progress --json
+   br comments list <id> --json
+   ```
+
+   If another live claim or comment names the same files, do not rely on the
+   fallback comment as a lock. Pick different ready work, split the file scope,
+   or wait for the other agent to finish.
+
+5. If the edit surface changes, add another comment before touching the new
+   files. At completion, close the bead with a reason that states Mail was
+   unavailable, then run `br sync --flush-only` and commit the code plus
+   `.beads/` changes together.
+
+6. If you find old `in_progress` work while Mail is degraded, use the stale
+   claim protocol above. A stale claim is not automatically safe to take just
+   because Mail is unavailable; require age plus evidence that the owner is no
+   longer active.
+
+This protocol does not replace Agent Mail. It is a shared audit trail for
+degraded sessions so abandoned work can be found through `br list --status
+in_progress --json`, `br comments list <id> --json`, and git history.
 
 ---
 
@@ -237,19 +420,34 @@ Returns:
 ### Python Example
 
 ```python
-import subprocess
 import json
+import subprocess
+
+
+class BrError(RuntimeError):
+    def __init__(self, exit_code, envelope, stdout, stderr):
+        error = envelope.get("error", {})
+        message = error.get("message") or stderr.strip() or f"br exited {exit_code}"
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.envelope = envelope
+        self.code = error.get("code")
+        self.hint = error.get("hint")
+        self.stdout = stdout
+        self.stderr = stderr
+
 
 def br_command(*args):
-    """Run br command and return parsed JSON."""
+    """Run br command and return parsed stdout JSON."""
     result = subprocess.run(
-        ['br', *args, '--json'],
+        ['br', '--json', *args],
         capture_output=True,
-        text=True
+        text=True,
+        check=False,
     )
     if result.returncode != 0:
-        error = json.loads(result.stdout)
-        raise RuntimeError(f"br error: {error.get('message', 'Unknown')}")
+        envelope = json.loads(result.stderr) if result.stderr.strip() else {}
+        raise BrError(result.returncode, envelope, result.stdout, result.stderr)
     return json.loads(result.stdout)
 
 # Find ready work
@@ -265,14 +463,24 @@ if ready:
 ### JavaScript/Node Example
 
 ```javascript
-const { execSync } = require('child_process');
+const { spawnSync } = require('node:child_process');
 
 function br(...args) {
-  const result = execSync(`br ${args.join(' ')} --json`, {
+  const result = spawnSync('br', ['--json', ...args], {
     encoding: 'utf-8',
-    stdio: ['pipe', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe']
   });
-  return JSON.parse(result);
+  if (result.status !== 0) {
+    const envelope = result.stderr.trim() ? JSON.parse(result.stderr) : {};
+    const error = envelope.error || {};
+    const err = new Error(error.message || result.stderr.trim() || `br exited ${result.status}`);
+    err.exitCode = result.status;
+    err.code = error.code;
+    err.hint = error.hint;
+    err.envelope = envelope;
+    throw err;
+  }
+  return JSON.parse(result.stdout);
 }
 
 // Find ready work
@@ -321,15 +529,19 @@ br list --json --assignee $(whoami) | jq '.issues[].title'
 
 ### Structured Error Response
 
+With `--json`, successful command data is written to stdout. Structured errors are written to stderr and the process exits non-zero, so agents must parse the stream that matches the exit code.
+
 ```json
 {
-  "error_code": 3,
-  "message": "Issue not found: bd-xyz999",
-  "kind": "not_found",
-  "recovery_hints": [
-    "Check the issue ID spelling",
-    "Use 'br list' to find valid IDs"
-  ]
+  "error": {
+    "code": "ISSUE_NOT_FOUND",
+    "message": "Issue not found: br-xyz999",
+    "hint": "Run 'br list' to see available issues.",
+    "retryable": false,
+    "context": {
+      "searched_id": "br-xyz999"
+    }
+  }
 }
 ```
 
@@ -350,6 +562,103 @@ def safe_close(issue_id, reason):
 
 ---
 
+## MCP Server
+
+`br serve` exposes the issue tracker as a Model Context Protocol server. It is
+an alternative to shelling out to `br --json ...` when an MCP-capable agent wants
+tool discovery, resource reads, guided prompts, and structured tool errors.
+
+### Build and Start
+
+The MCP server is feature-gated and is not included in default builds:
+
+```bash
+cargo build --release --features mcp
+RUST_LOG=error ./target/release/br serve --actor codex
+```
+
+Installed binary:
+
+```bash
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+RUST_LOG=error br serve --actor codex
+```
+
+Transport is stdio. Configure your MCP client to launch `br` as a child process;
+do not point it at a port.
+
+```json
+{
+  "mcpServers": {
+    "br": {
+      "command": "br",
+      "args": ["serve", "--actor", "codex"],
+      "env": {
+        "RUST_LOG": "error"
+      }
+    }
+  }
+}
+```
+
+### Exposed Surface
+
+Tools:
+
+- `list_issues`
+- `show_issue`
+- `create_issue`
+- `update_issue`
+- `close_issue`
+- `manage_dependencies`
+- `project_overview`
+
+Resources:
+
+- `beads://project/info`
+- `beads://issues/{id}`
+- `beads://schema`
+- `beads://labels`
+- `beads://issues/ready`
+- `beads://issues/blocked`
+- `beads://issues/in_progress`
+- `beads://coordination/status`
+- `beads://issues/deferred`
+- `beads://issues/bottlenecks`
+- `beads://graph/health`
+- `beads://events/recent`
+
+Prompts:
+
+- `triage`
+- `status_report`
+- `plan_next_work`
+- `polish_backlog`
+
+### Safety and Locking
+
+MCP serve uses the same local storage contract as the CLI:
+
+- It opens the current workspace discovered from the process working directory
+  and CLI overrides.
+- It does not run git, push, pull, or talk to remote services.
+- It does not listen on a network socket; access is limited to the client that
+  starts the stdio process.
+- Mutating tools acquire the workspace `.write.lock`, write audit events with
+  the configured `--actor`, and attempt the normal JSONL auto-flush after a
+  successful mutation.
+- Handlers open fresh SQLite connections rather than sharing one long-lived
+  connection across MCP calls.
+
+### When to Prefer MCP
+
+Use MCP when an agent is already MCP-native, needs to discover available actions
+without memorizing CLI flags, or should receive structured recovery data such as
+`suggested_tool_calls`. Use shell commands with `--json` for short scripts,
+bulk pipelines, and workflows that need standard Unix composition with `jq`.
+
+---
+
 ## Robot Mode Flags
 
 These flags enable machine-friendly output:
@@ -367,12 +676,22 @@ These flags enable machine-friendly output:
 ```bash
 # Machine-friendly create
 br create "New issue" --silent
-# Output: bd-abc123
+# Output: br-abc123
 
 # Quiet mode with JSON
-br close bd-123 --quiet --json
+br close br-123 --quiet --json
 # Outputs JSON, no status messages
 ```
+
+---
+
+## Swarm-Scale Tuning
+
+For 256GB+ RAM and 64+ core agent hosts, see
+[Swarm-Scale Tuning](SWARM_SCALE_TUNING.md). It covers conservative defaults,
+high-core build hygiene, `.write.lock` timeout profiles, Agent Mail reservation
+patterns, MCP serve topology, performance evidence collection, and rollback
+rules for future snapshot/cache/controller features.
 
 ---
 
@@ -390,7 +709,7 @@ br ready --json --limit 10
 br update <id> --claim
 # ... work ...
 br close <id> --reason "Completed by Claude"
-br sync --flush-only
+br sync --flush-only  # final JSONL export check before committing .beads/
 ```
 
 ### Cursor AI
@@ -434,9 +753,10 @@ br update <id> --status in_progress --assignee copilot
 3. **Set `BD_ACTOR`** for audit trail attribution
 4. **Use `--claim`** for atomic status+assignee updates
 5. **Create discovered issues** with `--deps discovered-from:<id>`
-6. **Sync at session end** with `br sync --flush-only`
+6. **Run a final JSONL export check** at session end with `br sync --flush-only`
 7. **Use `br ready`** to find actionable work
 8. **Include reasons** when closing issues
+9. **Use degraded comments** only when Agent Mail reservations are unavailable
 
 ### DON'T
 
@@ -454,7 +774,7 @@ br update <id> --status in_progress --assignee copilot
 br ready --json > /tmp/session_start.json
 
 # Session end checklist
-br sync --flush-only
+br sync --flush-only  # idempotent; mutations normally auto-flushed already
 git add .beads/
 git commit -m "Update issues"
 ```
@@ -496,13 +816,13 @@ See [AGENTS.md](../AGENTS.md) for detailed bv integration.
 
 **"Database not initialized"**
 ```bash
-br init --prefix myproj
+br init
 ```
 
 **"Issue not found"**
 ```bash
 # Use partial ID matching
-br show abc  # Matches bd-abc123
+br show abc  # Matches br-abc123
 
 # List to find correct ID
 br list --json | jq '.issues[].id'
@@ -520,7 +840,7 @@ br list --json --lock-timeout 10000
 br dep cycles --json
 
 # Remove problematic dependency
-br dep remove bd-123 bd-456
+br dep remove br-123 br-456
 ```
 
 ### Debug Logging

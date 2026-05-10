@@ -6,9 +6,14 @@
 
 ## Overview
 
-`br` (beads_rust) is a **non-invasive** issue tracker. The `br sync` command synchronizes your SQLite database with a JSONL file for git-based collaboration.
+`br` (beads_rust) is a local-first issue tracker. This document covers the
+safety model for the `br sync` command, which synchronizes your SQLite database
+with a JSONL file for git-based collaboration.
 
-**Key safety principle**: `br sync` will never modify your source code or execute git commands.
+**Key safety principle**: with the default `.beads/` paths, `br sync` will never
+modify your source code or execute git commands. External JSONL paths require
+explicit opt-in and remain subject to extension, symlink, traversal, and `.git/`
+guards.
 
 ---
 
@@ -18,6 +23,8 @@
 |-----------|-------------|
 | **Export** (`--flush-only`) | Writes issues from SQLite to `.beads/issues.jsonl` |
 | **Import** (`--import-only`) | Reads issues from JSONL into SQLite |
+| **Merge** (`--merge`) | Three-way merge of base snapshot, SQLite, and JSONL |
+| **Rebuild** (`--import-only --rebuild`) | Treats JSONL as authoritative and rebuilds SQLite from it |
 | **Status** (`--status`) | Shows sync state without modifying anything |
 
 All file I/O is confined to the `.beads/` directory by default.
@@ -26,14 +33,20 @@ All file I/O is confined to the `.beads/` directory by default.
 
 ## What br sync Will NEVER Do
 
-These are explicit design non-goals. `br` will never:
+These are explicit design non-goals for the sync command. `br sync` will never:
 
 1. **Execute git commands** - No commits, no pushes, no staging
-2. **Modify files outside `.beads/`** - Your source code is never touched
+2. **Modify files outside its sync allowlist** - Default writes stay in `.beads/`; external JSONL paths require explicit opt-in
 3. **Install or invoke git hooks** - Fully manual hook setup if desired
 4. **Run as a daemon** - Simple CLI only, no background processes
 5. **Auto-commit changes** - Every git operation requires explicit user action
 6. **Connect to external services** - Offline-first, no network calls
+
+Other explicitly requested br commands have their own scope: for example,
+`br changelog`, `br orphans`, and commit-activity `br stats` inspect git
+history, while `br agents`, `br doctor --repair`, `br config`, and `br
+completions -o` can write the user-requested files they manage. Those commands
+do not weaken the `br sync` invariants described here.
 
 ---
 
@@ -54,6 +67,14 @@ These are explicit design non-goals. `br` will never:
 | **Schema validation** | Importing malformed JSON | **None** - must fix JSONL |
 | **Tombstone protection** | Resurrecting deleted issues | **None** - by design |
 
+### Merge Guards
+
+| Guard | What it prevents | Override |
+|-------|-----------------|----------|
+| **Both modified conflict** | Silently choosing between divergent SQLite and JSONL edits | `--force`, `--force-db`, `--force-jsonl` |
+| **Delete vs modify conflict** | Silently deleting one side's edit | `--force`, `--force-db`, `--force-jsonl` |
+| **Convergent creation conflict** | Silently choosing between independently created same-ID issues | `--force`, `--force-db`, `--force-jsonl` |
+
 ---
 
 ## Using --force Safely
@@ -66,17 +87,67 @@ br sync --flush-only --force
 
 # Safe: Import after confirming JSONL is authoritative
 br sync --import-only --force
+
+# Safe: Merge after confirming the newer timestamp should win
+br sync --merge --force
 ```
 
 **When to use --force:**
 - After a deliberate database reset
 - When JSONL is known to be authoritative
 - During recovery from corruption
+- During `--merge`, when timestamp-based conflict resolution is intentional
 
 **When NOT to use --force:**
 - Routinely (defeats the purpose of guards)
 - Without understanding why a guard triggered
 - When the error message is unclear
+
+Use `--force-db` or `--force-jsonl` instead of `--force` when you want a specific
+side of a merge conflict to win regardless of timestamps:
+
+```bash
+# Keep local SQLite changes for merge conflicts
+br sync --merge --force-db
+
+# Keep JSONL changes for merge conflicts
+br sync --merge --force-jsonl
+```
+
+The merge base is `.beads/beads.base.jsonl`. A successful export or merge updates
+that snapshot so future `--merge` runs can distinguish local SQLite edits from
+JSONL edits.
+
+`--force-db`, `--force-jsonl`, and `--force` are mutually exclusive during
+`--merge`. They only resolve semantic merge conflicts; they do not bypass JSONL
+syntax validation or unresolved git conflict markers.
+
+---
+
+## Rebuilding From JSONL
+
+Use `--rebuild` only when JSONL is the source of truth and the SQLite database
+should be made to match it:
+
+```bash
+# Equivalent forms
+br sync --rebuild
+br sync --import-only --rebuild
+```
+
+`--rebuild` is import-only. It is rejected with `--flush-only` and `--merge`.
+After importing JSONL, br removes database entries absent from JSONL and
+preserves deletion tombstones when they are still needed for sync safety.
+
+When rebuild is part of corruption recovery, br preserves the original database
+family under `.beads/.br_recovery/` before creating the repaired database. These
+artifacts are evidence for diagnosis; inspect them before pruning anything.
+
+If `--rename-prefix` is combined with rebuild, imported IDs may be rewritten to
+the configured prefix. In that mode, br skips set-difference orphan cleanup
+because the original JSONL IDs no longer match the rewritten database IDs. If
+open-time recovery already rebuilt the database before `--rename-prefix` could
+apply, br reports a rerun command with the needed flags.
 
 ---
 
@@ -99,6 +170,10 @@ Paths outside `.beads/` require the explicit `--allow-external-jsonl` opt-in.
 **Safety notes:**
 - External paths bypass the default confinement
 - Symlinks pointing outside `.beads/` are rejected
+- If import preflight rejects a path, it stops before opening or parsing that path
+- Automatic flush validates the JSONL target before inspecting an existing file
+- Startup auto-import and no-db prefix inference validate existing JSONL targets before hashing or reading them
+- `br sync --allow-external-jsonl` carries that path policy through startup recovery, config loading, and no-db startup imports
 - Paths are canonicalized before use
 
 ---
@@ -169,9 +244,9 @@ This incident motivated every design decision in `br`'s safety model.
 
 | Layer | Protection | Failure Mode Blocked |
 |-------|------------|---------------------|
-| **No git operations** | Cannot execute `git rm`, `git clean`, or any git command | Eliminates the primary attack vector from the original incident |
-| **Path confinement** | All writes strictly confined to `.beads/` directory | Prevents accidental modification of source code, configs, or system files |
-| **Path validation** | Rejects traversal (`../`), symlink escapes, and disallowed extensions | Blocks path injection attacks and symlink-based escapes |
+| **No sync git operations** | `br sync` has no runtime git subprocess path | Eliminates the primary attack vector from the original incident |
+| **Sync write allowlist** | Default writes stay in `.beads/`; external JSONL writes require opt-in | Prevents accidental modification of source code, configs, or system files |
+| **Path validation** | Rejects `.git`, traversal (`../`), symlink escapes, and disallowed extensions | Blocks path injection attacks and symlink-based escapes |
 | **Atomic writes** | Uses temp file + rename; partial failures don't corrupt | Prevents data loss from interrupted operations |
 | **Safety guards** | Empty DB and stale DB guards require `--force` to override | Makes destructive operations explicit and intentional |
 
@@ -205,11 +280,12 @@ If a safety guard triggers unexpectedly, the verbose log will show exactly why.
 
 ### The Core Guarantee
 
-**Even if `br sync` has a bug, it cannot delete your source code.**
+**With the default `.beads/` paths, even if `br sync` has a bug, it cannot
+delete your source code.**
 
 This is not a best-effort promise—it's an architectural constraint enforced by:
-1. Code that literally cannot call git (no git library, no shell-out to git)
-2. Path validation that rejects anything outside `.beads/`
+1. Sync code that does not call git
+2. Path validation that rejects anything outside `.beads/` unless an external JSONL path is explicitly allowed
 3. Tests that would fail if these constraints were violated
 
 ---

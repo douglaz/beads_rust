@@ -2,10 +2,14 @@
 //!
 //! Checks issues for missing recommended template sections based on issue type.
 
-use super::{auto_import_storage_ctx_if_stale, resolve_issue_id};
+use super::{
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    cli_for_routed_workspace, resolve_issue_id,
+};
 use crate::cli::LintArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
@@ -24,6 +28,14 @@ struct LintResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     missing: Vec<String>,
     warnings: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suggestions: Vec<LintSuggestion>,
+}
+
+#[derive(Debug, Serialize)]
+struct LintSuggestion {
+    section: String,
+    hint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,7 +65,6 @@ impl LintSummary {
 #[derive(Debug, Clone, Copy)]
 struct RequiredSection {
     heading: &'static str,
-    #[allow(dead_code)] // Kept for future use in suggestions
     hint: &'static str,
     allow_structured_criteria: bool,
 }
@@ -98,15 +109,42 @@ pub fn execute(
 
     let issues = if args.ids.is_empty() {
         let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-        let storage = &storage_ctx.storage;
-        let filters = build_filters(args)?;
-        storage.list_issues(&filters)?
+        lint_issues_with_storage(args, &storage_ctx.storage)?
     } else {
         resolve_issues(&beads_dir, args, cli)?
     };
 
-    let summary = lint_issues(&issues);
+    render_lint_output(lint_issues(&issues), ctx);
+    Ok(())
+}
 
+/// Execute the all-issues lint scan using storage already opened by the caller.
+///
+/// Returns `Ok(false)` when explicit issue IDs require the normal routed path.
+///
+/// # Errors
+///
+/// Returns an error if database access fails or filters are invalid.
+pub fn execute_with_storage_ctx(
+    args: &LintArgs,
+    ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<bool> {
+    if !args.ids.is_empty() {
+        return Ok(false);
+    }
+
+    let issues = lint_issues_with_storage(args, &storage_ctx.storage)?;
+    render_lint_output(lint_issues(&issues), ctx);
+    Ok(true)
+}
+
+fn lint_issues_with_storage(args: &LintArgs, storage: &SqliteStorage) -> Result<Vec<Issue>> {
+    let filters = build_filters(args)?;
+    storage.list_lint_issues_for_command_output(&filters)
+}
+
+fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
     if ctx.is_toon() {
         let output = LintOutput {
             total: summary.warnings,
@@ -114,7 +152,7 @@ pub fn execute(
             results: summary.results,
         };
         ctx.toon(&output);
-        return Ok(());
+        return;
     }
 
     if ctx.is_json() {
@@ -124,12 +162,12 @@ pub fn execute(
             results: summary.results,
         };
         ctx.json_pretty(&output);
-        return Ok(());
+        return;
     }
 
     if ctx.is_quiet() {
         if summary.results.is_empty() {
-            return Ok(());
+            return;
         }
         std::process::exit(summary.exit_code(false));
     }
@@ -142,7 +180,7 @@ pub fn execute(
                 "✓ No template warnings found ({} issues checked)",
                 summary.checked
             );
-            return Ok(());
+            return;
         }
 
         println!(
@@ -151,9 +189,14 @@ pub fn execute(
             summary.warnings
         );
         for result in &summary.results {
-            println!("{} [{}]: {}", result.id, result.issue_type, result.title);
-            for missing in &result.missing {
-                println!("  ⚠ Missing: {missing}");
+            println!(
+                "{} [{}]: {}",
+                result.id,
+                result.issue_type,
+                sanitize_terminal_inline(&result.title)
+            );
+            for suggestion in &result.suggestions {
+                println!("  ⚠ Missing: {} - {}", suggestion.section, suggestion.hint);
             }
             println!();
         }
@@ -198,7 +241,11 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
 
         for (issue_type, results) in by_type {
             content.append_styled(
-                &format!("{issue_type} ({})\n", results.len()),
+                &format!(
+                    "{} ({})\n",
+                    sanitize_terminal_inline(issue_type),
+                    results.len()
+                ),
                 theme.section.clone(),
             );
             for result in results {
@@ -206,15 +253,20 @@ fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
                 content.append_styled(&result.id, theme.issue_id.clone());
                 content.append(" ");
                 content.append_styled(
-                    &format!("[{}] ", result.issue_type),
+                    &format!("[{}] ", sanitize_terminal_inline(&result.issue_type)),
                     issue_type_style(theme, &result.issue_type),
                 );
-                content.append_styled(&result.title, theme.issue_title.clone());
+                content.append_styled(
+                    sanitize_terminal_inline(&result.title).as_ref(),
+                    theme.issue_title.clone(),
+                );
                 content.append("\n");
 
-                for missing in &result.missing {
+                for suggestion in &result.suggestions {
                     content.append_styled("    missing: ", theme.dimmed.clone());
-                    content.append_styled(missing, theme.warning.clone());
+                    content.append_styled(&suggestion.section, theme.warning.clone());
+                    content.append_styled(" - ", theme.dimmed.clone());
+                    content.append_styled(&suggestion.hint, theme.dimmed.clone());
                     content.append("\n");
                 }
             }
@@ -277,6 +329,7 @@ fn build_filters(args: &LintArgs) -> Result<ListFilters> {
         filters.statuses = Some(vec![status]);
     } else if status_filter.eq_ignore_ascii_case("all") {
         filters.include_closed = true;
+        filters.include_deferred = true;
     }
 
     Ok(filters)
@@ -291,7 +344,13 @@ fn resolve_issues(
     let mut issues_by_input = std::collections::HashMap::new();
 
     for batch in routed_batches {
-        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
+        let mut batch_cli = routed_cli_for_batch(cli, batch.is_external);
+        let routed_write_lock = acquire_routed_workspace_write_lock(
+            &batch.beads_dir,
+            batch.is_external,
+            batch_cli.lock_timeout,
+        )?;
+        routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);
         let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
         auto_import_storage_ctx_if_stale(&mut storage_ctx, &batch_cli)?;
         let config_layer = storage_ctx.load_config(&batch_cli)?;
@@ -324,7 +383,7 @@ fn fetch_issues_in_resolved_order(
     storage: &SqliteStorage,
     resolved_ids: &[String],
 ) -> Result<Vec<Issue>> {
-    let mut issues_by_id = storage
+    let issues_by_id = storage
         .get_issues_by_ids(resolved_ids)?
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
@@ -334,18 +393,15 @@ fn fetch_issues_in_resolved_order(
         .iter()
         .map(|id| {
             issues_by_id
-                .remove(id)
+                .get(id)
+                .cloned()
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })
         })
         .collect()
 }
 
 fn routed_cli_for_batch(cli: &config::CliOverrides, is_external: bool) -> config::CliOverrides {
-    let mut routed_cli = cli.clone();
-    if is_external {
-        routed_cli.db = None;
-    }
-    routed_cli
+    cli_for_routed_workspace(cli, is_external)
 }
 
 fn lint_issues(issues: &[Issue]) -> LintSummary {
@@ -377,12 +433,25 @@ fn lint_issue(issue: &Issue) -> Option<LintResult> {
         return None;
     }
 
+    let missing_headings = missing
+        .iter()
+        .map(|section| section.heading.to_string())
+        .collect();
+    let suggestions = missing
+        .iter()
+        .map(|section| LintSuggestion {
+            section: section.heading.to_string(),
+            hint: section.hint.to_string(),
+        })
+        .collect();
+
     Some(LintResult {
         id: issue.id.clone(),
         title: issue.title.clone(),
         issue_type: issue.issue_type.as_str().to_string(),
         warnings: missing.len(),
-        missing: missing.into_iter().map(|m| m.heading.to_string()).collect(),
+        missing: missing_headings,
+        suggestions,
     })
 }
 
@@ -431,7 +500,8 @@ fn strip_heading_prefix(heading: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
+    use tempfile::TempDir;
 
     fn make_issue(
         issue_type: IssueType,
@@ -496,6 +566,14 @@ mod tests {
                 .missing
                 .contains(&"## Acceptance Criteria".to_string())
         );
+        assert!(result.suggestions.iter().any(|suggestion| {
+            suggestion.section == "## Steps to Reproduce"
+                && suggestion.hint == "Describe how to reproduce the bug"
+        }));
+        assert!(result.suggestions.iter().any(|suggestion| {
+            suggestion.section == "## Acceptance Criteria"
+                && suggestion.hint == "Define criteria to verify the fix"
+        }));
     }
 
     #[test]
@@ -503,6 +581,75 @@ mod tests {
         let description = "## steps to reproduce\n- foo\n# acceptance criteria\n- bar";
         let issue = make_issue(IssueType::Bug, Some(description), None);
         assert!(lint_issue(&issue).is_none());
+    }
+
+    #[test]
+    fn lint_issues_with_storage_matches_full_hydration_results() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 3, 12, 0, 0).unwrap();
+
+        let mut missing = make_issue(IssueType::Task, Some("Needs a real section"));
+        missing.id = "bd-lint-missing".to_string();
+        missing.title = "Lint missing section".to_string();
+        missing.created_at = now;
+        missing.updated_at = now;
+        missing.design = Some("unused design".repeat(512));
+        missing.acceptance_criteria = Some("unused criteria".repeat(512));
+        missing.notes = Some("unused notes".repeat(512));
+        missing.owner = Some("owner".to_string());
+        missing.sender = Some("cli".to_string());
+
+        let mut complete = make_issue(
+            IssueType::Task,
+            Some("## Acceptance Criteria\n- Already present"),
+        );
+        complete.id = "bd-lint-complete".to_string();
+        complete.title = "Lint complete section".to_string();
+        complete.created_at = now;
+        complete.updated_at = now;
+
+        storage.create_issue(&missing, "tester").unwrap();
+        storage.create_issue(&complete, "tester").unwrap();
+
+        let args = LintArgs::default();
+        let filters = build_filters(&args).unwrap();
+        let full_summary = lint_issues(&storage.list_issues(&filters).unwrap());
+        let projected_raw = lint_issues_with_storage(&args, &storage).unwrap();
+        let projected_issue = projected_raw
+            .iter()
+            .find(|issue| issue.id == "bd-lint-missing")
+            .unwrap();
+        assert!(projected_issue.design.is_none());
+        assert!(projected_issue.acceptance_criteria.is_none());
+        assert!(projected_issue.notes.is_none());
+        assert!(projected_issue.owner.is_none());
+        assert!(projected_issue.sender.is_none());
+
+        let projected_summary = lint_issues(&projected_raw);
+        assert_eq!(projected_summary.checked, full_summary.checked);
+        assert_eq!(projected_summary.warnings, full_summary.warnings);
+        assert_eq!(
+            serde_json::to_value(projected_summary.results).unwrap(),
+            serde_json::to_value(full_summary.results).unwrap()
+        );
+    }
+
+    #[test]
+    fn fetch_issues_in_resolved_order_preserves_duplicate_ids() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue(IssueType::Bug, Some("Bug report")), "tester")
+            .expect("create issue");
+
+        let duplicate_ids = vec!["bd-123".to_string(), "bd-123".to_string()];
+        let issues =
+            fetch_issues_in_resolved_order(&storage, &duplicate_ids).expect("duplicate lookup");
+
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].id, "bd-123");
+        assert_eq!(issues[1].id, "bd-123");
     }
 
     #[test]

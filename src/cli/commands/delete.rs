@@ -5,10 +5,13 @@
 
 use crate::cli::DeleteArgs;
 use crate::cli::commands::{
-    auto_import_storage_ctx_if_stale, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
+    RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
+    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_ids,
+    retry_mutation_with_jsonl_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
@@ -63,6 +66,11 @@ struct PreparedDeleteRoute {
     cascade_delete: Vec<String>,
     final_delete_ids: Vec<String>,
     auto_flush_external: bool,
+    _routed_write_lock: RoutedWorkspaceWriteLock,
+}
+
+fn delete_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
 }
 
 /// Execute the delete command.
@@ -160,7 +168,7 @@ pub fn execute(
             } else {
                 println!("The following issues depend on issues being deleted:");
                 for dep in &blocked_dependents {
-                    println!("  - {dep}");
+                    println!("  - {}", delete_display_text(dep));
                 }
                 if full_cascade.len() > blocked_dependents.len() {
                     println!(
@@ -170,7 +178,7 @@ pub fn execute(
                     let direct_set: HashSet<&String> = blocked_dependents.iter().collect();
                     for dep in &full_cascade {
                         if !direct_set.contains(dep) {
-                            println!("  - {dep}");
+                            println!("  - {}", delete_display_text(dep));
                         }
                     }
                 }
@@ -230,7 +238,11 @@ pub fn execute(
                     .storage
                     .get_issue(id)?
                     .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
-                println!("  - {}: {}", id, issue.title);
+                println!(
+                    "  - {}: {}",
+                    delete_display_text(id),
+                    sanitize_terminal_inline(&issue.title)
+                );
             }
             if !cascade_ids.is_empty() {
                 println!(
@@ -238,13 +250,13 @@ pub fn execute(
                     cascade_ids.len()
                 );
                 for dep in &cascade_ids {
-                    println!("  - {dep}");
+                    println!("  - {}", delete_display_text(dep));
                 }
             }
             if args.force && !blocked_dependents.is_empty() {
                 println!("Would orphan {} dependent(s):", blocked_dependents.len());
                 for dep in &blocked_dependents {
-                    println!("  - {dep}");
+                    println!("  - {}", delete_display_text(dep));
                 }
             }
             return Ok(());
@@ -342,7 +354,7 @@ pub fn execute(
     } else {
         println!("Deleted {} issue(s):", result.deleted_count);
         for id in &result.deleted {
-            println!("  - {id}");
+            println!("  - {}", delete_display_text(id));
         }
 
         if result.dependencies_removed > 0 {
@@ -352,7 +364,7 @@ pub fn execute(
         if !result.orphaned_issues.is_empty() {
             println!("Orphaned {} issue(s):", result.orphaned_issues.len());
             for id in &result.orphaned_issues {
-                println!("  - {id}");
+                println!("  - {}", delete_display_text(id));
             }
         }
     }
@@ -429,6 +441,11 @@ fn execute_routed(
         } else {
             Vec::new()
         };
+        let cascade_delete = if args.cascade {
+            cascade_delete
+        } else {
+            Vec::new()
+        };
         render_routed_delete_preview(
             ctx,
             &DeletePreviewResult {
@@ -444,7 +461,7 @@ fn execute_routed(
 
     let mut result = DeleteResult::new();
     for route in &prepared_routes {
-        let batch_result = apply_delete_route(args, route)?;
+        let batch_result = apply_delete_route(args, route, ctx)?;
         merge_delete_result(&mut result, batch_result);
     }
     finalize_delete_result(&mut result);
@@ -465,7 +482,7 @@ fn execute_routed(
 
     ctx.success(&format!("Deleted {} issue(s)", result.deleted_count));
     for id in &result.deleted {
-        ctx.print_line(&format!("  - {id}"));
+        ctx.print_line(&format!("  - {}", delete_display_text(id)));
     }
 
     if result.dependencies_removed > 0 {
@@ -481,7 +498,7 @@ fn execute_routed(
             result.orphaned_issues.len()
         ));
         for id in &result.orphaned_issues {
-            ctx.print_line(&format!("  - {id}"));
+            ctx.print_line(&format!("  - {}", delete_display_text(id)));
         }
     }
 
@@ -495,6 +512,8 @@ fn prepare_delete_route(
     cli: &config::CliOverrides,
     auto_flush_external: bool,
 ) -> Result<PreparedDeleteRoute> {
+    let routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
     let config_layer = storage_ctx.load_config(cli)?;
@@ -527,10 +546,15 @@ fn prepare_delete_route(
         cascade_delete,
         final_delete_ids,
         auto_flush_external,
+        _routed_write_lock: routed_write_lock,
     })
 }
 
-fn apply_delete_route(args: &DeleteArgs, route: &PreparedDeleteRoute) -> Result<DeleteResult> {
+fn apply_delete_route(
+    args: &DeleteArgs,
+    route: &PreparedDeleteRoute,
+    ctx: &OutputContext,
+) -> Result<DeleteResult> {
     let mut storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route.route_cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, &route.route_cli)?;
     let config_layer = storage_ctx.load_config(&route.route_cli)?;
@@ -592,10 +616,11 @@ fn apply_delete_route(args: &DeleteArgs, route: &PreparedDeleteRoute) -> Result<
     if route.auto_flush_external
         && let Err(error) = storage_ctx.auto_flush_if_enabled()
     {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 
@@ -619,7 +644,7 @@ fn render_routed_delete_preview(ctx: &OutputContext, preview: &DeletePreviewResu
     if !preview.blocked_dependents.is_empty() {
         ctx.warning("The following issues depend on issues being deleted:");
         for dep in &preview.blocked_dependents {
-            ctx.print_line(&format!("  - {dep}"));
+            ctx.print_line(&format!("  - {}", delete_display_text(dep)));
         }
         if preview.cascade_delete.len() > preview.blocked_dependents.len() {
             ctx.newline();
@@ -630,7 +655,7 @@ fn render_routed_delete_preview(ctx: &OutputContext, preview: &DeletePreviewResu
             let direct_set: HashSet<&String> = preview.blocked_dependents.iter().collect();
             for dep in &preview.cascade_delete {
                 if !direct_set.contains(dep) {
-                    ctx.print_line(&format!("  - {dep}"));
+                    ctx.print_line(&format!("  - {}", delete_display_text(dep)));
                 }
             }
         }
@@ -653,7 +678,7 @@ fn render_routed_delete_preview(ctx: &OutputContext, preview: &DeletePreviewResu
         preview.would_delete.len()
     ));
     for id in &preview.would_delete {
-        ctx.print_line(&format!("  - {id}"));
+        ctx.print_line(&format!("  - {}", delete_display_text(id)));
     }
     if !preview.cascade_delete.is_empty() {
         ctx.info(&format!(
@@ -661,7 +686,7 @@ fn render_routed_delete_preview(ctx: &OutputContext, preview: &DeletePreviewResu
             preview.cascade_delete.len()
         ));
         for dep in &preview.cascade_delete {
-            ctx.print_line(&format!("  - {dep}"));
+            ctx.print_line(&format!("  - {}", delete_display_text(dep)));
         }
     }
     if !preview.orphaned_issues.is_empty() {
@@ -670,7 +695,7 @@ fn render_routed_delete_preview(ctx: &OutputContext, preview: &DeletePreviewResu
             preview.orphaned_issues.len()
         ));
         for dep in &preview.orphaned_issues {
-            ctx.print_line(&format!("  - {dep}"));
+            ctx.print_line(&format!("  - {}", delete_display_text(dep)));
         }
     }
 }
@@ -821,10 +846,11 @@ fn render_dependents_warning_rich(
 
     for dep_id in direct_dependents {
         content.append_styled("  \u{2022} ", theme.dimmed.clone());
-        content.append_styled(dep_id, theme.issue_id.clone());
+        let display_id = delete_display_text(dep_id);
+        content.append_styled(&display_id, theme.issue_id.clone());
         if let Some(issue) = issues_by_id.get(dep_id) {
             content.append_styled(": ", theme.dimmed.clone());
-            content.append(&issue.title);
+            content.append(sanitize_terminal_inline(&issue.title).as_ref());
         }
         content.append("\n");
     }
@@ -846,10 +872,11 @@ fn render_dependents_warning_rich(
         );
         for dep_id in &transitive {
             content.append_styled("  \u{21b3} ", theme.warning.clone());
-            content.append_styled(dep_id, theme.issue_id.clone());
+            let display_id = delete_display_text(dep_id);
+            content.append_styled(&display_id, theme.issue_id.clone());
             if let Some(issue) = issues_by_id.get(*dep_id) {
                 content.append_styled(": ", theme.dimmed.clone());
-                content.append(&issue.title);
+                content.append(sanitize_terminal_inline(&issue.title).as_ref());
             }
             content.append("\n");
         }
@@ -913,10 +940,11 @@ fn render_dry_run_rich(
 
     for id in ids {
         content.append_styled("  \u{2717} ", theme.error.clone());
-        content.append_styled(id, theme.issue_id.clone());
+        let display_id = delete_display_text(id);
+        content.append_styled(&display_id, theme.issue_id.clone());
         if let Some(issue) = issues_by_id.get(id) {
             content.append_styled(": ", theme.dimmed.clone());
-            content.append(&issue.title);
+            content.append(sanitize_terminal_inline(&issue.title).as_ref());
         }
         content.append("\n");
     }
@@ -930,10 +958,11 @@ fn render_dry_run_rich(
 
         for id in cascade_ids {
             content.append_styled("  \u{21b3} ", theme.warning.clone());
-            content.append_styled(id, theme.issue_id.clone());
+            let display_id = delete_display_text(id);
+            content.append_styled(&display_id, theme.issue_id.clone());
             if let Some(issue) = issues_by_id.get(id) {
                 content.append_styled(": ", theme.dimmed.clone());
-                content.append(&issue.title);
+                content.append(sanitize_terminal_inline(&issue.title).as_ref());
             }
             content.append("\n");
         }
@@ -948,10 +977,11 @@ fn render_dry_run_rich(
 
         for id in orphan_ids {
             content.append_styled("  \u{26a0} ", theme.warning.clone());
-            content.append_styled(id, theme.issue_id.clone());
+            let display_id = delete_display_text(id);
+            content.append_styled(&display_id, theme.issue_id.clone());
             if let Some(issue) = issues_by_id.get(id) {
                 content.append_styled(": ", theme.dimmed.clone());
-                content.append(&issue.title);
+                content.append(sanitize_terminal_inline(&issue.title).as_ref());
             }
             content.append("\n");
         }
@@ -992,10 +1022,11 @@ fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx
 
     for id in &result.deleted {
         content.append_styled("  \u{2713} ", theme.success.clone());
-        content.append_styled(id, theme.issue_id.clone());
+        let display_id = delete_display_text(id);
+        content.append_styled(&display_id, theme.issue_id.clone());
         if let Some(issue) = issues_by_id.get(id) {
             content.append_styled(": ", theme.dimmed.clone());
-            content.append(&issue.title);
+            content.append(sanitize_terminal_inline(&issue.title).as_ref());
         }
         content.append("\n");
     }
@@ -1023,10 +1054,11 @@ fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx
 
         for id in &result.orphaned_issues {
             content.append_styled("  \u{26a0} ", theme.warning.clone());
-            content.append_styled(id, theme.issue_id.clone());
+            let display_id = delete_display_text(id);
+            content.append_styled(&display_id, theme.issue_id.clone());
             if let Some(issue) = issues_by_id.get(id) {
                 content.append_styled(": ", theme.dimmed.clone());
-                content.append(&issue.title);
+                content.append(sanitize_terminal_inline(&issue.title).as_ref());
             }
             content.append("\n");
         }
@@ -1097,6 +1129,19 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn delete_display_text_sanitizes_terminal_controls() {
+        let display = delete_display_text("bd-\x1b[2J\rreset\x08\nnext\x07\u{9b}");
+
+        assert!(!display.chars().any(char::is_control));
+        assert!(display.contains("\\u{1b}[2J"));
+        assert!(display.contains("\\r"));
+        assert!(display.contains("\\u{8}"));
+        assert!(display.contains("\\n"));
+        assert!(display.contains("\\u{7}"));
+        assert!(display.contains("\\u{9b}"));
     }
 
     #[test]

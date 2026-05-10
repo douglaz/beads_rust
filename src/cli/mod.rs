@@ -14,10 +14,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::config;
-use crate::format::truncate_title;
+use crate::format::{format_status_label, truncate_title};
 use crate::model::{IssueType, Status};
 
 pub mod commands;
+
+pub(crate) const DEFAULT_LIST_LIMIT: usize = 50;
+pub(crate) const DEFAULT_LIST_OFFSET: usize = 0;
 
 #[derive(Clone, Copy)]
 enum IssueCompletionFilter {
@@ -234,6 +237,7 @@ fn saved_queries_from_db(db_path: &Path) -> BTreeSet<String> {
             }
         }
 
+        conn.close()?;
         Ok(queries)
     }) else {
         return BTreeSet::new();
@@ -462,7 +466,7 @@ fn issue_id_candidates(prefix: &str, filter: IssueCompletionFilter) -> Vec<Compl
         }
         if filter.matches(&issue.status) {
             let title = truncate_title(&issue.title, 60);
-            let help = format!("{} | {}", issue.status.as_str(), title);
+            let help = format!("{} | {}", format_status_label(&issue.status, false), title);
             candidates.push(CompletionCandidate::new(&issue.id).help(Some(StyledStr::from(help))));
         }
     }
@@ -494,21 +498,25 @@ fn issue_type_is_standard(value: &str) -> bool {
         .any(|(candidate, _)| candidate.eq_ignore_ascii_case(value))
 }
 
+fn issue_type_candidates(prefix: &str) -> Vec<CompletionCandidate> {
+    let mut candidates = static_candidates(prefix, ISSUE_TYPE_CANDIDATES);
+    candidates.extend(
+        completion_index()
+            .types
+            .iter()
+            .filter(|value| !issue_type_is_standard(value))
+            .filter(|value| matches_prefix_case_insensitive(value, prefix))
+            .map(CompletionCandidate::new),
+    );
+    candidates
+}
+
 fn issue_type_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let Some(prefix) = current.to_str() else {
         return Vec::new();
     };
 
-    let mut candidates = static_candidates(prefix, ISSUE_TYPE_CANDIDATES);
-    for value in &completion_index().types {
-        if issue_type_is_standard(value) {
-            continue;
-        }
-        if matches_prefix_case_insensitive(value, prefix) {
-            candidates.push(CompletionCandidate::new(value));
-        }
-    }
-    candidates
+    issue_type_candidates(prefix)
 }
 
 fn issue_type_completer_delimited(current: &OsStr) -> Vec<CompletionCandidate> {
@@ -516,19 +524,10 @@ fn issue_type_completer_delimited(current: &OsStr) -> Vec<CompletionCandidate> {
         return Vec::new();
     };
     let (prefix, needle) = split_delimited_prefix(current, ',');
-    let mut candidates = static_candidates(needle, ISSUE_TYPE_CANDIDATES)
+    issue_type_candidates(needle)
         .into_iter()
         .map(|candidate| candidate.add_prefix(prefix.clone()))
-        .collect::<Vec<_>>();
-    for value in &completion_index().types {
-        if issue_type_is_standard(value) {
-            continue;
-        }
-        if matches_prefix_case_insensitive(value, needle) {
-            candidates.push(CompletionCandidate::new(value).add_prefix(prefix.clone()));
-        }
-    }
-    candidates
+        .collect()
 }
 
 fn issue_type_standard_completer(current: &OsStr) -> Vec<CompletionCandidate> {
@@ -708,7 +707,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub allow_stale: bool,
 
-    /// `SQLite` busy timeout in ms
+    /// `SQLite` busy/write-lock timeout in ms
     #[arg(long, global = true)]
     pub lock_timeout: Option<u64>,
 
@@ -743,6 +742,9 @@ pub enum Commands {
     /// List blocked issues
     Blocked(BlockedArgs),
 
+    /// Describe br's machine-readable contracts and safety guarantees
+    Capabilities(CapabilitiesArgs),
+
     /// Generate changelog from closed issues
     Changelog(ChangelogArgs),
 
@@ -761,6 +763,13 @@ pub enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
+    },
+
+    /// Diagnose swarm coordination state without mutating claims
+    #[command(alias = "coord")]
+    Coordination {
+        #[command(subcommand)]
+        command: CoordinationCommands,
     },
 
     /// Count issues with optional grouping
@@ -844,7 +853,18 @@ pub enum Commands {
     /// Reopen an issue
     Reopen(ReopenArgs),
 
-    /// Emit JSON Schemas for br output types (for agent/tooling integration)
+    /// Print concise in-tool docs for automation agents
+    #[command(name = "robot-docs", alias = "robot_docs")]
+    RobotDocs {
+        #[command(subcommand)]
+        command: RobotDocsCommands,
+    },
+
+    /// Rank ready work for agent swarms with explainable evidence
+    #[command(alias = "schedule")]
+    Scheduler(SchedulerArgs),
+
+    /// Emit JSON Schemas and per-command output envelope shapes (for agent/tooling integration)
     ///
     /// IMPORTANT: br schema is not a stable API and is subject to change.
     /// Use at your own risk.
@@ -881,7 +901,9 @@ SAFETY GUARANTEES:
 MODES (one required unless --status):
   --flush-only    Export database to JSONL (safe by default)
   --import-only   Import JSONL into database (validates first)
+  --merge         Three-way merge .beads/beads.base.jsonl + DB + JSONL
   --status        Show sync status (read-only)
+  --witness       Emit deterministic JSONL chunk witness (read-only)
 
 SAFETY GUARDS:
   Export guards (bypassed with --force):
@@ -892,6 +914,16 @@ SAFETY GUARDS:
     • Conflict markers: Rejects files with git merge conflict markers
     • Invalid JSON: Rejects malformed JSONL entries
 
+  Merge guards:
+    • Semantic conflicts require --force-db, --force-jsonl, or --force
+    • --force-db keeps the local SQLite version
+    • --force-jsonl keeps the JSONL version
+    • --force keeps the newer timestamp
+
+  Rebuild:
+    • --rebuild is import-only and treats JSONL as authoritative
+    • Removes DB entries absent from JSONL while preserving tombstones
+
 VERBOSE LOGGING:
   -v     Show INFO-level safety guard decisions
   -vv    Show DEBUG-level file operations
@@ -900,8 +932,12 @@ EXAMPLES:
   br sync --flush-only           Export database to .beads/issues.jsonl
   br sync --flush-only -v        Export with safety logging
   br sync --import-only          Import from JSONL (validates first)
+  br sync --merge                Merge DB and JSONL changes
+  br sync --merge --force-db     Keep local DB conflicts
+  br sync --merge --force-jsonl  Keep JSONL conflicts
   br sync --rebuild              Import + remove DB entries not in JSONL
-  br sync --status               Show current sync status")]
+  br sync --status               Show current sync status
+  br sync --witness --json       Emit JSONL chunk witness")]
     Sync(SyncArgs),
 
     /// Undefer issues (make ready again)
@@ -963,12 +999,21 @@ pub struct CreateArgs {
     pub title: Option<String>,
 
     /// Issue title (alternative to positional argument)
-    #[arg(long = "title")]
+    #[arg(long = "title", conflicts_with = "title")]
     pub title_flag: Option<String>, // Handled in logic
 
     /// Issue type (task, bug, feature, etc.)
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
     pub type_: Option<String>,
+
+    /// Human-readable slug embedded in the generated ID. Example: `--slug
+    /// survey-my-thing` produces an ID of the form `br-survey-my-thing-<hash>`,
+    /// keeping the configured prefix and the uniquifying hash suffix. The slug
+    /// is normalized to lowercase ASCII alphanumeric + single hyphens (runs of
+    /// other characters collapse to one hyphen, leading/trailing hyphens are
+    /// stripped, length is capped at 48 characters after normalization).
+    #[arg(long)]
+    pub slug: Option<String>,
 
     /// Priority (0-4 or P0-P4)
     #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
@@ -1196,6 +1241,10 @@ pub struct InfoArgs {
     #[arg(long)]
     pub schema: bool,
 
+    /// Include graph projection/cache health details
+    #[arg(long)]
+    pub projections: bool,
+
     /// Show recent changes and exit
     #[arg(long = "whats-new", conflicts_with = "thanks")]
     pub whats_new: bool,
@@ -1221,10 +1270,61 @@ pub struct SchemaArgs {
     pub stats: bool,
 }
 
+/// Subcommands for coordination diagnosis.
+#[derive(Subcommand, Debug)]
+pub enum CoordinationCommands {
+    /// Show hidden in-progress claims with stale-claim evidence
+    Status(CoordinationStatusArgs),
+}
+
+/// Arguments for `br coordination status`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct CoordinationStatusArgs {
+    /// Assumed owner kind for current claims when no snapshot supplies owner metadata
+    #[arg(long, value_enum, default_value_t)]
+    pub owner_kind: CoordinationOwnerKindArg,
+
+    /// Number of latest comments to include per claim
+    #[arg(long, default_value_t = 2)]
+    pub comments: usize,
+
+    /// Offline Agent Mail reservation snapshot file (JSON array, wrapper object, or JSONL)
+    #[arg(long)]
+    pub reservations: Option<PathBuf>,
+
+    /// Offline Agent Mail agent snapshot file (JSON array, wrapper object, or JSONL)
+    #[arg(long)]
+    pub agents: Option<PathBuf>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Owner-kind policy for coordination claim assessment.
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum CoordinationOwnerKindArg {
+    /// Treat assigned in-progress claims as swarm-agent claims
+    #[default]
+    SwarmAgent,
+    /// Treat assigned claims as human-owned
+    Human,
+    /// Treat assigned claims as unclear ownership
+    Unknown,
+}
+
 /// Schema targets for `br schema`.
 #[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum SchemaTarget {
-    /// Emit a bundle containing all schemas
+    /// Emit a bundle containing all schemas and the per-command shape map
     #[default]
     All,
     /// Core Issue object (used by many commands)
@@ -1243,8 +1343,47 @@ pub enum SchemaTarget {
     TreeNode,
     /// Stats output
     Statistics,
+    /// Coordination status output
+    CoordinationStatus,
     /// Structured error envelope (stderr JSON when robot mode or non-TTY)
     Error,
+    /// Per-command JSON output envelope map (top-level shape + jq filter per command)
+    Commands,
+}
+
+/// Arguments for the capabilities command.
+#[derive(Args, Debug, Default, Clone)]
+pub struct CapabilitiesArgs {
+    /// Include detailed metadata for one command path, e.g. "create" or "comments add"
+    #[arg(long, visible_alias = "for", value_name = "COMMAND_PATH")]
+    pub command: Option<String>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+}
+
+/// Subcommands for robot-oriented in-tool documentation.
+#[derive(Subcommand, Debug, Clone)]
+pub enum RobotDocsCommands {
+    /// Print the concise agent guide
+    Guide(RobotDocsGuideArgs),
+}
+
+/// Arguments for `br robot-docs guide`.
+#[derive(Args, Debug, Default, Clone)]
+pub struct RobotDocsGuideArgs {
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
 }
 
 /// Output format for list command.
@@ -1334,8 +1473,10 @@ pub fn resolve_output_format(
 pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
     match cmd {
         Commands::Close(args) => args.robot,
+        Commands::Coordination { command } => coordination_command_requests_robot_json(command),
         Commands::Reopen(args) => args.robot,
         Commands::Ready(args) => args.robot,
+        Commands::Scheduler(args) => args.robot,
         Commands::Blocked(args) => args.robot,
         Commands::Stats(args) | Commands::Status(args) => args.robot,
         Commands::Defer(args) => args.robot,
@@ -1344,6 +1485,12 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
         _ => false,
+    }
+}
+
+const fn coordination_command_requests_robot_json(command: &CoordinationCommands) -> bool {
+    match command {
+        CoordinationCommands::Status(args) => args.robot,
     }
 }
 
@@ -1473,11 +1620,11 @@ pub struct ListArgs {
     pub all: bool,
 
     /// Maximum number of results (0 = unlimited, default: 50)
-    #[arg(long, default_value = "50")]
+    #[arg(long)]
     pub limit: Option<usize>,
 
     /// Number of results to skip (for pagination, default: 0)
-    #[arg(long, default_value = "0")]
+    #[arg(long)]
     pub offset: Option<usize>,
 
     /// Sort field (`priority`, `created_at`, `updated_at`, `title`)
@@ -1799,6 +1946,8 @@ pub struct CommentListArgs {
 pub enum AuditCommands {
     /// Append an audit interaction entry
     Record(AuditRecordArgs),
+    /// Record coordination status rows as bounded audit interactions
+    Coordination(AuditCoordinationArgs),
     /// Append a label entry referencing an existing interaction
     Label(AuditLabelArgs),
     /// View audit log for an issue
@@ -1845,6 +1994,17 @@ pub struct AuditRecordArgs {
     /// Read a JSON object from stdin (must match audit.Entry schema)
     #[arg(long)]
     pub stdin: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AuditCoordinationArgs {
+    /// Read a coordination status JSON object or JSONL stream from stdin
+    #[arg(long)]
+    pub stdin: bool,
+
+    /// Command that produced the coordination snapshot
+    #[arg(long, default_value = "br coordination status")]
+    pub command: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1922,7 +2082,7 @@ pub struct CountArgs {
     #[arg(long)]
     pub unassigned: bool,
 
-    /// Include closed and tombstone issues
+    /// Include closed issues; tombstones require `--status tombstone`
     #[arg(long)]
     pub include_closed: bool,
 
@@ -2069,6 +2229,34 @@ pub struct ReadyArgs {
     pub robot: bool,
 }
 
+/// Arguments for the scheduler command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct SchedulerArgs {
+    /// Maximum recommendations to return (default: 20, 0 = unlimited)
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+
+    /// Maximum ready candidates to score before truncating (default: 512, 0 = unlimited)
+    #[arg(long, default_value_t = 512)]
+    pub candidate_limit: usize,
+
+    /// Non-negative claim age threshold, in hours, for stale-claim evidence
+    #[arg(long, default_value_t = 2)]
+    pub stale_claim_hours: i64,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
 /// Arguments for the blocked command.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug, Clone, Default)]
@@ -2136,6 +2324,34 @@ pub struct CloseArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    // Closure-time policy gates (issue #274 — Phase 1).
+    //
+    // All fields below are inert when the project has no `.beads/policy.yaml`
+    // file. Solo-dev workflows see no behavior change; only opt-in repos
+    // observe gating or attribution capture.
+    //
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME).
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS).
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL).
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
+
+    /// Bypass closure-time policy gates. Requires `--bypass-reason`.
+    /// Only honoured when `.beads/policy.yaml` has `allow_bypass: true`
+    /// (which is the default).
+    #[arg(long)]
+    pub bypass_policy: bool,
+
+    /// Reason for bypassing policy gates. Required when `--bypass-policy` is set.
+    #[arg(long, value_name = "REASON")]
+    pub bypass_reason: Option<String>,
 }
 
 /// Arguments for the reopen command.
@@ -2166,6 +2382,9 @@ pub enum SortPolicy {
     Oldest,
 }
 
+/// Default worker cap for read-only witness planning on high-core swarm hosts.
+pub const DEFAULT_WITNESS_PARALLELISM: usize = 64;
+
 /// Arguments for the sync command.
 #[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -2188,7 +2407,7 @@ pub struct SyncArgs {
     /// Perform a 3-way merge (Base + Local DB + Remote JSONL)
     ///
     /// Reconciles changes when both the database and JSONL have been modified.
-    /// Uses `.beads/base_snapshot.jsonl` as the common ancestor.
+    /// Uses `.beads/beads.base.jsonl` as the common ancestor.
     #[arg(long)]
     pub merge: bool,
 
@@ -2198,12 +2417,59 @@ pub struct SyncArgs {
     #[arg(long)]
     pub status: bool,
 
+    /// Emit deterministic JSONL chunk witness (read-only)
+    ///
+    /// Reads the resolved issues.jsonl bytes and emits chunk/root hashes
+    /// without opening or mutating the SQLite database.
+    #[arg(long)]
+    pub witness: bool,
+
+    /// Lines per JSONL witness chunk
+    ///
+    /// Only used with --witness. Larger chunks reduce witness size; smaller
+    /// chunks improve unchanged-chunk localization for parallel sync planning.
+    #[arg(
+        long = "witness-chunk-lines",
+        default_value_t = 1024,
+        value_name = "LINES",
+        requires = "witness"
+    )]
+    pub witness_chunk_lines: usize,
+
+    /// Parallel worker cap for read-only JSONL witness hashing and work planning
+    ///
+    /// Only used with --witness. When omitted, br uses a deterministic
+    /// 64-worker cap rather than host-dependent CPU detection so robot output
+    /// remains stable across machines.
+    #[arg(
+        long = "witness-parallelism",
+        value_name = "WORKERS",
+        requires = "witness"
+    )]
+    pub witness_parallelism: Option<usize>,
+
+    /// Parallel worker cap for JSONL export line preparation
+    ///
+    /// Used by --flush-only and merge export writeback. When omitted, br uses
+    /// up to 64 workers capped by host parallelism. Use 1 for the serial
+    /// fallback.
+    #[arg(long = "export-parallelism", value_name = "WORKERS")]
+    pub export_parallelism: Option<usize>,
+
     /// Override safety guards (use with caution!)
     ///
     /// Bypasses Empty DB Guard and Stale DB Guard for export.
     /// Does NOT bypass conflict marker detection or JSON validation.
     #[arg(long, short = 'f')]
     pub force: bool,
+
+    /// Resolve sync --merge conflicts by keeping the local SQLite database version.
+    #[arg(long, requires = "merge", conflicts_with_all = ["force", "force_jsonl"])]
+    pub force_db: bool,
+
+    /// Resolve sync --merge conflicts by keeping the JSONL file version.
+    #[arg(long, requires = "merge", conflicts_with_all = ["force", "force_db"])]
+    pub force_jsonl: bool,
 
     /// Allow using a JSONL path outside the .beads directory.
     ///
@@ -2388,6 +2654,10 @@ pub struct DoctorArgs {
     /// Attempt to repair detected issues (rebuilds DB from JSONL)
     #[arg(long)]
     pub repair: bool,
+
+    /// Allow another JSONL rebuild after prior failed recovery evidence
+    #[arg(long)]
+    pub allow_repeated_repair: bool,
 }
 
 /// Arguments for the upgrade command.
@@ -2543,38 +2813,55 @@ pub struct AgentsArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, InheritedOutputMode, OutputFormat, OutputFormatBasic,
-        resolve_output_format_basic_with_outer_mode, resolve_output_format_with_outer_mode,
+        Cli, Commands, InheritedOutputMode, OutputFormat, OutputFormatBasic, issue_type_completer,
+        issue_type_completer_delimited, resolve_output_format_basic_with_outer_mode,
+        resolve_output_format_with_outer_mode,
     };
     use crate::storage::sqlite::SqliteStorage;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+    use clap_complete::engine::CompletionCandidate;
+    use std::ffi::OsStr;
     use tempfile::TempDir;
 
+    const CLI_REFERENCE: &str = include_str!("../../docs/CLI_REFERENCE.md");
+
     #[test]
-    fn test_list_limit_defaults_to_50() {
+    fn test_list_limit_is_none_when_omitted() {
         let cli = Cli::parse_from(["br", "list"]);
-        match cli.command {
-            Commands::List(args) => assert_eq!(args.limit, Some(50)),
-            _ => panic!("expected list command"),
-        }
+        assert!(
+            matches!(&cli.command, Commands::List(_)),
+            "expected list command"
+        );
+        let Commands::List(args) = cli.command else {
+            return;
+        };
+        assert_eq!(args.limit, None);
     }
 
     #[test]
     fn test_list_limit_zero_parses_as_unlimited() {
         let cli = Cli::parse_from(["br", "list", "--limit", "0"]);
-        match cli.command {
-            Commands::List(args) => assert_eq!(args.limit, Some(0)),
-            _ => panic!("expected list command"),
-        }
+        assert!(
+            matches!(&cli.command, Commands::List(_)),
+            "expected list command"
+        );
+        let Commands::List(args) = cli.command else {
+            return;
+        };
+        assert_eq!(args.limit, Some(0));
     }
 
     #[test]
     fn test_ready_assignee_flag_accepts_missing_value() {
         let cli = Cli::parse_from(["br", "ready", "--assignee"]);
-        match cli.command {
-            Commands::Ready(args) => assert_eq!(args.assignee.as_deref(), Some("")),
-            _ => panic!("expected ready command"),
-        }
+        assert!(
+            matches!(&cli.command, Commands::Ready(_)),
+            "expected ready command"
+        );
+        let Commands::Ready(args) = cli.command else {
+            return;
+        };
+        assert_eq!(args.assignee.as_deref(), Some(""));
     }
 
     #[test]
@@ -2582,6 +2869,27 @@ mod tests {
         let err = Cli::try_parse_from(["br", "ready", "--assignee", "alice", "--unassigned"])
             .expect_err("ready filters should conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_create_positional_title_conflicts_with_title_flag() {
+        let err =
+            Cli::try_parse_from(["br", "create", "positional title", "--title", "flag title"])
+                .expect_err("create should reject ambiguous title sources");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_issue_type_delimited_completion_preserves_plain_candidate_order() {
+        let plain = candidate_values(issue_type_completer(OsStr::new("bu")));
+        let delimited = candidate_values(issue_type_completer_delimited(OsStr::new("task, bu")));
+        let expected = plain
+            .iter()
+            .map(|value| format!("task, {value}"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(plain.first().map(String::as_str), Some("bug"));
+        assert_eq!(delimited, expected);
     }
 
     #[test]
@@ -2635,5 +2943,80 @@ mod tests {
             false,
         );
         assert_eq!(resolved, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_cli_reference_documents_current_clap_surface() {
+        assert_all_top_level_commands_are_documented();
+        assert_doc_contains_all(CLAP_DRIFT_SENTINELS);
+    }
+
+    const CLAP_DRIFT_SENTINELS: &[&str] = &[
+        "--lock-timeout <LOCK_TIMEOUT>",
+        "`--from-file <PATH>` | Read IDs from file",
+        "`--cascade` | Delete dependents recursively",
+        "`--force` | Bypass dependent checks, orphaning dependents",
+        "`--hard` | Prune tombstones from JSONL immediately",
+        "br config <COMMAND>",
+        "`set <KEY=VALUE>` or `set <KEY> <VALUE>`",
+        "`delete <KEY>` | Delete a config value; `unset` is an alias",
+        "`save <NAME> [FILTERS...]`",
+        "no free-form query string argument",
+        "`--allow-external-jsonl` | Allow JSONL path outside `.beads/`",
+        "`--rename-prefix` | During import, rewrite mismatched issue IDs",
+        "`--rebuild` | During import, rebuild SQLite from JSONL",
+        "`--notes-contains <TEXT>` | Notes contains substring",
+        "`--format <FMT>` | Output format: text, json, csv, toon",
+        "`--days <N>` | Issues not updated in N days (default: 30)",
+        "`--reservations <PATH>` | Offline Agent Mail reservation snapshot",
+        "`--agents <PATH>` | Offline Agent Mail agent snapshot",
+        "br coordination status --reservations reservations.json --agents agents.jsonl --json",
+        "beads://coordination/status",
+        "`issue-with-counts`, `issue-details`",
+    ];
+
+    fn assert_all_top_level_commands_are_documented() {
+        let command = Cli::command();
+        let missing = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .filter(|name| !is_generated_help_command(name))
+            .filter(|name| !top_level_command_is_documented(name))
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "docs/CLI_REFERENCE.md is missing top-level command headings: {missing:?}"
+        );
+    }
+
+    fn is_generated_help_command(name: &str) -> bool {
+        name == "help"
+    }
+
+    fn top_level_command_is_documented(name: &str) -> bool {
+        if name == "status" {
+            return CLI_REFERENCE.contains("### stats / status");
+        }
+        if name == "undefer" {
+            return CLI_REFERENCE.contains("### defer / undefer");
+        }
+        CLI_REFERENCE.contains(&format!("### {name}"))
+    }
+
+    fn assert_doc_contains_all(needles: &[&str]) {
+        for needle in needles {
+            assert!(
+                CLI_REFERENCE.contains(needle),
+                "docs/CLI_REFERENCE.md is missing Clap drift sentinel: {needle}"
+            );
+        }
+    }
+
+    fn candidate_values(candidates: Vec<CompletionCandidate>) -> Vec<String> {
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect()
     }
 }

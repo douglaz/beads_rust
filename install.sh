@@ -14,10 +14,13 @@
 #   --artifact-url URL Use a custom release artifact URL
 #   --checksum SHA     Provide expected SHA256 checksum
 #   --checksum-url URL Provide a custom checksum URL
+#   --insecure-skip-checksum
+#                      Allow installation without checksum verification
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
-#   --skip-skills      Don't install Claude Code / Codex skills
+#   --skip-skills      Don't install any Claude Code / Codex skills
+#   --with-migration-skill  Install the bd-to-br-migration skill (opt-in; default is to skip it)
 #   --uninstall        Remove br and clean up
 #   --help             Show this help
 #
@@ -119,10 +122,16 @@ UNINSTALL=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
+INSECURE_SKIP_CHECKSUM=0
 LOCK_FILE="/tmp/br-install.lock"
-SYSTEM=0
 NO_GUM=0
 SKIP_SKILLS=0
+# Per-skill opt-ins. Default is to NOT install the bd-to-br-migration skill
+# (see #261 — once a user has migrated, the skill just pollutes context;
+# it's a one-time tool, not a steady-state surface). Pass
+# --with-migration-skill to include it. --skip-skills still wins and
+# suppresses every skill regardless of this flag.
+INSTALL_MIGRATION_SKILL=0
 MAX_RETRIES=3
 DOWNLOAD_TIMEOUT=120
 INSTALLER_VERSION="2.0.0"
@@ -149,6 +158,8 @@ try_install_gum() {
     # Skip if in CI or non-interactive
     [[ -z "${CI:-}" ]] || return 1
     [[ -t 1 ]] || return 1
+
+    printf >&2 '%s\n' "Note: installing 'gum' (charmbracelet/gum) for styled output. Pass --no-gum to skip."
 
     # Inline OS detection
     local os="unknown"
@@ -389,6 +400,7 @@ usage() {
         gum style --faint "    --artifact-url URL Use a custom release artifact URL"
         gum style --faint "    --checksum SHA     Provide expected SHA256 checksum"
         gum style --faint "    --checksum-url URL Provide a custom checksum URL"
+        gum style --faint "    --insecure-skip-checksum  Allow unverified binary install"
         gum style --faint "    --from-source      Build from source instead of binary"
         echo ""
         gum style --foreground 39 "  Behavior"
@@ -396,7 +408,8 @@ usage() {
         gum style --faint "    --verify           Run self-test after install"
         gum style --faint "    --quiet            Suppress progress messages"
         gum style --faint "    --no-gum           Disable gum formatting"
-        gum style --faint "    --skip-skills      Don't install Claude/Codex skills"
+        gum style --faint "    --skip-skills      Don't install any Claude/Codex skills"
+        gum style --faint "    --with-migration-skill  Install the bd-to-br-migration skill (opt-in)"
         echo ""
         gum style --foreground 39 "  Maintenance"
         gum style --faint "    --uninstall        Remove br and clean up"
@@ -449,12 +462,15 @@ Options:
   --artifact-url URL Use a custom release artifact URL
   --checksum SHA     Provide expected SHA256 checksum
   --checksum-url URL Provide a custom checksum URL
+  --insecure-skip-checksum
+                      Allow installation without checksum verification
   --easy-mode        Auto-update PATH in shell rc files
   --verify           Run self-test after install
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
-  --skip-skills      Don't install Claude Code / Codex skills
+  --skip-skills      Don't install any Claude Code / Codex skills
+  --with-migration-skill  Install the bd-to-br-migration skill (opt-in)
   --uninstall        Remove br and clean up
 
 Environment Variables:
@@ -496,16 +512,18 @@ while [ $# -gt 0 ]; do
         --version=*) VERSION="${1#*=}"; shift;;
         --dest) DEST="$2"; shift 2;;
         --dest=*) DEST="${1#*=}"; shift;;
-        --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
+        --system) DEST="/usr/local/bin"; shift;;
         --easy-mode) EASY=1; shift;;
         --verify) VERIFY=1; shift;;
         --artifact-url) ARTIFACT_URL="$2"; shift 2;;
         --checksum) CHECKSUM="$2"; shift 2;;
         --checksum-url) CHECKSUM_URL="$2"; shift 2;;
+        --insecure-skip-checksum) INSECURE_SKIP_CHECKSUM=1; shift;;
         --from-source) FROM_SOURCE=1; shift;;
         --quiet|-q) QUIET=1; shift;;
         --no-gum) NO_GUM=1; shift;;
         --skip-skills) SKIP_SKILLS=1; shift;;
+        --with-migration-skill) INSTALL_MIGRATION_SKILL=1; shift;;
         --uninstall) UNINSTALL=1; shift;;
         -h|--help) usage;;
         *) shift;;
@@ -554,7 +572,7 @@ do_uninstall() {
 # Platform Detection
 # ============================================================================
 detect_platform() {
-    local os arch
+    local os arch libc
 
     case "$(uname -s)" in
         Linux*)  os="linux" ;;
@@ -570,7 +588,49 @@ detect_platform() {
         *) die "Unsupported architecture: $(uname -m)" ;;
     esac
 
-    echo "${os}_${arch}"
+    # Distinguish glibc vs musl on Linux. Alpine and other musl-based distros
+    # need the statically linked musl binary; the gnu artifact references
+    # libgcc_s/_Unwind_* symbols that musl's libc-compat shim does not provide
+    # (see #284).
+    libc=""
+    if [ "$os" = "linux" ]; then
+        # Detection order, cheapest and most reliable first:
+        #   1. /etc/alpine-release  — Alpine fast path (cheap stat).
+        #   2. /proc/self/maps      — what *this running bash* is linked
+        #      against. Bulletproof: it survives systems that have the
+        #      musl cross-toolchain installed alongside glibc (which
+        #      makes /lib/ld-musl-*.so* present even on glibc hosts), and
+        #      side-steps the `set -o pipefail` interaction with `ldd`.
+        #   3. `ldd --version` output sniff — last resort for exotic
+        #      systems with no /proc (e.g. heavily restricted containers).
+        #
+        # Note on the ldd path: musl's `ldd` exits non-zero even when it
+        # prints "musl libc" to stderr, so `if … | grep -q …` is never
+        # taken under `pipefail`. We capture combined output first and
+        # match with `case` to avoid the pipeline entirely.
+        if [ -f /etc/alpine-release ]; then
+            libc="musl"
+        elif grep -q 'ld-musl' /proc/self/maps 2>/dev/null; then
+            libc="musl"
+        elif command -v ldd >/dev/null 2>&1; then
+            ldd_output=$(ldd --version 2>&1 || true)
+            case "$ldd_output" in
+                *[Mm]usl*) libc="musl" ;;
+            esac
+        fi
+        # Only musl_arm64 and musl_amd64 are published; armv7 keeps gnu (no musl
+        # artifact yet). If we somehow detected musl on armv7, fall back to gnu
+        # rather than fabricating an artifact name that does not exist.
+        if [ "$libc" = "musl" ] && [ "$arch" != "amd64" ] && [ "$arch" != "arm64" ]; then
+            libc=""
+        fi
+    fi
+
+    if [ -n "$libc" ]; then
+        echo "${os}_${libc}_${arch}"
+    else
+        echo "${os}_${arch}"
+    fi
 }
 
 # ============================================================================
@@ -768,9 +828,20 @@ install_skills() {
     )
 
     local skill
+    local _skills_installed_count=0
     for skill in "${skills[@]}"; do
         local skill_name="${skill%%:*}"
         local files_str="${skill#*:}"
+
+        # Per-skill opt-ins: map skill_name to its flag var.
+        case "$skill_name" in
+            bd-to-br-migration)
+                if [ "$INSTALL_MIGRATION_SKILL" -ne 1 ]; then
+                    log_step "Skipping skill: $skill_name (opt-in via --with-migration-skill)"
+                    continue
+                fi
+                ;;
+        esac
 
         log_step "Installing skill: $skill_name"
 
@@ -796,13 +867,17 @@ install_skills() {
             if download_file "$url" "$tmp_file"; then
                 mv "$tmp_file" "$claude_dest"
                 # Make scripts executable
-                [[ "$file" == scripts/* ]] && chmod +x "$claude_dest" 2>/dev/null || true
+                if [[ "$file" == scripts/* ]]; then
+                    chmod +x "$claude_dest" 2>/dev/null || true
+                fi
                 log_debug "Downloaded $file to Claude skills"
                 files_installed=$((files_installed + 1))
 
                 # Copy to Codex skills
                 cp "$claude_dest" "$codex_dest" 2>/dev/null || true
-                [[ "$file" == scripts/* ]] && chmod +x "$codex_dest" 2>/dev/null || true
+                if [[ "$file" == scripts/* ]]; then
+                    chmod +x "$codex_dest" 2>/dev/null || true
+                fi
             else
                 rm -f "$tmp_file" 2>/dev/null || true
                 log_debug "Could not download $file (may not exist)"
@@ -811,13 +886,18 @@ install_skills() {
 
         if [ "$files_installed" -gt 0 ]; then
             log_success "Installed skill: $skill_name ($files_installed files)"
+            _skills_installed_count=$((_skills_installed_count + 1))
         else
             log_warn "Skill $skill_name: no files could be downloaded"
         fi
     done
 
-    # Print fancy skills summary
-    print_skills_summary "$claude_skills_dir" "$codex_skills_dir"
+    # Only show the fancy skills summary when at least one skill actually
+    # landed files on disk. Don't advertise skills that were skipped (e.g.
+    # bd-to-br-migration is opt-in per #261) or whose downloads all failed.
+    if [ "$_skills_installed_count" -gt 0 ]; then
+        print_skills_summary "$claude_skills_dir" "$codex_skills_dir"
+    fi
 }
 
 # Print beautiful skills installation summary
@@ -854,7 +934,7 @@ print_skills_summary() {
             "  $(gum style --foreground 82 '/bd-to-br-migration')" \
             "" \
             "$(gum style --foreground 214 'Codex') $(gum style --faint '(dollar command):')" \
-            "  $(gum style --foreground 82 '$bd-to-br-migration')"
+            "  $(gum style --foreground 82 "\$bd-to-br-migration")"
 
         echo ""
         gum style --foreground 245 --italic "Skills auto-trigger when agents detect bd→br migration needs"
@@ -916,6 +996,7 @@ ensure_rust() {
     export PATH="$HOME/.cargo/bin:$PATH"
 
     # Source cargo env
+    # shellcheck source=/dev/null
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 }
 
@@ -923,17 +1004,8 @@ ensure_rust() {
 # Pre-build cleanup for source builds
 # ============================================================================
 prepare_for_build() {
-    # Kill any stuck cargo processes
-    pkill -9 -f "cargo build" 2>/dev/null || true
-
-    # Clear cargo locks
-    rm -f ~/.cargo/.package-cache 2>/dev/null || true
-    rm -f ~/.cargo/registry/.crate-cache.lock 2>/dev/null || true
-
-    # Clean up old br build directories
-    rm -rf /tmp/br-build-* 2>/dev/null || true
-
-    # Check disk space (need at least 1GB)
+    # Source builds use TMP-scoped clone and target directories, so preflight
+    # must not disturb unrelated Cargo processes or shared Cargo caches.
     local avail_kb
     if [[ "$OSTYPE" == "darwin"* ]]; then
         avail_kb=$(df -k /tmp | tail -1 | awk '{print $4}')
@@ -942,12 +1014,8 @@ prepare_for_build() {
     fi
 
     if [ "$avail_kb" -lt 1048576 ]; then
-        log_warn "Low disk space in /tmp ($(( avail_kb / 1024 ))MB). Cleaning up..."
-        rm -rf /tmp/cargo-target 2>/dev/null || true
-        rm -rf ~/.cargo/registry/cache 2>/dev/null || true
+        log_warn "Low disk space in /tmp ($(( avail_kb / 1024 ))MB). Source build may fail; set TMPDIR to a larger filesystem and retry if needed."
     fi
-
-    sleep 1
 }
 
 # ============================================================================
@@ -1149,6 +1217,164 @@ build_from_source() {
 # ============================================================================
 # Download release binary
 # ============================================================================
+is_valid_sha256() {
+    [[ "${1:-}" =~ ^[[:xdigit:]]{64}$ ]]
+}
+
+verify_archive_checksum() {
+    local archive_path="$1"
+    local archive_name="$2"
+    local expected="$3"
+
+    if [ -z "$expected" ]; then
+        if [ "$INSECURE_SKIP_CHECKSUM" -eq 1 ]; then
+            log_warn "Checksum not available for $archive_name; continuing because --insecure-skip-checksum was provided"
+            return 0
+        fi
+        log_error "Checksum not available for $archive_name; refusing to install an unverified binary"
+        log_error "Provide --checksum/--checksum-url, publish ${archive_name}.sha256, or pass --insecure-skip-checksum explicitly"
+        return 1
+    fi
+
+    if ! is_valid_sha256 "$expected"; then
+        log_error "Invalid SHA256 checksum format for $archive_name"
+        return 1
+    fi
+
+    log_step "Verifying checksum..."
+    local actual=""
+    if command -v sha256sum &>/dev/null; then
+        actual=$(sha256sum "$archive_path" | awk '{print $1}')
+    elif command -v shasum &>/dev/null; then
+        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}')
+    else
+        if [ "$INSECURE_SKIP_CHECKSUM" -eq 1 ]; then
+            log_warn "No SHA256 tool found; continuing because --insecure-skip-checksum was provided"
+            return 0
+        fi
+        log_error "No SHA256 verification tool found (need sha256sum or shasum)"
+        return 1
+    fi
+
+    if [ "$expected" != "$actual" ]; then
+        log_error "Checksum mismatch!"
+        log_error "  Expected: $expected"
+        log_error "  Got:      $actual"
+        return 1
+    fi
+    log_success "Checksum verified"
+}
+
+archive_member_name_is_safe() {
+    local member="${1:-}"
+    local normalized parts part
+
+    [ -n "$member" ] || return 1
+    case "$member" in
+        /*|\\*|[A-Za-z]:*) return 1 ;;
+    esac
+
+    normalized="${member//\\//}"
+    local IFS='/'
+    read -r -a parts <<< "$normalized"
+    for part in "${parts[@]}"; do
+        if [ "$part" = ".." ]; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+validate_archive_members_python() {
+    local archive_path="$1"
+    local archive_kind="$2"
+
+    python3 - "$archive_path" "$archive_kind" <<'PY'
+import stat
+import sys
+import tarfile
+import zipfile
+
+archive_path, archive_kind = sys.argv[1], sys.argv[2]
+
+def reject_reason(name):
+    if not name:
+        return "empty member name"
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or name.startswith("\\"):
+        return "absolute member path"
+    if len(name) >= 2 and name[1] == ":" and name[0].isalpha():
+        return "drive-qualified member path"
+    if any(part == ".." for part in normalized.split("/")):
+        return "parent-directory member path"
+    return None
+
+try:
+    if archive_kind == "tar":
+        with tarfile.open(archive_path, "r:*") as archive:
+            for member in archive.getmembers():
+                reason = reject_reason(member.name)
+                if reason:
+                    raise ValueError(f"{member.name}: {reason}")
+                if member.issym() or member.islnk():
+                    raise ValueError(f"{member.name}: links are not allowed in release archives")
+    elif archive_kind == "zip":
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.infolist():
+                reason = reject_reason(member.filename)
+                if reason:
+                    raise ValueError(f"{member.filename}: {reason}")
+                mode = (member.external_attr >> 16) & 0o170000
+                if stat.S_ISLNK(mode):
+                    raise ValueError(f"{member.filename}: symlinks are not allowed in release archives")
+    else:
+        raise ValueError(f"unsupported archive kind: {archive_kind}")
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+validate_tar_archive_members() {
+    local archive_path="$1"
+    local member line entry_type
+
+    if command -v python3 >/dev/null 2>&1; then
+        validate_archive_members_python "$archive_path" "tar"
+        return $?
+    fi
+
+    while IFS= read -r member; do
+        if ! archive_member_name_is_safe "$member"; then
+            log_error "Unsafe archive member path: $member"
+            return 1
+        fi
+    done < <(tar -tzf "$archive_path")
+
+    while IFS= read -r line; do
+        entry_type="${line:0:1}"
+        case "$entry_type" in
+            l|h)
+                log_error "Release archive contains link entries; refusing to extract"
+                return 1
+                ;;
+        esac
+    done < <(tar -tzvf "$archive_path")
+}
+
+validate_zip_archive_members() {
+    local archive_path="$1"
+
+    if command -v python3 >/dev/null 2>&1; then
+        validate_archive_members_python "$archive_path" "zip"
+        return $?
+    fi
+
+    log_error "python3 is required to validate zip archive members safely"
+    return 1
+}
+
 download_release() {
     local platform="$1"
 
@@ -1191,48 +1417,35 @@ download_release() {
         fi
     fi
 
-    if [ -n "$expected" ]; then
-        log_step "Verifying checksum..."
-        local actual
-        if command -v sha256sum &>/dev/null; then
-            actual=$(sha256sum "$TMP/$archive_name" | awk '{print $1}')
-        elif command -v shasum &>/dev/null; then
-            actual=$(shasum -a 256 "$TMP/$archive_name" | awk '{print $1}')
-        else
-            log_warn "No SHA256 tool found, skipping verification"
-            actual="$expected"
-        fi
-
-        if [ "$expected" != "$actual" ]; then
-            log_error "Checksum mismatch!"
-            log_error "  Expected: $expected"
-            log_error "  Got:      $actual"
-            return 1
-        fi
-        log_success "Checksum verified"
-    else
-        log_warn "Checksum not available, skipping verification"
-    fi
+    verify_archive_checksum "$TMP/$archive_name" "$archive_name" "$expected" || return 1
 
     # Extract
     log_step "Extracting..."
+    local extract_dir="$TMP/extract"
+    mkdir -p "$extract_dir"
     case "$archive_name" in
         *.tar.gz)
-            if ! tar -xzf "$TMP/$archive_name" -C "$TMP" 2>/dev/null; then
+            if ! validate_tar_archive_members "$TMP/$archive_name"; then
+                return 1
+            fi
+            if ! tar -xzf "$TMP/$archive_name" -C "$extract_dir" 2>/dev/null; then
                 return 1
             fi
             ;;
         *.zip)
+            if ! validate_zip_archive_members "$TMP/$archive_name"; then
+                return 1
+            fi
             if command -v unzip &>/dev/null; then
-                if ! unzip -q "$TMP/$archive_name" -d "$TMP" 2>/dev/null; then
+                if ! unzip -q "$TMP/$archive_name" -d "$extract_dir" 2>/dev/null; then
                     return 1
                 fi
             elif command -v bsdtar &>/dev/null; then
-                if ! bsdtar -xf "$TMP/$archive_name" -C "$TMP" 2>/dev/null; then
+                if ! bsdtar -xf "$TMP/$archive_name" -C "$extract_dir" 2>/dev/null; then
                     return 1
                 fi
             elif command -v python3 &>/dev/null; then
-                if ! python3 - "$TMP/$archive_name" "$TMP" <<'PY'
+                if ! python3 - "$TMP/$archive_name" "$extract_dir" <<'PY'
 import sys
 import zipfile
 
@@ -1256,7 +1469,7 @@ PY
 
     # Find binary
     local bin
-    if ! bin=$(find_binary_candidate "$TMP" "$BINARY_NAME"); then
+    if ! bin=$(find_binary_candidate "$extract_dir" "$BINARY_NAME"); then
         return 1
     fi
 
@@ -1284,33 +1497,37 @@ check_conflicts() {
     fi
 
     if [ ${#conflicts[@]} -gt 0 ]; then
-        log_warn "Found br in multiple locations:"
-        log_step "  Installed: $installed_path"
-        for conflict in "${conflicts[@]}"; do
-            log_step "  Conflict:  $conflict"
-        done
-
-        # Check PATH priority
         local active_br
-        active_br=$(command -v br 2>/dev/null || echo "")
+        active_br=$(command -v "$BINARY_NAME" 2>/dev/null || echo "")
+
         if [ -n "$active_br" ] && [ "$active_br" != "$installed_path" ]; then
             log_warn "The active br ($active_br) differs from the newly installed version!"
-            log_warn "To use the new version, either:"
-            log_step "  1. Remove the conflicting binary: rm $active_br"
-            log_step "  2. Adjust PATH so $DEST comes first"
+            log_step "  Installed: $installed_path"
+            log_warn "Additional br location(s):"
+            for conflict in "${conflicts[@]}"; do
+                log_step "  Conflict:  $conflict"
+            done
+            log_warn "To use the new version, either adjust PATH so $DEST comes first, or move/remove the conflicting binary manually."
+
+            # Offer to remove conflicts in easy mode.
+            if [ "$EASY" -eq 1 ]; then
+                for conflict in "${conflicts[@]}"; do
+                    if [ -t 0 ] && [[ "$GUM_AVAILABLE" == "true" ]]; then
+                        if gum confirm "Remove conflicting binary at $conflict?"; then
+                            rm -f "$conflict"
+                            log_success "Removed $conflict"
+                        fi
+                    fi
+                done
+            fi
+
+            return 0
         fi
 
-        # Offer to remove conflicts in easy mode
-        if [ "$EASY" -eq 1 ]; then
-            for conflict in "${conflicts[@]}"; do
-                if [ -t 0 ] && [[ "$GUM_AVAILABLE" == "true" ]]; then
-                    if gum confirm "Remove conflicting binary at $conflict?"; then
-                        rm -f "$conflict"
-                        log_success "Removed $conflict"
-                    fi
-                fi
-            done
-        fi
+        log_step "Found additional br location(s); $installed_path remains active"
+        for conflict in "${conflicts[@]}"; do
+            log_step "  Other:     $conflict"
+        done
     fi
 }
 

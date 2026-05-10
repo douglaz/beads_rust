@@ -1,6 +1,6 @@
 // Storage and sync performance benchmarks.
 //
-// Run with: cargo bench
+// Run with: cargo bench --bench storage_perf
 //
 // Performance Targets:
 // | Operation           | Target    | Description                      |
@@ -19,7 +19,7 @@
     clippy::cast_possible_wrap
 )]
 
-use beads_rust::model::{Issue, IssueType, Priority, Status};
+use beads_rust::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use chrono::Utc;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -124,6 +124,24 @@ fn setup_db_with_issues(count: usize) -> (TempDir, SqliteStorage) {
     (dir, storage)
 }
 
+fn setup_db_with_multi_label_issues(count: usize) -> (TempDir, SqliteStorage) {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let db_path = dir.path().join("bench.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("Failed to open db");
+
+    for i in 0..count {
+        let mut issue = create_test_issue(i);
+        if i.is_multiple_of(2) {
+            issue.labels.push("label-even".to_string());
+        }
+        storage
+            .create_issue(&issue, "benchmark")
+            .expect("Failed to create issue");
+    }
+
+    (dir, storage)
+}
+
 /// Set up a database with issues and dependencies.
 fn setup_db_with_deps(issue_count: usize, dep_count: usize) -> (TempDir, SqliteStorage) {
     let dir = TempDir::new().expect("Failed to create temp dir");
@@ -138,17 +156,43 @@ fn setup_db_with_deps(issue_count: usize, dep_count: usize) -> (TempDir, SqliteS
             .expect("Failed to create issue");
     }
 
-    // Create dependencies (avoiding cycles)
-    for d in 0..dep_count {
-        let from_idx = (d * 2 + 1) % issue_count;
-        let to_idx = (d * 2) % issue_count;
-        if from_idx != to_idx && from_idx > to_idx {
-            let from_id = format!("bench-{from_idx:06}");
+    // Create unique acyclic dependencies. Higher-index issues depend on
+    // lower-index issues, so this can scale to deep DAGs without cycles.
+    // Load them through the import helper so setup does not dominate
+    // `--quick` runs with per-edge cycle detection.
+    let mut added = 0usize;
+    'deps: for from_idx in 1..issue_count {
+        let from_id = format!("bench-{from_idx:06}");
+        let mut dependencies = Vec::new();
+        for to_idx in 0..from_idx {
             let to_id = format!("bench-{to_idx:06}");
-            // Ignore errors from duplicate dependencies
-            let _ = storage.add_dependency(&from_id, &to_id, "blocks", "benchmark");
+            dependencies.push(Dependency {
+                issue_id: from_id.clone(),
+                depends_on_id: to_id,
+                dep_type: DependencyType::Blocks,
+                created_at: Utc::now(),
+                created_by: Some("benchmark".to_string()),
+                metadata: None,
+                thread_id: None,
+            });
+            added += 1;
+            if added == dep_count {
+                break;
+            }
+        }
+        if !dependencies.is_empty() {
+            storage
+                .sync_dependencies_for_import(&from_id, &dependencies)
+                .expect("benchmark dependency import should succeed");
+        }
+        if added == dep_count {
+            break 'deps;
         }
     }
+
+    storage
+        .rebuild_blocked_cache(true)
+        .expect("benchmark blocked cache rebuild should succeed");
 
     (dir, storage)
 }
@@ -173,6 +217,27 @@ fn configure_group<M: criterion::measurement::Measurement>(
     }
 }
 
+fn should_skip_group(group_name: &str) -> bool {
+    std::env::var("BENCH_ONLY_GROUP").is_ok_and(|only| group_name != only)
+}
+
+fn configured_sizes(defaults: &[usize], env_var: &str) -> Vec<usize> {
+    let Ok(raw) = std::env::var(env_var) else {
+        return defaults.to_vec();
+    };
+    let sizes: Vec<usize> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| value.parse().ok())
+        .collect();
+    if sizes.is_empty() {
+        defaults.to_vec()
+    } else {
+        sizes
+    }
+}
+
 // =============================================================================
 // Storage Operation Benchmarks
 // =============================================================================
@@ -181,6 +246,9 @@ fn configure_group<M: criterion::measurement::Measurement>(
 fn bench_create_single(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/create";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -211,6 +279,9 @@ fn bench_create_single(c: &mut Criterion) {
 fn bench_create_batch(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/create_batch";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -248,6 +319,9 @@ fn bench_create_batch(c: &mut Criterion) {
 fn bench_update_issue(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/update";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -309,6 +383,9 @@ fn bench_update_issue(c: &mut Criterion) {
 fn bench_close_issue_with_reason(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/close";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -350,6 +427,9 @@ fn bench_close_issue_with_reason(c: &mut Criterion) {
 fn bench_delete_issue(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/delete";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -390,6 +470,9 @@ fn bench_delete_issue(c: &mut Criterion) {
 fn bench_list_issues(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/list";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -418,6 +501,9 @@ fn bench_list_issues(c: &mut Criterion) {
 fn bench_list_issues_filtered(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/list_filtered";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -441,6 +527,24 @@ fn bench_list_issues_filtered(c: &mut Criterion) {
         log_bench_end(bench_name, bench_start);
     });
 
+    let (_multi_label_dir, multi_label_storage) = setup_db_with_multi_label_issues(1000);
+    let multi_label_filters = ListFilters {
+        labels: Some(vec!["label-2".to_string(), "label-even".to_string()]),
+        ..ListFilters::default()
+    };
+
+    group.bench_function("filtered_multi_label_and", |b| {
+        let bench_name = "storage/list_filtered/filtered_multi_label_and";
+        let bench_start = log_bench_start(bench_name);
+        b.iter(|| {
+            let issues = multi_label_storage
+                .list_issues(black_box(&multi_label_filters))
+                .unwrap();
+            black_box(issues)
+        });
+        log_bench_end(bench_name, bench_start);
+    });
+
     group.finish();
     log_group_end(group_name);
 }
@@ -449,11 +553,14 @@ fn bench_list_issues_filtered(c: &mut Criterion) {
 fn bench_ready_query(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/ready";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
 
-    for (issues, deps) in [(100, 200), (500, 1000), (1000, 2000)] {
+    for (issues, deps) in [(100, 200), (500, 1000), (1000, 2000), (10000, 20000)] {
         let (_dir, storage) = setup_db_with_deps(issues, deps);
         let label = format!("{issues}i_{deps}d");
 
@@ -483,6 +590,9 @@ fn bench_ready_query(c: &mut Criterion) {
 fn bench_blocked_query(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/blocked";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -518,11 +628,14 @@ fn bench_blocked_query(c: &mut Criterion) {
 fn bench_export(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "sync/export";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
 
-    for size in [100, 500, 1000, 2000, 5000] {
+    for size in configured_sizes(&[100, 500, 1000, 2000, 5000, 10000], "BENCH_SYNC_SIZES") {
         let (_dir, storage) = setup_db_with_issues(size);
 
         group.throughput(Throughput::Elements(size as u64));
@@ -546,11 +659,14 @@ fn bench_export(c: &mut Criterion) {
 fn bench_import(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "sync/import";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
 
-    for size in [100, 500, 1000, 2000, 5000] {
+    for size in configured_sizes(&[100, 500, 1000, 2000, 5000, 10000], "BENCH_SYNC_SIZES") {
         // Create source data
         let (_src_dir, src_storage) = setup_db_with_issues(size);
         let mut buffer = Cursor::new(Vec::new());
@@ -591,6 +707,9 @@ fn bench_import(c: &mut Criterion) {
 fn bench_dirty_tracking_mark(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "sync/dirty_mark";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -629,6 +748,9 @@ fn bench_dirty_tracking_mark(c: &mut Criterion) {
 fn bench_dirty_tracking_query(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "sync/dirty_query";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -674,6 +796,9 @@ fn bench_dirty_tracking_query(c: &mut Criterion) {
 fn bench_add_dependency(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/add_dep";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -718,6 +843,9 @@ fn bench_add_dependency(c: &mut Criterion) {
 fn bench_cycle_detection(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/cycle_detection";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -788,6 +916,9 @@ fn bench_generate_id(c: &mut Criterion) {
 
     init_bench_logging();
     let group_name = "id/generate";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -840,6 +971,9 @@ fn bench_resolve_id_prefix(c: &mut Criterion) {
 
     init_bench_logging();
     let group_name = "id/resolve_prefix";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -878,6 +1012,9 @@ fn bench_id_hash(c: &mut Criterion) {
 
     init_bench_logging();
     let group_name = "id/hash";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -905,6 +1042,9 @@ fn bench_content_hash(c: &mut Criterion) {
 
     init_bench_logging();
     let group_name = "id/content_hash";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);
@@ -948,6 +1088,9 @@ fn bench_content_hash(c: &mut Criterion) {
 fn bench_search(c: &mut Criterion) {
     init_bench_logging();
     let group_name = "storage/search";
+    if should_skip_group(group_name) {
+        return;
+    }
     log_group_start(group_name);
     let mut group = c.benchmark_group(group_name);
     configure_group(&mut group);

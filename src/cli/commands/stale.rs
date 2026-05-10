@@ -1,7 +1,7 @@
 use crate::cli::StaleArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::StaleIssue;
+use crate::format::{StaleIssue, format_status_label, sanitize_terminal_inline};
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -72,8 +72,7 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
     filters.sort = Some("updated_at".to_string());
     filters.reverse = true; // updated_at default is DESC, so reverse gets ASC
 
-    let stale = storage.list_issues(&filters)?;
-    let stale_output: Vec<StaleIssue> = stale.iter().cloned().map(StaleIssue::from).collect();
+    let stale = storage.list_stale_issues_for_command_output(&filters)?;
 
     // Output based on mode
     if matches!(ctx.mode(), OutputMode::Quiet) {
@@ -83,9 +82,10 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
     if matches!(ctx.mode(), OutputMode::Rich) {
         render_stale_rich(&stale, now, args.days, ctx);
     } else if ctx.is_toon() {
+        let stale_output = stale_issue_outputs(&stale);
         ctx.toon(&stale_output);
     } else if ctx.is_json() {
-        ctx.json(&stale_output);
+        ctx.json_array(stale.iter().map(stale_issue_output));
     } else {
         println!(
             "Stale issues ({} not updated in {}+ days):",
@@ -94,15 +94,17 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
         );
         for (idx, issue) in stale.iter().enumerate() {
             let days_stale = (now - issue.updated_at).num_days().max(0);
-            let status = issue.status.as_str();
+            let status = format_status_label(&issue.status, false);
+            let issue_id = stale_display_text(&issue.id);
             if let Some(assignee) = issue.assignee.as_deref() {
                 println!(
                     "{}. [{}] {}d {} {} ({assignee})",
                     idx + 1,
                     status,
                     days_stale,
-                    issue.id,
-                    issue.title
+                    issue_id,
+                    sanitize_terminal_inline(&issue.title),
+                    assignee = sanitize_terminal_inline(assignee)
                 );
             } else {
                 println!(
@@ -110,14 +112,31 @@ fn execute_inner(args: &StaleArgs, ctx: &OutputContext, storage: &SqliteStorage)
                     idx + 1,
                     status,
                     days_stale,
-                    issue.id,
-                    issue.title
+                    issue_id,
+                    sanitize_terminal_inline(&issue.title)
                 );
             }
         }
     }
 
     Ok(())
+}
+
+fn stale_issue_outputs(stale: &[Issue]) -> Vec<StaleIssue> {
+    stale.iter().map(stale_issue_output).collect()
+}
+
+fn stale_issue_output(issue: &Issue) -> StaleIssue {
+    StaleIssue {
+        created_at: issue.created_at,
+        id: issue.id.clone(),
+        issue_type: issue.issue_type.clone(),
+        priority: issue.priority,
+        status: issue.status.clone(),
+        title: issue.title.clone(),
+        updated_at: issue.updated_at,
+        assignee: issue.assignee.clone(),
+    }
 }
 
 fn parse_statuses(values: &[String]) -> Result<Vec<Status>> {
@@ -184,22 +203,35 @@ fn render_stale_rich(
         line.append_styled(&format!("{:>3}d ", days_stale), staleness_style);
 
         // Status badge
-        line.append_styled(&format!("[{}] ", issue.status.as_str()), status_style);
+        line.append_styled(
+            &format!("[{}] ", format_status_label(&issue.status, false)),
+            status_style,
+        );
 
         // Issue ID
-        line.append_styled(&issue.id, theme.issue_id.clone());
+        line.append_styled(&stale_display_text(&issue.id), theme.issue_id.clone());
         line.append(" ");
 
         // Title
-        line.append_styled(&issue.title, theme.issue_title.clone());
+        line.append_styled(
+            sanitize_terminal_inline(&issue.title).as_ref(),
+            theme.issue_title.clone(),
+        );
 
         // Assignee if present
         if let Some(ref assignee) = issue.assignee {
-            line.append_styled(&format!(" (@{})", assignee), theme.dimmed.clone());
+            line.append_styled(
+                &format!(" (@{})", sanitize_terminal_inline(assignee)),
+                theme.dimmed.clone(),
+            );
         }
 
         ctx.render(&line);
     }
+}
+
+fn stale_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
 }
 
 #[cfg(test)]
@@ -256,6 +288,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stale_display_text_escapes_terminal_controls() {
+        let rendered = stale_display_text("bd-1\x1b]52;c;bad\x07");
+
+        assert!(!rendered.chars().any(char::is_control));
+        assert_eq!(rendered, "bd-1\\u{1b}]52;c;bad\\u{7}");
+    }
+
+    #[test]
+    fn test_stale_issue_output_iterator_matches_materialized_outputs() {
+        let now = Utc::now();
+        let issues = vec![
+            make_issue("bd-1", now - Duration::days(10)),
+            make_issue("bd-2", now - Duration::days(40)),
+        ];
+
+        let streamed: Vec<StaleIssue> = issues.iter().map(stale_issue_output).collect();
+        let materialized: Vec<StaleIssue> = issues.iter().cloned().map(StaleIssue::from).collect();
+
+        let streamed_json = serde_json::to_vec(&streamed).expect("serialize streamed stale output");
+        let materialized_json =
+            serde_json::to_vec(&materialized).expect("serialize materialized stale output");
+        assert_eq!(streamed_json, materialized_json);
+
+        let helper_json = serde_json::to_vec(&stale_issue_outputs(&issues))
+            .expect("serialize helper stale output");
+        assert_eq!(helper_json, materialized_json);
+    }
+
     /// Filter and sort stale issues for testing purposes.
     /// Note: In production, this filtering is done by the storage layer via SQL.
     fn filter_stale_issues(
@@ -266,7 +327,7 @@ mod tests {
         let threshold = now - Duration::days(threshold_days);
         let mut stale: Vec<Issue> = issues
             .into_iter()
-            .filter(|i| i.updated_at < threshold)
+            .filter(|i| i.updated_at <= threshold)
             .collect();
         // Sort by updated_at ascending (oldest first)
         stale.sort_by_key(|a| a.updated_at);
@@ -282,12 +343,14 @@ mod tests {
             make_issue("bd-1", now - Duration::days(10)),
             make_issue("bd-2", now - Duration::days(40)),
             make_issue("bd-3", now - Duration::days(60)),
+            make_issue("bd-4", now - Duration::days(30)),
         ];
 
         let stale = filter_stale_issues(issues, now, 30);
-        assert_eq!(stale.len(), 2);
+        assert_eq!(stale.len(), 3);
         assert_eq!(stale[0].id, "bd-3");
         assert_eq!(stale[1].id, "bd-2");
+        assert_eq!(stale[2].id, "bd-4");
         info!("test_filter_stale_issues_orders_oldest_first: assertions passed");
     }
 }

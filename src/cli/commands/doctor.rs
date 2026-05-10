@@ -5,6 +5,7 @@
 use crate::cli::DoctorArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
@@ -13,13 +14,15 @@ use crate::sync::{
     snapshot_tombstones, tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
     validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
 };
+use chrono::{NaiveDate, Utc};
 use fsqlite::Connection;
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -45,14 +48,20 @@ struct CheckResult {
 #[derive(Debug, Clone, Serialize)]
 struct DoctorReport {
     ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_health: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reliability_audit: Option<ReliabilityAuditRecord>,
     checks: Vec<CheckResult>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct DoctorRepairResult {
     imported: usize,
     skipped: usize,
     fk_violations_cleaned: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    verified_backups: Vec<config::RecoveryBackupVerification>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,14 +73,48 @@ struct DoctorRun {
 #[derive(Debug, Clone, Default, Serialize)]
 struct LocalRepairResult {
     blocked_cache_rebuilt: bool,
-    wal_checkpoint_completed: bool,
     indexes_reindexed: bool,
     vacuumed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     quarantined_artifacts: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RecoveryAuditRecord {
+    phase: String,
+    action: String,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    applied_actions: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    quarantined_artifacts: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    verified_backups: Vec<config::RecoveryBackupVerification>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imported: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fk_violations_cleaned: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PriorJsonlRebuildFailureEvidence {
+    path: PathBuf,
+    artifact_count: usize,
+}
+
 const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
+const BLOCKED_CACHE_CONTENT_MISMATCH_FINDING: &str =
+    "blocked_issues_cache content differs from direct dependency graph and needs rebuild";
+const READY_PROJECTION_CONTENT_MISMATCH_FINDING: &str =
+    "ready projection content differs from direct dependency graph and needs rebuild";
+const JSONL_REBUILD_AUTHORITY_ERROR_PREFIX: &str = "Cannot repair: JSONL authority is unsafe";
+const JSONL_REBUILD_REPEAT_ERROR_PREFIX: &str =
+    "Cannot repair: previous JSONL rebuild verification failed";
+const JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX: &str = ".verification-failed.json";
 const ROOT_GITIGNORE_OFFENDING_PATTERNS: &[&str] = &[
     ".beads",
     ".beads/",
@@ -96,7 +139,6 @@ struct SidecarInspection {
     /// Warning-level findings that are informational but do not require repair.
     warning_findings: Vec<String>,
     quarantine_candidates: Vec<PathBuf>,
-    wal_requires_reconciliation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,11 +153,110 @@ enum FilesystemPathKind {
 impl LocalRepairResult {
     fn applied(&self) -> bool {
         self.blocked_cache_rebuilt
-            || self.wal_checkpoint_completed
             || self.indexes_reindexed
             || self.vacuumed
             || !self.quarantined_artifacts.is_empty()
     }
+}
+
+fn local_repair_applied_actions(repair: &LocalRepairResult) -> Vec<String> {
+    let mut actions = Vec::new();
+    if repair.blocked_cache_rebuilt {
+        actions.push("blocked_cache_rebuilt".to_string());
+    }
+    if repair.indexes_reindexed {
+        actions.push("indexes_reindexed".to_string());
+    }
+    if repair.vacuumed {
+        actions.push("vacuumed".to_string());
+    }
+    if !repair.quarantined_artifacts.is_empty() {
+        actions.push("quarantined_artifacts".to_string());
+    }
+    actions
+}
+
+fn local_repair_audit_record(
+    phase: &str,
+    outcome: &str,
+    repair: &LocalRepairResult,
+    reason: Option<String>,
+) -> RecoveryAuditRecord {
+    RecoveryAuditRecord {
+        phase: phase.to_string(),
+        action: "local_repair".to_string(),
+        outcome: outcome.to_string(),
+        reason,
+        applied_actions: local_repair_applied_actions(repair),
+        quarantined_artifacts: repair.quarantined_artifacts.clone(),
+        verified_backups: Vec::new(),
+        imported: None,
+        skipped: None,
+        fk_violations_cleaned: None,
+    }
+}
+
+fn jsonl_rebuild_audit_record(
+    phase: &str,
+    outcome: &str,
+    repair: Option<&DoctorRepairResult>,
+    reason: Option<String>,
+) -> RecoveryAuditRecord {
+    RecoveryAuditRecord {
+        phase: phase.to_string(),
+        action: "jsonl_rebuild".to_string(),
+        outcome: outcome.to_string(),
+        reason,
+        applied_actions: Vec::new(),
+        quarantined_artifacts: Vec::new(),
+        verified_backups: repair.map_or_else(Vec::new, |result| result.verified_backups.clone()),
+        imported: repair.map(|result| result.imported),
+        skipped: repair.map(|result| result.skipped),
+        fk_violations_cleaned: repair.map(|result| result.fk_violations_cleaned),
+    }
+}
+
+fn no_op_repair_audit_record(repaired_gitignore: bool) -> RecoveryAuditRecord {
+    let applied_actions = if repaired_gitignore {
+        vec!["gitignore_repaired".to_string()]
+    } else {
+        Vec::new()
+    };
+    RecoveryAuditRecord {
+        phase: "doctor.noop".to_string(),
+        action: "repair".to_string(),
+        outcome: if repaired_gitignore {
+            "gitignore_repaired".to_string()
+        } else {
+            "nothing_to_repair".to_string()
+        },
+        reason: None,
+        applied_actions,
+        quarantined_artifacts: Vec::new(),
+        verified_backups: Vec::new(),
+        imported: None,
+        skipped: None,
+        fk_violations_cleaned: None,
+    }
+}
+
+fn emit_recovery_audit_record(record: &RecoveryAuditRecord) {
+    let applied_actions = record.applied_actions.join(",");
+    tracing::info!(
+        target: "br::reliability",
+        phase = %record.phase,
+        action = %record.action,
+        outcome = %record.outcome,
+        reason = record.reason.as_deref().unwrap_or(""),
+        applied_actions = %applied_actions,
+        quarantined_artifacts = record.quarantined_artifacts.len(),
+        verified_backups = record.verified_backups.len(),
+        verified_backup_details = ?record.verified_backups,
+        imported = record.imported.unwrap_or(0),
+        skipped = record.skipped.unwrap_or(0),
+        fk_violations_cleaned = record.fk_violations_cleaned.unwrap_or(0),
+        "doctor recovery audit record"
+    );
 }
 
 impl FilesystemPathKind {
@@ -159,17 +300,311 @@ fn has_error(checks: &[CheckResult]) -> bool {
         .any(|check| matches!(check.status, CheckStatus::Error))
 }
 
+fn push_anomaly(anomalies: &mut Vec<AnomalyClass>, anomaly: AnomalyClass) {
+    if !anomalies.contains(&anomaly) {
+        anomalies.push(anomaly);
+    }
+}
+
+fn check_message(check: &CheckResult) -> String {
+    check.message.clone().unwrap_or_else(|| check.name.clone())
+}
+
+fn check_findings(check: &CheckResult) -> Vec<String> {
+    check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("findings"))
+        .and_then(serde_json::Value::as_array)
+        .map(|findings| {
+            findings
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_else(|| check.message.iter().cloned().collect())
+}
+
+fn blocked_cache_rebuild_finding(finding: &str) -> bool {
+    finding.contains(BLOCKED_CACHE_STALE_FINDING)
+        || finding.contains(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING)
+        || finding.contains(READY_PROJECTION_CONTENT_MISMATCH_FINDING)
+}
+
+fn parse_duplicate_identifier_and_count(finding: &str, marker: &str) -> Option<(String, i64)> {
+    let (_, tail) = finding.split_once(marker)?;
+    let (identifier, count_tail) = tail.split_once("' (")?;
+    let count_text = count_tail
+        .strip_suffix(" rows)")
+        .or_else(|| count_tail.strip_suffix(" row)"))?;
+    let count = count_text.parse().ok()?;
+    Some((identifier.to_string(), count))
+}
+
+fn append_recoverable_anomaly_findings(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    for finding in check_findings(check) {
+        if finding.contains("sqlite_master contains duplicate") {
+            let (name, count) = parse_duplicate_identifier_and_count(&finding, " entries for '")
+                .unwrap_or_else(|| ("unknown".to_string(), 2));
+            push_anomaly(anomalies, AnomalyClass::DuplicateSchemaRows { name, count });
+        } else if finding.contains("config contains duplicate rows") {
+            let (key, count) = parse_duplicate_identifier_and_count(&finding, " rows for key '")
+                .unwrap_or_else(|| ("unknown".to_string(), 2));
+            push_anomaly(anomalies, AnomalyClass::DuplicateConfigKeys { key, count });
+        } else if finding.contains("metadata contains duplicate rows") {
+            let (key, count) = parse_duplicate_identifier_and_count(&finding, " rows for key '")
+                .unwrap_or_else(|| ("unknown".to_string(), 2));
+            push_anomaly(
+                anomalies,
+                AnomalyClass::DuplicateMetadataKeys { key, count },
+            );
+        } else if finding.contains(BLOCKED_CACHE_STALE_FINDING) {
+            push_anomaly(anomalies, AnomalyClass::BlockedCacheStale);
+        } else if finding.contains(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING) {
+            push_anomaly(anomalies, AnomalyClass::BlockedCacheContentMismatch);
+        } else if finding.contains(READY_PROJECTION_CONTENT_MISMATCH_FINDING) {
+            push_anomaly(anomalies, AnomalyClass::ReadyProjectionContentMismatch);
+        }
+    }
+}
+
+fn append_null_default_anomalies(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    let Some(findings) = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("findings"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+
+    for finding in findings {
+        let table = finding
+            .get("table")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let column = finding
+            .get("column")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        push_anomaly(
+            anomalies,
+            AnomalyClass::NullInNotNullColumn {
+                table: table.to_string(),
+                column: column.to_string(),
+            },
+        );
+    }
+}
+
+fn append_count_mismatch_anomaly(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    let Some(details) = check.details.as_ref() else {
+        return;
+    };
+    let Some(db_count) = details.get("db").and_then(serde_json::Value::as_i64) else {
+        return;
+    };
+    let Some(jsonl_count) = details.get("jsonl").and_then(serde_json::Value::as_u64) else {
+        return;
+    };
+    let Ok(db_count) = usize::try_from(db_count) else {
+        return;
+    };
+    let Ok(jsonl_count) = usize::try_from(jsonl_count) else {
+        return;
+    };
+
+    push_anomaly(
+        anomalies,
+        AnomalyClass::DbJsonlCountMismatch {
+            db_count,
+            jsonl_count,
+        },
+    );
+}
+
+fn sidecar_presence_from_check(check: &CheckResult) -> (bool, bool) {
+    let findings = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("findings"))
+        .and_then(serde_json::Value::as_array);
+
+    if let Some(findings) = findings {
+        let has_wal = findings
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|finding| finding.starts_with("WAL sidecar"));
+        let has_shm = findings
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|finding| finding.starts_with("SHM sidecar"));
+        if has_wal || has_shm {
+            return (has_wal, has_shm);
+        }
+    }
+
+    let message = check.message.as_deref().unwrap_or_default().trim_start();
+    (
+        message.starts_with("WAL sidecar"),
+        message.starts_with("SHM sidecar"),
+    )
+}
+
+fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    match check.name.as_str() {
+        "db.exists" if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(anomalies, AnomalyClass::DatabaseMissing);
+        }
+        "db.open"
+        | "schema.tables"
+        | "schema.columns"
+        | "sqlite.integrity_check"
+        | "sqlite3.integrity_check"
+            if matches!(check.status, CheckStatus::Error) =>
+        {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::DatabaseCorrupt {
+                    detail: check_message(check),
+                },
+            );
+        }
+        "sqlite.integrity_check" | "sqlite3.integrity_check"
+            if is_repairable_integrity_warning_check(check) =>
+        {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::DatabaseCorrupt {
+                    detail: check_message(check),
+                },
+            );
+        }
+        "jsonl.parse" if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::JsonlParseError {
+                    detail: check_message(check),
+                },
+            );
+        }
+        "sync_conflict_markers" if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(anomalies, AnomalyClass::JsonlConflictMarkers);
+        }
+        "counts.db_vs_jsonl" if matches!(check.status, CheckStatus::Warn) => {
+            append_count_mismatch_anomaly(check, anomalies);
+        }
+        "sync.metadata" => {
+            let message = check.message.as_deref().unwrap_or_default();
+            if message.contains("External changes pending import") {
+                push_anomaly(anomalies, AnomalyClass::JsonlNewer);
+            } else if message.contains("Local changes pending export") {
+                push_anomaly(anomalies, AnomalyClass::DbNewer);
+            }
+        }
+        "db.recovery_artifacts" if matches!(check.status, CheckStatus::Warn) => {
+            push_anomaly(anomalies, AnomalyClass::StaleRecoveryArtifacts);
+        }
+        "db.sidecars" if matches!(check.status, CheckStatus::Error) => {
+            let message = check.message.as_deref().unwrap_or_default();
+            if message.contains("rollback journal") {
+                push_anomaly(anomalies, AnomalyClass::JournalSidecarPresent);
+            } else {
+                let (has_wal, has_shm) = sidecar_presence_from_check(check);
+                push_anomaly(
+                    anomalies,
+                    AnomalyClass::SidecarMismatch { has_wal, has_shm },
+                );
+            }
+        }
+        "db.recoverable_anomalies"
+            if matches!(check.status, CheckStatus::Error | CheckStatus::Warn) =>
+        {
+            append_recoverable_anomaly_findings(check, anomalies);
+        }
+        "db.null_defaults" if matches!(check.status, CheckStatus::Warn) => {
+            append_null_default_anomalies(check, anomalies);
+        }
+        "db.write_probe" if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::WriteProbeFailed {
+                    detail: check_message(check),
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+fn classify_doctor_checks(
+    db_path: &Path,
+    jsonl_path: &Path,
+    checks: &[CheckResult],
+) -> WorkspaceClassification {
+    let mut anomalies = crate::health::classify_file_state(db_path, jsonl_path);
+    for check in checks {
+        append_doctor_check_anomalies(check, &mut anomalies);
+    }
+    WorkspaceClassification::from_anomalies(anomalies)
+}
+
+fn emit_doctor_reliability_audit(
+    phase: &str,
+    report_ok: bool,
+    audit: &ReliabilityAuditRecord,
+    checks: &[CheckResult],
+) {
+    let warning_count = checks
+        .iter()
+        .filter(|check| matches!(check.status, CheckStatus::Warn))
+        .count();
+    let error_count = checks
+        .iter()
+        .filter(|check| matches!(check.status, CheckStatus::Error))
+        .count();
+    audit.emit_tracing(phase, if report_ok { "ok" } else { "findings" });
+    tracing::info!(
+        target: "br::reliability",
+        phase,
+        ok = report_ok,
+        workspace_health = %audit.health,
+        anomaly_count = audit.anomaly_count,
+        warning_count,
+        error_count,
+        "doctor check summary"
+    );
+}
+
+#[cfg(test)]
 fn report_has_blocked_cache_stale_finding(report: &DoctorReport) -> bool {
+    report_has_blocked_cache_finding(report, |message| {
+        message.contains(BLOCKED_CACHE_STALE_FINDING)
+    })
+}
+
+fn report_has_blocked_cache_rebuild_finding(report: &DoctorReport) -> bool {
+    report_has_blocked_cache_finding(report, blocked_cache_rebuild_finding)
+}
+
+fn report_has_projection_content_mismatch_finding(report: &DoctorReport) -> bool {
+    report_has_blocked_cache_finding(report, |message| {
+        message.contains(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING)
+            || message.contains(READY_PROJECTION_CONTENT_MISMATCH_FINDING)
+    })
+}
+
+fn report_has_blocked_cache_finding(
+    report: &DoctorReport,
+    predicate: impl Fn(&str) -> bool + Copy,
+) -> bool {
     report.checks.iter().any(|check| {
         if check.name != "db.recoverable_anomalies" {
             return false;
         }
 
-        if check
-            .message
-            .as_deref()
-            .is_some_and(|message| message.contains(BLOCKED_CACHE_STALE_FINDING))
-        {
+        if check.message.as_deref().is_some_and(predicate) {
             return true;
         }
 
@@ -179,11 +614,9 @@ fn report_has_blocked_cache_stale_finding(report: &DoctorReport) -> bool {
             .and_then(|details| details.get("findings"))
             .and_then(serde_json::Value::as_array)
             .is_some_and(|findings| {
-                findings.iter().any(|finding| {
-                    finding
-                        .as_str()
-                        .is_some_and(|message| message.contains(BLOCKED_CACHE_STALE_FINDING))
-                })
+                findings
+                    .iter()
+                    .any(|finding| finding.as_str().is_some_and(predicate))
             })
     })
 }
@@ -218,10 +651,13 @@ fn report_has_page_corruption(report: &DoctorReport) -> bool {
     })
 }
 
-/// Compact the database via VACUUM to fix page-level anomalies (free space
-/// corruption, B-tree malformation) that arise from frankensqlite's B-tree
-/// layer.  VACUUM rewrites every page from scratch, eliminating any internal
-/// accounting discrepancies.
+/// Compact the database to fix page-level anomalies (free space corruption,
+/// orphaned pages, B-tree malformation) that arise from frankensqlite's B-tree
+/// layer.
+///
+/// Run in-place VACUUM first, then try to install a compacted copy via VACUUM
+/// INTO. If upstream sqlite3 still reports `Page N: never used` afterward,
+/// the caller escalates to a JSONL rebuild.
 fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
     if !db_path.is_file() {
         tracing::debug!(
@@ -230,16 +666,30 @@ fn repair_via_vacuum(db_path: &Path, repair: &mut LocalRepairResult) {
         );
         return;
     }
-    match Connection::open(db_path.to_string_lossy().into_owned()) {
-        Ok(conn) => match conn.execute("VACUUM") {
-            Ok(_) => {
-                repair.vacuumed = true;
-                tracing::info!(path = %db_path.display(), "VACUUM completed successfully");
-            }
-            Err(err) => {
+    match SqliteStorage::open(db_path) {
+        Ok(storage) => {
+            if let Err(err) = storage.execute_raw("VACUUM") {
                 tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
+                return;
             }
-        },
+
+            repair.vacuumed = true;
+            match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
+                Ok(_storage) => {
+                    tracing::info!(
+                        path = %db_path.display(),
+                        "VACUUM plus VACUUM INTO compaction completed successfully"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "VACUUM INTO compaction failed after VACUUM"
+                    );
+                }
+            }
+        }
         Err(err) => {
             tracing::warn!(
                 path = %db_path.display(),
@@ -304,7 +754,7 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
         Ok(())
     })();
 
-    match probe {
+    let probe_ok = match probe {
         Ok(()) => {
             tracing::info!("Post-repair write probe passed");
             true
@@ -315,7 +765,14 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
             let _ = conn.execute("ROLLBACK");
             false
         }
+    };
+
+    if let Err(err) = conn.close() {
+        tracing::warn!(error = %err, "Post-repair write probe connection close failed");
+        return false;
     }
+
+    probe_ok
 }
 
 /// Return true if any integrity check reported WARN-level page anomalies
@@ -331,48 +788,68 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
 ///
 /// See #253 for the original report and the exact sequence that leaves the
 /// DB in this state.
-fn report_has_warn_level_page_anomaly(report: &DoctorReport) -> bool {
-    report.checks.iter().any(|check| {
-        if !matches!(check.status, CheckStatus::Warn) {
-            return false;
-        }
-        if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
-            return false;
-        }
-        check.message.as_deref().is_some_and(|msg| {
-            let lower = msg.to_lowercase();
-            lower.contains("never used")
-                || lower.contains("free space corruption")
-                || lower.contains("malformed")
-                || lower.contains("disk image")
-        })
+fn is_warn_level_page_anomaly_check(check: &CheckResult) -> bool {
+    if !matches!(check.status, CheckStatus::Warn) {
+        return false;
+    }
+    if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
+        return false;
+    }
+    check.message.as_deref().is_some_and(|msg| {
+        let lower = msg.to_lowercase();
+        lower.contains("never used")
+            || lower.contains("free space corruption")
+            || lower.contains("malformed")
+            || lower.contains("disk image")
     })
+}
+
+fn report_has_warn_level_page_anomaly(report: &DoctorReport) -> bool {
+    report.checks.iter().any(is_warn_level_page_anomaly_check)
+}
+
+fn repair_report_verified(report: &DoctorReport) -> bool {
+    report.ok && !report_has_warn_level_page_anomaly(report)
 }
 
 /// Return true if any integrity check reported partial-index row mismatches
 /// ("row N missing from index") as a warning.  These can be repaired via `REINDEX`.
+fn is_partial_index_warning_check(check: &CheckResult) -> bool {
+    if !matches!(check.status, CheckStatus::Warn) {
+        return false;
+    }
+    if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
+        return false;
+    }
+    check
+        .message
+        .as_deref()
+        .is_some_and(|msg| msg.to_lowercase().contains("missing from index"))
+}
+
 fn report_has_partial_index_warnings(report: &DoctorReport) -> bool {
-    report.checks.iter().any(|check| {
-        if !matches!(check.status, CheckStatus::Warn) {
-            return false;
-        }
-        if check.name != "sqlite.integrity_check" && check.name != "sqlite3.integrity_check" {
-            return false;
-        }
-        check
-            .message
-            .as_deref()
-            .is_some_and(|msg| msg.to_lowercase().contains("missing from index"))
-    })
+    report.checks.iter().any(is_partial_index_warning_check)
+}
+
+fn is_repairable_integrity_warning_check(check: &CheckResult) -> bool {
+    is_warn_level_page_anomaly_check(check) || is_partial_index_warning_check(check)
+}
+
+fn warning_repair_verified(
+    report: &DoctorReport,
+    repaired_blocked_cache: bool,
+    repaired_partial_index_warnings: bool,
+) -> bool {
+    report.ok
+        && (!repaired_blocked_cache || !report_has_blocked_cache_rebuild_finding(report))
+        && (!repaired_partial_index_warnings || !report_has_partial_index_warnings(report))
+        && !report_has_warn_level_page_anomaly(report)
 }
 
 fn local_repair_message(local_repair: &LocalRepairResult) -> String {
     let mut actions = Vec::new();
     if local_repair.blocked_cache_rebuilt {
-        actions.push("rebuilt the stale blocked cache".to_string());
-    }
-    if local_repair.wal_checkpoint_completed {
-        actions.push("checkpointed database WAL state".to_string());
+        actions.push("rebuilt the blocked cache".to_string());
     }
     if local_repair.indexes_reindexed {
         actions.push("rebuilt all indexes via REINDEX".to_string());
@@ -482,9 +959,9 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     if wal_kind.is_regular_file() && !shm_kind.exists() {
         // frankensqlite manages the WAL index in process-local memory rather than in an SHM
         // file, so a WAL without a sibling SHM is the normal operating state — not an error.
-        // We record this as a warning finding so callers can observe it, but we do not set
-        // wal_requires_reconciliation and do not quarantine the WAL, because the WAL is
-        // valid and the database is accessible.  The db.write_probe check validates liveness.
+        // We record this as a warning finding so callers can observe it, but we do not
+        // quarantine the WAL, because the WAL is valid and the database is accessible.
+        // The db.write_probe check validates liveness.
         inspection.warning_findings.push(format!(
             "WAL sidecar exists without a matching SHM sidecar at {} (expected for frankensqlite)",
             PathBuf::from(format!("{}-wal", db_path.to_string_lossy())).display()
@@ -565,36 +1042,10 @@ fn check_recovery_artifacts(
     db_path: &Path,
     checks: &mut Vec<CheckResult>,
 ) -> Result<()> {
-    let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
-    let db_prefix = db_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("beads.db");
-    let db_parent = db_path.parent().unwrap_or(beads_dir);
-    let mut artifacts = Vec::new();
-
-    if recovery_dir.is_dir() {
-        for entry in fs::read_dir(&recovery_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(db_prefix) {
-                artifacts.push(entry.path().display().to_string());
-            }
-        }
-    }
-
-    for entry in fs::read_dir(db_parent)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(&format!("{db_prefix}.bad_")) {
-            artifacts.push(entry.path().display().to_string());
-        }
-    }
-
-    artifacts.sort();
-    artifacts.dedup();
+    let artifacts = recovery_artifacts_for_db_family(beads_dir, db_path)?
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
 
     if artifacts.is_empty() {
         push_check(checks, "db.recovery_artifacts", CheckStatus::Ok, None, None);
@@ -612,6 +1063,91 @@ fn check_recovery_artifacts(
     }
 
     Ok(())
+}
+
+fn db_family_prefix(db_path: &Path) -> &str {
+    db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("beads.db")
+}
+
+fn recovery_artifacts_for_db_family(beads_dir: &Path, db_path: &Path) -> Result<Vec<PathBuf>> {
+    let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
+    let db_prefix = db_family_prefix(db_path);
+    let db_parent = db_path.parent().unwrap_or(beads_dir);
+    let mut artifacts = Vec::new();
+
+    if recovery_dir.is_dir() {
+        for entry in fs::read_dir(&recovery_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(db_prefix) {
+                artifacts.push(entry.path());
+            }
+        }
+    }
+
+    for entry in fs::read_dir(db_parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&format!("{db_prefix}.bad_")) {
+            artifacts.push(entry.path());
+        }
+    }
+
+    artifacts.sort();
+    artifacts.dedup();
+    Ok(artifacts)
+}
+
+fn is_failed_jsonl_rebuild_artifact(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.contains(".rebuild-failed")
+                || name.ends_with(JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX)
+        })
+}
+
+fn prior_jsonl_rebuild_failure_evidence(
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<Option<PriorJsonlRebuildFailureEvidence>> {
+    let artifacts = recovery_artifacts_for_db_family(beads_dir, db_path)?;
+    let evidence_path = artifacts
+        .iter()
+        .find(|path| is_failed_jsonl_rebuild_artifact(path))
+        .cloned();
+
+    Ok(evidence_path.map(|path| PriorJsonlRebuildFailureEvidence {
+        path,
+        artifact_count: artifacts.len(),
+    }))
+}
+
+fn repeated_jsonl_rebuild_refusal_message(evidence: &PriorJsonlRebuildFailureEvidence) -> String {
+    format!(
+        "{JSONL_REBUILD_REPEAT_ERROR_PREFIX}: prior failed recovery evidence remains at '{}' among {} preserved database-family artifact(s). Inspect and preserve the recovery evidence before rerunning with --allow-repeated-repair.",
+        evidence.path.display(),
+        evidence.artifact_count
+    )
+}
+
+fn repeated_jsonl_rebuild_refusal_reason(
+    beads_dir: &Path,
+    db_path: &Path,
+    allow_repeated_repair: bool,
+) -> Result<Option<String>> {
+    if allow_repeated_repair {
+        return Ok(None);
+    }
+
+    Ok(prior_jsonl_rebuild_failure_evidence(beads_dir, db_path)?
+        .as_ref()
+        .map(repeated_jsonl_rebuild_refusal_message))
 }
 
 fn push_inspection_error(
@@ -637,22 +1173,42 @@ fn build_issue_write_probe_check(
     let mut details = serde_json::json!({ "issue_id": issue_id });
 
     match (update_result, rollback_result) {
-        (Ok(_), Ok(_)) => CheckResult {
-            name: "db.write_probe".to_string(),
-            status: CheckStatus::Ok,
-            message: Some(format!(
-                "Rollback-only issue write succeeded for {issue_id}"
-            )),
-            details: None,
-        },
-        (Ok(_), Err(rollback_err)) => {
+        (Ok(affected_rows), Ok(_)) => {
+            if affected_rows > 0 {
+                CheckResult {
+                    name: "db.write_probe".to_string(),
+                    status: CheckStatus::Ok,
+                    message: Some(format!(
+                        "Rollback-only issue write succeeded for {issue_id}"
+                    )),
+                    details: None,
+                }
+            } else {
+                details["affected_rows"] = serde_json::json!(affected_rows);
+                CheckResult {
+                    name: "db.write_probe".to_string(),
+                    status: CheckStatus::Error,
+                    message: Some(format!(
+                        "Rollback-only issue write affected 0 rows for {issue_id}"
+                    )),
+                    details: Some(details),
+                }
+            }
+        }
+        (Ok(affected_rows), Err(rollback_err)) => {
+            details["affected_rows"] = serde_json::json!(affected_rows);
             details["rollback_error"] = serde_json::json!(rollback_err.to_string());
+            let message = if affected_rows == 0 {
+                format!(
+                    "Rollback-only issue write affected 0 rows and rollback also failed: {rollback_err}"
+                )
+            } else {
+                format!("Rollback-only issue write succeeded but rollback failed: {rollback_err}")
+            };
             CheckResult {
                 name: "db.write_probe".to_string(),
                 status: CheckStatus::Error,
-                message: Some(format!(
-                    "Rollback-only issue write succeeded but rollback failed: {rollback_err}"
-                )),
+                message: Some(message),
                 details: Some(details),
             }
         }
@@ -683,6 +1239,8 @@ fn repair_database_from_jsonl(
     cli: &config::CliOverrides,
     show_progress: bool,
 ) -> Result<DoctorRepairResult> {
+    preflight_jsonl_rebuild_authority(jsonl_path)?;
+
     let bootstrap_layer = config::ConfigLayer::merge_layers(&[
         config::load_startup_config(beads_dir)?,
         cli.as_layer(),
@@ -700,56 +1258,172 @@ fn repair_database_from_jsonl(
     // rebuild only replays what's in the JSONL.
     let preserved_tombstones = preserved_tombstones_for_doctor_rebuild(db_path, jsonl_path);
 
-    let (mut storage, import_result) = config::repair_database_from_jsonl(
+    let (mut storage, import_result, verified_backups) = config::repair_database_from_jsonl(
         beads_dir,
         db_path,
         jsonl_path,
         cli.lock_timeout,
         &bootstrap_layer,
         show_progress,
+        false,
     )?;
 
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
 
-    let fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
-
-    if fk_violations > 0 {
-        tracing::warn!(
-            violations = fk_violations,
-            "FK violations found after repair import; cleaning orphans"
-        );
-        for table in &[
-            "dependencies",
-            "labels",
-            "comments",
-            "events",
-            "dirty_issues",
-            "export_hashes",
-            "blocked_issues_cache",
-            "child_counters",
-        ] {
-            let col = if *table == "child_counters" {
-                "parent_id"
-            } else {
-                "issue_id"
-            };
-            let cleanup = format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)");
-            storage.execute_raw(&cleanup)?;
-        }
-
-        let remaining_fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
-        if remaining_fk_violations > 0 {
-            return Err(BeadsError::Config(format!(
-                "Repair import finished with {remaining_fk_violations} foreign key violation(s) still present"
-            )));
-        }
-    }
+    let fk_violations_cleaned = cleanup_repair_missing_issue_references(&mut storage)?;
 
     Ok(DoctorRepairResult {
         imported: import_result.imported_count,
         skipped: import_result.skipped_count,
-        fk_violations_cleaned: fk_violations,
+        fk_violations_cleaned,
+        verified_backups,
     })
+}
+
+fn cleanup_repair_missing_issue_references(storage: &mut SqliteStorage) -> Result<usize> {
+    let missing_references = storage.missing_issue_references()?;
+    if missing_references.is_empty() {
+        return Ok(0);
+    }
+
+    tracing::warn!(
+        references = ?missing_references,
+        "Missing issue references found after repair import; cleaning local orphans"
+    );
+
+    let orphan_tables = &[
+        ("dependencies", "issue_id"),
+        ("dependencies", "depends_on_id"),
+        ("labels", "issue_id"),
+        ("comments", "issue_id"),
+        ("events", "issue_id"),
+        ("dirty_issues", "issue_id"),
+        ("export_hashes", "issue_id"),
+        ("blocked_issues_cache", "issue_id"),
+        ("child_counters", "parent_id"),
+    ];
+    let mut cleaned = 0usize;
+    let mut dependency_rows_cleaned = 0usize;
+
+    for (table, col) in orphan_tables {
+        let external_dependency_filter = match (*table, *col) {
+            ("dependencies", "issue_id") => " AND issue_id NOT LIKE 'external:%'",
+            ("dependencies", "depends_on_id") => " AND depends_on_id NOT LIKE 'external:%'",
+            _ => "",
+        };
+        let cleanup = format!(
+            "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues){external_dependency_filter}"
+        );
+        let removed = storage.execute_raw_count(&cleanup)?;
+        if *table == "dependencies" {
+            dependency_rows_cleaned += removed;
+        }
+        cleaned += removed;
+    }
+
+    let remaining = storage.missing_issue_references()?;
+    if !remaining.is_empty() {
+        return Err(BeadsError::Config(format!(
+            "Repair import finished with orphaned issue references still present: {}",
+            remaining.join(", ")
+        )));
+    }
+
+    if dependency_rows_cleaned > 0 {
+        storage.rebuild_blocked_cache(true)?;
+    }
+
+    Ok(cleaned)
+}
+
+fn preflight_jsonl_rebuild_authority(jsonl_path: &Path) -> Result<()> {
+    let conflict_markers = scan_conflict_markers(jsonl_path)?;
+    if !conflict_markers.is_empty() {
+        let preview = conflict_markers
+            .iter()
+            .take(3)
+            .map(|marker| {
+                let branch = marker
+                    .branch
+                    .as_ref()
+                    .map_or(String::new(), |branch| format!(" ({branch})"));
+                format!("line {}: {:?}{branch}", marker.line, marker.marker_type)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let suffix = if conflict_markers.len() > 3 {
+            " ..."
+        } else {
+            ""
+        };
+        return Err(BeadsError::Config(format!(
+            "{JSONL_REBUILD_AUTHORITY_ERROR_PREFIX}: found {} merge conflict marker(s): {preview}{suffix}. Resolve JSONL conflicts before rebuilding SQLite from it.",
+            conflict_markers.len()
+        )));
+    }
+
+    let validation = validate_jsonl_issue_records(jsonl_path)?;
+    if validation.invalid_count > 0 {
+        let preview = validation.preview_messages().join("; ");
+        let suffix = if validation.invalid_count > validation.failures.len() {
+            " ..."
+        } else {
+            ""
+        };
+        return Err(BeadsError::Config(format!(
+            "{JSONL_REBUILD_AUTHORITY_ERROR_PREFIX}: found {} invalid issue record(s): {preview}{suffix}. Fix JSONL before rebuilding SQLite from it.",
+            validation.invalid_count
+        )));
+    }
+
+    Ok(())
+}
+
+fn jsonl_rebuild_failure_outcome(err: &BeadsError) -> &'static str {
+    if let BeadsError::Config(message) = err
+        && message.starts_with(JSONL_REBUILD_AUTHORITY_ERROR_PREFIX)
+    {
+        return "refused";
+    }
+    "failed"
+}
+
+fn write_jsonl_rebuild_verification_failed_marker(
+    beads_dir: &Path,
+    db_path: &Path,
+    post_repair: &DoctorRun,
+    repair_result: &DoctorRepairResult,
+) -> Result<PathBuf> {
+    let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
+    fs::create_dir_all(&recovery_dir)?;
+    let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f");
+    let marker_path = recovery_dir.join(format!(
+        "{}.{stamp}{JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX}",
+        db_family_prefix(db_path)
+    ));
+    let failed_checks = post_repair
+        .report
+        .checks
+        .iter()
+        .filter(|check| {
+            matches!(check.status, CheckStatus::Error) || is_warn_level_page_anomaly_check(check)
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "phase": "doctor.jsonl_rebuild",
+        "action": "jsonl_rebuild",
+        "outcome": "verification_failed",
+        "created_at": Utc::now().to_rfc3339(),
+        "db_path": db_path.display().to_string(),
+        "imported": repair_result.imported,
+        "skipped": repair_result.skipped,
+        "fk_violations_cleaned": repair_result.fk_violations_cleaned,
+        "verified_backups": &repair_result.verified_backups,
+        "workspace_health": post_repair.report.workspace_health.as_deref(),
+        "failed_checks": failed_checks,
+    });
+    fs::write(&marker_path, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(marker_path)
 }
 
 /// Best-effort snapshot of unflushed local tombstones, guarded on every
@@ -823,20 +1497,29 @@ fn repair_recoverable_db_state(
     }
 
     match SqliteStorage::open(db_path) {
-        Ok(storage) => match storage.ensure_blocked_cache_fresh() {
-            Ok(blocked_cache_rebuilt) => {
-                repair.blocked_cache_rebuilt = blocked_cache_rebuilt;
-                repair
+        Ok(mut storage) => {
+            let force_rebuild = report_has_projection_content_mismatch_finding(report);
+            let rebuild_result = if force_rebuild {
+                storage.rebuild_blocked_cache(true).map(|_| true)
+            } else {
+                storage.ensure_blocked_cache_fresh()
+            };
+
+            match rebuild_result {
+                Ok(blocked_cache_rebuilt) => {
+                    repair.blocked_cache_rebuilt = blocked_cache_rebuilt;
+                    repair
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "Skipping blocked-cache repair; falling back to JSONL rebuild"
+                    );
+                    repair
+                }
             }
-            Err(err) => {
-                tracing::warn!(
-                    path = %db_path.display(),
-                    error = %err,
-                    "Skipping blocked-cache repair; falling back to JSONL rebuild"
-                );
-                repair
-            }
-        },
+        }
         Err(err) => {
             tracing::warn!(
                 path = %db_path.display(),
@@ -880,6 +1563,13 @@ fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
                     );
                 }
             }
+            if let Err(err) = conn.close() {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "REINDEX connection close failed"
+                );
+            }
         }
         Err(err) => {
             tracing::warn!(
@@ -893,10 +1583,7 @@ fn repair_partial_indexes(db_path: &Path, repair: &mut LocalRepairResult) {
 
 fn repair_database_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
     match inspect_database_sidecars(db_path) {
-        Ok(initial_inspection) => {
-            checkpoint_anomalous_wal(db_path, &initial_inspection, repair);
-            quarantine_anomalous_sidecars(beads_dir, db_path, repair);
-        }
+        Ok(_) => quarantine_anomalous_sidecars(beads_dir, db_path, repair),
         Err(err) => tracing::warn!(
             path = %db_path.display(),
             error = %err,
@@ -905,50 +1592,13 @@ fn repair_database_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut Local
     }
 }
 
-fn checkpoint_anomalous_wal(
-    db_path: &Path,
-    inspection: &SidecarInspection,
-    repair: &mut LocalRepairResult,
-) {
-    if !inspection.wal_requires_reconciliation || !db_path.is_file() {
-        return;
-    }
-
-    match SqliteStorage::open(db_path) {
-        Ok(storage) => match storage.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)") {
-            Ok(()) => repair.wal_checkpoint_completed = true,
-            Err(err) => tracing::warn!(
-                path = %db_path.display(),
-                error = %err,
-                "Failed to checkpoint anomalous WAL sidecar before quarantine"
-            ),
-        },
-        Err(err) => tracing::warn!(
-            path = %db_path.display(),
-            error = %err,
-            "Failed to open database while reconciling anomalous sidecars"
-        ),
-    }
-}
-
 fn quarantine_anomalous_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
     match inspect_database_sidecars(db_path) {
         Ok(post_checkpoint_inspection) => {
-            let mut quarantine_paths: BTreeSet<_> = post_checkpoint_inspection
+            let quarantine_paths: BTreeSet<_> = post_checkpoint_inspection
                 .quarantine_candidates
                 .into_iter()
                 .collect();
-            let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
-
-            if post_checkpoint_inspection.wal_requires_reconciliation
-                && !repair.wal_checkpoint_completed
-                && quarantine_paths.remove(&wal_path)
-            {
-                tracing::warn!(
-                    path = %wal_path.display(),
-                    "Skipping WAL quarantine because checkpoint reconciliation did not succeed"
-                );
-            }
 
             if !quarantine_paths.is_empty() {
                 match config::quarantine_database_artifacts(
@@ -999,6 +1649,9 @@ fn print_report(report: &DoctorReport, ctx: &OutputContext) -> Result<()> {
 
 fn print_report_plain(report: &DoctorReport) {
     println!("br doctor");
+    if let Some(health) = &report.workspace_health {
+        println!("HEALTH workspace: {health}");
+    }
     for check in &report.checks {
         let label = match check.status {
             CheckStatus::Ok => "OK",
@@ -1038,6 +1691,12 @@ fn render_doctor_rich(report: &DoctorReport, ctx: &OutputContext) {
         content.append_styled("Issues found", theme.error.clone());
     }
     content.append("\n");
+
+    if let Some(health) = &report.workspace_health {
+        content.append_styled("Health: ", theme.dimmed.clone());
+        content.append_styled(health, theme.accent.clone());
+        content.append("\n");
+    }
 
     content.append_styled("Checks: ", theme.dimmed.clone());
     content.append_styled(
@@ -1283,6 +1942,194 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
     }
 }
 
+fn push_recoverable_anomalies_check(checks: &mut Vec<CheckResult>, findings: &[String]) {
+    if findings.is_empty() {
+        push_check(
+            checks,
+            "db.recoverable_anomalies",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+    } else if findings
+        .iter()
+        .all(|finding| blocked_cache_rebuild_finding(finding))
+    {
+        push_check(
+            checks,
+            "db.recoverable_anomalies",
+            CheckStatus::Warn,
+            Some(findings[0].clone()),
+            Some(serde_json::json!({ "findings": findings })),
+        );
+    } else {
+        push_check(
+            checks,
+            "db.recoverable_anomalies",
+            CheckStatus::Error,
+            Some(findings[0].clone()),
+            Some(serde_json::json!({ "findings": findings })),
+        );
+    }
+}
+
+/// beads_rust-m3mi: flag closed beads whose `close_reason` matches a
+/// well-known audit-suspect pattern (e.g. "Forced close due to cycle"),
+/// unless the bead carries an `audit-historical-cycle-close-YYYY-MM-DD` label
+/// which acts as the explicit triage escape hatch.
+///
+/// Default patterns are defined inline; documented allowlist (substring
+/// matches that should never be flagged) skips legitimate close-reasons
+/// like "auto-closed by doctor" or "merged into".
+///
+/// Severity: Warn — these are NOT broken DB states; just audit-suspect
+/// closures that deserve operator attention.
+const HISTORICAL_CYCLE_CLOSE_LABEL_PREFIX: &str = "audit-historical-cycle-close-";
+
+fn is_historical_cycle_close_label(label: &str) -> bool {
+    let Some(date) = label
+        .trim()
+        .strip_prefix(HISTORICAL_CYCLE_CLOSE_LABEL_PREFIX)
+    else {
+        return false;
+    };
+
+    let bytes = date.as_bytes();
+    let has_date_shape = bytes.len() == 10
+        && bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[4] == b'-'
+        && bytes[5].is_ascii_digit()
+        && bytes[6].is_ascii_digit()
+        && bytes[7] == b'-'
+        && bytes[8].is_ascii_digit()
+        && bytes[9].is_ascii_digit();
+    has_date_shape && NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+}
+
+fn check_suspect_close_reasons(conn: &Connection, checks: &mut Vec<CheckResult>) {
+    // Default patterns: (case-insensitive substring matches; lowercase form below)
+    let default_patterns: &[&str] = &[
+        "forced close due to cycle",
+        "due to dep cycle",
+        "due to dependency cycle",
+        "temporarily closed",
+        "wip close",
+    ];
+    // Default allowlist: substrings that must never be flagged
+    let default_allowlist: &[&str] = &[
+        "auto-closed by doctor",
+        "closed by epic close-eligible",
+        "merged into",
+        "superseded by",
+    ];
+
+    // Query closed beads' id, close_reason, labels (joined as ASCII-unit-
+    // separated, since `br update --add-label` rejects this character so
+    // it can never appear inside a label and is a safe split delimiter).
+    // GROUP_CONCAT separator can't contain commas in case a label ever
+    // does — the validator forbids commas today, but we don't want to
+    // create a latent bug if the schema ever changes.
+    let rows = match conn.query(
+        "SELECT i.id, i.close_reason,
+                COALESCE(GROUP_CONCAT(l.label, char(31)), '') AS labels
+         FROM issues i
+         LEFT JOIN labels l ON l.issue_id = i.id
+         WHERE i.status = 'closed' AND i.close_reason IS NOT NULL
+         GROUP BY i.id
+         ORDER BY i.id",
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            push_check(
+                checks,
+                "audit.suspect_close_reasons",
+                CheckStatus::Warn,
+                Some(format!(
+                    "Failed to query closed beads for close_reason audit: {err}"
+                )),
+                None,
+            );
+            return;
+        }
+    };
+
+    let mut matches: Vec<serde_json::Value> = Vec::new();
+    for row in rows {
+        let id = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string();
+        let reason = row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string();
+        let labels = row
+            .get(2)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() || reason.is_empty() {
+            continue;
+        }
+
+        // Skip only if a label is the documented dated historical-triage marker.
+        // Split on ASCII unit separator (matches the GROUP_CONCAT separator
+        // above; safe even if a label ever contained a comma).
+        let has_historical_label = labels.split('\x1f').any(is_historical_cycle_close_label);
+        if has_historical_label {
+            continue;
+        }
+
+        let reason_lower = reason.to_lowercase();
+
+        // Skip if any allowlist substring matches
+        if default_allowlist.iter().any(|a| reason_lower.contains(a)) {
+            continue;
+        }
+
+        // Match against suspect patterns
+        if let Some(matched) = default_patterns.iter().find(|p| reason_lower.contains(*p)) {
+            matches.push(serde_json::json!({
+                "bead_id": id,
+                "matched_pattern": matched,
+                "close_reason": reason,
+                "has_historical_label": false,
+            }));
+        }
+    }
+
+    if matches.is_empty() {
+        push_check(
+            checks,
+            "audit.suspect_close_reasons",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+
+    let count = matches.len();
+    push_check(
+        checks,
+        "audit.suspect_close_reasons",
+        CheckStatus::Warn,
+        Some(format!(
+            "{count} closed bead(s) have audit-suspect close_reason text without an audit-historical-cycle-close-<YYYY-MM-DD> escape-hatch label"
+        )),
+        Some(serde_json::json!({
+            "patterns_used": default_patterns,
+            "allowlist_used": default_allowlist,
+            "matches": matches,
+        })),
+    );
+}
+
 fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
     let duplicate_schema_rows = conn.query(
         "SELECT type, name, COUNT(*) AS row_count
@@ -1365,27 +2212,126 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     {
         findings.push(BLOCKED_CACHE_STALE_FINDING.to_string());
     }
-
-    if findings.is_empty() {
-        push_check(
-            checks,
-            "db.recoverable_anomalies",
-            CheckStatus::Ok,
-            None,
-            None,
-        );
-    } else {
-        push_check(
-            checks,
-            "db.recoverable_anomalies",
-            CheckStatus::Error,
-            Some(findings[0].clone()),
-            Some(serde_json::json!({ "findings": findings })),
-        );
+    let blocked_cache_health = SqliteStorage::blocked_cache_projection_health(conn);
+    if blocked_cache_health.has_mismatch() {
+        findings.push(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING.to_string());
+    }
+    let ready_projection_health = SqliteStorage::ready_projection_health(conn);
+    if ready_projection_health.has_mismatch() {
+        findings.push(READY_PROJECTION_CONTENT_MISMATCH_FINDING.to_string());
     }
 
+    push_recoverable_anomalies_check(checks, &findings);
     Ok(())
 }
+
+/// (table, column, fix_sql) tuples for every NOT NULL DEFAULT column that
+/// can hold a storage-class NULL on legacy databases. Mirrors the schema
+/// bootstrap's v8 migration in `backfill_storage_null_in_default_columns`
+/// — a doctor warning here means a NULL appeared *after* migration ran
+/// (issue #269 covers the legacy backfill, #177 the typeof-vs-IS-NULL
+/// rationale).
+const NULL_DEFAULT_CHECKS: &[(&str, &str, &str)] = &[
+    // issues
+    (
+        "issues",
+        "description",
+        "UPDATE issues SET description = '' WHERE typeof(description) = 'null'",
+    ),
+    (
+        "issues",
+        "design",
+        "UPDATE issues SET design = '' WHERE typeof(design) = 'null'",
+    ),
+    (
+        "issues",
+        "acceptance_criteria",
+        "UPDATE issues SET acceptance_criteria = '' WHERE typeof(acceptance_criteria) = 'null'",
+    ),
+    (
+        "issues",
+        "notes",
+        "UPDATE issues SET notes = '' WHERE typeof(notes) = 'null'",
+    ),
+    (
+        "issues",
+        "status",
+        "UPDATE issues SET status = 'open' WHERE typeof(status) = 'null'",
+    ),
+    (
+        "issues",
+        "priority",
+        "UPDATE issues SET priority = 2 WHERE typeof(priority) = 'null'",
+    ),
+    (
+        "issues",
+        "issue_type",
+        "UPDATE issues SET issue_type = 'task' WHERE typeof(issue_type) = 'null'",
+    ),
+    (
+        "issues",
+        "source_repo",
+        "UPDATE issues SET source_repo = '.' WHERE typeof(source_repo) = 'null'",
+    ),
+    (
+        "issues",
+        "ephemeral",
+        "UPDATE issues SET ephemeral = 0 WHERE typeof(ephemeral) = 'null'",
+    ),
+    (
+        "issues",
+        "pinned",
+        "UPDATE issues SET pinned = 0 WHERE typeof(pinned) = 'null'",
+    ),
+    (
+        "issues",
+        "is_template",
+        "UPDATE issues SET is_template = 0 WHERE typeof(is_template) = 'null'",
+    ),
+    // dependencies
+    (
+        "dependencies",
+        "type",
+        "UPDATE dependencies SET type = 'blocks' WHERE typeof(type) = 'null'",
+    ),
+    (
+        "dependencies",
+        "created_by",
+        "UPDATE dependencies SET created_by = '' WHERE typeof(created_by) = 'null'",
+    ),
+    // comments
+    (
+        "comments",
+        "author",
+        "UPDATE comments SET author = '' WHERE typeof(author) = 'null'",
+    ),
+    (
+        "comments",
+        "text",
+        "UPDATE comments SET text = '' WHERE typeof(text) = 'null'",
+    ),
+    (
+        "comments",
+        "created_at",
+        "UPDATE comments SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
+    ),
+    // events
+    (
+        "events",
+        "event_type",
+        "UPDATE events SET event_type = '' WHERE typeof(event_type) = 'null'",
+    ),
+    (
+        "events",
+        "actor",
+        "UPDATE events SET actor = '' WHERE typeof(actor) = 'null'",
+    ),
+    (
+        "events",
+        "created_at",
+        "UPDATE events SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
+    ),
+];
 
 /// Check for NULL values in NOT NULL columns that should have DEFAULTs.
 ///
@@ -1397,23 +2343,7 @@ fn check_null_defaults(conn: &Connection, checks: &mut Vec<CheckResult>) {
     // that cause IS NULL predicates to silently return 0 rows even when NULLs
     // exist in the table.  typeof() bypasses the index and checks the actual
     // storage class.  See issue #177 for details.
-    let queries: &[(&str, &str, &str)] = &[
-        (
-            "events",
-            "actor",
-            "UPDATE events SET actor = '' WHERE typeof(actor) = 'null'",
-        ),
-        (
-            "events",
-            "created_at",
-            "UPDATE events SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
-        ),
-        (
-            "comments",
-            "created_at",
-            "UPDATE comments SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
-        ),
-    ];
+    let queries: &[(&str, &str, &str)] = NULL_DEFAULT_CHECKS;
 
     let mut null_findings = Vec::new();
 
@@ -1511,24 +2441,6 @@ fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
         update_result,
         rollback_result,
     ));
-}
-
-fn check_live_issue_write_probe(db_path: &Path, checks: &mut Vec<CheckResult>) {
-    match Connection::open(db_path.to_string_lossy().into_owned()) {
-        Ok(conn) => {
-            let _ = conn.execute("PRAGMA busy_timeout=0");
-            check_issue_write_probe(&conn, checks);
-        }
-        Err(err) => push_check(
-            checks,
-            "db.write_probe",
-            CheckStatus::Error,
-            Some(format!(
-                "Failed to open live DB for rollback-only write probe: {err}"
-            )),
-            Some(serde_json::json!({ "path": db_path.display().to_string() })),
-        ),
-    }
 }
 
 fn sqlite_cli_integrity_messages(db_path: &Path) -> Result<Vec<String>> {
@@ -1676,9 +2588,21 @@ fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         return;
     };
     let gitignore_path = project_root.join(".gitignore");
-    let Ok(content) = fs::read_to_string(&gitignore_path) else {
-        // No .gitignore is fine — nothing to warn about.
-        return;
+    let content = match read_root_gitignore_content(&gitignore_path) {
+        Ok(Some(content)) => content,
+        Ok(None) => return,
+        Err(err) => {
+            push_check(
+                checks,
+                "gitignore.beads_inner",
+                CheckStatus::Warn,
+                Some(format!("Could not inspect root .gitignore: {err}")),
+                Some(serde_json::json!({
+                    "gitignore_path": gitignore_path.display().to_string(),
+                })),
+            );
+            return;
+        }
     };
 
     let offending: Vec<String> = content
@@ -1725,8 +2649,15 @@ fn fix_root_gitignore_if_warned(
         return false;
     };
     let gitignore_path = project_root.join(".gitignore");
-    let Ok(content) = fs::read_to_string(&gitignore_path) else {
-        return false;
+    let content = match read_root_gitignore_content(&gitignore_path) {
+        Ok(Some(content)) => content,
+        Ok(None) => return false,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!("Skipping .gitignore repair: {err}"));
+            }
+            return false;
+        }
     };
 
     let filtered: Vec<&str> = content
@@ -1738,7 +2669,7 @@ fn fix_root_gitignore_if_warned(
         new_content.push('\n');
     }
 
-    if let Err(err) = fs::write(&gitignore_path, new_content) {
+    if let Err(err) = write_root_gitignore_atomically(&gitignore_path, new_content.as_bytes()) {
         if !ctx.is_json() {
             ctx.warning(&format!("Failed to fix .gitignore: {err}"));
         }
@@ -1749,6 +2680,89 @@ fn fix_root_gitignore_if_warned(
         }
         true
     }
+}
+
+fn read_root_gitignore_content(gitignore_path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(gitignore_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err(BeadsError::Config(format!(
+            "refusing to inspect or repair symlinked root .gitignore: {}",
+            gitignore_path.display()
+        )));
+    }
+
+    if !metadata.is_file() {
+        return Err(BeadsError::Config(format!(
+            "root .gitignore is not a regular file: {}",
+            gitignore_path.display()
+        )));
+    }
+
+    Ok(Some(fs::read_to_string(gitignore_path)?))
+}
+
+fn root_gitignore_temp_path(gitignore_path: &Path, attempt: u32) -> PathBuf {
+    let pid = std::process::id();
+    let file_name = gitignore_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(".gitignore");
+    let temp_name = if attempt == 0 {
+        format!("{file_name}.{pid}.tmp")
+    } else {
+        format!("{file_name}.{pid}.{attempt}.tmp")
+    };
+    gitignore_path.with_file_name(temp_name)
+}
+
+fn create_root_gitignore_temp_file(gitignore_path: &Path) -> Result<(PathBuf, fs::File)> {
+    for attempt in 0..64_u32 {
+        let temp_path = root_gitignore_temp_path(gitignore_path, attempt);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temp .gitignore file for {}",
+        gitignore_path.display()
+    )))
+}
+
+fn write_root_gitignore_atomically(gitignore_path: &Path, contents: &[u8]) -> Result<()> {
+    let permissions = fs::symlink_metadata(gitignore_path)?.permissions();
+    let (temp_path, mut temp_file) = create_root_gitignore_temp_file(gitignore_path)?;
+    if let Err(err) = fs::set_permissions(&temp_path, permissions) {
+        tracing::warn!(
+            path = %gitignore_path.display(),
+            error = %err,
+            "Failed to apply original .gitignore permissions before atomic rewrite"
+        );
+    }
+    if let Err(err) = temp_file
+        .write_all(contents)
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.into());
+    }
+    drop(temp_file);
+    crate::util::durable_rename(&temp_path, gitignore_path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })?;
+    Ok(())
 }
 
 fn discover_jsonl(beads_dir: &Path) -> Option<PathBuf> {
@@ -2313,9 +3327,16 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
         &mut checks,
     );
 
+    let classification = classify_doctor_checks(&paths.db_path, &paths.jsonl_path, &checks);
+    let reliability_audit = classification.audit_record("doctor.inspect");
+    let ok = !has_error(&checks);
+    emit_doctor_reliability_audit("inspect", ok, &reliability_audit, &checks);
+
     Ok(DoctorRun {
         report: DoctorReport {
-            ok: !has_error(&checks),
+            ok,
+            workspace_health: Some(classification.health.to_string()),
+            reliability_audit: Some(reliability_audit),
             checks,
         },
         jsonl_path,
@@ -2423,6 +3444,8 @@ fn inspect_existing_doctor_database(
         }
         check_null_defaults(&conn, checks);
         check_integrity(&conn, checks);
+        // beads_rust-m3mi: audit-suspect close_reasons (warn level)
+        check_suspect_close_reasons(&conn, checks);
         if let Err(err) = check_db_count(&conn, jsonl_count, checks) {
             push_inspection_error(
                 checks,
@@ -2432,10 +3455,11 @@ fn inspect_existing_doctor_database(
             );
         }
         check_sync_metadata(&conn, snapshot_db_path, jsonl_path, checks);
+        check_issue_write_probe(&conn, checks);
+        conn.close()?;
         Ok(())
     }) {
         Ok(()) => {
-            check_live_issue_write_probe(db_path, checks);
             check_sqlite_cli_integrity(db_path, checks);
         }
         Err(err) => {
@@ -2469,6 +3493,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         );
         let report = DoctorReport {
             ok: !has_error(&checks),
+            workspace_health: None,
+            reliability_audit: None,
             checks,
         };
         print_report(&report, ctx)?;
@@ -2488,6 +3514,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             );
             let report = DoctorReport {
                 ok: !has_error(&checks),
+                workspace_health: None,
+                reliability_audit: None,
                 checks,
             };
             print_report(&report, ctx)?;
@@ -2516,56 +3544,115 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
+    let mut local_repair = LocalRepairResult::default();
+
     if initial.report.ok {
-        // Even when there are no errors, partial-index warnings can be repaired
-        // via REINDEX.  Run it when --repair is passed and the warnings are present.
-        if report_has_partial_index_warnings(&initial.report) {
-            let mut repair = LocalRepairResult::default();
-            repair_partial_indexes(&paths.db_path, &mut repair);
-            let post_reindex = collect_doctor_report(&beads_dir, &paths)?;
+        let has_blocked_cache_rebuild = report_has_blocked_cache_rebuild_finding(&initial.report);
+        let has_partial_index_warnings = report_has_partial_index_warnings(&initial.report);
+        let has_warn_page_anomalies = report_has_warn_level_page_anomaly(&initial.report);
+
+        // Even when there are no errors, planned deferred cache rebuilds and
+        // integrity warnings can be repaired. Run those local repairs when
+        // --repair is passed and the warnings are present.
+        if has_blocked_cache_rebuild || has_partial_index_warnings || has_warn_page_anomalies {
+            local_repair = if has_blocked_cache_rebuild {
+                repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report)
+            } else {
+                LocalRepairResult::default()
+            };
+
+            if has_partial_index_warnings {
+                repair_partial_indexes(&paths.db_path, &mut local_repair);
+            }
+
+            if has_warn_page_anomalies {
+                repair_via_vacuum(&paths.db_path, &mut local_repair);
+            }
+
+            let post_warning_repair = collect_doctor_report(&beads_dir, &paths)?;
+            let verified = warning_repair_verified(
+                &post_warning_repair.report,
+                has_blocked_cache_rebuild,
+                has_partial_index_warnings,
+            );
             let repair_message = repair_outcome_message(
                 gitignore_repaired,
-                Some(&repair),
-                Some(REINDEX_INCOMPLETE_MESSAGE),
+                Some(&local_repair),
+                has_partial_index_warnings.then_some(REINDEX_INCOMPLETE_MESSAGE),
             );
+            let recovery_audit = local_repair_audit_record(
+                "doctor.warn_repair",
+                if verified {
+                    "verified"
+                } else if has_warn_page_anomalies {
+                    "needs_jsonl_rebuild"
+                } else {
+                    "verification_failed"
+                },
+                &local_repair,
+                (!verified).then(|| {
+                    if has_warn_page_anomalies {
+                        "local warning repair did not clear page-level integrity warnings"
+                            .to_string()
+                    } else {
+                        "local warning repair did not clear all requested warnings".to_string()
+                    }
+                }),
+            );
+            emit_recovery_audit_record(&recovery_audit);
+            if verified {
+                if ctx.is_json() {
+                    ctx.json(&serde_json::json!({
+                        "report": initial.report,
+                        "repaired": gitignore_repaired || local_repair.applied(),
+                        "local_repair": local_repair,
+                        "recovery_audit": recovery_audit,
+                        "message": repair_message,
+                        "post_repair": post_warning_repair.report,
+                        "verified": true,
+                    }));
+                } else {
+                    print_report(&initial.report, ctx)?;
+                    ctx.info(&repair_message);
+                    ctx.info("Post-repair verification:");
+                    print_report(&post_warning_repair.report, ctx)?;
+                }
+                return Ok(());
+            }
+
+            if !ctx.is_json() {
+                ctx.info(&repair_message);
+                ctx.info(
+                    "Local warning repair did not clear all integrity warnings; rebuilding DB from JSONL...",
+                );
+            }
+        } else {
+            let recovery_audit = no_op_repair_audit_record(gitignore_repaired);
+            emit_recovery_audit_record(&recovery_audit);
             if ctx.is_json() {
                 ctx.json(&serde_json::json!({
                     "report": initial.report,
-                    "repaired": gitignore_repaired || repair.applied(),
-                    "local_repair": repair,
-                    "message": repair_message,
-                    "post_repair": post_reindex.report,
-                    "verified": post_reindex.report.ok,
+                    "repaired": gitignore_repaired,
+                    "recovery_audit": recovery_audit,
+                    "message": repair_outcome_message(gitignore_repaired, None, None)
                 }));
             } else {
                 print_report(&initial.report, ctx)?;
-                ctx.info(&repair_message);
-                ctx.info("Post-repair verification:");
-                print_report(&post_reindex.report, ctx)?;
+                ctx.info(&repair_outcome_message(gitignore_repaired, None, None));
             }
-        } else if ctx.is_json() {
-            ctx.json(&serde_json::json!({
-                "report": initial.report,
-                "repaired": gitignore_repaired,
-                "message": repair_outcome_message(gitignore_repaired, None, None)
-            }));
-        } else {
-            print_report(&initial.report, ctx)?;
-            ctx.info(&repair_outcome_message(gitignore_repaired, None, None));
+            return Ok(());
         }
-        return Ok(());
     }
 
-    let mut local_repair = if report_has_blocked_cache_stale_finding(&initial.report)
-        || report_has_sidecar_anomaly(&initial.report)
+    if !local_repair.applied()
+        && (report_has_blocked_cache_rebuild_finding(&initial.report)
+            || report_has_sidecar_anomaly(&initial.report))
     {
-        repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report)
-    } else {
-        LocalRepairResult::default()
-    };
+        local_repair = repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report);
+    }
 
     // Also attempt REINDEX if partial-index warnings are present alongside errors.
-    if report_has_partial_index_warnings(&initial.report) {
+    if !local_repair.indexes_reindexed && report_has_partial_index_warnings(&initial.report) {
         repair_partial_indexes(&paths.db_path, &mut local_repair);
     }
 
@@ -2602,7 +3689,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
-    if after_local_repair.report.ok {
+    if repair_report_verified(&after_local_repair.report) {
         // Issue #245: REINDEX can fix index ordering so integrity_check
         // passes, but the underlying B-tree corruption may still cause
         // writes to fail (reads work, writes get ISSUE_NOT_FOUND).  Run a
@@ -2610,6 +3697,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // declaring success.
         let write_probe_ok = write_probe_after_repair(&paths.db_path);
         if !write_probe_ok {
+            let recovery_audit = local_repair_audit_record(
+                "doctor.local_repair",
+                "write_probe_failed",
+                &local_repair,
+                Some("rollback-only write probe failed after local repair".to_string()),
+            );
+            emit_recovery_audit_record(&recovery_audit);
             tracing::warn!(
                 "Post-repair write probe failed — local repair insufficient, \
                  falling through to full JSONL rebuild"
@@ -2618,11 +3712,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         } else {
             let repair_message =
                 repair_outcome_message(gitignore_repaired, Some(&local_repair), None);
+            let recovery_audit =
+                local_repair_audit_record("doctor.local_repair", "verified", &local_repair, None);
+            emit_recovery_audit_record(&recovery_audit);
             if ctx.is_json() {
                 ctx.json(&serde_json::json!({
                     "report": initial.report,
                     "repaired": gitignore_repaired || local_repair.applied(),
                     "local_repair": local_repair,
+                    "recovery_audit": recovery_audit,
                     "message": repair_message,
                     "post_repair": after_local_repair.report,
                     "verified": true,
@@ -2635,52 +3733,141 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             }
             return Ok(());
         }
+    } else if local_repair.applied() {
+        let reason = if after_local_repair.report.ok {
+            "local repair did not clear page-level integrity warnings"
+        } else {
+            "local repair did not clear doctor errors"
+        };
+        let recovery_audit = local_repair_audit_record(
+            "doctor.local_repair",
+            "needs_jsonl_rebuild",
+            &local_repair,
+            Some(reason.to_string()),
+        );
+        emit_recovery_audit_record(&recovery_audit);
     }
 
     let Some(jsonl_path) = initial.jsonl_path.as_ref() else {
+        let recovery_audit = jsonl_rebuild_audit_record(
+            "doctor.jsonl_rebuild",
+            "refused",
+            None,
+            Some("no JSONL file found to rebuild from".to_string()),
+        );
+        emit_recovery_audit_record(&recovery_audit);
         return Err(BeadsError::Config(
             "Cannot repair: no JSONL file found to rebuild from".to_string(),
         ));
     };
+
+    if let Some(reason) = repeated_jsonl_rebuild_refusal_reason(
+        &beads_dir,
+        &paths.db_path,
+        args.allow_repeated_repair,
+    )? {
+        let recovery_audit = jsonl_rebuild_audit_record(
+            "doctor.jsonl_rebuild",
+            "refused",
+            None,
+            Some(reason.clone()),
+        );
+        emit_recovery_audit_record(&recovery_audit);
+        return Err(BeadsError::Config(reason));
+    }
 
     if !ctx.is_json() {
         print_report(&initial.report, ctx)?;
         ctx.info("Repairing: rebuilding DB from JSONL...");
     }
 
-    let repair_result =
-        repair_database_from_jsonl(&beads_dir, &paths.db_path, jsonl_path, cli, !ctx.is_json())
-            .map_err(|err| {
-                BeadsError::Config(format!(
-                    "Repair import failed: {err}. \
+    let repair_result = match repair_database_from_jsonl(
+        &beads_dir,
+        &paths.db_path,
+        jsonl_path,
+        cli,
+        !ctx.is_json(),
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            let outcome = jsonl_rebuild_failure_outcome(&err);
+            let recovery_audit = jsonl_rebuild_audit_record(
+                "doctor.jsonl_rebuild",
+                outcome,
+                None,
+                Some(err.to_string()),
+            );
+            emit_recovery_audit_record(&recovery_audit);
+            if outcome == "refused" {
+                return Err(err);
+            }
+            return Err(BeadsError::Config(format!(
+                "Repair import failed: {err}. \
              The JSONL file may be corrupt. \
              Try manually editing the JSONL to fix invalid records."
-                ))
-            })?;
+            )));
+        }
+    };
 
     let post_repair = collect_doctor_report(&beads_dir, &paths)?;
+    let post_repair_verified = repair_report_verified(&post_repair.report);
+    let verification_failure_marker = if post_repair_verified {
+        None
+    } else {
+        Some(write_jsonl_rebuild_verification_failed_marker(
+            &beads_dir,
+            &paths.db_path,
+            &post_repair,
+            &repair_result,
+        )?)
+    };
+    let verification_failure_reason = verification_failure_marker.as_ref().map(|path| {
+        format!(
+            "post-repair verification failed; evidence marker written to '{}'",
+            path.display()
+        )
+    });
+    let recovery_audit = jsonl_rebuild_audit_record(
+        "doctor.jsonl_rebuild",
+        if post_repair_verified {
+            "verified"
+        } else {
+            "verification_failed"
+        },
+        Some(&repair_result),
+        verification_failure_reason.clone(),
+    );
+    emit_recovery_audit_record(&recovery_audit);
 
     if ctx.is_json() {
         ctx.json(&serde_json::json!({
             "report": initial.report,
             "repaired": true,
             "local_repair": local_repair,
+            "recovery_audit": recovery_audit,
             "imported": repair_result.imported,
             "skipped": repair_result.skipped,
             "fk_violations_cleaned": repair_result.fk_violations_cleaned,
+            "verified_backups": &repair_result.verified_backups,
             "post_repair": post_repair.report,
-            "verified": post_repair.report.ok,
+            "verified": post_repair_verified,
+            "recovery_failure_marker": verification_failure_marker
+                .as_ref()
+                .map(|path| path.display().to_string()),
         }));
     } else {
         ctx.info(&format!(
             "Repair complete: imported {}, skipped {}",
             repair_result.imported, repair_result.skipped
         ));
+        if let Some(reason) = verification_failure_reason.as_deref() {
+            ctx.warning(reason);
+        }
         ctx.info("Post-repair verification:");
         print_report(&post_repair.report, ctx)?;
     }
 
-    if !post_repair.report.ok {
+    if !post_repair_verified {
         return Err(BeadsError::Config(
             "Repair completed, but post-repair verification still found issues".to_string(),
         ));
@@ -2692,6 +3879,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
@@ -2745,6 +3933,533 @@ mod tests {
             dependencies: Vec::new(),
             comments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_repair_orphan_cleanup_preserves_external_dependency_endpoints() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut epic = sample_issue("bd-epic", "Epic");
+        epic.issue_type = IssueType::Epic;
+        storage.create_issue(&epic, "tester").unwrap();
+
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('external:child:cap', 'bd-epic', 'parent-child', '2026-01-01T00:00:00Z', 'tester');
+                 INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('missing-issue', 'tester', 'dangling', '2026-01-01T00:00:00Z');
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let cleaned = cleanup_repair_missing_issue_references(&mut storage).unwrap();
+
+        assert_eq!(cleaned, 1, "only the real local orphan should be removed");
+        let external_rows = storage
+            .execute_raw_query(
+                "SELECT issue_id, depends_on_id
+                 FROM dependencies
+                 WHERE issue_id = 'external:child:cap'",
+            )
+            .unwrap();
+        assert_eq!(
+            external_rows.len(),
+            1,
+            "external dependency endpoints must survive doctor repair cleanup"
+        );
+    }
+
+    #[test]
+    fn test_repair_orphan_cleanup_rebuilds_blocked_cache_after_dependency_cleanup() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = sample_issue("bd-local", "Local");
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-local', 'bd-missing', 'blocks', '2026-01-01T00:00:00Z', 'tester');
+                 INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at)
+                 VALUES ('bd-local', '[\"bd-missing\"]', '2026-01-01T00:00:00Z');
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let cleaned = cleanup_repair_missing_issue_references(&mut storage).unwrap();
+
+        assert_eq!(
+            cleaned, 1,
+            "only the missing dependency row should be removed"
+        );
+        let cache_rows = storage
+            .execute_raw_query(
+                "SELECT issue_id
+                 FROM blocked_issues_cache
+                 WHERE issue_id = 'bd-local'",
+            )
+            .unwrap();
+        assert!(
+            cache_rows.is_empty(),
+            "dependency cleanup must rebuild stale blocked cache rows"
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_write_probe_failure_recoverable() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "db.write_probe".to_string(),
+            status: CheckStatus::Error,
+            message: Some(
+                "Rollback-only issue write failed: database disk image is malformed".to_string(),
+            ),
+            details: Some(serde_json::json!({ "issue_id": "bd-probe" })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Recoverable);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::WriteProbeFailed { .. })),
+            "expected write-probe failure anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_invalid_jsonl_unsafe() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "jsonl.parse".to_string(),
+            status: CheckStatus::Error,
+            message: Some("Malformed or invalid issue records: 1".to_string()),
+            details: Some(serde_json::json!({ "path": jsonl_path.display().to_string() })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Unsafe);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlParseError { .. })),
+            "expected JSONL parse anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_repairable_integrity_warnings_recoverable() {
+        for (check_name, message) in [
+            ("sqlite.integrity_check", "Page 55: never used"),
+            (
+                "sqlite3.integrity_check",
+                "row 42 missing from index idx_foo",
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("beads.db");
+            let jsonl_path = temp.path().join("issues.jsonl");
+            let checks = vec![CheckResult {
+                name: check_name.to_string(),
+                status: CheckStatus::Warn,
+                message: Some(message.to_string()),
+                details: None,
+            }];
+
+            let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+            assert_eq!(classification.health, WorkspaceHealth::Recoverable);
+            assert!(
+                classification.anomalies.iter().any(|anomaly| {
+                    matches!(
+                        anomaly,
+                        AnomalyClass::DatabaseCorrupt { detail } if detail == message
+                    )
+                }),
+                "expected repairable integrity warning anomaly for {check_name}: {:?}",
+                classification.anomalies
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_ignores_benign_integrity_warning() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "sqlite.integrity_check".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("out of order index idx_foo".to_string()),
+            details: None,
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Healthy);
+        assert!(
+            classification.anomalies.is_empty(),
+            "benign integrity warning should not create health anomalies: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_count_mismatch_degraded() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "counts.db_vs_jsonl".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("DB and JSONL counts differ".to_string()),
+            details: Some(serde_json::json!({ "db": 2, "jsonl": 1 })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::DbJsonlCountMismatch {
+                        db_count: 2,
+                        jsonl_count: 1
+                    }
+                )
+            }),
+            "expected count mismatch anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_marks_warn_recoverable_anomalies_degraded() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "db.recoverable_anomalies".to_string(),
+            status: CheckStatus::Warn,
+            message: Some(BLOCKED_CACHE_STALE_FINDING.to_string()),
+            details: Some(serde_json::json!({
+                "findings": [
+                    BLOCKED_CACHE_STALE_FINDING,
+                    BLOCKED_CACHE_CONTENT_MISMATCH_FINDING,
+                    READY_PROJECTION_CONTENT_MISMATCH_FINDING,
+                ]
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        let anomalies = &classification.anomalies;
+        assert!(
+            anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::BlockedCacheStale)),
+            "expected blocked-cache stale anomaly: {:?}",
+            anomalies
+        );
+        assert!(
+            anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::BlockedCacheContentMismatch)),
+            "expected blocked-cache content mismatch anomaly: {:?}",
+            anomalies
+        );
+        assert!(
+            anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::ReadyProjectionContentMismatch)),
+            "expected ready projection mismatch anomaly: {:?}",
+            anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_preserves_duplicate_finding_details() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "db.recoverable_anomalies".to_string(),
+            status: CheckStatus::Error,
+            message: Some(
+                "sqlite_master contains duplicate table entries for 'blocked_issues_cache' (3 rows)"
+                    .to_string(),
+            ),
+            details: Some(serde_json::json!({
+                "findings": [
+                    "sqlite_master contains duplicate table entries for 'blocked_issues_cache' (3 rows)",
+                    "config contains duplicate rows for key 'issue_prefix' (4 rows)",
+                    "metadata contains duplicate rows for key 'project' (5 rows)",
+                ]
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Recoverable);
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::DuplicateSchemaRows { name, count }
+                        if name == "blocked_issues_cache" && *count == 3
+                )
+            }),
+            "expected schema duplicate details: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::DuplicateConfigKeys { key, count }
+                        if key == "issue_prefix" && *count == 4
+                )
+            }),
+            "expected config duplicate details: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::DuplicateMetadataKeys { key, count }
+                        if key == "project" && *count == 5
+                )
+            }),
+            "expected metadata duplicate details: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_preserves_shm_only_sidecar_presence() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        let checks = vec![CheckResult {
+            name: "db.sidecars".to_string(),
+            status: CheckStatus::Error,
+            message: Some(format!(
+                "SHM sidecar exists without a matching WAL sidecar at {}",
+                shm_path.display()
+            )),
+            details: Some(serde_json::json!({
+                "findings": [
+                    format!(
+                        "SHM sidecar exists without a matching WAL sidecar at {}",
+                        shm_path.display()
+                    )
+                ],
+                "quarantine_candidates": [shm_path.display().to_string()],
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::SidecarMismatch {
+                        has_wal: false,
+                        has_shm: true
+                    }
+                )
+            }),
+            "expected SHM-only sidecar anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_preserves_shm_only_sidecar_presence_without_details() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "db.sidecars".to_string(),
+            status: CheckStatus::Error,
+            message: Some("SHM sidecar exists without a matching WAL sidecar".to_string()),
+            details: None,
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert!(
+            classification.anomalies.iter().any(|anomaly| {
+                matches!(
+                    anomaly,
+                    AnomalyClass::SidecarMismatch {
+                        has_wal: false,
+                        has_shm: true
+                    }
+                )
+            }),
+            "expected SHM-only sidecar anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_local_repair_audit_records_applied_actions_and_artifacts() {
+        let repair = LocalRepairResult {
+            blocked_cache_rebuilt: true,
+            indexes_reindexed: true,
+            vacuumed: false,
+            quarantined_artifacts: vec![".beads/.br_recovery/beads.db-shm.test".to_string()],
+        };
+
+        let audit = local_repair_audit_record(
+            "doctor.local_repair",
+            "verified",
+            &repair,
+            Some("post-repair checks passed".to_string()),
+        );
+
+        assert_eq!(audit.phase, "doctor.local_repair");
+        assert_eq!(audit.action, "local_repair");
+        assert_eq!(audit.outcome, "verified");
+        assert_eq!(
+            audit.applied_actions,
+            vec![
+                "blocked_cache_rebuilt".to_string(),
+                "indexes_reindexed".to_string(),
+                "quarantined_artifacts".to_string()
+            ]
+        );
+        assert_eq!(audit.quarantined_artifacts.len(), 1);
+        assert_eq!(audit.reason.as_deref(), Some("post-repair checks passed"));
+    }
+
+    #[test]
+    fn test_jsonl_rebuild_audit_records_import_counts() {
+        let repair = DoctorRepairResult {
+            imported: 3,
+            skipped: 1,
+            fk_violations_cleaned: 2,
+            verified_backups: Vec::new(),
+        };
+
+        let audit =
+            jsonl_rebuild_audit_record("doctor.jsonl_rebuild", "verified", Some(&repair), None);
+
+        assert_eq!(audit.action, "jsonl_rebuild");
+        assert_eq!(audit.imported, Some(3));
+        assert_eq!(audit.skipped, Some(1));
+        assert_eq!(audit.fk_violations_cleaned, Some(2));
+    }
+
+    #[test]
+    fn test_repeated_jsonl_rebuild_refusal_reason_detects_failed_marker() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir)?;
+
+        let recovery_dir = config::recovery_dir_for_db_path(&db_path, &beads_dir);
+        fs::create_dir_all(&recovery_dir)?;
+        let marker = recovery_dir.join(format!(
+            "beads.db.20260421_120000_000000{}",
+            JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX
+        ));
+        fs::write(&marker, b"{\"outcome\":\"verification_failed\"}")?;
+
+        let reason =
+            repeated_jsonl_rebuild_refusal_reason(&beads_dir, &db_path, false)?.expect("reason");
+        assert!(reason.contains(JSONL_REBUILD_REPEAT_ERROR_PREFIX));
+        assert!(reason.contains(&marker.display().to_string()));
+        assert!(reason.contains("--allow-repeated-repair"));
+
+        let allowed = repeated_jsonl_rebuild_refusal_reason(&beads_dir, &db_path, true)?;
+        assert!(allowed.is_none(), "explicit override should permit retry");
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_jsonl_rebuild_verification_failed_marker_records_failed_checks() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir)?;
+
+        let post_repair = DoctorRun {
+            report: DoctorReport {
+                ok: false,
+                workspace_health: Some("unsafe".to_string()),
+                reliability_audit: None,
+                checks: vec![
+                    CheckResult {
+                        name: "sqlite.integrity_check".to_string(),
+                        status: CheckStatus::Error,
+                        message: Some("database disk image is malformed".to_string()),
+                        details: None,
+                    },
+                    CheckResult {
+                        name: "jsonl.parse".to_string(),
+                        status: CheckStatus::Ok,
+                        message: Some("Parsed 1 records".to_string()),
+                        details: None,
+                    },
+                ],
+            },
+            jsonl_path: None,
+        };
+        let repair = DoctorRepairResult {
+            imported: 1,
+            skipped: 0,
+            fk_violations_cleaned: 0,
+            verified_backups: Vec::new(),
+        };
+
+        let marker = write_jsonl_rebuild_verification_failed_marker(
+            &beads_dir,
+            &db_path,
+            &post_repair,
+            &repair,
+        )?;
+        assert!(
+            marker
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX)),
+            "unexpected marker path: {}",
+            marker.display()
+        );
+
+        let payload: serde_json::Value = serde_json::from_slice(&fs::read(&marker)?)?;
+        assert_eq!(payload["outcome"], "verification_failed");
+        assert_eq!(payload["workspace_health"], "unsafe");
+        assert_eq!(payload["imported"], 1);
+        let failed_checks = payload["failed_checks"]
+            .as_array()
+            .expect("failed check array");
+        assert_eq!(failed_checks.len(), 1);
+        assert_eq!(failed_checks[0]["name"], "sqlite.integrity_check");
+
+        let evidence = prior_jsonl_rebuild_failure_evidence(&beads_dir, &db_path)?
+            .expect("marker should become repeated-repair evidence");
+        assert_eq!(evidence.path, marker);
+        Ok(())
     }
 
     #[test]
@@ -2832,6 +4547,69 @@ mod tests {
         let after_check =
             find_check(&report_after.report.checks, "gitignore.beads_inner").expect("status");
         assert!(matches!(after_check.status, CheckStatus::Ok));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_root_gitignore_warns_for_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_gitignore = outside.path().join("gitignore-target");
+        fs::write(&outside_gitignore, ".beads/\n").unwrap();
+        symlink(&outside_gitignore, temp.path().join(".gitignore")).unwrap();
+
+        let mut checks = Vec::new();
+        check_root_gitignore(&beads_dir, &mut checks);
+
+        let check = find_check(&checks, "gitignore.beads_inner").expect("gitignore check");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("symlinked root .gitignore")),
+            "warning should explain that symlinked .gitignore is unsupported: {check:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fix_root_gitignore_if_warned_refuses_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_gitignore = outside.path().join("gitignore-target");
+        let original = ".beads/\nkeep-me\n";
+        fs::write(&outside_gitignore, original).unwrap();
+        let root_gitignore = temp.path().join(".gitignore");
+        symlink(&outside_gitignore, &root_gitignore).unwrap();
+
+        let mut checks = Vec::new();
+        check_root_gitignore(&beads_dir, &mut checks);
+        let report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks,
+        };
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true);
+
+        assert!(!fix_root_gitignore_if_warned(&beads_dir, &report, &ctx));
+        assert_eq!(fs::read_to_string(&outside_gitignore).unwrap(), original);
+        assert!(
+            fs::symlink_metadata(&root_gitignore)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "doctor repair must leave the symlink itself untouched"
+        );
     }
 
     #[test]
@@ -3188,6 +4966,201 @@ mod tests {
     }
 
     #[test]
+    fn test_check_recoverable_anomalies_treats_stale_blocked_cache_as_warning() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.mark_blocked_cache_stale()?;
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_recoverable_anomalies(&conn, &mut checks)?;
+
+        let check = find_check(&checks, "db.recoverable_anomalies").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert_eq!(check.message.as_deref(), Some(BLOCKED_CACHE_STALE_FINDING));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_recoverable_anomalies_warns_on_blocked_cache_content_mismatch() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = sample_issue("bd-blocker", "Blocker");
+        let target = sample_issue("bd-target", "Target");
+        storage.create_issue(&blocker, "tester")?;
+        storage.create_issue(&target, "tester")?;
+        storage.add_dependency(&target.id, &blocker.id, "blocks", "tester")?;
+        assert!(storage.ensure_blocked_cache_fresh()?);
+        storage.execute_test_sql(
+            "UPDATE blocked_issues_cache
+             SET blocked_by = '[\"bd-other:open\"]'
+             WHERE issue_id = 'bd-target'",
+        )?;
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_recoverable_anomalies(&conn, &mut checks)?;
+
+        let check = find_check(&checks, "db.recoverable_anomalies").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        assert_eq!(
+            check.message.as_deref(),
+            Some(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING)
+        );
+        let findings = check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("findings"))
+            .and_then(serde_json::Value::as_array)
+            .expect("findings array");
+        assert!(findings.iter().any(|finding| {
+            finding
+                .as_str()
+                .is_some_and(|message| message == BLOCKED_CACHE_CONTENT_MISMATCH_FINDING)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_recoverable_anomalies_warns_on_ready_projection_mismatch() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = sample_issue("bd-blocker", "Blocker");
+        let target = sample_issue("bd-target", "Target");
+        storage.create_issue(&blocker, "tester")?;
+        storage.create_issue(&target, "tester")?;
+        storage.add_dependency(&target.id, &blocker.id, "blocks", "tester")?;
+        assert!(storage.ensure_blocked_cache_fresh()?);
+        storage.execute_test_sql(
+            "DELETE FROM blocked_issues_cache
+             WHERE issue_id = 'bd-target'",
+        )?;
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_recoverable_anomalies(&conn, &mut checks)?;
+
+        let check = find_check(&checks, "db.recoverable_anomalies").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let findings = check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("findings"))
+            .and_then(serde_json::Value::as_array)
+            .expect("findings array");
+        assert!(findings.iter().any(|finding| {
+            finding
+                .as_str()
+                .is_some_and(|message| message == READY_PROJECTION_CONTENT_MISMATCH_FINDING)
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_repair_recoverable_db_state_rebuilds_blocked_cache_content_mismatch() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = sample_issue("bd-blocker", "Blocker");
+        let target = sample_issue("bd-target", "Target");
+        storage.create_issue(&blocker, "tester")?;
+        storage.create_issue(&target, "tester")?;
+        storage.add_dependency(&target.id, &blocker.id, "blocks", "tester")?;
+        assert!(storage.ensure_blocked_cache_fresh()?);
+        storage.execute_test_sql(
+            "UPDATE blocked_issues_cache
+             SET blocked_by = '[\"bd-other:open\"]'
+             WHERE issue_id = 'bd-target'",
+        )?;
+        drop(storage);
+
+        let report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "db.recoverable_anomalies".to_string(),
+                status: CheckStatus::Warn,
+                message: Some(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING.to_string()),
+                details: Some(serde_json::json!({
+                    "findings": [BLOCKED_CACHE_CONTENT_MISMATCH_FINDING],
+                })),
+            }],
+        };
+
+        let repair = repair_recoverable_db_state(temp.path(), &db_path, &report);
+
+        assert!(repair.blocked_cache_rebuilt);
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let rows = storage.execute_raw_query(
+            "SELECT blocked_by
+             FROM blocked_issues_cache
+             WHERE issue_id = 'bd-target'",
+        )?;
+        let blocked_by = rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("");
+        assert_eq!(blocked_by, "[\"bd-blocker:open\"]");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_repair_recoverable_db_state_rebuilds_ready_projection_mismatch() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let blocker = sample_issue("bd-blocker", "Blocker");
+        let target = sample_issue("bd-target", "Target");
+        storage.create_issue(&blocker, "tester")?;
+        storage.create_issue(&target, "tester")?;
+        storage.add_dependency(&target.id, &blocker.id, "blocks", "tester")?;
+        assert!(storage.ensure_blocked_cache_fresh()?);
+        storage.execute_test_sql(
+            "DELETE FROM blocked_issues_cache
+             WHERE issue_id = 'bd-target'",
+        )?;
+        drop(storage);
+
+        let report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "db.recoverable_anomalies".to_string(),
+                status: CheckStatus::Warn,
+                message: Some(READY_PROJECTION_CONTENT_MISMATCH_FINDING.to_string()),
+                details: Some(serde_json::json!({
+                    "findings": [READY_PROJECTION_CONTENT_MISMATCH_FINDING],
+                })),
+            }],
+        };
+
+        let repair = repair_recoverable_db_state(temp.path(), &db_path, &report);
+
+        assert!(repair.blocked_cache_rebuilt);
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let rows = storage.execute_raw_query(
+            "SELECT blocked_by
+             FROM blocked_issues_cache
+             WHERE issue_id = 'bd-target'",
+        )?;
+        assert_eq!(rows.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_check_database_sidecars_warns_on_wal_without_shm() -> Result<()> {
         // frankensqlite does not create SHM files — WAL without SHM is expected and should
         // produce a Warn (informational) rather than an Error that triggers repair.
@@ -3264,6 +5237,8 @@ mod tests {
 
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Error,
@@ -3307,6 +5282,8 @@ mod tests {
 
         let report = DoctorReport {
             ok: true, // Warn-only report is considered ok
+            workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Warn,
@@ -3319,10 +5296,6 @@ mod tests {
         };
 
         let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
-        assert!(
-            !repair.wal_checkpoint_completed,
-            "no checkpoint should be attempted for a Warn-level sidecar check"
-        );
         assert!(
             repair.quarantined_artifacts.is_empty(),
             "WAL should not be quarantined for a Warn-level sidecar check"
@@ -3338,6 +5311,8 @@ mod tests {
     fn test_report_has_blocked_cache_stale_finding_detects_detail_entry() {
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.recoverable_anomalies".to_string(),
                 status: CheckStatus::Error,
@@ -3358,6 +5333,8 @@ mod tests {
     fn test_report_has_blocked_cache_stale_finding_ignores_other_recoverable_errors() {
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.recoverable_anomalies".to_string(),
                 status: CheckStatus::Error,
@@ -3403,7 +5380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inspect_existing_doctor_database_uses_live_write_probe() {
+    fn test_inspect_existing_doctor_database_uses_snapshot_write_probe() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
@@ -3424,13 +5401,13 @@ mod tests {
 
         let check = find_check(&checks, "db.write_probe").expect("check present");
         assert!(
-            matches!(check.status, CheckStatus::Warn),
-            "unexpected live write probe status: {:?}",
+            matches!(check.status, CheckStatus::Ok),
+            "unexpected snapshot write probe status: {:?}",
             check.status
         );
         assert!(
             check.message.as_deref().is_some_and(|message| {
-                message.contains("Failed to begin rollback-only write probe")
+                message.contains("Rollback-only issue write succeeded for bd-probe")
             }),
             "unexpected check message: {:?}",
             check.message
@@ -3457,6 +5434,57 @@ mod tests {
             check.message
         );
         assert_eq!(check.details.unwrap()["issue_id"], "bd-probe");
+    }
+
+    #[test]
+    fn test_build_issue_write_probe_check_marks_zero_row_update_as_error() {
+        let check = build_issue_write_probe_check("bd-probe", Ok(0), Ok(0));
+
+        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("affected 0 rows")),
+            "unexpected check message: {:?}",
+            check.message
+        );
+        let details = check
+            .details
+            .expect("zero-row error should include details");
+        assert_eq!(details["issue_id"], "bd-probe");
+        assert_eq!(details["affected_rows"], 0);
+    }
+
+    #[test]
+    fn test_build_issue_write_probe_check_reports_zero_row_update_before_rollback_failure() {
+        let check = build_issue_write_probe_check(
+            "bd-probe",
+            Ok(0),
+            Err(FrankenError::Internal("rollback failed".to_string())),
+        );
+
+        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("affected 0 rows")),
+            "unexpected check message: {:?}",
+            check.message
+        );
+        let details = check
+            .details
+            .expect("rollback failure should include details");
+        assert_eq!(details["issue_id"], "bd-probe");
+        assert_eq!(details["affected_rows"], 0);
+        assert!(
+            details["rollback_error"]
+                .as_str()
+                .is_some_and(|message| message.contains("rollback failed")),
+            "unexpected rollback error detail: {}",
+            details["rollback_error"]
+        );
     }
 
     #[test]
@@ -3568,6 +5596,112 @@ mod tests {
     }
 
     #[test]
+    fn test_repair_database_from_jsonl_refuses_conflict_markers_without_backup() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .create_issue(&sample_issue("bd-keep", "Keep me"), "tester")
+                .unwrap();
+        }
+
+        fs::write(
+            &jsonl_path,
+            "<<<<<<< HEAD\n{\"id\":\"bd-keep\"}\n=======\n{\"id\":\"bd-other\"}\n>>>>>>> branch\n",
+        )
+        .unwrap();
+
+        let err = repair_database_from_jsonl(
+            &beads_dir,
+            &db_path,
+            &jsonl_path,
+            &config::CliOverrides::default(),
+            false,
+        )
+        .unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains(JSONL_REBUILD_AUTHORITY_ERROR_PREFIX)
+                && err_msg.contains("merge conflict marker"),
+            "unexpected error: {err_msg}"
+        );
+        assert_eq!(jsonl_rebuild_failure_outcome(&err), "refused");
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let issue = reopened
+            .get_issue("bd-keep")
+            .unwrap()
+            .expect("original DB should remain untouched after refused repair");
+        assert_eq!(issue.title, "Keep me");
+
+        let recovery_dir = beads_dir.join(".br_recovery");
+        let backup_count =
+            fs::read_dir(&recovery_dir).map_or(0, |entries| entries.flatten().count());
+        assert_eq!(
+            backup_count, 0,
+            "JSONL authority preflight failures should not create recovery backups"
+        );
+    }
+
+    #[test]
+    fn test_repair_database_from_jsonl_refuses_duplicate_ids_without_backup() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .create_issue(&sample_issue("bd-keep", "Keep me"), "tester")
+                .unwrap();
+        }
+
+        let issue = sample_issue("bd-dup", "Duplicate");
+        let issue_json = serde_json::to_string(&issue).unwrap();
+        fs::write(&jsonl_path, format!("{issue_json}\n{issue_json}\n")).unwrap();
+
+        let err = repair_database_from_jsonl(
+            &beads_dir,
+            &db_path,
+            &jsonl_path,
+            &config::CliOverrides::default(),
+            false,
+        )
+        .unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains(JSONL_REBUILD_AUTHORITY_ERROR_PREFIX)
+                && err_msg.contains("Duplicate issue id 'bd-dup'"),
+            "unexpected error: {err_msg}"
+        );
+        assert_eq!(jsonl_rebuild_failure_outcome(&err), "refused");
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let issue = reopened
+            .get_issue("bd-keep")
+            .unwrap()
+            .expect("original DB should remain untouched after refused repair");
+        assert_eq!(issue.title, "Keep me");
+
+        let recovery_dir = beads_dir.join(".br_recovery");
+        let backup_count =
+            fs::read_dir(&recovery_dir).map_or(0, |entries| entries.flatten().count());
+        assert_eq!(
+            backup_count, 0,
+            "JSONL authority preflight failures should not create recovery backups"
+        );
+    }
+
+    #[test]
     fn test_repair_database_from_jsonl_restores_issue_prefix_from_jsonl() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -3649,6 +5783,8 @@ mod tests {
         let db_path = temp.path().join("missing.db");
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
+            reliability_audit: None,
             checks: Vec::new(),
         };
 
@@ -3673,6 +5809,8 @@ mod tests {
         ] {
             let report = DoctorReport {
                 ok: true, // WARNs don't flip ok → false
+                workspace_health: None,
+                reliability_audit: None,
                 checks: vec![CheckResult {
                     name: "sqlite.integrity_check".to_string(),
                     status: CheckStatus::Warn,
@@ -3689,6 +5827,8 @@ mod tests {
         // sqlite3 binary variant should also match (the C sqlite3 cross-check).
         let report = DoctorReport {
             ok: true,
+            workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "sqlite3.integrity_check".to_string(),
                 status: CheckStatus::Warn,
@@ -3704,6 +5844,8 @@ mod tests {
         // "missing from index" is a partial-index REINDEX case, not a VACUUM case.
         let report = DoctorReport {
             ok: true,
+            workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "sqlite.integrity_check".to_string(),
                 status: CheckStatus::Warn,
@@ -3717,6 +5859,8 @@ mod tests {
         // not a VACUUM case.
         let report = DoctorReport {
             ok: true,
+            workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "sqlite.integrity_check".to_string(),
                 status: CheckStatus::Warn,
@@ -3734,6 +5878,8 @@ mod tests {
         // specifically scoped to WARN-level residue left after light repair.
         let report = DoctorReport {
             ok: false,
+            workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "sqlite.integrity_check".to_string(),
                 status: CheckStatus::Error,
@@ -3748,6 +5894,8 @@ mod tests {
     fn report_has_warn_level_page_anomaly_ignores_non_integrity_checks() {
         let report = DoctorReport {
             ok: true,
+            workspace_health: None,
+            reliability_audit: None,
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
                 status: CheckStatus::Warn,
@@ -3756,5 +5904,226 @@ mod tests {
             }],
         };
         assert!(!report_has_warn_level_page_anomaly(&report));
+    }
+
+    #[test]
+    fn warning_repair_verified_requires_repaired_page_warning_to_clear() {
+        let dirty_report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "sqlite3.integrity_check".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("Page 55: never used".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!warning_repair_verified(&dirty_report, false, false));
+
+        let clean_report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "sqlite3.integrity_check".to_string(),
+                status: CheckStatus::Ok,
+                message: None,
+                details: None,
+            }],
+        };
+        assert!(warning_repair_verified(&clean_report, false, false));
+    }
+
+    #[test]
+    fn warning_repair_verified_rejects_page_warning_introduced_by_other_repair() {
+        let report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![
+                CheckResult {
+                    name: "db.recoverable_anomalies".to_string(),
+                    status: CheckStatus::Ok,
+                    message: None,
+                    details: None,
+                },
+                CheckResult {
+                    name: "sqlite3.integrity_check".to_string(),
+                    status: CheckStatus::Warn,
+                    message: Some("Page 55: never used".to_string()),
+                    details: None,
+                },
+            ],
+        };
+
+        assert!(!warning_repair_verified(&report, true, false));
+    }
+
+    // ========================================================================
+    // beads_rust-m3mi: audit.suspect_close_reasons check tests (added 2026-05-09)
+    // ========================================================================
+
+    fn closed_issue_with_reason(id: &str, title: &str, reason: &str) -> Issue {
+        let mut issue = sample_issue(id, title);
+        issue.status = Status::Closed;
+        issue.closed_at = Some(Utc::now());
+        issue.close_reason = Some(reason.to_string());
+        issue
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_finds_matching_bead() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let bad = closed_issue_with_reason(
+            "br-bad",
+            "Bad close",
+            "Implemented foo. Forced close due to cycle.",
+        );
+        storage.create_issue(&bad, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        let matches_arr = details["matches"].as_array().expect("matches array");
+        assert_eq!(matches_arr.len(), 1);
+        assert_eq!(matches_arr[0]["bead_id"], "br-bad");
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_skips_beads_with_historical_label() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let mut triaged = closed_issue_with_reason(
+            "br-triaged",
+            "Triaged",
+            "Implemented bar. Forced close due to cycle.",
+        );
+        triaged.labels = vec!["audit-historical-cycle-close-2026-05-09".to_string()];
+        storage.create_issue(&triaged, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "historical-label bead must NOT trigger warn; got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_rejects_malformed_historical_label() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let mut malformed = closed_issue_with_reason(
+            "br-malformed",
+            "Malformed label",
+            "Implemented bar. Forced close due to cycle.",
+        );
+        malformed.labels = vec!["audit-historical-cycle-close-not-a-date".to_string()];
+        storage.create_issue(&malformed, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "malformed historical-label bead must trigger warn; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        let matches_arr = details["matches"].as_array().expect("matches array");
+        assert_eq!(matches_arr.len(), 1);
+        assert_eq!(matches_arr[0]["bead_id"], "br-malformed");
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_does_not_honor_undocumented_allowed_label() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let mut suspect = closed_issue_with_reason(
+            "br-allowed",
+            "Undocumented allow label",
+            "Implemented baz. Forced close due to cycle.",
+        );
+        suspect.labels = vec!["audit-suspect-allowed".to_string()];
+        storage.create_issue(&suspect, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "undocumented allow label must trigger warn; got {:?}",
+            check.status
+        );
+        let details = check.details.as_ref().expect("details present");
+        let matches_arr = details["matches"].as_array().expect("matches array");
+        assert_eq!(matches_arr.len(), 1);
+        assert_eq!(matches_arr[0]["bead_id"], "br-allowed");
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_returns_ok_when_no_matches() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let normal = closed_issue_with_reason(
+            "br-normal",
+            "Normal close",
+            "Verified by tests/e2e_basic_lifecycle.rs::list_basic.",
+        );
+        storage.create_issue(&normal, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn check_suspect_close_reasons_skips_default_allowlist() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let auto = closed_issue_with_reason(
+            "br-auto",
+            "Auto-closed",
+            "auto-closed by doctor: stale recovery artifact",
+        );
+        storage.create_issue(&auto, "tester").unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_suspect_close_reasons(&conn, &mut checks);
+
+        let check = find_check(&checks, "audit.suspect_close_reasons").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "allowlist entry must NOT trigger warn; got {:?}",
+            check.status
+        );
     }
 }

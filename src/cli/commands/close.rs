@@ -2,14 +2,20 @@
 
 use crate::cli::CloseArgs as CliCloseArgs;
 use crate::cli::commands::{
-    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
-    preserve_blocked_cache_on_error, resolve_issue_ids, update_issue_with_recovery,
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    report_auto_flush_failure, resolve_issue_ids, update_issue_with_recovery,
+};
+use crate::close_policy::{
+    self, AttributionTier, AttributionValues, CloseEvidence, ClosePolicy, PolicyDocument,
+    PolicyViolation,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::{IssueType, Status};
+use crate::format::sanitize_terminal_inline;
+use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
-use crate::storage::IssueUpdate;
+use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -29,6 +35,16 @@ pub struct CloseArgs {
     pub session: Option<String>,
     /// Return newly unblocked issues (single ID only)
     pub suggest_next: bool,
+    /// Tier 1 attribution: agent name (issue #274 Phase 1).
+    pub agent_name: Option<String>,
+    /// Tier 1 attribution: harness identifier.
+    pub harness: Option<String>,
+    /// Tier 1 attribution: model identifier.
+    pub model: Option<String>,
+    /// Bypass closure-time policy gates.
+    pub bypass_policy: bool,
+    /// Reason for bypass. Required when `bypass_policy = true`.
+    pub bypass_reason: Option<String>,
 }
 
 impl From<&CliCloseArgs> for CloseArgs {
@@ -39,8 +55,121 @@ impl From<&CliCloseArgs> for CloseArgs {
             force: cli.force,
             session: cli.session.clone(),
             suggest_next: cli.suggest_next,
+            agent_name: cli.agent_name.clone(),
+            harness: cli.harness.clone(),
+            model: cli.model.clone(),
+            bypass_policy: cli.bypass_policy,
+            bypass_reason: cli.bypass_reason.clone(),
         }
     }
+}
+
+/// Aggregate of policy gates that fired for a single candidate close.
+struct EvaluatedGates {
+    violations: Vec<PolicyViolation>,
+}
+
+/// Validate the `--bypass-policy` / `--bypass-reason` flag pair before
+/// touching storage. Mirrors the documented contract: bypass requires a
+/// non-empty reason and is meaningless without `--bypass-policy`.
+fn validate_bypass_args(args: &CloseArgs) -> Result<()> {
+    if args.bypass_policy {
+        let reason_present = args
+            .bypass_reason
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if !reason_present {
+            return Err(BeadsError::validation(
+                "bypass-reason",
+                "--bypass-policy requires --bypass-reason \"<text>\"",
+            ));
+        }
+    } else if args
+        .bypass_reason
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return Err(BeadsError::validation(
+            "bypass-policy",
+            "--bypass-reason was set without --bypass-policy",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve attribution values for the close. CLI flags take precedence over
+/// env vars; both are ignored when the policy.yaml `attribution.tier` is
+/// `off`. Tier 2/3 ("require"/"allowlist") are out of scope for Phase 1.
+fn resolve_attribution_for_close(
+    args: &CloseArgs,
+    policy_doc: &PolicyDocument,
+) -> AttributionValues {
+    if policy_doc.close_policy.attribution.tier == AttributionTier::Off {
+        return AttributionValues::default();
+    }
+    AttributionValues::resolve_from_env(
+        args.agent_name.as_deref(),
+        args.harness.as_deref(),
+        args.model.as_deref(),
+    )
+}
+
+/// Run every enabled gate against `issue` and produce the (possibly empty)
+/// violation list.
+fn evaluate_close_policy(
+    policy: &ClosePolicy,
+    storage: &SqliteStorage,
+    issue_id: &str,
+    issue: &Issue,
+    args: &CloseArgs,
+    close_actor: &str,
+) -> Result<EvaluatedGates> {
+    // Look up the in_progress actor only when the gate is enabled — this
+    // saves a query per close for repos that don't enable that specific
+    // gate.
+    let in_progress_actor = if policy.forbid_self_close_after_in_progress.enabled {
+        storage.find_last_in_progress_actor(issue_id)?
+    } else {
+        None
+    };
+
+    let evidence = CloseEvidence {
+        issue_id,
+        close_reason: args.reason.as_deref(),
+        description: issue.description.as_deref(),
+        design: issue.design.as_deref(),
+        acceptance_criteria: issue.acceptance_criteria.as_deref(),
+        notes: issue.notes.as_deref(),
+        close_actor,
+        in_progress_actor: in_progress_actor.as_deref(),
+    };
+
+    let violations = close_policy::evaluate(policy, &evidence);
+    Ok(EvaluatedGates { violations })
+}
+
+fn summarize_violations(violations: &[PolicyViolation]) -> String {
+    if let [single] = violations {
+        return single.message.clone();
+    }
+    let lines: Vec<String> = violations
+        .iter()
+        .map(|v| format!("- {}", v.message))
+        .collect();
+    format!("{} gates fired:\n{}", violations.len(), lines.join("\n"))
+}
+
+fn emit_bypass_warning(ctx: &OutputContext, issue_id: &str, violations: &[PolicyViolation]) {
+    let summary = summarize_violations(violations);
+    let id = sanitize_terminal_inline(issue_id);
+    let summary = sanitize_terminal_inline(&summary);
+    ctx.warning(&format!(
+        "Closing {} despite policy violation(s) (--bypass-policy): {}",
+        id.as_ref(),
+        summary.as_ref()
+    ));
 }
 
 /// Execute the close command from CLI args.
@@ -204,6 +333,35 @@ fn emit_close_structured_output(
     Ok(())
 }
 
+fn close_human_message(closed: &ClosedIssue) -> String {
+    let id = sanitize_terminal_inline(&closed.id);
+    let title = sanitize_terminal_inline(&closed.title);
+    let mut message = format!("Closed {}: {}", id.as_ref(), title.as_ref());
+    if let Some(reason) = &closed.close_reason {
+        let reason = sanitize_terminal_inline(reason);
+        message.push_str(" (");
+        message.push_str(reason.as_ref());
+        message.push(')');
+    }
+    message
+}
+
+fn skipped_human_message(skipped: &SkippedIssue) -> String {
+    let id = sanitize_terminal_inline(&skipped.id);
+    let reason = sanitize_terminal_inline(&skipped.reason);
+    format!("Skipped {}: {}", id.as_ref(), reason.as_ref())
+}
+
+fn unblocked_human_line(issue: &UnblockedIssue) -> String {
+    let id = sanitize_terminal_inline(&issue.id);
+    let title = sanitize_terminal_inline(&issue.title);
+    format!("  {}: {}", id.as_ref(), title.as_ref())
+}
+
+fn issue_input_text(input: &str) -> String {
+    sanitize_terminal_inline(input).into_owned()
+}
+
 fn reorder_routed_items_by_requested_inputs<T>(
     requested_inputs: &[String],
     routed_items: Vec<(Vec<String>, Vec<T>)>,
@@ -220,7 +378,7 @@ fn reorder_routed_items_by_requested_inputs<T>(
     let mut ordered_items: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
     for (batch_inputs, batch_items) in routed_items {
         if batch_inputs.len() != batch_items.len() {
-            return Err(BeadsError::Config(format!(
+            return Err(BeadsError::internal(format!(
                 "{context} produced mismatched issue/result counts"
             )));
         }
@@ -230,11 +388,18 @@ fn reorder_routed_items_by_requested_inputs<T>(
                 .get_mut(input.as_str())
                 .and_then(VecDeque::pop_front)
             else {
-                return Err(BeadsError::Config(format!(
+                let input = issue_input_text(&input);
+                return Err(BeadsError::internal(format!(
                     "{context} returned unexpected issue input {input}"
                 )));
             };
-            ordered_items[index] = Some(item);
+            let Some(slot) = ordered_items.get_mut(index) else {
+                let input = issue_input_text(&input);
+                return Err(BeadsError::internal(format!(
+                    "{context} returned out-of-range issue input {input}"
+                )));
+            };
+            *slot = Some(item);
         }
     }
 
@@ -243,10 +408,11 @@ fn reorder_routed_items_by_requested_inputs<T>(
         .enumerate()
         .map(|(index, item)| {
             item.ok_or_else(|| {
-                BeadsError::Config(format!(
-                    "{context} did not produce a result for {}",
-                    requested_inputs[index]
-                ))
+                let input = requested_inputs
+                    .get(index)
+                    .map(|input| issue_input_text(input))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                BeadsError::internal(format!("{context} did not produce a result for {input}"))
             })
         })
         .collect()
@@ -305,10 +471,7 @@ pub fn execute(
 ) -> Result<()> {
     let args = CloseArgs {
         ids,
-        reason: None,
-        force: false,
-        session: None,
-        suggest_next: false,
+        ..CloseArgs::default()
     };
 
     execute_with_args(&args, json, cli, ctx)
@@ -328,6 +491,10 @@ pub fn execute_with_args(
 ) -> Result<()> {
     tracing::info!("Executing close command");
     let use_structured_output = use_json || ctx.is_json() || ctx.is_toon();
+
+    // Up-front bypass argument-pair validation. Done before any storage IO so
+    // a misuse of the bypass flag never silently slips past policy gates.
+    validate_bypass_args(args)?;
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
@@ -372,8 +539,13 @@ pub fn execute_with_args(
                 None
             };
 
-            let execution =
-                execute_route(&batch_args, &batch_cli, &batch.beads_dir, batch.is_external)?;
+            let execution = execute_route(
+                &batch_args,
+                &batch_cli,
+                ctx,
+                &batch.beads_dir,
+                batch.is_external,
+            )?;
             let CloseExecution {
                 unblocked,
                 ordered_outcomes,
@@ -397,7 +569,7 @@ pub fn execute_with_args(
     } else {
         let mut local_args = args.clone();
         local_args.ids = target_inputs;
-        let execution = execute_route(&local_args, cli, &beads_dir, false)?;
+        let execution = execute_route(&local_args, cli, ctx, &beads_dir, false)?;
         closed_issues = execution.closed;
         skipped_issues = execution.skipped;
         unblocked_issues = execution.unblocked;
@@ -416,20 +588,16 @@ pub fn execute_with_args(
         ctx.info("No issues to close.");
     } else {
         for closed in &closed_issues {
-            let mut msg = format!("Closed {}: {}", closed.id, closed.title);
-            if let Some(reason) = &closed.close_reason {
-                msg.push_str(&format!(" ({reason})"));
-            }
-            ctx.success(&msg);
+            ctx.success(&close_human_message(closed));
         }
         for skipped in &skipped_issues {
-            ctx.warning(&format!("Skipped {}: {}", skipped.id, skipped.reason));
+            ctx.warning(&skipped_human_message(skipped));
         }
         if !unblocked_issues.is_empty() {
             ctx.newline();
             ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
             for issue in &unblocked_issues {
-                ctx.print_line(&format!("  {}: {}", issue.id, issue.title));
+                ctx.print_line(&unblocked_human_line(issue));
             }
         }
     }
@@ -447,9 +615,12 @@ pub fn execute_with_args(
 fn execute_route(
     args: &CloseArgs,
     cli: &config::CliOverrides,
+    ctx: &OutputContext,
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<CloseExecution> {
+    let _routed_write_lock =
+        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
@@ -458,6 +629,18 @@ fn execute_route(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
+
+    // Closure-time policy gates (issue #274 Phase 1). Loading happens once per
+    // route; if the file is absent the doc is the all-off default.
+    let policy_doc = close_policy::load_for_beads_dir(beads_dir)?;
+    let policy_active = policy_doc.close_policy.is_active();
+    let attribution = resolve_attribution_for_close(args, &policy_doc);
+    if args.bypass_policy && !policy_doc.allow_bypass {
+        return Err(BeadsError::validation(
+            "bypass-policy",
+            ".beads/policy.yaml has allow_bypass: false; --bypass-policy is disabled",
+        ));
+    }
 
     let epic_counts = storage_ctx.storage.get_epic_counts()?;
     let blocked_before: Vec<String> = if args.suggest_next {
@@ -532,6 +715,49 @@ fn execute_route(
             continue;
         }
 
+        // Supplementary guard: catch dot-notation children (e.g. `epic.1`,
+        // `epic.2`) that exist in the issues table without a formal
+        // parent-child dep row. These slip past `epic_counts` because
+        // get_epic_counts only scans the dependencies table. Missing-dep
+        // children occur with legacy-bd migrations, bulk JSONL imports,
+        // and hand-edited JSONL. Without this check, closing the parent
+        // silently orphans the open children.
+        let requested_dot_children = if args.force {
+            Vec::new()
+        } else {
+            let open_dot_children = storage_ctx.storage.get_open_dot_notation_children(id)?;
+            let (requested_children, unrequested_children): (Vec<String>, Vec<String>) =
+                open_dot_children
+                    .into_iter()
+                    .partition(|child_id| requested_ids.contains(child_id));
+            if !unrequested_children.is_empty() {
+                let label = if issue.issue_type == IssueType::Epic {
+                    "epic"
+                } else {
+                    "parent issue"
+                };
+                let preview: Vec<String> = unrequested_children.iter().take(5).cloned().collect();
+                let suffix = if unrequested_children.len() > preview.len() {
+                    format!(", +{} more", unrequested_children.len() - preview.len())
+                } else {
+                    String::new()
+                };
+                let skipped = SkippedIssue {
+                    id: id.clone(),
+                    reason: format!(
+                        "{label} has {} open dot-notation child issue(s): {}{} (use --force to close anyway)",
+                        unrequested_children.len(),
+                        preview.join(", "),
+                        suffix
+                    ),
+                };
+                ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+                skipped_issues.push(skipped);
+                continue;
+            }
+            requested_children
+        };
+
         if args.force {
             open_issues.insert(id.clone(), issue);
             continue;
@@ -554,6 +780,7 @@ fn execute_route(
         } else {
             Vec::new()
         };
+        blocker_ids.extend(requested_dot_children);
         blocker_ids.sort();
         blocker_ids.dedup();
         let (internal_blockers, external_blockers): (Vec<String>, Vec<String>) = blocker_ids
@@ -574,6 +801,36 @@ fn execute_route(
             &external_blockers_by_id,
         )
     };
+
+    let mut policy_evaluations_by_id: HashMap<String, EvaluatedGates> = HashMap::new();
+    if policy_active {
+        for id in &resolved_ids {
+            let Some(issue) = open_issues.get(id) else {
+                continue;
+            };
+            if !args.force && !batch_closable_ids.contains(id) {
+                continue;
+            }
+
+            let evaluated_gates = evaluate_close_policy(
+                &policy_doc.close_policy,
+                &storage_ctx.storage,
+                id,
+                issue,
+                args,
+                &actor,
+            )?;
+            if !evaluated_gates.violations.is_empty() && !args.bypass_policy {
+                let summary = summarize_violations(&evaluated_gates.violations);
+                return Err(BeadsError::PolicyViolation {
+                    issue_id: id.clone(),
+                    summary,
+                    violations: evaluated_gates.violations,
+                });
+            }
+            policy_evaluations_by_id.insert(id.clone(), evaluated_gates);
+        }
+    }
 
     for id in &resolved_ids {
         let Some(issue) = open_issues.get(id) else {
@@ -607,6 +864,19 @@ fn execute_route(
             continue;
         }
 
+        let gates_fired = if let Some(evaluated_gates) = policy_evaluations_by_id.get(id) {
+            if !evaluated_gates.violations.is_empty() && args.bypass_policy {
+                emit_bypass_warning(ctx, id, &evaluated_gates.violations);
+            }
+            evaluated_gates
+                .violations
+                .iter()
+                .map(|v| v.gate.clone())
+                .collect::<Vec<String>>()
+        } else {
+            Vec::new()
+        };
+
         let now = Utc::now();
         let close_reason = args.reason.clone().unwrap_or_else(|| "done".to_string());
         let update = IssueUpdate {
@@ -634,6 +904,33 @@ fn execute_route(
         )?;
         cache_dirty = true;
         tracing::info!(id = %id, reason = ?args.reason, "Issue closed");
+
+        if policy_active {
+            // Best-effort persistence of attribution + bypass auditing. Failure
+            // to record metadata never undoes a successful close: the close
+            // already committed, and burning down a successful close because of
+            // an optional auxiliary table would be a regression for users whose
+            // schema could not migrate. We log and move on.
+            let bypass_reason = if args.bypass_policy {
+                args.bypass_reason.as_deref()
+            } else {
+                None
+            };
+            let metadata_result = storage_ctx.storage.record_close_metadata(
+                id,
+                &attribution,
+                args.bypass_policy && !gates_fired.is_empty(),
+                bypass_reason,
+                &gates_fired,
+            );
+            if let Err(error) = metadata_result {
+                tracing::warn!(
+                    issue_id = %id,
+                    error = %error,
+                    "failed to record closure-time policy metadata; close already committed"
+                );
+            }
+        }
 
         let closed = ClosedIssue {
             id: id.clone(),
@@ -727,10 +1024,11 @@ fn execute_route(
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
-        tracing::debug!(
-            beads_dir = %storage_ctx.paths.beads_dir.display(),
-            error = %error,
-            "Routed auto-flush failed (non-fatal)"
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
         );
     }
 
@@ -810,6 +1108,11 @@ mod tests {
             force: true,
             session: Some("session-456".to_string()),
             suggest_next: true,
+            agent_name: Some("agent-1".to_string()),
+            harness: Some("codex-cli".to_string()),
+            model: Some("gpt-5".to_string()),
+            bypass_policy: true,
+            bypass_reason: Some("Manual override approved".to_string()),
         };
         assert_eq!(args.ids.len(), 2);
         assert_eq!(args.ids[0], "bd-abc");
@@ -817,6 +1120,14 @@ mod tests {
         assert!(args.force);
         assert_eq!(args.session.as_deref(), Some("session-456"));
         assert!(args.suggest_next);
+        assert_eq!(args.agent_name.as_deref(), Some("agent-1"));
+        assert_eq!(args.harness.as_deref(), Some("codex-cli"));
+        assert_eq!(args.model.as_deref(), Some("gpt-5"));
+        assert!(args.bypass_policy);
+        assert_eq!(
+            args.bypass_reason.as_deref(),
+            Some("Manual override approved")
+        );
     }
 
     // =========================================================================
@@ -990,6 +1301,85 @@ mod tests {
         assert!(parsed.closed_at.contains("2026-12-31"));
     }
 
+    #[test]
+    fn close_human_messages_sanitize_terminal_controls() {
+        let closed = ClosedIssue {
+            id: "bd-close\x1b[2J".to_string(),
+            title: "bad\rtitle\x08".to_string(),
+            status: "closed".to_string(),
+            closed_at: "2026-12-31T23:59:59Z".to_string(),
+            close_reason: Some("done\nnext\x07\u{9b}".to_string()),
+        };
+        let skipped = SkippedIssue {
+            id: "bd-skip\x1b[2J".to_string(),
+            reason: "blocked\rby\nterminal\x07".to_string(),
+        };
+        let unblocked = UnblockedIssue {
+            id: "bd-unblock\x1b[2J".to_string(),
+            title: "ready\nlater\x08".to_string(),
+            priority: 1,
+        };
+
+        let close_message = close_human_message(&closed);
+        let skipped_message = skipped_human_message(&skipped);
+        let unblocked_line = unblocked_human_line(&unblocked);
+
+        for text in [&close_message, &skipped_message, &unblocked_line] {
+            assert!(!text.chars().any(char::is_control));
+            assert!(text.contains("\\u{1b}[2J"));
+        }
+        assert!(close_message.contains("\\r"));
+        assert!(close_message.contains("\\u{8}"));
+        assert!(close_message.contains("\\n"));
+        assert!(close_message.contains("\\u{7}"));
+        assert!(close_message.contains("\\u{9b}"));
+        assert!(skipped_message.contains("\\r"));
+        assert!(skipped_message.contains("\\n"));
+        assert!(skipped_message.contains("\\u{7}"));
+        assert!(unblocked_line.contains("\\n"));
+        assert!(unblocked_line.contains("\\u{8}"));
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_missing_input_error() {
+        let requested = vec!["bd-close\x1b[2J\nbad".to_string(), "bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-ok".to_string()], vec!["ok"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "close routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
+        }
+    }
+
+    #[test]
+    fn reorder_routed_items_sanitizes_unexpected_input_error() {
+        let requested = vec!["bd-ok".to_string()];
+        let routed_items = vec![(vec!["bd-close\x1b[2J\nbad".to_string()], vec!["bad"])];
+
+        let err =
+            reorder_routed_items_by_requested_inputs(&requested, routed_items, "close routing")
+                .unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::Internal { .. }),
+            "unexpected error: {err:?}"
+        );
+        if let BeadsError::Internal { message } = err {
+            assert!(!message.chars().any(char::is_control));
+            assert!(message.contains("\\u{1b}[2J"));
+            assert!(message.contains("\\n"));
+        }
+    }
+
     // =========================================================================
     // SkippedIssue serialization tests
     // =========================================================================
@@ -1140,12 +1530,23 @@ mod tests {
             force: true,
             session: Some("sess".to_string()),
             suggest_next: true,
+            agent_name: Some("agent-clone".to_string()),
+            harness: Some("harness-clone".to_string()),
+            model: Some("model-clone".to_string()),
+            bypass_policy: true,
+            bypass_reason: Some("Clone bypass reason".to_string()),
         };
         let cloned = args.clone();
         assert_eq!(cloned.ids, args.ids);
         assert_eq!(cloned.reason, args.reason);
         assert_eq!(cloned.force, args.force);
         assert_eq!(cloned.session, args.session);
+        assert_eq!(cloned.suggest_next, args.suggest_next);
+        assert_eq!(cloned.agent_name, args.agent_name);
+        assert_eq!(cloned.harness, args.harness);
+        assert_eq!(cloned.model, args.model);
+        assert_eq!(cloned.bypass_policy, args.bypass_policy);
+        assert_eq!(cloned.bypass_reason, args.bypass_reason);
         assert_eq!(cloned.suggest_next, args.suggest_next);
     }
 
@@ -1209,6 +1610,91 @@ mod tests {
     }
 
     #[test]
+    fn execute_with_args_closes_requested_dot_notation_child_with_parent() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-parent", "Legacy parent"), "tester")
+            .expect("create parent");
+        storage
+            .create_issue(&make_issue("bd-parent.1", "Legacy child"), "tester")
+            .expect("create dot child");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-parent".to_string(), "bd-parent.1".to_string()],
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("close parent and dot child in one batch");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let parent = storage
+            .get_issue("bd-parent")
+            .expect("get parent")
+            .expect("parent exists");
+        let child = storage
+            .get_issue("bd-parent.1")
+            .expect("get child")
+            .expect("child exists");
+
+        assert_eq!(parent.status, Status::Closed);
+        assert_eq!(child.status, Status::Closed);
+    }
+
+    #[test]
+    fn execute_with_args_keeps_parent_blocked_by_unrequested_dot_notation_child() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-parent", "Legacy parent"), "tester")
+            .expect("create parent");
+        storage
+            .create_issue(&make_issue("bd-parent.1", "Legacy child"), "tester")
+            .expect("create dot child");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-parent".to_string()],
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&args, true, &CliOverrides::default(), &ctx)
+            .expect_err("parent-only close should remain blocked by dot child");
+        assert!(matches!(err, BeadsError::NothingToDo { .. }));
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let parent = storage
+            .get_issue("bd-parent")
+            .expect("get parent")
+            .expect("parent exists");
+        let child = storage
+            .get_issue("bd-parent.1")
+            .expect("get child")
+            .expect("child exists");
+
+        assert_eq!(parent.status, Status::Open);
+        assert_eq!(child.status, Status::Open);
+    }
+
+    #[test]
     fn execute_with_args_returns_nothing_to_do_when_all_requested_issues_are_skipped() {
         let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
@@ -1236,5 +1722,144 @@ mod tests {
         let err = execute_with_args(&args, true, &CliOverrides::default(), &ctx)
             .expect_err("all-skipped close should fail");
         assert!(matches!(err, BeadsError::NothingToDo { .. }));
+    }
+
+    #[test]
+    fn execute_with_args_records_clean_policy_close_metadata() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-policy", "Policy governed"), "tester")
+            .expect("create policy issue");
+        drop(storage);
+
+        std::fs::write(
+            beads_dir.join(close_policy::POLICY_FILE_NAME),
+            "close_policy:\n  require_close_reason:\n    enabled: true\n    min_length: 4\n",
+        )
+        .expect("write policy");
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-policy".to_string()],
+            reason: Some("done cleanly".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx).expect("close issue");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let metadata = storage
+            .get_close_metadata("bd-policy")
+            .expect("read close metadata")
+            .expect("active policy should record metadata even when no gate fires");
+        assert!(!metadata.bypassed_policy);
+        assert!(metadata.bypass_reason.is_none());
+        assert!(metadata.policy_gates_fired.is_empty());
+        assert!(metadata.closed_by_agent_name.is_none());
+        assert!(metadata.closed_by_harness.is_none());
+        assert!(metadata.closed_by_model.is_none());
+    }
+
+    #[test]
+    fn execute_with_args_policy_violation_in_batch_does_not_close_earlier_issue() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-clean", "Clean policy issue"), "tester")
+            .expect("create clean issue");
+        let mut failing_issue = make_issue("bd-policy-fail", "Policy failing issue");
+        failing_issue.acceptance_criteria = Some("- [ ] Finish remaining work\n".to_string());
+        storage
+            .create_issue(&failing_issue, "tester")
+            .expect("create failing issue");
+        drop(storage);
+
+        std::fs::write(
+            beads_dir.join(close_policy::POLICY_FILE_NAME),
+            "close_policy:\n  require_acceptance_criteria_satisfied:\n    enabled: true\n",
+        )
+        .expect("write policy");
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-clean".to_string(), "bd-policy-fail".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect_err("policy violation should abort the batch before mutation");
+        assert!(
+            matches!(err, BeadsError::PolicyViolation { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let clean = storage
+            .get_issue("bd-clean")
+            .expect("read clean issue")
+            .expect("clean issue exists");
+        let failing = storage
+            .get_issue("bd-policy-fail")
+            .expect("read failing issue")
+            .expect("failing issue exists");
+        assert_eq!(clean.status, Status::Open);
+        assert_eq!(failing.status, Status::Open);
+        assert!(
+            storage
+                .get_close_metadata("bd-clean")
+                .expect("read clean metadata")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn execute_with_args_leaves_no_policy_close_metadata_invisible() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-no-policy", "No policy"), "tester")
+            .expect("create no-policy issue");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-no-policy".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx).expect("close issue");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        assert!(
+            storage
+                .get_close_metadata("bd-no-policy")
+                .expect("read close metadata")
+                .is_none(),
+            "repos without an active policy should retain the no-observable-change invariant"
+        );
     }
 }

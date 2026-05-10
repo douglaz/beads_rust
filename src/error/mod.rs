@@ -6,7 +6,6 @@
 //! # Design
 //!
 //! - Uses `thiserror` for derive-based error types
-//! - Supports `anyhow` integration for gradual migration
 //! - Provides recovery hints for user-facing errors
 //! - Matches bd's exit code conventions
 //! - Provides structured JSON output for AI coding agents
@@ -22,8 +21,7 @@ use thiserror::Error;
 
 /// Primary error type for `beads_rust` operations.
 ///
-/// Design: Structured variants for common cases, with `Other` for
-/// wrapped anyhow errors during migration.
+/// Design: Structured variants for common cases.
 #[derive(Error, Debug)]
 pub enum BeadsError {
     // === Storage Errors ===
@@ -127,6 +125,18 @@ pub enum BeadsError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// External command failed or returned unusable output.
+    #[error("External command failed: {command}: {reason}")]
+    ExternalCommand { command: String, reason: String },
+
+    /// Self-update or upgrade operation failed.
+    #[error("Upgrade failed: {reason}")]
+    Upgrade { reason: String },
+
+    /// Internal consistency check failed.
+    #[error("Internal error: {message}")]
+    Internal { message: String },
+
     /// Beads workspace not initialized.
     #[error("Beads not initialized: run 'br init' first")]
     NotInitialized,
@@ -162,9 +172,19 @@ pub enum BeadsError {
     #[error("Nothing to do: {reason}")]
     NothingToDo { reason: String },
 
-    /// Wrapped anyhow error for gradual migration.
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
+    // === Policy Errors ===
+    /// One or more closure-time policy gates fired.
+    ///
+    /// Display format intentionally repeats the gate that fired and a
+    /// short explanation so terminal output stays readable; structured
+    /// callers should serialise the inner [`crate::close_policy::PolicyViolation`]s
+    /// via [`StructuredError::context`].
+    #[error("Policy violation closing {issue_id}: {summary}")]
+    PolicyViolation {
+        issue_id: String,
+        summary: String,
+        violations: Vec<crate::close_policy::PolicyViolation>,
+    },
 }
 
 impl BeadsError {
@@ -229,6 +249,7 @@ impl BeadsError {
                 | Self::InvalidPriority { .. }
                 | Self::PrefixMismatch { .. }
                 | Self::AmbiguousId { .. }
+                | Self::PolicyViolation { .. }
         )
     }
 
@@ -264,6 +285,9 @@ impl BeadsError {
             Self::InvalidType { .. } => {
                 Some("Valid types: task, bug, feature, epic, chore, docs, question")
             }
+            Self::PolicyViolation { .. } => Some(
+                "Fix the violation(s) above, or pass --bypass-policy --bypass-reason \"<text>\" if your project's policy.yaml allows bypass.",
+            ),
             _ => None,
         }
     }
@@ -283,6 +307,31 @@ impl BeadsError {
         Self::Validation {
             field: field.into(),
             reason: reason.into(),
+        }
+    }
+
+    /// Create an external command failure.
+    #[must_use]
+    pub fn external_command(command: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::ExternalCommand {
+            command: command.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a self-update failure.
+    #[must_use]
+    pub fn upgrade(reason: impl Into<String>) -> Self {
+        Self::Upgrade {
+            reason: reason.into(),
+        }
+    }
+
+    /// Create an internal consistency error.
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
         }
     }
 
@@ -322,6 +371,38 @@ mod tests {
     fn test_validation_error() {
         let err = BeadsError::validation("title", "cannot be empty");
         assert_eq!(err.to_string(), "Validation failed: title: cannot be empty");
+    }
+
+    #[test]
+    fn test_external_command_uses_io_error_code() {
+        let err = BeadsError::external_command("git", "failed to resolve ref");
+        let structured = StructuredError::from_error(&err);
+
+        assert_eq!(structured.code, ErrorCode::IoError);
+        assert_eq!(err.exit_code(), 8);
+    }
+
+    #[test]
+    fn test_internal_uses_internal_error_code() {
+        let err = BeadsError::internal("routed command produced mismatched counts");
+        let structured = StructuredError::from_error(&err);
+
+        assert_eq!(structured.code, ErrorCode::InternalError);
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_upgrade_uses_io_error_code_with_context() {
+        let err = BeadsError::upgrade("network timeout");
+        let structured = StructuredError::from_error(&err);
+
+        assert_eq!(structured.code, ErrorCode::IoError);
+        assert_eq!(err.exit_code(), 8);
+        let context = structured.context.expect("upgrade context");
+        assert_eq!(
+            context["operation"],
+            serde_json::Value::String("upgrade".to_string())
+        );
     }
 
     #[test]

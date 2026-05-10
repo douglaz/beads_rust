@@ -9,6 +9,7 @@
 
 pub mod history;
 pub mod path;
+pub mod witness;
 
 pub use path::{
     ALLOWED_EXACT_NAMES, ALLOWED_EXTENSIONS, PathValidation, is_sync_path_allowed,
@@ -20,29 +21,54 @@ use crate::error::{BeadsError, Result};
 use crate::model::{Comment, Dependency, Issue};
 use crate::storage::SqliteStorage;
 use crate::sync::history::HistoryConfig;
-use crate::util::id::parse_id;
+use crate::util::id::{IdConfig, IdGenerator, parse_id};
 use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::IssueValidator;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::util::hex_encode;
+use indicatif::ProgressBar;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const DEFAULT_WRITE_LOCK_TIMEOUT_MS: u64 = 30_000;
+const WRITE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const EXPORT_ISSUE_BATCH_SIZE: usize = 1024;
+const EXPORT_FULL_SCAN_ISSUE_THRESHOLD: usize = 20_000;
+const EXPORT_PARALLEL_PREPARE_MIN_ISSUES: usize = 256;
+const DEFAULT_JSONL_EXPORT_PARALLELISM: usize = 64;
+const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
+const MAX_JSONL_TEMP_PATH_ATTEMPTS: u32 = 64;
 
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
 ///
 /// This serializes all mutating operations across processes, preventing
 /// concurrent-write deadlocks in the underlying SQLite engine. Uses a fast-path
-/// `try_lock()` for the uncontended case, then falls back to a true blocking
-/// `lock()` that waits indefinitely until the holder releases. The lock is
-/// held until the returned `File` drops.
+/// `try_lock()` for the uncontended case, then polls with a bounded timeout for
+/// contended locks. The lock is held until the returned `File` drops.
 #[allow(clippy::incompatible_msrv)]
-#[must_use]
-pub fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
+pub fn blocking_write_lock(beads_dir: &Path) -> Result<File> {
+    blocking_write_lock_with_timeout(beads_dir, None)
+}
+
+/// Acquire a bounded exclusive lock on `.beads/.write.lock`.
+///
+/// `lock_timeout_ms` uses the same millisecond setting as `--lock-timeout`.
+/// When unset, a 30s default prevents a stuck writer from parking every
+/// subsequent mutating command indefinitely.
+#[allow(clippy::incompatible_msrv)]
+pub fn blocking_write_lock_with_timeout(
+    beads_dir: &Path,
+    lock_timeout_ms: Option<u64>,
+) -> Result<File> {
     let lock_path = beads_dir.join(".write.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -50,32 +76,77 @@ pub fn blocking_write_lock(beads_dir: &Path) -> Option<File> {
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .ok()?;
+        .map_err(|err| {
+            BeadsError::Config(format!(
+                "Failed to open write lock at {}: {err}",
+                lock_path.display()
+            ))
+        })?;
 
     // Fast path: non-blocking try for the common uncontended case.
-    if file.try_lock().is_ok() {
-        return Some(file);
-    }
-
-    // Contended: block until the current holder releases.
-    tracing::debug!(".write.lock is held by another process; waiting for release");
-    match file.lock() {
-        Ok(()) => Some(file),
-        Err(e) => {
-            tracing::debug!("failed to acquire .write.lock: {e}; proceeding without lock");
-            None
+    match file.try_lock() {
+        Ok(()) => return Ok(file),
+        Err(TryLockError::WouldBlock) => {}
+        Err(TryLockError::Error(err)) => {
+            return Err(BeadsError::Config(format!(
+                "Failed to acquire write lock at {}: {err}",
+                lock_path.display()
+            )));
         }
     }
+
+    let timeout_ms = lock_timeout_ms.unwrap_or(DEFAULT_WRITE_LOCK_TIMEOUT_MS);
+    let timeout = Duration::from_millis(timeout_ms);
+    let start = Instant::now();
+    tracing::debug!(
+        timeout_ms,
+        lock_path = %lock_path.display(),
+        ".write.lock is held by another process; waiting with timeout"
+    );
+
+    loop {
+        if start.elapsed() >= timeout {
+            return Err(write_lock_timeout_error(&lock_path, timeout_ms));
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        thread::sleep(remaining.min(WRITE_LOCK_POLL_INTERVAL));
+
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(err)) => {
+                tracing::debug!("failed to acquire .write.lock: {err}");
+                return Err(BeadsError::Config(format!(
+                    "Failed to acquire write lock at {}: {err}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
+}
+
+fn write_lock_timeout_error(lock_path: &Path, timeout_ms: u64) -> BeadsError {
+    BeadsError::Config(format!(
+        "Timed out after {timeout_ms}ms waiting for write lock at {}. \
+         Another br process may be holding .write.lock; retry after it exits or investigate a stuck process.",
+        lock_path.display()
+    ))
+}
+
+#[must_use]
+pub const fn default_write_lock_timeout_ms() -> u64 {
+    DEFAULT_WRITE_LOCK_TIMEOUT_MS
 }
 
 /// Try to acquire an exclusive advisory lock on `.beads/.sync.lock`.
 ///
 /// Returns the lock file on success. The lock is held until the returned
 /// `File` is dropped. If another process already holds the lock, returns
-/// `None` (non-blocking).
+/// `Ok(None)` (non-blocking). Lock-file open or OS lock errors are returned
+/// separately so callers do not confuse a broken lock path with contention.
 #[allow(clippy::incompatible_msrv)]
-#[must_use]
-pub fn try_sync_lock(beads_dir: &Path) -> Option<File> {
+pub fn try_sync_lock(beads_dir: &Path) -> Result<Option<File>> {
     let lock_path = beads_dir.join(".sync.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -83,10 +154,19 @@ pub fn try_sync_lock(beads_dir: &Path) -> Option<File> {
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .ok()?;
+        .map_err(|err| {
+            BeadsError::Config(format!(
+                "Failed to open sync lock at {}: {err}",
+                lock_path.display()
+            ))
+        })?;
     match file.try_lock() {
-        Ok(()) => Some(file),
-        Err(_) => None,
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => Err(BeadsError::Config(format!(
+            "Failed to acquire sync lock at {}: {err}",
+            lock_path.display()
+        ))),
     }
 }
 
@@ -117,8 +197,114 @@ impl Drop for TempFileGuard {
 }
 
 pub(crate) fn export_temp_path(output_path: &Path) -> PathBuf {
-    output_path.with_extension(format!("jsonl.{}.tmp", std::process::id()))
+    export_temp_path_for_attempt(output_path, 0)
 }
+
+fn export_temp_path_for_attempt(output_path: &Path, attempt: u32) -> PathBuf {
+    let pid = std::process::id();
+    if attempt == 0 {
+        return output_path.with_extension(format!("jsonl.{pid}.tmp"));
+    }
+
+    let retry_suffix = u64::from(pid)
+        .saturating_mul(100)
+        .saturating_add(u64::from(attempt));
+    output_path.with_extension(format!("jsonl.{retry_suffix}.tmp"))
+}
+
+fn create_jsonl_temp_file(output_path: &Path, config: &ExportConfig) -> Result<(PathBuf, File)> {
+    for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
+        let temp_path = export_temp_path_for_attempt(output_path, attempt);
+
+        if let Some(ref beads_dir) = config.beads_dir {
+            validate_temp_file_path(
+                &temp_path,
+                output_path,
+                beads_dir,
+                config.allow_external_jsonl,
+            )?;
+            tracing::debug!(
+                temp_path = %temp_path.display(),
+                target_path = %output_path.display(),
+                "Temp file path validated"
+            );
+        }
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp_file) => return Ok((temp_path, temp_file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&temp_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(BeadsError::Config(format!(
+                        "Temporary export file already exists: {}",
+                        temp_path.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temporary export file for {}",
+        output_path.display()
+    )))
+}
+
+fn create_base_snapshot_temp_file(
+    snapshot_path: &Path,
+    jsonl_dir: &Path,
+) -> Result<(PathBuf, File)> {
+    for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
+        let temp_path = export_temp_path_for_attempt(snapshot_path, attempt);
+        validate_temp_file_path(&temp_path, snapshot_path, jsonl_dir, false)?;
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp_file) => return Ok((temp_path, temp_file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&temp_path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(BeadsError::Config(format!(
+                        "Temporary base snapshot file already exists: {}",
+                        temp_path.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temporary base snapshot file for {}",
+        snapshot_path.display()
+    )))
+}
+
+#[cfg(unix)]
+fn set_restrictive_jsonl_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    if let Err(error) = fs::set_permissions(path, perms) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "Failed to set restrictive permissions on JSONL file"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn set_restrictive_jsonl_permissions(_path: &Path) {}
 
 /// Configuration for JSONL export.
 #[derive(Debug, Clone, Default)]
@@ -142,6 +328,11 @@ pub struct ExportConfig {
     pub show_progress: bool,
     /// Configuration for history backups.
     pub history: HistoryConfig,
+    /// Worker cap for parallel JSONL line preparation during file exports.
+    ///
+    /// `0` means "auto": use up to 64 workers, capped by host parallelism.
+    /// `1` is the deterministic serial fallback.
+    pub max_parallel_workers: usize,
 }
 
 /// Export error handling policy.
@@ -403,6 +594,18 @@ pub struct ImportResult {
     pub orphans_removed: usize,
     /// Number of orphaned FK rows cleaned after deferred-FK import.
     pub orphan_cleaned_count: usize,
+    /// Number of label rows imported from JSONL for applied issue records.
+    pub labels_imported: usize,
+    /// Number of dependency rows imported from JSONL for applied issue records.
+    pub dependencies_imported: usize,
+    /// Number of comment rows imported from JSONL for applied issue records.
+    pub comments_imported: usize,
+    /// Number of export-hash rows recorded for the imported JSONL snapshot.
+    pub export_hashes_recorded: usize,
+    /// Number of blocked-cache rows rebuilt after import.
+    pub blocked_cache_entries: usize,
+    /// Number of child-counter rows rebuilt after import.
+    pub child_counter_entries: usize,
 }
 
 // ============================================================================
@@ -957,6 +1160,7 @@ pub fn preflight_import(
                     "Use a path within .beads/ directory or set --allow-external-jsonl.",
                 ));
                 tracing::debug!(path = %input_path.display(), error = %e, "Path validation: FAIL");
+                return Ok(result);
             }
         }
     }
@@ -1200,6 +1404,7 @@ const CONFLICT_END: &str = ">>>>>>>";
 /// Returns an error if the file cannot be read.
 pub fn scan_conflict_markers(path: &Path) -> Result<Vec<ConflictMarker>> {
     let file = File::open(path)?;
+    path::validate_jsonl_fd_metadata(&file, path)?;
     let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut markers = Vec::new();
 
@@ -1280,6 +1485,7 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, HashSet::new())),
         Err(e) => return Err(BeadsError::Io(e)),
     };
+    path::validate_jsonl_fd_metadata(&file, path)?;
 
     let mut reader = BufReader::new(file);
     let mut count = 0;
@@ -1374,6 +1580,380 @@ fn read_jsonl_lines_by_id(path: &Path) -> Result<BTreeMap<String, String>> {
     Ok(lines_by_id)
 }
 
+fn export_issue_ids(storage: &SqliteStorage) -> Result<Vec<String>> {
+    let rows = storage.execute_raw_query(
+        r"SELECT id
+          FROM issues
+          WHERE (ephemeral = 0 OR ephemeral IS NULL)
+            AND id NOT LIKE '%-wisp-%'
+          ORDER BY id ASC",
+    )?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|row| row.first().and_then(SqliteValue::as_text).map(String::from))
+        .collect())
+}
+
+fn hydrate_export_issue_batch(
+    storage: &SqliteStorage,
+    ids: &[String],
+    ctx: &mut ExportContext,
+) -> Result<Vec<Issue>> {
+    let mut issues = storage.get_issues_by_ids(ids)?;
+    issues.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+
+    let deps_map = match storage.get_dependencies_full_for_issues(ids) {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Dependency,
+                "batch",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
+    let labels_map = match storage.get_labels_for_issues(ids) {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Label,
+                "batch",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
+    let comments_map = match storage.get_comments_for_issues(ids) {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Comment,
+                "batch",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
+
+    populate_export_issue_relations(
+        storage,
+        &mut issues,
+        deps_map.as_ref(),
+        labels_map.as_ref(),
+        comments_map.as_ref(),
+        ctx,
+    );
+
+    Ok(issues)
+}
+
+fn hydrate_export_issues_full_scan(
+    storage: &SqliteStorage,
+    ctx: &mut ExportContext,
+) -> Result<Vec<Issue>> {
+    let mut issues = storage.get_all_issues_for_export()?;
+
+    let deps_map = match storage.get_dependency_records_for_export() {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Dependency,
+                "export",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
+    let labels_map = match storage.get_labels_for_export() {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Label,
+                "export",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
+    let comments_map = match storage.get_comments_for_export() {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Comment,
+                "export",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
+
+    populate_export_issue_relations(
+        storage,
+        &mut issues,
+        deps_map.as_ref(),
+        labels_map.as_ref(),
+        comments_map.as_ref(),
+        ctx,
+    );
+
+    Ok(issues)
+}
+
+fn populate_export_issue_relations(
+    storage: &SqliteStorage,
+    issues: &mut [Issue],
+    deps_map: Option<&HashMap<String, Vec<Dependency>>>,
+    labels_map: Option<&HashMap<String, Vec<String>>>,
+    comments_map: Option<&HashMap<String, Vec<Comment>>>,
+    ctx: &ExportContext,
+) {
+    for issue in issues {
+        if let Some(map) = deps_map {
+            if let Some(deps) = map.get(&issue.id) {
+                issue.dependencies.clone_from(deps);
+            }
+        } else if ctx.policy != ExportErrorPolicy::RequiredCore
+            && let Ok(deps) = storage.get_dependencies_full(&issue.id)
+        {
+            issue.dependencies = deps;
+        }
+
+        if let Some(map) = labels_map {
+            if let Some(labels) = map.get(&issue.id) {
+                issue.labels.clone_from(labels);
+            }
+        } else if ctx.policy != ExportErrorPolicy::RequiredCore
+            && let Ok(labels) = storage.get_labels(&issue.id)
+        {
+            issue.labels = labels;
+        }
+
+        if let Some(map) = comments_map {
+            if let Some(comments) = map.get(&issue.id) {
+                issue.comments.clone_from(comments);
+            }
+        } else if ctx.policy != ExportErrorPolicy::RequiredCore
+            && let Ok(comments) = storage.get_comments(&issue.id)
+        {
+            issue.comments = comments;
+        }
+
+        normalize_issue_for_export(issue);
+    }
+}
+
+fn write_export_issue_jsonl<W: Write>(
+    writer: &mut W,
+    issue: &Issue,
+    hasher: &mut Sha256,
+    buffer: &mut Vec<u8>,
+    ctx: &mut ExportContext,
+) -> Result<bool> {
+    buffer.clear();
+    if let Err(err) = serde_json::to_writer(&mut *buffer, issue) {
+        ctx.handle_error(ExportError::new(
+            ExportEntityType::Issue,
+            issue.id.clone(),
+            err.to_string(),
+        ))?;
+        return Ok(false);
+    }
+
+    if let Err(err) = writer
+        .write_all(buffer)
+        .and_then(|()| writer.write_all(b"\n"))
+    {
+        ctx.handle_error(ExportError::new(
+            ExportEntityType::Issue,
+            issue.id.clone(),
+            err.to_string(),
+        ))?;
+        return Ok(false);
+    }
+
+    hasher.update(&*buffer);
+    hasher.update(b"\n");
+
+    Ok(true)
+}
+
+struct PreparedExportIssue {
+    id: String,
+    jsonl_line: Vec<u8>,
+    content_hash: String,
+    dependency_count: usize,
+    label_count: usize,
+    comment_count: usize,
+}
+
+enum PreparedExportEntry {
+    Issue(PreparedExportIssue),
+    SkippedTombstone(String),
+    Error(ExportError),
+}
+
+fn effective_export_parallelism(config: &ExportConfig) -> usize {
+    if config.max_parallel_workers == 1 || export_parallelism_disabled_by_env() {
+        return 1;
+    }
+
+    let host_parallelism = thread::available_parallelism()
+        .map_or(DEFAULT_JSONL_EXPORT_PARALLELISM, std::num::NonZero::get);
+    let cap = if config.max_parallel_workers == 0 {
+        DEFAULT_JSONL_EXPORT_PARALLELISM
+    } else {
+        config.max_parallel_workers
+    };
+
+    cap.min(host_parallelism).max(1)
+}
+
+fn export_parallelism_disabled_by_env() -> bool {
+    std::env::var_os("BR_DISABLE_PARALLEL_JSONL_EXPORT").is_some_and(|value| {
+        let value = value.to_string_lossy();
+        value != "0" && !value.eq_ignore_ascii_case("false")
+    })
+}
+
+const fn should_prepare_export_issues_parallel(issue_count: usize, max_parallelism: usize) -> bool {
+    max_parallelism > 1 && issue_count >= EXPORT_PARALLEL_PREPARE_MIN_ISSUES
+}
+
+fn prepare_export_issue_jsonl(issue: &Issue, retention_days: Option<u64>) -> PreparedExportEntry {
+    if issue.is_expired_tombstone(retention_days) {
+        return PreparedExportEntry::SkippedTombstone(issue.id.clone());
+    }
+
+    let mut jsonl_line = Vec::with_capacity(1024);
+    if let Err(err) = serde_json::to_writer(&mut jsonl_line, issue) {
+        return PreparedExportEntry::Error(ExportError::new(
+            ExportEntityType::Issue,
+            issue.id.clone(),
+            err.to_string(),
+        ));
+    }
+    jsonl_line.push(b'\n');
+
+    PreparedExportEntry::Issue(PreparedExportIssue {
+        id: issue.id.clone(),
+        jsonl_line,
+        content_hash: issue
+            .content_hash
+            .clone()
+            .unwrap_or_else(|| crate::util::content_hash(issue)),
+        dependency_count: issue.dependencies.len(),
+        label_count: issue.labels.len(),
+        comment_count: issue.comments.len(),
+    })
+}
+
+fn prepare_export_issue_chunk(
+    issues: &[Issue],
+    retention_days: Option<u64>,
+) -> Vec<PreparedExportEntry> {
+    issues
+        .iter()
+        .map(|issue| prepare_export_issue_jsonl(issue, retention_days))
+        .collect()
+}
+
+fn prepare_export_issues_jsonl_parallel(
+    issues: &[Issue],
+    retention_days: Option<u64>,
+    max_parallelism: usize,
+) -> Result<Vec<PreparedExportEntry>> {
+    if !should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
+        return Ok(prepare_export_issue_chunk(issues, retention_days));
+    }
+
+    let worker_count = max_parallelism.min(issues.len());
+    let chunk_size = issues.len().div_ceil(worker_count);
+
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for (chunk_index, chunk) in issues.chunks(chunk_size).enumerate() {
+            let start_index = chunk_index * chunk_size;
+            handles.push(scope.spawn(move || {
+                (
+                    start_index,
+                    prepare_export_issue_chunk(chunk, retention_days),
+                )
+            }));
+        }
+
+        let mut chunks = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let chunk = handle.join().map_err(|_| {
+                BeadsError::Config("Parallel JSONL export worker panicked".to_string())
+            })?;
+            chunks.push(chunk);
+        }
+
+        chunks.sort_unstable_by_key(|(start_index, _)| *start_index);
+        let total_entries = chunks.iter().map(|(_, entries)| entries.len()).sum();
+        let mut entries = Vec::with_capacity(total_entries);
+        for (_, chunk_entries) in chunks {
+            entries.extend(chunk_entries);
+        }
+
+        Ok(entries)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_prepared_export_entries<W: Write>(
+    writer: &mut W,
+    prepared_entries: Vec<PreparedExportEntry>,
+    hasher: &mut Sha256,
+    ctx: &mut ExportContext,
+    report: &mut ExportReport,
+    exported_ids: &mut Vec<String>,
+    skipped_tombstone_ids: &mut Vec<String>,
+    issue_hashes: &mut Vec<(String, String)>,
+    progress: Option<&ProgressBar>,
+) -> Result<()> {
+    for entry in prepared_entries {
+        match entry {
+            PreparedExportEntry::Issue(prepared) => {
+                if let Err(err) = writer.write_all(&prepared.jsonl_line) {
+                    ctx.handle_error(ExportError::new(
+                        ExportEntityType::Issue,
+                        prepared.id,
+                        err.to_string(),
+                    ))?;
+                    increment_progress(progress);
+                    continue;
+                }
+
+                hasher.update(&prepared.jsonl_line);
+                exported_ids.push(prepared.id.clone());
+                issue_hashes.push((prepared.id, prepared.content_hash));
+                report.issues_exported += 1;
+                report.dependencies_exported += prepared.dependency_count;
+                report.labels_exported += prepared.label_count;
+                report.comments_exported += prepared.comment_count;
+            }
+            PreparedExportEntry::SkippedTombstone(id) => {
+                skipped_tombstone_ids.push(id);
+            }
+            PreparedExportEntry::Error(err) => {
+                ctx.handle_error(err)?;
+            }
+        }
+        increment_progress(progress);
+    }
+
+    Ok(())
+}
+
+fn increment_progress(progress: Option<&ProgressBar>) {
+    if let Some(progress) = progress {
+        progress.inc(1);
+    }
+}
+
 /// Export issues from `SQLite` to JSONL format.
 ///
 /// This implements the classic beads export semantics:
@@ -1439,8 +2019,8 @@ pub fn export_to_jsonl_with_policy(
         history::backup_before_export(beads_dir, &config.history, &output_abs)?;
     }
 
-    // Get all issues for export (sorted by ID, excludes ephemerals/wisps)
-    let mut issues = storage.get_all_issues_for_export()?;
+    // Get sorted export IDs up front for safety checks and bounded batch hydration.
+    let export_ids = export_issue_ids(storage)?;
 
     // Fetch dirty metadata for safe clearing later
     let dirty_metadata = storage.get_dirty_issue_metadata()?;
@@ -1450,7 +2030,7 @@ pub fn export_to_jsonl_with_policy(
         let (jsonl_count, jsonl_ids) = analyze_jsonl(output_path)?;
 
         // Check 1: prevent exporting empty database over non-empty JSONL
-        if issues.is_empty() && jsonl_count > 0 {
+        if export_ids.is_empty() && jsonl_count > 0 {
             return Err(BeadsError::Config(format!(
                 "Refusing to export empty database over non-empty JSONL file.\n\
                  Database has 0 issues, JSONL has {jsonl_count} lines.\n\
@@ -1461,7 +2041,7 @@ pub fn export_to_jsonl_with_policy(
 
         // Check 2: prevent exporting stale database that would lose issues
         if !jsonl_ids.is_empty() {
-            let db_ids: HashSet<String> = issues.iter().map(|i| i.id.clone()).collect();
+            let db_ids: HashSet<String> = export_ids.iter().cloned().collect();
             let missing: Vec<_> = jsonl_ids.difference(&db_ids).collect();
 
             if !missing.is_empty() {
@@ -1480,7 +2060,7 @@ pub fn export_to_jsonl_with_policy(
                      Database has {} issues, JSONL has {} unique issues.\n\
                      Export would lose {} issue(s): {}{}\n\
                      Hint: Run import first, or use --force to override.",
-                    issues.len(),
+                    export_ids.len(),
                     jsonl_ids.len(),
                     missing_list.len(),
                     preview
@@ -1498,84 +2078,10 @@ pub fn export_to_jsonl_with_policy(
     let mut report = ExportReport::new(config.error_policy);
 
     let progress = create_progress_bar(
-        issues.len() as u64,
+        export_ids.len() as u64,
         "Exporting issues",
         config.show_progress,
     );
-
-    // Populate dependencies and labels for all issues (batch queries to avoid N+1)
-    let all_deps = match storage.get_all_dependency_records() {
-        Ok(map) => Some(map),
-        Err(err) => {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Dependency,
-                "all",
-                err.to_string(),
-            ))?;
-            None
-        }
-    };
-    let all_labels = match storage.get_all_labels() {
-        Ok(map) => Some(map),
-        Err(err) => {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Label,
-                "all",
-                err.to_string(),
-            ))?;
-            None
-        }
-    };
-    let all_comments = match storage.get_all_comments() {
-        Ok(map) => Some(map),
-        Err(err) => {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Comment,
-                "all",
-                err.to_string(),
-            ))?;
-            None
-        }
-    };
-
-    for issue in &mut issues {
-        // Dependencies
-        if let Some(ref map) = all_deps {
-            if let Some(deps) = map.get(&issue.id) {
-                issue.dependencies = deps.clone();
-            }
-        } else if ctx.policy != ExportErrorPolicy::RequiredCore {
-            // Bulk failed, but we are in best-effort/partial mode — try individual query
-            if let Ok(deps) = storage.get_dependencies_full(&issue.id) {
-                issue.dependencies = deps;
-            }
-        }
-
-        // Labels
-        if let Some(ref map) = all_labels {
-            if let Some(labels) = map.get(&issue.id) {
-                issue.labels = labels.clone();
-            }
-        } else if ctx.policy != ExportErrorPolicy::RequiredCore
-            && let Ok(labels) = storage.get_labels(&issue.id)
-        {
-            issue.labels = labels;
-        }
-
-        // Normalize for consistent round-trip hashing (matches import behavior)
-        normalize_issue_for_export(issue);
-
-        // Comments
-        if let Some(ref map) = all_comments {
-            if let Some(comments) = map.get(&issue.id) {
-                issue.comments = comments.clone();
-            }
-        } else if ctx.policy != ExportErrorPolicy::RequiredCore
-            && let Ok(comments) = storage.get_comments(&issue.id)
-        {
-            issue.comments = comments;
-        }
-    }
 
     // Write to temp file for atomic rename
     let parent_dir = output_path.parent().ok_or_else(|| {
@@ -1585,96 +2091,129 @@ pub fn export_to_jsonl_with_policy(
     // Ensure parent directory exists
     fs::create_dir_all(parent_dir)?;
 
-    let temp_path = export_temp_path(output_path);
-
-    // Validate temp file path (PC-4: temp files must be in same directory as target)
-    if let Some(ref beads_dir) = config.beads_dir {
-        validate_temp_file_path(
-            &temp_path,
-            output_path,
-            beads_dir,
-            config.allow_external_jsonl,
-        )?;
-        tracing::debug!(
-            temp_path = %temp_path.display(),
-            target_path = %output_path.display(),
-            "Temp file path validated"
-        );
-    }
-
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary export file already exists: {}",
-                    temp_path.display()
-                ))
-            } else {
-                err.into()
-            }
-        })?;
+    let (temp_path, temp_file) = create_jsonl_temp_file(output_path, config)?;
     let mut temp_guard = TempFileGuard::new(temp_path.clone());
+    set_restrictive_jsonl_permissions(&temp_path);
     let mut writer = BufWriter::new(temp_file);
 
     // Write JSONL and compute hash
     let mut hasher = Sha256::new();
-    let issues_len = issues.len();
-    let mut exported_ids = Vec::with_capacity(issues_len);
+    let mut exported_ids = Vec::with_capacity(export_ids.len());
     let mut skipped_tombstone_ids = Vec::new(); // Usually small
-    let mut issue_hashes = Vec::with_capacity(issues_len);
+    let mut issue_hashes = Vec::with_capacity(export_ids.len());
     let mut buffer = Vec::with_capacity(1024);
+    let max_parallelism = effective_export_parallelism(config);
 
-    for issue in &issues {
-        // Skip expired tombstones
-        if issue.is_expired_tombstone(config.retention_days) {
-            skipped_tombstone_ids.push(issue.id.clone());
-            progress.inc(1);
-            continue;
+    if export_ids.len() <= EXPORT_FULL_SCAN_ISSUE_THRESHOLD {
+        let issues = hydrate_export_issues_full_scan(storage, &mut ctx)?;
+        if should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
+            let prepared = prepare_export_issues_jsonl_parallel(
+                &issues,
+                config.retention_days,
+                max_parallelism,
+            )?;
+            write_prepared_export_entries(
+                &mut writer,
+                prepared,
+                &mut hasher,
+                &mut ctx,
+                &mut report,
+                &mut exported_ids,
+                &mut skipped_tombstone_ids,
+                &mut issue_hashes,
+                Some(&progress),
+            )?;
+        } else {
+            for issue in &issues {
+                // Skip expired tombstones
+                if issue.is_expired_tombstone(config.retention_days) {
+                    skipped_tombstone_ids.push(issue.id.clone());
+                    progress.inc(1);
+                    continue;
+                }
+
+                if !write_export_issue_jsonl(
+                    &mut writer,
+                    issue,
+                    &mut hasher,
+                    &mut buffer,
+                    &mut ctx,
+                )? {
+                    progress.inc(1);
+                    continue;
+                }
+
+                exported_ids.push(issue.id.clone());
+                issue_hashes.push((
+                    issue.id.clone(),
+                    issue
+                        .content_hash
+                        .clone()
+                        .unwrap_or_else(|| crate::util::content_hash(issue)),
+                ));
+                report.issues_exported += 1;
+                report.dependencies_exported += issue.dependencies.len();
+                report.labels_exported += issue.labels.len();
+                report.comments_exported += issue.comments.len();
+                progress.inc(1);
+            }
         }
+    } else {
+        for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
+            let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+            if should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
+                let prepared = prepare_export_issues_jsonl_parallel(
+                    &issues,
+                    config.retention_days,
+                    max_parallelism,
+                )?;
+                write_prepared_export_entries(
+                    &mut writer,
+                    prepared,
+                    &mut hasher,
+                    &mut ctx,
+                    &mut report,
+                    &mut exported_ids,
+                    &mut skipped_tombstone_ids,
+                    &mut issue_hashes,
+                    Some(&progress),
+                )?;
+            } else {
+                for issue in &issues {
+                    // Skip expired tombstones
+                    if issue.is_expired_tombstone(config.retention_days) {
+                        skipped_tombstone_ids.push(issue.id.clone());
+                        progress.inc(1);
+                        continue;
+                    }
 
-        buffer.clear();
-        if let Err(err) = serde_json::to_writer(&mut buffer, issue) {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Issue,
-                issue.id.clone(),
-                err.to_string(),
-            ))?;
-            progress.inc(1);
-            continue;
+                    if !write_export_issue_jsonl(
+                        &mut writer,
+                        issue,
+                        &mut hasher,
+                        &mut buffer,
+                        &mut ctx,
+                    )? {
+                        progress.inc(1);
+                        continue;
+                    }
+
+                    exported_ids.push(issue.id.clone());
+                    issue_hashes.push((
+                        issue.id.clone(),
+                        issue
+                            .content_hash
+                            .clone()
+                            .unwrap_or_else(|| crate::util::content_hash(issue)),
+                    ));
+                    report.issues_exported += 1;
+                    report.dependencies_exported += issue.dependencies.len();
+                    report.labels_exported += issue.labels.len();
+                    report.comments_exported += issue.comments.len();
+                    progress.inc(1);
+                }
+            }
         }
-
-        if let Err(err) = writer
-            .write_all(&buffer)
-            .and_then(|()| writer.write_all(b"\n"))
-        {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Issue,
-                issue.id.clone(),
-                err.to_string(),
-            ))?;
-            progress.inc(1);
-            continue;
-        }
-
-        hasher.update(&buffer);
-        hasher.update(b"\n");
-
-        exported_ids.push(issue.id.clone());
-        issue_hashes.push((
-            issue.id.clone(),
-            issue
-                .content_hash
-                .clone()
-                .unwrap_or_else(|| crate::util::content_hash(issue)),
-        ));
-        report.issues_exported += 1;
-        report.dependencies_exported += issue.dependencies.len();
-        report.labels_exported += issue.labels.len();
-        report.comments_exported += issue.comments.len();
-        progress.inc(1);
     }
 
     progress.finish_with_message("Export complete");
@@ -1687,7 +2226,7 @@ pub fn export_to_jsonl_with_policy(
         .sync_all()?;
 
     // Compute final hash
-    let content_hash = format!("{:x}", hasher.finalize());
+    let content_hash = hex_encode(&hasher.finalize());
 
     // Verify staged export integrity before replacing the live JSONL.
     let actual_count = count_issues_in_jsonl(&temp_path)?;
@@ -1714,23 +2253,9 @@ pub fn export_to_jsonl_with_policy(
         )?;
     }
 
-    // Atomic rename
-    fs::rename(&temp_path, output_path)?;
+    // Atomic rename plus parent-directory fsync for power-loss durability.
+    crate::util::durable_rename(&temp_path, output_path)?;
     temp_guard.persist();
-
-    // Set file permissions (0600)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = fs::set_permissions(output_path, perms) {
-            tracing::warn!(
-                path = %output_path.display(),
-                error = %e,
-                "Failed to set restrictive permissions on exported JSONL file"
-            );
-        }
-    }
 
     let result = ExportResult {
         exported_count: exported_ids.len(),
@@ -1773,128 +2298,62 @@ pub fn export_to_writer_with_policy<W: Write>(
     writer: &mut W,
     policy: ExportErrorPolicy,
 ) -> Result<(ExportResult, ExportReport)> {
-    let mut issues = storage.get_all_issues_for_export()?;
+    let export_ids = export_issue_ids(storage)?;
 
-    // Populate dependencies and labels
     let mut ctx = ExportContext::new(policy);
     let mut report = ExportReport::new(policy);
-    let all_deps = match storage.get_all_dependency_records() {
-        Ok(map) => Some(map),
-        Err(err) => {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Dependency,
-                "all",
-                err.to_string(),
-            ))?;
-            None
-        }
-    };
-    let all_labels = match storage.get_all_labels() {
-        Ok(map) => Some(map),
-        Err(err) => {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Label,
-                "all",
-                err.to_string(),
-            ))?;
-            None
-        }
-    };
-    let all_comments = match storage.get_all_comments() {
-        Ok(map) => Some(map),
-        Err(err) => {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Comment,
-                "all",
-                err.to_string(),
-            ))?;
-            None
-        }
-    };
-
-    for issue in &mut issues {
-        // Dependencies
-        if let Some(ref map) = all_deps {
-            if let Some(deps) = map.get(&issue.id) {
-                issue.dependencies = deps.clone();
-            }
-        } else if ctx.policy != ExportErrorPolicy::RequiredCore {
-            // Bulk failed, but we are in best-effort/partial mode — try individual query
-            if let Ok(deps) = storage.get_dependencies_full(&issue.id) {
-                issue.dependencies = deps;
-            }
-        }
-
-        // Labels
-        if let Some(ref map) = all_labels {
-            if let Some(labels) = map.get(&issue.id) {
-                issue.labels = labels.clone();
-            }
-        } else if ctx.policy != ExportErrorPolicy::RequiredCore
-            && let Ok(labels) = storage.get_labels(&issue.id)
-        {
-            issue.labels = labels;
-        }
-
-        // Normalize for consistent round-trip hashing (matches import behavior)
-        normalize_issue_for_export(issue);
-
-        // Comments
-        if let Some(ref map) = all_comments {
-            if let Some(comments) = map.get(&issue.id) {
-                issue.comments = comments.clone();
-            }
-        } else if ctx.policy != ExportErrorPolicy::RequiredCore
-            && let Ok(comments) = storage.get_comments(&issue.id)
-        {
-            issue.comments = comments;
-        }
-    }
 
     let mut hasher = Sha256::new();
-    let issues_len = issues.len();
-    let mut exported_ids = Vec::with_capacity(issues_len);
+    let mut exported_ids = Vec::with_capacity(export_ids.len());
     let skipped_tombstone_ids = Vec::new();
-    let mut issue_hashes = Vec::with_capacity(issues_len);
+    let mut issue_hashes = Vec::with_capacity(export_ids.len());
+    let mut buffer = Vec::with_capacity(1024);
 
-    for issue in &issues {
-        let json = match serde_json::to_string(issue) {
-            Ok(json) => json,
-            Err(err) => {
-                ctx.handle_error(ExportError::new(
-                    ExportEntityType::Issue,
-                    issue.id.clone(),
-                    err.to_string(),
-                ))?;
+    if export_ids.len() <= EXPORT_FULL_SCAN_ISSUE_THRESHOLD {
+        let issues = hydrate_export_issues_full_scan(storage, &mut ctx)?;
+        for issue in &issues {
+            if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
                 continue;
             }
-        };
-        if let Err(err) = writeln!(writer, "{json}") {
-            ctx.handle_error(ExportError::new(
-                ExportEntityType::Issue,
-                issue.id.clone(),
-                err.to_string(),
-            ))?;
-            continue;
-        }
-        hasher.update(json.as_bytes());
-        hasher.update(b"\n");
 
-        exported_ids.push(issue.id.clone());
-        issue_hashes.push((
-            issue.id.clone(),
-            issue
-                .content_hash
-                .clone()
-                .unwrap_or_else(|| crate::util::content_hash(issue)),
-        ));
-        report.issues_exported += 1;
-        report.dependencies_exported += issue.dependencies.len();
-        report.labels_exported += issue.labels.len();
-        report.comments_exported += issue.comments.len();
+            exported_ids.push(issue.id.clone());
+            issue_hashes.push((
+                issue.id.clone(),
+                issue
+                    .content_hash
+                    .clone()
+                    .unwrap_or_else(|| crate::util::content_hash(issue)),
+            ));
+            report.issues_exported += 1;
+            report.dependencies_exported += issue.dependencies.len();
+            report.labels_exported += issue.labels.len();
+            report.comments_exported += issue.comments.len();
+        }
+    } else {
+        for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
+            let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
+            for issue in &issues {
+                if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
+                    continue;
+                }
+
+                exported_ids.push(issue.id.clone());
+                issue_hashes.push((
+                    issue.id.clone(),
+                    issue
+                        .content_hash
+                        .clone()
+                        .unwrap_or_else(|| crate::util::content_hash(issue)),
+                ));
+                report.issues_exported += 1;
+                report.dependencies_exported += issue.dependencies.len();
+                report.labels_exported += issue.labels.len();
+                report.comments_exported += issue.comments.len();
+            }
+        }
     }
 
-    let content_hash = format!("{:x}", hasher.finalize());
+    let content_hash = hex_encode(&hasher.finalize());
 
     let result = ExportResult {
         exported_count: exported_ids.len(),
@@ -1987,110 +2446,174 @@ pub fn compute_staleness_refreshing_witnesses(
     Ok(staleness)
 }
 
+/// Check whether auto-import needs to inspect the JSONL contents.
+///
+/// This is the read-command startup fast path: when JSONL is not newer, callers
+/// do not need dirty-count or pending-flush state because no import can happen.
+/// If JSONL may be newer, `auto_import_if_stale` recomputes the full staleness
+/// record before deciding whether a local dirty DB should block import.
+///
+/// # Errors
+///
+/// Returns an error if reading JSONL metadata, stored witnesses, or hashing
+/// fails. Opportunistic witness refresh failures are logged and ignored.
+pub fn auto_import_probe_refreshing_witnesses(
+    storage: &mut SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    allow_external_jsonl: bool,
+) -> Result<bool> {
+    if jsonl_path.exists() {
+        validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+    }
+    let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
+    if let Some(observed) = probe.refresh_witness {
+        refresh_jsonl_witness_best_effort(storage, jsonl_path, &observed);
+    }
+    Ok(probe.jsonl_newer)
+}
+
+/// Check whether auto-import needs to inspect JSONL contents without mutating metadata.
+///
+/// This variant is intended for read-only startup probes. It deliberately skips
+/// the opportunistic JSONL witness refresh that
+/// [`auto_import_probe_refreshing_witnesses`] performs, so callers can use a
+/// read-only SQLite handle and reopen writable storage only if import work is
+/// actually needed.
+///
+/// # Errors
+///
+/// Returns an error if reading JSONL metadata, stored witnesses, or hashing
+/// fails.
+pub fn auto_import_probe(
+    storage: &SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    allow_external_jsonl: bool,
+) -> Result<bool> {
+    if jsonl_path.exists() {
+        validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+    }
+    compute_jsonl_newer_impl(storage, jsonl_path).map(|probe| probe.jsonl_newer)
+}
+
 fn compute_staleness_impl(
     storage: &SqliteStorage,
     jsonl_path: &Path,
 ) -> Result<(StalenessCheck, Option<JsonlWitness>)> {
     let jsonl_exists = jsonl_path.exists();
     let (dirty_count, _needs_flush, db_newer) = pending_export_state(storage, jsonl_exists)?;
-    let mut refresh_witness = None;
-
-    let (jsonl_mtime, jsonl_newer) = if jsonl_exists {
-        let observed = observed_jsonl_witness(jsonl_path)?;
-        let stored_mtime = storage.get_metadata(METADATA_JSONL_MTIME)?;
-        let stored_size = storage.get_metadata(METADATA_JSONL_SIZE)?;
-        let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
-
-        if stored_mtime.as_deref() == Some(observed.mtime_witness.as_str()) {
-            let stored_size_matches =
-                stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
-            let jsonl_newer = if stored_size_matches {
-                stored_hash.is_none()
-            } else {
-                stored_hash.as_ref().is_none_or(|hash| {
-                    compute_jsonl_hash(jsonl_path)
-                        .map_or(true, |current_hash| &current_hash != hash)
-                })
-            };
-
-            if !jsonl_newer && stored_hash.is_some() && !stored_size_matches {
-                refresh_witness = Some(observed.clone());
-            }
-
-            return Ok((
-                StalenessCheck {
-                    dirty_count,
-                    jsonl_exists: true,
-                    jsonl_mtime: Some(observed.mtime),
-                    jsonl_newer,
-                    db_newer,
-                },
-                refresh_witness,
-            ));
-        }
-
-        let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
-        let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
-
-        // Get the latest known sync time (either import or export)
-        let mut latest_sync_ts: Option<chrono::DateTime<Utc>> = None;
-
-        if let Some(import_time) = &last_import_time
-            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(import_time)
-        {
-            latest_sync_ts = Some(ts.with_timezone(&Utc));
-        }
-
-        if let Some(export_time) = &last_export_time
-            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(export_time)
-        {
-            let ts_utc = ts.with_timezone(&Utc);
-            if latest_sync_ts.is_none_or(|latest| ts_utc > latest) {
-                latest_sync_ts = Some(ts_utc);
-            }
-        }
-
-        // JSONL is newer if it was modified after the latest sync
-        // If metadata is missing or invalid, assume JSONL is newer (safe default)
-        let mtime_newer = latest_sync_ts.is_none_or(|sync_ts| {
-            let sync_sys_time = std::time::SystemTime::from(sync_ts);
-            observed.mtime > sync_sys_time
-        });
-
-        let jsonl_newer = if mtime_newer {
-            stored_hash.as_ref().is_none_or(|stored_hash| {
-                compute_jsonl_hash(jsonl_path)
-                    .map_or(true, |current_hash| &current_hash != stored_hash)
-            })
-        } else {
-            false
-        };
-
-        if !jsonl_newer && stored_hash.is_some() {
-            let stored_size_matches =
-                stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
-            if stored_mtime.as_deref() != Some(observed.mtime_witness.as_str())
-                || !stored_size_matches
-            {
-                refresh_witness = Some(observed.clone());
-            }
-        }
-
-        (Some(observed.mtime), jsonl_newer)
-    } else {
-        (None, false)
-    };
+    let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
 
     Ok((
         StalenessCheck {
             dirty_count,
-            jsonl_exists,
-            jsonl_mtime,
-            jsonl_newer,
+            jsonl_exists: probe.jsonl_exists,
+            jsonl_mtime: probe.jsonl_mtime,
+            jsonl_newer: probe.jsonl_newer,
             db_newer,
         },
-        refresh_witness,
+        probe.refresh_witness,
     ))
+}
+
+struct JsonlNewerProbe {
+    jsonl_exists: bool,
+    jsonl_mtime: Option<std::time::SystemTime>,
+    jsonl_newer: bool,
+    refresh_witness: Option<JsonlWitness>,
+}
+
+fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Result<JsonlNewerProbe> {
+    if !jsonl_path.exists() {
+        return Ok(JsonlNewerProbe {
+            jsonl_exists: false,
+            jsonl_mtime: None,
+            jsonl_newer: false,
+            refresh_witness: None,
+        });
+    }
+
+    let observed = observed_jsonl_witness(jsonl_path)?;
+    let stored_mtime = storage.get_metadata(METADATA_JSONL_MTIME)?;
+    let stored_size = storage.get_metadata(METADATA_JSONL_SIZE)?;
+    let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
+    let mut refresh_witness = None;
+
+    if stored_mtime.as_deref() == Some(observed.mtime_witness.as_str()) {
+        let stored_size_matches =
+            stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
+        let jsonl_newer = if stored_size_matches {
+            stored_hash.is_none()
+        } else {
+            stored_hash.as_ref().is_none_or(|hash| {
+                compute_jsonl_hash(jsonl_path).map_or(true, |current_hash| &current_hash != hash)
+            })
+        };
+
+        if !jsonl_newer && stored_hash.is_some() && !stored_size_matches {
+            refresh_witness = Some(observed.clone());
+        }
+
+        return Ok(JsonlNewerProbe {
+            jsonl_exists: true,
+            jsonl_mtime: Some(observed.mtime),
+            jsonl_newer,
+            refresh_witness,
+        });
+    }
+
+    let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
+    let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
+
+    // Get the latest known sync time (either import or export)
+    let mut latest_sync_ts: Option<chrono::DateTime<Utc>> = None;
+
+    if let Some(import_time) = &last_import_time
+        && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(import_time)
+    {
+        latest_sync_ts = Some(ts.with_timezone(&Utc));
+    }
+
+    if let Some(export_time) = &last_export_time
+        && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(export_time)
+    {
+        let ts_utc = ts.with_timezone(&Utc);
+        if latest_sync_ts.is_none_or(|latest| ts_utc > latest) {
+            latest_sync_ts = Some(ts_utc);
+        }
+    }
+
+    // JSONL is newer if it was modified after the latest sync.
+    // If metadata is missing or invalid, assume JSONL is newer (safe default).
+    let mtime_newer = latest_sync_ts.is_none_or(|sync_ts| {
+        let sync_sys_time = std::time::SystemTime::from(sync_ts);
+        observed.mtime > sync_sys_time
+    });
+
+    let jsonl_newer = if mtime_newer {
+        stored_hash.as_ref().is_none_or(|stored_hash| {
+            compute_jsonl_hash(jsonl_path).map_or(true, |current_hash| &current_hash != stored_hash)
+        })
+    } else {
+        false
+    };
+
+    if !jsonl_newer && stored_hash.is_some() {
+        let stored_size_matches =
+            stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
+        if stored_mtime.as_deref() != Some(observed.mtime_witness.as_str()) || !stored_size_matches
+        {
+            refresh_witness = Some(observed.clone());
+        }
+    }
+
+    Ok(JsonlNewerProbe {
+        jsonl_exists: true,
+        jsonl_mtime: Some(observed.mtime),
+        jsonl_newer,
+        refresh_witness,
+    })
 }
 
 #[cfg(test)]
@@ -2111,11 +2634,6 @@ fn observed_jsonl_witness(jsonl_path: &Path) -> Result<JsonlWitness> {
 
 fn parse_jsonl_size_witness(value: &str) -> Option<u64> {
     value.parse().ok()
-}
-
-fn record_jsonl_witness_in_tx(storage: &SqliteStorage, jsonl_path: &Path) -> Result<()> {
-    let observed = observed_jsonl_witness(jsonl_path)?;
-    record_observed_jsonl_witness_in_tx(storage, &observed)
 }
 
 fn record_observed_jsonl_witness_in_tx(
@@ -2189,6 +2707,9 @@ pub fn auto_import_if_stale(
         return Ok(AutoImportResult::default());
     }
 
+    if jsonl_path.exists() {
+        validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+    }
     let staleness = compute_staleness_refreshing_witnesses(storage, jsonl_path)?;
     if !staleness.jsonl_newer {
         return Ok(AutoImportResult::default());
@@ -2256,6 +2777,10 @@ pub fn finalize_export(
     jsonl_path: &Path,
 ) -> Result<()> {
     use chrono::Utc;
+    let observed_jsonl = observed_jsonl_witness(jsonl_path)?;
+    let prior_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
+    let export_hashes_current =
+        export_hashes_certified_current(result, prior_content_hash.as_deref());
 
     storage.with_write_transaction(|storage| -> Result<()> {
         // Clear dirty flags for exported issues (safe version with timestamp validation)
@@ -2263,15 +2788,16 @@ pub fn finalize_export(
             storage.clear_dirty_issues(&result.exported_marked_at)?;
         }
 
-        // Record export hashes for each exported issue (for incremental export detection)
-        if let Some(hashes) = issue_hashes {
-            storage.set_export_hashes_in_tx(hashes)?;
+        // Record export hashes for each exported issue. Keep unchanged rows
+        // stable so full flushes do not rewrite the export_hashes table.
+        if !export_hashes_current && let Some(hashes) = issue_hashes {
+            storage.set_changed_export_hashes_in_tx(hashes)?;
         }
 
         // Update metadata
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
         storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-        record_jsonl_witness_in_tx(storage, jsonl_path)?;
+        record_observed_jsonl_witness_in_tx(storage, &observed_jsonl)?;
 
         // Keep the row stable and clear the flag in place so ordinary export
         // cycles avoid delete+insert churn on the metadata B-tree.
@@ -2281,6 +2807,13 @@ pub fn finalize_export(
     })?;
 
     Ok(())
+}
+
+fn export_hashes_certified_current(
+    result: &ExportResult,
+    prior_content_hash: Option<&str>,
+) -> bool {
+    result.exported_marked_at.is_empty() && prior_content_hash == Some(result.content_hash.as_str())
 }
 
 fn normalize_issue_for_export(issue: &mut Issue) {
@@ -2358,9 +2891,9 @@ fn restore_foreign_keys_after_import(
         .unwrap_or(0);
 
     if foreign_keys_enabled != 1 {
-        return Err(BeadsError::Other(anyhow::anyhow!(
-            "Import completed with foreign key enforcement still disabled"
-        )));
+        return Err(BeadsError::internal(
+            "Import completed with foreign key enforcement still disabled",
+        ));
     }
 
     if !validate_integrity {
@@ -2368,12 +2901,36 @@ fn restore_foreign_keys_after_import(
     }
 
     if let Some((table, column)) = find_post_import_fk_violation(storage)? {
-        return Err(BeadsError::Other(anyhow::anyhow!(
-            "Import finished with orphaned rows in {table}.{column}"
-        )));
+        return Err(BeadsError::validation(
+            "jsonl import",
+            format!("orphaned rows in {table}.{column}"),
+        ));
     }
 
     Ok(())
+}
+
+fn finish_import_after_foreign_key_restore(
+    apply_result: Result<ImportResult>,
+    fk_restore_result: Result<()>,
+) -> Result<ImportResult> {
+    match (apply_result, fk_restore_result) {
+        (Ok(import_result), Ok(())) => Ok(import_result),
+        (Ok(_), Err(fk_err)) => Err(fk_err),
+        (Err(import_err), Ok(())) => Err(import_err),
+        (Err(import_err), Err(fk_err)) => {
+            tracing::error!(
+                error = %fk_err,
+                "Failed to restore foreign key enforcement after failed import"
+            );
+            Err(BeadsError::WithContext {
+                context: format!(
+                    "jsonl import failed, and SQLite foreign key enforcement could not be re-enabled: {fk_err}"
+                ),
+                source: Box::new(import_err),
+            })
+        }
+    }
 }
 
 fn find_post_import_fk_violation(storage: &SqliteStorage) -> Result<Option<(String, String)>> {
@@ -2419,6 +2976,18 @@ fn finalize_incremental_auto_flush(
     jsonl_path: Option<&Path>,
 ) -> Result<()> {
     use chrono::Utc;
+    let export_metadata = match content_hash {
+        Some(content_hash) => {
+            let jsonl_path = jsonl_path.ok_or_else(|| {
+                BeadsError::Config(
+                    "incremental auto-flush metadata update requires a JSONL path".to_string(),
+                )
+            })?;
+            Some((content_hash, observed_jsonl_witness(jsonl_path)?))
+        }
+        None => None,
+    };
+
     storage.with_write_transaction(|storage| -> Result<()> {
         if !clear_dirty_metadata.is_empty() {
             storage.clear_dirty_issues(clear_dirty_metadata)?;
@@ -2427,17 +2996,12 @@ fn finalize_incremental_auto_flush(
             storage.clear_export_hashes_in_tx(removed_hash_ids)?;
         }
         if !issue_hashes.is_empty() {
-            storage.set_export_hashes_in_tx(issue_hashes)?;
+            storage.set_changed_export_hashes_in_tx(issue_hashes)?;
         }
-        if let Some(content_hash) = content_hash {
+        if let Some((content_hash, observed_jsonl)) = &export_metadata {
             storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, content_hash)?;
             storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-            let jsonl_path = jsonl_path.ok_or_else(|| {
-                BeadsError::Config(
-                    "incremental auto-flush metadata update requires a JSONL path".to_string(),
-                )
-            })?;
-            record_jsonl_witness_in_tx(storage, jsonl_path)?;
+            record_observed_jsonl_witness_in_tx(storage, observed_jsonl)?;
         }
         storage.set_metadata_in_tx("needs_flush", "false")?;
         Ok(())
@@ -2446,22 +3010,99 @@ fn finalize_incremental_auto_flush(
     Ok(())
 }
 
-fn write_jsonl_lines_atomically(
-    lines_by_id: &BTreeMap<String, String>,
-    output_path: &Path,
-    config: &ExportConfig,
-) -> Result<String> {
+struct ExistingJsonlReplacementScan {
+    exported_count: usize,
+    changed: bool,
+    all_replacements_seen: bool,
+    sorted_by_id: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExistingJsonlReplacementWrite {
+    Unchanged {
+        exported_count: usize,
+    },
+    Written {
+        content_hash: String,
+        exported_count: usize,
+    },
+    Fallback,
+}
+
+struct JsonlTempOutput {
+    temp_path: PathBuf,
+    temp_guard: TempFileGuard,
+    writer: BufWriter<File>,
+}
+
+fn scan_existing_jsonl_replacements(
+    path: &Path,
+    replacement_lines: &HashMap<String, String>,
+) -> Result<ExistingJsonlReplacementScan> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut seen_ids = HashSet::new();
+    let mut seen_replacements = HashSet::with_capacity(replacement_lines.len());
+    let mut previous_id: Option<String> = None;
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+    let mut exported_count = 0;
+    let mut changed = false;
+    let mut sorted_by_id = true;
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let partial: PartialId = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
+
+        if !seen_ids.insert(partial.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                partial.id,
+                path.display(),
+                line_num
+            )));
+        }
+
+        if previous_id
+            .as_ref()
+            .is_some_and(|previous| previous > &partial.id)
+        {
+            sorted_by_id = false;
+        }
+        previous_id = Some(partial.id.clone());
+
+        if let Some(replacement) = replacement_lines.get(&partial.id) {
+            seen_replacements.insert(partial.id);
+            changed |= replacement != trimmed;
+        }
+
+        exported_count += 1;
+    }
+
+    Ok(ExistingJsonlReplacementScan {
+        exported_count,
+        changed,
+        all_replacements_seen: seen_replacements.len() == replacement_lines.len(),
+        sorted_by_id,
+    })
+}
+
+fn prepare_jsonl_temp_output(output_path: &Path, config: &ExportConfig) -> Result<JsonlTempOutput> {
     if let Some(ref beads_dir) = config.beads_dir {
         validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
-
-        let output_abs = if output_path.is_absolute() {
-            output_path.to_path_buf()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            cwd.join(output_path)
-        } else {
-            output_path.to_path_buf()
-        };
-
+        let output_abs = absolute_or_current_dir_join(output_path);
         history::backup_before_export(beads_dir, &config.history, &output_abs)?;
     }
 
@@ -2470,58 +3111,51 @@ fn write_jsonl_lines_atomically(
     })?;
     fs::create_dir_all(parent_dir)?;
 
-    let temp_path = export_temp_path(output_path);
-    if let Some(ref beads_dir) = config.beads_dir {
-        validate_temp_file_path(
-            &temp_path,
-            output_path,
-            beads_dir,
-            config.allow_external_jsonl,
-        )?;
+    let (temp_path, temp_file) = create_jsonl_temp_file(output_path, config)?;
+    let temp_guard = TempFileGuard::new(temp_path.clone());
+    set_restrictive_jsonl_permissions(&temp_path);
+
+    Ok(JsonlTempOutput {
+        temp_path,
+        temp_guard,
+        writer: BufWriter::new(temp_file),
+    })
+}
+
+fn absolute_or_current_dir_join(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
     }
+}
 
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary export file already exists: {}",
-                    temp_path.display()
-                ))
-            } else {
-                err.into()
-            }
-        })?;
-    let mut temp_guard = TempFileGuard::new(temp_path.clone());
-    let mut writer = BufWriter::new(temp_file);
-    let mut hasher = Sha256::new();
+fn persist_jsonl_temp_output(
+    temp_output: JsonlTempOutput,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<()> {
+    let JsonlTempOutput {
+        temp_path,
+        temp_guard,
+        writer,
+    } = temp_output;
 
-    for line in lines_by_id.values() {
-        writeln!(writer, "{line}")?;
-        hasher.update(line.as_bytes());
-        hasher.update(b"\n");
-    }
+    sync_jsonl_writer(writer)?;
+    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)
+}
 
-    writer.flush()?;
-    writer
-        .into_inner()
-        .map_err(|e| BeadsError::Io(e.into_error()))?
-        .sync_all()?;
-
-    let actual_count = count_issues_in_jsonl(&temp_path)?;
-    if actual_count != lines_by_id.len() {
-        return Err(BeadsError::Config(format!(
-            "Export verification failed: expected {} issues, JSONL has {} lines",
-            lines_by_id.len(),
-            actual_count
-        )));
-    }
-
+fn rename_jsonl_temp_output(
+    temp_path: &Path,
+    mut temp_guard: TempFileGuard,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<()> {
     if let Some(ref beads_dir) = config.beads_dir {
         require_safe_sync_overwrite_path(
-            &temp_path,
+            temp_path,
             beads_dir,
             config.allow_external_jsonl,
             "rename temp file",
@@ -2534,51 +3168,166 @@ fn write_jsonl_lines_atomically(
         )?;
     }
 
-    fs::rename(&temp_path, output_path)?;
+    crate::util::durable_rename(temp_path, output_path)?;
     temp_guard.persist();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = fs::set_permissions(output_path, perms) {
-            tracing::warn!(
-                path = %output_path.display(),
-                error = %e,
-                "Failed to set restrictive permissions on exported JSONL file"
-            );
-        }
-    }
-
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(())
 }
 
-fn try_incremental_auto_flush(
-    storage: &mut SqliteStorage,
-    beads_dir: &Path,
-    jsonl_path: &Path,
-    allow_external_jsonl: bool,
-) -> Result<Option<AutoFlushResult>> {
-    if !jsonl_path.exists() {
-        return Ok(None);
+fn sync_jsonl_writer(mut writer: BufWriter<File>) -> Result<()> {
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| BeadsError::Io(e.into_error()))?
+        .sync_all()?;
+    Ok(())
+}
+
+fn try_write_existing_jsonl_replacements_atomically(
+    replacement_lines: &HashMap<String, String>,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<ExistingJsonlReplacementWrite> {
+    let scan = scan_existing_jsonl_replacements(output_path, replacement_lines)?;
+
+    if !scan.all_replacements_seen || (scan.changed && !scan.sorted_by_id) {
+        return Ok(ExistingJsonlReplacementWrite::Fallback);
     }
 
-    let mut lines_by_id = read_jsonl_lines_by_id(jsonl_path)?;
-    let dirty_metadata = storage.get_dirty_issue_metadata()?;
-    if dirty_metadata.is_empty() {
-        return Ok(Some(AutoFlushResult::default()));
+    if !scan.changed {
+        return Ok(ExistingJsonlReplacementWrite::Unchanged {
+            exported_count: scan.exported_count,
+        });
     }
 
+    let (content_hash, exported_count) =
+        write_existing_jsonl_replacements_atomically(replacement_lines, output_path, config)?;
+    Ok(ExistingJsonlReplacementWrite::Written {
+        content_hash,
+        exported_count,
+    })
+}
+
+fn write_existing_jsonl_replacements_atomically(
+    replacement_lines: &HashMap<String, String>,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<(String, usize)> {
+    let input_file = File::open(output_path)?;
+    let mut reader = BufReader::new(input_file);
+    let mut temp_output = prepare_jsonl_temp_output(output_path, config)?;
+    let mut hasher = Sha256::new();
+    let mut seen_ids = HashSet::new();
+    let mut replaced_ids = HashSet::with_capacity(replacement_lines.len());
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+    let mut exported_count = 0;
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let partial: PartialId = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
+
+        if !seen_ids.insert(partial.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                partial.id,
+                output_path.display(),
+                line_num
+            )));
+        }
+
+        let output_line = if let Some(replacement) = replacement_lines.get(&partial.id) {
+            replaced_ids.insert(partial.id);
+            replacement.as_str()
+        } else {
+            trimmed
+        };
+
+        writeln!(temp_output.writer, "{output_line}")?;
+        hasher.update(output_line.as_bytes());
+        hasher.update(b"\n");
+        exported_count += 1;
+    }
+
+    if replaced_ids.len() != replacement_lines.len() {
+        return Err(BeadsError::Config(format!(
+            "JSONL changed while preparing incremental auto-flush for {} replacement(s)",
+            replacement_lines.len()
+        )));
+    }
+
+    persist_jsonl_temp_output(temp_output, output_path, config)?;
+
+    Ok((hex_encode(&hasher.finalize()), exported_count))
+}
+
+fn write_jsonl_lines_atomically(
+    lines_by_id: &BTreeMap<String, String>,
+    output_path: &Path,
+    config: &ExportConfig,
+) -> Result<String> {
+    let mut temp_output = prepare_jsonl_temp_output(output_path, config)?;
+    let mut hasher = Sha256::new();
+
+    for line in lines_by_id.values() {
+        writeln!(temp_output.writer, "{line}")?;
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    let JsonlTempOutput {
+        temp_path,
+        temp_guard,
+        writer,
+    } = temp_output;
+
+    sync_jsonl_writer(writer)?;
+    let actual_count = count_issues_in_jsonl(&temp_path)?;
+    if actual_count != lines_by_id.len() {
+        return Err(BeadsError::Config(format!(
+            "Export verification failed: expected {} issues, JSONL has {} lines",
+            lines_by_id.len(),
+            actual_count
+        )));
+    }
+
+    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)?;
+
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+struct IncrementalAutoFlushChanges {
+    dirty_metadata: Vec<(String, String)>,
+    removed_hash_ids: Vec<String>,
+    issue_hashes: Vec<(String, String)>,
+    replacement_lines: HashMap<String, String>,
+}
+
+fn collect_incremental_auto_flush_changes(
+    storage: &SqliteStorage,
+    dirty_metadata: Vec<(String, String)>,
+) -> Result<IncrementalAutoFlushChanges> {
     let dirty_len = dirty_metadata.len();
     let mut removed_hash_ids = Vec::with_capacity(dirty_len);
     let mut issue_hashes = Vec::with_capacity(dirty_len);
-    let mut changed = false;
+    let mut replacement_lines = HashMap::with_capacity(dirty_len);
 
     let dirty_ids: Vec<String> = dirty_metadata.iter().map(|(id, _)| id.clone()).collect();
     let batch_issues = storage.get_issues_for_export(&dirty_ids)?;
-    let mut issues_by_id: std::collections::HashMap<String, crate::model::Issue> = batch_issues
+    let mut issues_by_id: HashMap<String, crate::model::Issue> = batch_issues
         .into_iter()
-        .map(|i| (i.id.clone(), i))
+        .map(|issue| (issue.id.clone(), issue))
         .collect();
 
     for (issue_id, _) in &dirty_metadata {
@@ -2593,11 +3342,6 @@ fn try_incremental_auto_flush(
                     ))
                 })?;
 
-                if lines_by_id.get(issue_id) != Some(&json) {
-                    lines_by_id.insert(issue_id.clone(), json);
-                    changed = true;
-                }
-
                 issue_hashes.push((
                     issue_id.clone(),
                     issue
@@ -2605,38 +3349,137 @@ fn try_incremental_auto_flush(
                         .clone()
                         .unwrap_or_else(|| issue.compute_content_hash()),
                 ));
+                replacement_lines.insert(issue_id.clone(), json);
             }
-            Some(_) | None => {
-                removed_hash_ids.push(issue_id.clone());
-                changed |= lines_by_id.remove(issue_id).is_some();
-            }
+            Some(_) | None => removed_hash_ids.push(issue_id.clone()),
         }
     }
 
-    if !changed {
-        finalize_incremental_auto_flush(
-            storage,
-            &dirty_metadata,
-            &removed_hash_ids,
-            &issue_hashes,
-            None,
-            None,
-        )?;
+    Ok(IncrementalAutoFlushChanges {
+        dirty_metadata,
+        removed_hash_ids,
+        issue_hashes,
+        replacement_lines,
+    })
+}
+
+fn try_existing_line_auto_flush(
+    storage: &mut SqliteStorage,
+    jsonl_path: &Path,
+    export_config: &ExportConfig,
+    changes: &IncrementalAutoFlushChanges,
+) -> Result<Option<AutoFlushResult>> {
+    if !changes.removed_hash_ids.is_empty() || changes.replacement_lines.is_empty() {
+        return Ok(None);
+    }
+
+    let result = try_write_existing_jsonl_replacements_atomically(
+        &changes.replacement_lines,
+        jsonl_path,
+        export_config,
+    )?;
+
+    match result {
+        ExistingJsonlReplacementWrite::Unchanged { .. } => {
+            finalize_incremental_auto_flush(
+                storage,
+                &changes.dirty_metadata,
+                &changes.removed_hash_ids,
+                &changes.issue_hashes,
+                None,
+                None,
+            )?;
+            Ok(Some(AutoFlushResult::default()))
+        }
+        ExistingJsonlReplacementWrite::Written {
+            content_hash,
+            exported_count,
+        } => {
+            finalize_incremental_auto_flush(
+                storage,
+                &changes.dirty_metadata,
+                &changes.removed_hash_ids,
+                &changes.issue_hashes,
+                Some(&content_hash),
+                Some(jsonl_path),
+            )?;
+            Ok(Some(AutoFlushResult {
+                flushed: true,
+                exported_count,
+                content_hash,
+            }))
+        }
+        ExistingJsonlReplacementWrite::Fallback => Ok(None),
+    }
+}
+
+fn apply_incremental_auto_flush_changes(
+    lines_by_id: &mut BTreeMap<String, String>,
+    changes: &IncrementalAutoFlushChanges,
+) -> bool {
+    let mut changed = false;
+    for (issue_id, json) in &changes.replacement_lines {
+        if lines_by_id.get(issue_id) != Some(json) {
+            lines_by_id.insert(issue_id.clone(), json.clone());
+            changed = true;
+        }
+    }
+    for issue_id in &changes.removed_hash_ids {
+        changed |= lines_by_id.remove(issue_id).is_some();
+    }
+    changed
+}
+
+fn try_incremental_auto_flush(
+    storage: &mut SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    allow_external_jsonl: bool,
+) -> Result<Option<AutoFlushResult>> {
+    if !jsonl_path.exists() {
+        return Ok(None);
+    }
+
+    let dirty_metadata = storage.get_dirty_issue_metadata()?;
+    if dirty_metadata.is_empty() {
         return Ok(Some(AutoFlushResult::default()));
     }
 
+    let changes = collect_incremental_auto_flush_changes(storage, dirty_metadata)?;
     let export_config = ExportConfig {
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
         ..Default::default()
     };
+
+    if let Some(result) =
+        try_existing_line_auto_flush(storage, jsonl_path, &export_config, &changes)?
+    {
+        return Ok(Some(result));
+    }
+
+    let mut lines_by_id = read_jsonl_lines_by_id(jsonl_path)?;
+    let changed = apply_incremental_auto_flush_changes(&mut lines_by_id, &changes);
+
+    if !changed {
+        finalize_incremental_auto_flush(
+            storage,
+            &changes.dirty_metadata,
+            &changes.removed_hash_ids,
+            &changes.issue_hashes,
+            None,
+            None,
+        )?;
+        return Ok(Some(AutoFlushResult::default()));
+    }
+
     let content_hash = write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config)?;
     finalize_incremental_auto_flush(
         storage,
-        &dirty_metadata,
-        &removed_hash_ids,
-        &issue_hashes,
+        &changes.dirty_metadata,
+        &changes.removed_hash_ids,
+        &changes.issue_hashes,
         Some(&content_hash),
         Some(jsonl_path),
     )?;
@@ -2693,6 +3536,8 @@ pub fn auto_flush(
         return Ok(AutoFlushResult::default());
     }
 
+    validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
+
     // Refuse to auto-flush over a JSONL that still holds unresolved
     // merge-conflict markers. The downstream export path would otherwise
     // silently overwrite the `<<<<<<<` / `=======` / `>>>>>>>` regions
@@ -2701,13 +3546,16 @@ pub fn auto_flush(
     // `br sync --flush-only` already has a `--force` escape hatch for this
     // case; auto-flush has no such surface, so the only safe default is to
     // stop, log clearly, and let the next explicit sync surface the error.
-    if jsonl_exists && let Err(err) = ensure_no_conflict_markers(jsonl_path) {
-        tracing::warn!(
-            jsonl_path = %jsonl_path.display(),
-            error = %err,
-            "Skipping auto-flush: JSONL contains merge-conflict markers. Resolve them (or run `br sync --flush-only --force` to override) before the next write.",
-        );
-        return Ok(AutoFlushResult::default());
+    if jsonl_exists {
+        let conflict_markers = scan_conflict_markers(jsonl_path)?;
+        if !conflict_markers.is_empty() {
+            tracing::warn!(
+                jsonl_path = %jsonl_path.display(),
+                marker_count = conflict_markers.len(),
+                "Skipping auto-flush: JSONL contains merge-conflict markers. Resolve them (or run `br sync --flush-only --force` to override) before the next write.",
+            );
+            return Ok(AutoFlushResult::default());
+        }
     }
 
     tracing::debug!(
@@ -2779,6 +3627,7 @@ pub fn auto_flush(
 /// Returns an error if the file cannot be read or contains invalid JSON.
 pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
     let file = File::open(path)?;
+    path::validate_jsonl_fd_metadata(&file, path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
     let estimated_count = (file_size / 500) as usize;
     let mut reader = BufReader::new(file);
@@ -3005,8 +3854,21 @@ fn normalize_issue(issue: &mut Issue) {
         }
     }
 
-    // Recompute content hash
-    issue.content_hash = Some(content_hash(issue));
+    // Normalize legacy Go-beads (bd) terminal status aliases that survived
+    // JSONL import as `Status::Custom(_)`. Leaving them unmapped is
+    // corruptive: our own `is_terminal()` returns false for Custom, so the
+    // closed_at repair below skips them and the CHECK constraint later
+    // rejects the row. Downstream consumers (bv, bd-style readers) also
+    // reject unknown statuses outright.
+    if let crate::model::Status::Custom(raw) = &issue.status {
+        let key = raw.trim().to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "done" | "complete" | "completed" | "finished" | "resolved"
+        ) {
+            issue.status = crate::model::Status::Closed;
+        }
+    }
 
     // Wisp detection: if ID contains "-wisp-", mark as ephemeral
     if issue.id.contains("-wisp-") {
@@ -3039,6 +3901,490 @@ fn normalize_issue(issue: &mut Issue) {
     if issue.updated_at < issue.created_at {
         issue.updated_at = issue.created_at;
     }
+
+    // Recompute after all import repairs so the stored row hash matches the
+    // canonical issue state used by collision detection and export hashes.
+    issue.content_hash = Some(content_hash(issue));
+}
+
+#[derive(Debug)]
+struct PrefixRenameSeed {
+    old_id: String,
+    title: String,
+    description: Option<String>,
+    created_by: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Default)]
+struct ImportValidationPlan {
+    record_count: usize,
+    prefix_mismatches: Vec<PrefixRenameSeed>,
+    occupied_ids: HashSet<String>,
+}
+
+struct ImportMetadataMaps {
+    meta_by_id: HashMap<String, crate::storage::sqlite::IssueMetadata>,
+    id_by_ext_ref: HashMap<String, String>,
+    id_by_hash: HashMap<String, String>,
+}
+
+fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
+    let mut issue: Issue = serde_json::from_str(trimmed)
+        .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {line_num}: {e}")))?;
+
+    normalize_issue(&mut issue);
+
+    if let Err(errors) = IssueValidator::validate(&issue) {
+        let details = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(BeadsError::Config(format!(
+            "Validation failed for issue {} at line {}: {}",
+            issue.id, line_num, details
+        )));
+    }
+
+    Ok(issue)
+}
+
+fn for_each_jsonl_import_issue(
+    input_path: &Path,
+    mut handle_issue: impl FnMut(usize, Issue) -> Result<()>,
+) -> Result<()> {
+    let file = File::open(input_path)?;
+    path::validate_jsonl_fd_metadata(&file, input_path)?;
+    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut line = String::new();
+    let mut line_num = 0usize;
+
+    while reader.read_line(&mut line)? > 0 {
+        line_num += 1;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let issue = parse_normalized_import_issue(trimmed, line_num)?;
+            handle_issue(line_num, issue)?;
+        }
+        line.clear();
+    }
+
+    Ok(())
+}
+
+fn collect_import_validation_plan(
+    input_path: &Path,
+    config: &ImportConfig,
+    expected_prefix: Option<&str>,
+) -> Result<ImportValidationPlan> {
+    let mut plan = ImportValidationPlan::default();
+    let mut seen_ids = HashSet::new();
+
+    for_each_jsonl_import_issue(input_path, |line_num, issue| {
+        let prefix_mismatch = !config.skip_prefix_validation
+            && expected_prefix.is_some_and(|prefix| {
+                !id_matches_expected_prefix(&issue.id, prefix)
+                    && issue.status != crate::model::Status::Tombstone
+            });
+
+        if prefix_mismatch && !config.rename_on_import {
+            return Err(BeadsError::Config(format!(
+                "Prefix mismatch at line {}: expected '{}', found issue '{}'",
+                line_num,
+                expected_prefix.unwrap_or_default(),
+                issue.id
+            )));
+        }
+
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                issue.id,
+                input_path.display(),
+                line_num
+            )));
+        }
+
+        if prefix_mismatch {
+            plan.prefix_mismatches.push(PrefixRenameSeed {
+                old_id: issue.id,
+                title: issue.title,
+                description: issue.description,
+                created_by: issue.created_by,
+                created_at: issue.created_at,
+            });
+        } else {
+            plan.occupied_ids.insert(issue.id);
+        }
+        plan.record_count += 1;
+
+        Ok(())
+    })?;
+
+    Ok(plan)
+}
+
+fn build_prefix_renames(
+    storage: &SqliteStorage,
+    plan: &ImportValidationPlan,
+    expected_prefix: Option<&str>,
+) -> Result<HashMap<String, String>> {
+    if plan.prefix_mismatches.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let Some(prefix) = expected_prefix else {
+        return Ok(HashMap::new());
+    };
+
+    let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
+    let mut occupied_ids = plan.occupied_ids.clone();
+    occupied_ids.extend(storage.get_all_ids()?);
+
+    let mut generated_ids = HashSet::new();
+    let mut renames = HashMap::with_capacity(plan.prefix_mismatches.len());
+
+    for seed in &plan.prefix_mismatches {
+        let new_id = generator.generate(
+            &seed.title,
+            seed.description.as_deref(),
+            seed.created_by.as_deref(),
+            seed.created_at,
+            plan.record_count,
+            |candidate| occupied_ids.contains(candidate) || generated_ids.contains(candidate),
+        );
+        generated_ids.insert(new_id.clone());
+        renames.insert(seed.old_id.clone(), new_id);
+    }
+
+    Ok(renames)
+}
+
+fn apply_prefix_renames(issue: &mut Issue, renames: &HashMap<String, String>) {
+    use crate::util::content_hash;
+
+    if let Some(new_id) = renames.get(&issue.id) {
+        if issue.external_ref.is_none() {
+            issue.external_ref = Some(issue.id.clone());
+        }
+        issue.id.clone_from(new_id);
+        issue.content_hash = Some(content_hash(issue));
+    }
+
+    for dep in &mut issue.dependencies {
+        if let Some(new_target) = renames.get(&dep.depends_on_id) {
+            dep.depends_on_id.clone_from(new_target);
+        }
+        if let Some(new_source) = renames.get(&dep.issue_id) {
+            dep.issue_id.clone_from(new_source);
+        }
+    }
+
+    for comment in &mut issue.comments {
+        if let Some(new_source) = renames.get(&comment.issue_id) {
+            comment.issue_id.clone_from(new_source);
+        }
+    }
+}
+
+fn load_import_metadata_maps(storage: &SqliteStorage) -> Result<ImportMetadataMaps> {
+    let all_meta = storage.get_all_issues_metadata()?;
+    let meta_len = all_meta.len();
+    let mut meta_by_id = HashMap::with_capacity(meta_len);
+    let mut id_by_ext_ref = HashMap::with_capacity(meta_len);
+    let mut id_by_hash = HashMap::with_capacity(meta_len);
+
+    for metadata in all_meta {
+        let issue_id = metadata.id.clone();
+        if let Some(ext) = metadata.external_ref.as_ref() {
+            id_by_ext_ref
+                .entry(ext.clone())
+                .or_insert_with(|| issue_id.clone());
+        }
+        if let Some(hash) = metadata.content_hash.as_ref() {
+            // Preserve the first matching issue to mirror the old query_row
+            // collision path when multiple issues share the same content hash.
+            id_by_hash
+                .entry(hash.clone())
+                .or_insert_with(|| issue_id.clone());
+        }
+        meta_by_id.insert(issue_id, metadata);
+    }
+
+    Ok(ImportMetadataMaps {
+        meta_by_id,
+        id_by_ext_ref,
+        id_by_hash,
+    })
+}
+
+fn handle_duplicate_external_ref(
+    issue: &mut Issue,
+    seen_external_refs: &mut HashSet<String>,
+    config: &ImportConfig,
+) -> Result<()> {
+    let Some(ext_ref) = issue.external_ref.clone() else {
+        return Ok(());
+    };
+
+    if seen_external_refs.contains(&ext_ref) {
+        if config.clear_duplicate_external_refs {
+            issue.external_ref = None;
+            issue.content_hash = Some(crate::util::content_hash(issue));
+            Ok(())
+        } else {
+            Err(BeadsError::Config(format!(
+                "Duplicate external_ref: {ext_ref}"
+            )))
+        }
+    } else {
+        seen_external_refs.insert(ext_ref);
+        Ok(())
+    }
+}
+
+fn scan_import_collision_renames(
+    input_path: &Path,
+    config: &ImportConfig,
+    prefix_renames: &HashMap<String, String>,
+    metadata: &ImportMetadataMaps,
+    result: &mut ImportResult,
+    record_count: usize,
+) -> Result<HashMap<String, String>> {
+    let mut seen_external_refs = HashSet::new();
+    let mut renames = HashMap::new();
+    let progress =
+        create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
+
+    for_each_jsonl_import_issue(input_path, |_line_num, mut issue| {
+        apply_prefix_renames(&mut issue, prefix_renames);
+
+        if issue.ephemeral {
+            result.skipped_count += 1;
+            progress.inc(1);
+            return Ok(());
+        }
+
+        handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
+
+        let computed_hash = crate::util::content_hash(&issue);
+        let collision = detect_collision(
+            &issue,
+            &metadata.id_by_ext_ref,
+            &metadata.id_by_hash,
+            &metadata.meta_by_id,
+            &computed_hash,
+        );
+        let _action = determine_action(
+            &collision,
+            &issue,
+            &metadata.meta_by_id,
+            config.force_upsert,
+        )?;
+        let target_id = match &collision {
+            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+            CollisionResult::NewIssue => issue.id.clone(),
+        };
+
+        if target_id != issue.id {
+            renames.insert(issue.id.clone(), target_id);
+        }
+
+        progress.inc(1);
+        Ok(())
+    })?;
+
+    progress.finish_with_message("Scan complete");
+    Ok(renames)
+}
+
+fn apply_collision_renames(issue: &mut Issue, renames: &HashMap<String, String>) {
+    if let Some(new_id) = renames.get(&issue.id) {
+        issue.id.clone_from(new_id);
+    }
+
+    for dep in &mut issue.dependencies {
+        if let Some(new_target) = renames.get(&dep.depends_on_id) {
+            dep.depends_on_id.clone_from(new_target);
+        }
+        if let Some(new_source) = renames.get(&dep.issue_id) {
+            dep.issue_id.clone_from(new_source);
+        }
+    }
+
+    for comment in &mut issue.comments {
+        if let Some(new_source) = renames.get(&comment.issue_id) {
+            comment.issue_id.clone_from(new_source);
+        }
+    }
+}
+
+fn cleanup_import_orphans_in_tx(storage: &SqliteStorage) -> Result<usize> {
+    let orphan_tables = &[
+        ("dependencies", "issue_id"),
+        ("dependencies", "depends_on_id"),
+        ("labels", "issue_id"),
+        ("comments", "issue_id"),
+        ("events", "issue_id"),
+        ("dirty_issues", "issue_id"),
+        ("blocked_issues_cache", "issue_id"),
+        ("child_counters", "parent_id"),
+    ];
+    let mut orphans_cleaned = 0usize;
+
+    for (table, col) in orphan_tables {
+        let external_dependency_filter = match (*table, *col) {
+            ("dependencies", "issue_id") => " AND issue_id NOT LIKE 'external:%'",
+            ("dependencies", "depends_on_id") => " AND depends_on_id NOT LIKE 'external:%'",
+            _ => "",
+        };
+        let sql = format!(
+            "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues){external_dependency_filter}"
+        );
+        orphans_cleaned += storage.execute_raw_count(&sql)?;
+    }
+
+    Ok(orphans_cleaned)
+}
+
+fn skipped_import_matches_stored_issue(
+    storage: &SqliteStorage,
+    target_id: &str,
+    incoming: &Issue,
+) -> Result<bool> {
+    let Some(mut stored) = storage.get_issue_for_export(target_id)? else {
+        return Ok(false);
+    };
+    let mut expected = incoming.clone();
+    if expected.id != target_id {
+        expected.id = target_id.to_string();
+    }
+
+    normalize_issue_for_export(&mut stored);
+    normalize_issue_for_export(&mut expected);
+    Ok(stored.sync_equals(&expected))
+}
+
+fn export_hash_entry_for_import_action(
+    storage: &SqliteStorage,
+    action: &CollisionAction,
+    target_id: &str,
+    issue: &Issue,
+    computed_hash: &str,
+) -> Result<Option<(String, String)>> {
+    match action {
+        CollisionAction::Insert | CollisionAction::Update { .. } => {
+            Ok(Some((target_id.to_string(), computed_hash.to_string())))
+        }
+        CollisionAction::Skip { .. } => {
+            if skipped_import_matches_stored_issue(storage, target_id, issue)? {
+                Ok(Some((target_id.to_string(), computed_hash.to_string())))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_import_actions_in_tx(
+    storage: &SqliteStorage,
+    input_path: &Path,
+    config: &ImportConfig,
+    prefix_renames: &HashMap<String, String>,
+    collision_renames: &HashMap<String, String>,
+    metadata: &ImportMetadataMaps,
+    base_result: &ImportResult,
+    progress: &indicatif::ProgressBar,
+) -> Result<ImportResult> {
+    let mut tx_result = base_result.clone();
+    let mut seen_external_refs = HashSet::new();
+    let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
+    let mut export_hash_ids = HashSet::new();
+    let mut uncertified_local_wins = 0usize;
+
+    progress.set_position(0);
+    storage.clear_all_export_hashes_in_tx()?;
+
+    for_each_jsonl_import_issue(input_path, |_line_num, mut issue| {
+        apply_prefix_renames(&mut issue, prefix_renames);
+
+        if issue.ephemeral {
+            progress.inc(1);
+            return Ok(());
+        }
+
+        handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
+
+        let computed_hash = crate::util::content_hash(&issue);
+        let collision = detect_collision(
+            &issue,
+            &metadata.id_by_ext_ref,
+            &metadata.id_by_hash,
+            &metadata.meta_by_id,
+            &computed_hash,
+        );
+        let action = determine_action(
+            &collision,
+            &issue,
+            &metadata.meta_by_id,
+            config.force_upsert,
+        )?;
+        let target_id = match &collision {
+            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+            CollisionResult::NewIssue => issue.id.clone(),
+        };
+
+        apply_collision_renames(&mut issue, collision_renames);
+        process_import_action(storage, &action, &issue, &mut tx_result)?;
+
+        if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
+            storage,
+            &action,
+            &target_id,
+            &issue,
+            &computed_hash,
+        )? {
+            export_hash_ids.insert(export_id.clone());
+            export_hash_batch.push((export_id, export_hash));
+            if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
+                storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
+                export_hash_batch.clear();
+            }
+        } else {
+            uncertified_local_wins += 1;
+        }
+
+        progress.inc(1);
+        Ok(())
+    })?;
+
+    if !export_hash_batch.is_empty() {
+        storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
+    }
+    tx_result.export_hashes_recorded = export_hash_ids.len();
+    if uncertified_local_wins > 0 {
+        tracing::debug!(
+            count = uncertified_local_wins,
+            "Import preserved local records that differ from JSONL; marking database for flush"
+        );
+        storage.set_metadata_in_tx("needs_flush", "true")?;
+    }
+
+    let orphans_cleaned = cleanup_import_orphans_in_tx(storage)?;
+    if orphans_cleaned > 0 {
+        tracing::info!(
+            count = orphans_cleaned,
+            "Cleaned orphaned FK rows after import"
+        );
+        tx_result.orphan_cleaned_count = orphans_cleaned;
+    }
+
+    tx_result.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
+    tx_result.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
+
+    Ok(tx_result)
 }
 
 /// Import issues from a JSONL file.
@@ -3072,8 +4418,6 @@ pub fn import_from_jsonl(
     config: &ImportConfig,
     expected_prefix: Option<&str>,
 ) -> Result<ImportResult> {
-    use crate::util::content_hash;
-
     // Step 0: Path validation (PC-1, PC-2, PC-3, NGI-3) - BEFORE any file operations
     if let Some(ref beads_dir) = config.beads_dir {
         validate_sync_path_with_external(input_path, beads_dir, config.allow_external_jsonl)?;
@@ -3088,288 +4432,37 @@ pub fn import_from_jsonl(
     // Step 1: Conflict marker scan
     ensure_no_conflict_markers(input_path)?;
 
-    // Step 2: Parse, Normalize, and Validate JSONL
+    // Step 2: Parse, Normalize, Validate, and collect minimal rename state.
     let spinner = create_spinner("Parsing and validating issues", config.show_progress);
-    let file = File::open(input_path)?;
-    let file_size = file.metadata().map_or(0, |m| m.len());
-    // Estimate ~500 bytes per issue to pre-allocate vector capacity
-    let estimated_count = (file_size / 500) as usize;
-    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
-    let mut issues = Vec::with_capacity(estimated_count);
-    let mut seen_ids = HashSet::with_capacity(estimated_count);
-    let mut mismatches = Vec::new();
-
-    let mut line = String::new();
-    let mut line_num = 0;
-    while reader.read_line(&mut line)? > 0 {
-        line_num += 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            line.clear();
-            continue;
-        }
-        let mut issue: Issue = serde_json::from_str(trimmed)
-            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
-
-        // 1. Normalize (Step 3)
-        normalize_issue(&mut issue);
-
-        // 2. Validate (Step 3.5)
-        if let Err(errors) = IssueValidator::validate(&issue) {
-            let details = errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(BeadsError::Config(format!(
-                "Validation failed for issue {} at line {}: {}",
-                issue.id, line_num, details
-            )));
-        }
-
-        // 3. Prefix Check (Step 4)
-        if !config.skip_prefix_validation
-            && let Some(prefix) = expected_prefix
-            && !id_matches_expected_prefix(&issue.id, prefix)
-            && issue.status != crate::model::Status::Tombstone
-        {
-            if !config.rename_on_import {
-                return Err(BeadsError::Config(format!(
-                    "Prefix mismatch at line {}: expected '{}', found issue '{}'",
-                    line_num, prefix, issue.id
-                )));
-            }
-            mismatches.push(issue.id.clone());
-        }
-
-        // 4. Reject duplicate IDs instead of silently collapsing records.
-        if !seen_ids.insert(issue.id.clone()) {
-            return Err(BeadsError::Config(format!(
-                "Duplicate issue id '{}' in {} at line {}",
-                issue.id,
-                input_path.display(),
-                line_num
-            )));
-        }
-        issues.push(issue);
-
-        line.clear();
-    }
+    let validation_plan = collect_import_validation_plan(input_path, config, expected_prefix)?;
     spinner.finish_with_message("Parsed and validated issues");
 
     let mut result = ImportResult::default();
 
     // Step 5: Handle renames if requested
-    if config.rename_on_import
-        && !mismatches.is_empty()
-        && let Some(prefix) = expected_prefix
-    {
-        use crate::util::id::{IdConfig, IdGenerator};
+    let prefix_renames = if config.rename_on_import {
+        build_prefix_renames(storage, &validation_plan, expected_prefix)?
+    } else {
+        HashMap::new()
+    };
 
-        let mismatch_set: std::collections::HashSet<String> = mismatches.iter().cloned().collect();
-
-        // Collect details to avoid borrowing issues during generation
-        let to_rename: Vec<_> = issues
-            .iter()
-            .filter(|i| mismatch_set.contains(&i.id))
-            .map(|i| {
-                (
-                    i.id.clone(),
-                    i.title.clone(),
-                    i.description.clone(),
-                    i.created_by.clone(),
-                    i.created_at,
-                )
-            })
-            .collect();
-
-        let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
-        let mut renames = std::collections::HashMap::new();
-        let existing_ids: std::collections::HashSet<String> =
-            storage.get_all_ids()?.into_iter().collect();
-
-        // Collect all IDs that will NOT be renamed to avoid collisions
-        let mut occupied_ids: std::collections::HashSet<String> = issues
-            .iter()
-            .filter(|i| !mismatch_set.contains(&i.id))
-            .map(|i| i.id.clone())
-            .collect();
-
-        // Add existing IDs from storage to occupied set
-        occupied_ids.extend(existing_ids);
-
-        let mut generated_ids = std::collections::HashSet::new();
-
-        for (old_id, title, desc, creator, created_at) in to_rename {
-            let new_id = generator.generate(
-                &title,
-                desc.as_deref(),
-                creator.as_deref(),
-                created_at,
-                issues.len(),
-                |candidate| occupied_ids.contains(candidate) || generated_ids.contains(candidate),
-            );
-            generated_ids.insert(new_id.clone());
-            renames.insert(old_id, new_id);
-        }
-
-        // Apply renames
-        for issue in &mut issues {
-            if let Some(new_id) = renames.get(&issue.id) {
-                // Preserve old ID in external_ref if empty
-                if issue.external_ref.is_none() {
-                    issue.external_ref = Some(issue.id.clone());
-                }
-                issue.id = new_id.clone();
-                // Recompute content hash since ID/external_ref changed
-                issue.content_hash = Some(content_hash(issue));
-            }
-            // Update dependencies
-            for dep in &mut issue.dependencies {
-                if let Some(new_target) = renames.get(&dep.depends_on_id) {
-                    dep.depends_on_id = new_target.clone();
-                }
-                if let Some(new_source) = renames.get(&dep.issue_id) {
-                    dep.issue_id = new_source.clone();
-                }
-            }
-            // Update comments
-            for comment in &mut issue.comments {
-                if let Some(new_source) = renames.get(&comment.issue_id) {
-                    comment.issue_id = new_source.clone();
-                }
-            }
-        }
-    }
-
-    // Preload all metadata for O(1) collision detection (avoiding N+1 queries)
-    let all_meta = storage.get_all_issues_metadata()?;
-    let meta_len = all_meta.len();
-    let mut meta_by_id = std::collections::HashMap::with_capacity(meta_len);
-    let mut id_by_ext_ref = std::collections::HashMap::with_capacity(meta_len);
-    let mut id_by_hash = std::collections::HashMap::with_capacity(meta_len);
-
-    for m in all_meta {
-        let issue_id = m.id.clone();
-        if let Some(ext) = m.external_ref.as_ref() {
-            id_by_ext_ref
-                .entry(ext.clone())
-                .or_insert_with(|| issue_id.clone());
-        }
-        if let Some(hash) = m.content_hash.as_ref() {
-            // Preserve the first matching issue to mirror the old query_row
-            // collision path when multiple issues share the same content hash.
-            id_by_hash
-                .entry(hash.clone())
-                .or_insert_with(|| issue_id.clone());
-        }
-        meta_by_id.insert(issue_id, m);
-    }
+    // Preload metadata for O(1) collision detection while streaming the input.
+    let metadata = load_import_metadata_maps(storage)?;
 
     // Phase 1: Scan and Resolve IDs
-    let mut seen_external_refs: HashSet<String> = HashSet::new();
-    let mut renames: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let issues_len = issues.len();
-    let mut import_ops = Vec::with_capacity(issues_len);
-    let mut new_export_hashes = Vec::with_capacity(issues_len);
-
-    let progress =
-        create_progress_bar(issues.len() as u64, "Scanning issues", config.show_progress);
-
-    for mut issue in issues {
-        // Skip ephemerals during import (they shouldn't be in JSONL anyway)
-        if issue.ephemeral {
-            result.skipped_count += 1;
-            progress.inc(1);
-            continue;
-        }
-
-        // Handle external ref duplicates before collision detection
-        if let Some(ref ext_ref) = issue.external_ref {
-            if seen_external_refs.contains(ext_ref) {
-                if config.clear_duplicate_external_refs {
-                    issue.external_ref = None;
-                    issue.content_hash = Some(content_hash(&issue));
-                } else {
-                    progress.inc(1);
-                    return Err(BeadsError::Config(format!(
-                        "Duplicate external_ref: {ext_ref}"
-                    )));
-                }
-            } else {
-                seen_external_refs.insert(ext_ref.clone());
-            }
-        }
-
-        // Compute content hash for collision detection
-        let computed_hash = content_hash(&issue);
-
-        // Detect collision
-        let collision = detect_collision(
-            &issue,
-            &id_by_ext_ref,
-            &id_by_hash,
-            &meta_by_id,
-            &computed_hash,
-        );
-
-        // Determine action
-        let action = determine_action(&collision, &issue, &meta_by_id, config.force_upsert)?;
-
-        // Determine target ID and record mapping
-        let target_id = match &collision {
-            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
-            CollisionResult::NewIssue => {
-                // Keep distinct rows from the same JSONL snapshot distinct during the scan
-                // phase. Only metadata-backed collisions (already in storage) should remap
-                // IDs; otherwise `--no-db` imports can collapse valid duplicate records or
-                // try to update rows that do not exist yet.
-                issue.id.clone()
-            }
-        };
-
-        if target_id != issue.id {
-            renames.insert(issue.id.clone(), target_id.clone());
-        }
-
-        // Collect hash for export_hashes table
-        new_export_hashes.push((target_id, computed_hash));
-
-        import_ops.push((issue, action));
-        progress.inc(1);
-    }
-    progress.finish_with_message("Scan complete");
+    let collision_renames = scan_import_collision_renames(
+        input_path,
+        config,
+        &prefix_renames,
+        &metadata,
+        &mut result,
+        validation_plan.record_count,
+    )?;
 
     let jsonl_hash = compute_jsonl_hash(input_path)?;
+    let observed_jsonl = observed_jsonl_witness(input_path)?;
 
-    // Phase 2: Remap Dependencies
-    if !renames.is_empty() {
-        for (issue, _) in &mut import_ops {
-            // Update issue ID if it was remapped (e.g. collision with existing issue)
-            if let Some(new_id) = renames.get(&issue.id) {
-                issue.id = new_id.clone();
-            }
-
-            // Remap dependencies to point to the resolved IDs
-            for dep in &mut issue.dependencies {
-                if let Some(new_target) = renames.get(&dep.depends_on_id) {
-                    dep.depends_on_id = new_target.clone();
-                }
-                if let Some(new_source) = renames.get(&dep.issue_id) {
-                    dep.issue_id = new_source.clone();
-                }
-            }
-
-            // Remap comments to point to the resolved ID
-            for comment in &mut issue.comments {
-                if let Some(new_source) = renames.get(&comment.issue_id) {
-                    comment.issue_id = new_source.clone();
-                }
-            }
-        }
-    }
-
-    // Phase 3: Execute Actions
+    // Phase 2: Execute Actions
     //
     // Disable FK constraints during bulk import so that issues can reference
     // other issues (in dependencies/comments) that haven't been inserted yet.
@@ -3382,64 +4475,26 @@ pub fn import_from_jsonl(
         })?;
 
     let progress = create_progress_bar(
-        import_ops.len() as u64,
+        validation_plan.record_count as u64,
         "Importing issues",
         config.show_progress,
     );
 
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
-        let mut tx_result = result.clone();
-        progress.set_position(0);
-        // Keep export-hash state transactional so failed imports do not
-        // erase incremental export bookkeeping.
-        storage.clear_all_export_hashes_in_tx()?;
+        let tx_result = stream_import_actions_in_tx(
+            storage,
+            input_path,
+            config,
+            &prefix_renames,
+            &collision_renames,
+            &metadata,
+            &result,
+            &progress,
+        )?;
 
-        for (issue, action) in &import_ops {
-            process_import_action(storage, action, issue, &mut tx_result)?;
-            progress.inc(1);
-        }
-
-        // Clean up any orphaned rows left by FK-deferred import
-        // (e.g., dependencies referencing issues not in the JSONL)
-        let orphan_tables = &[
-            ("dependencies", "issue_id"),
-            ("dependencies", "depends_on_id"),
-            ("labels", "issue_id"),
-            ("comments", "issue_id"),
-            ("events", "issue_id"),
-            ("dirty_issues", "issue_id"),
-            ("blocked_issues_cache", "issue_id"),
-            ("child_counters", "parent_id"),
-        ];
-        let mut orphans_cleaned = 0usize;
-        for (table, col) in orphan_tables {
-            let sql = if *table == "dependencies" && *col == "depends_on_id" {
-                format!(
-                    "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues) AND {col} NOT LIKE 'external:%'"
-                )
-            } else {
-                format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)")
-            };
-            orphans_cleaned += storage.execute_raw_count(&sql)?;
-        }
-        if orphans_cleaned > 0 {
-            tracing::info!(
-                count = orphans_cleaned,
-                "Cleaned orphaned FK rows after import"
-            );
-            tx_result.orphan_cleaned_count = orphans_cleaned;
-        }
-
-        if !new_export_hashes.is_empty() {
-            storage.set_export_hashes_in_tx(&new_export_hashes)?;
-        }
-
-        storage.rebuild_blocked_cache_in_tx()?;
-        storage.rebuild_child_counters_in_tx()?;
-        storage
-            .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
+        storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
-        record_jsonl_witness_in_tx(storage, input_path)?;
+        record_observed_jsonl_witness_in_tx(storage, &observed_jsonl)?;
 
         Ok(tx_result)
     });
@@ -3447,33 +4502,34 @@ pub fn import_from_jsonl(
     let validate_foreign_keys = apply_result.is_ok();
     let fk_restore_result = restore_foreign_keys_after_import(storage, validate_foreign_keys);
 
-    match (apply_result, fk_restore_result) {
-        (Ok(import_result), Ok(())) => {
+    match finish_import_after_foreign_key_restore(apply_result, fk_restore_result) {
+        Ok(import_result) => {
             progress.finish_with_message("Import complete");
             Ok(import_result)
         }
-        (Ok(_), Err(fk_err)) => {
+        Err(err) => {
             progress.finish_and_clear();
-            Err(fk_err)
-        }
-        (Err(import_err), Ok(())) => {
-            progress.finish_and_clear();
-            Err(import_err)
-        }
-        (Err(import_err), Err(fk_err)) => {
-            tracing::error!(
-                error = %fk_err,
-                "Failed to restore foreign key enforcement after failed import"
-            );
-            progress.finish_and_clear();
-            Err(import_err)
+            Err(err)
         }
     }
 }
 
-fn id_matches_expected_prefix(id: &str, expected_prefix: &str) -> bool {
+pub(crate) fn id_matches_expected_prefix(id: &str, expected_prefix: &str) -> bool {
     let normalized_prefix = expected_prefix.trim_end_matches('-');
-    parse_id(id).is_ok_and(|parsed| parsed.prefix == normalized_prefix)
+    if normalized_prefix.is_empty() {
+        return false;
+    }
+
+    parse_id(id).is_ok_and(|parsed| {
+        // Slugged root IDs are shaped as `<prefix>-<slug>-<hash>`.
+        // `parse_id` treats the slug as part of the hyphenated prefix, so
+        // prefix guardrails must accept this generated prefix family.
+        parsed.prefix == normalized_prefix
+            || parsed
+                .prefix
+                .strip_prefix(normalized_prefix)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    })
 }
 
 /// Process a single import action.
@@ -3485,10 +4541,16 @@ fn process_import_action(
 ) -> Result<()> {
     match action {
         CollisionAction::Insert => {
-            storage.upsert_issue_for_import(issue)?;
-            sync_issue_relations(storage, issue)?;
+            if insert_new_import_issue(storage, issue)?
+                && !storage.has_owned_relation_rows_for_import(&issue.id)?
+            {
+                storage.insert_new_issue_relations_for_import(issue)?;
+            } else {
+                sync_issue_relations(storage, issue)?;
+            }
             result.imported_count += 1;
             result.created_count += 1;
+            record_imported_relation_counts(result, issue);
         }
         CollisionAction::Update { existing_id } => {
             // When updating by external_ref or content_hash, the incoming issue may have
@@ -3504,6 +4566,7 @@ fn process_import_action(
             }
             result.imported_count += 1;
             result.updated_count += 1;
+            record_imported_relation_counts(result, issue);
         }
         CollisionAction::Skip { reason } => {
             tracing::debug!(id = %issue.id, reason = %reason, "Skipping issue");
@@ -3515,6 +4578,30 @@ fn process_import_action(
         }
     }
     Ok(())
+}
+
+fn insert_new_import_issue(storage: &SqliteStorage, issue: &Issue) -> Result<bool> {
+    match storage.insert_new_issue_for_import(issue) {
+        Ok(_) => Ok(true),
+        Err(BeadsError::Database(
+            fsqlite_error::FrankenError::PrimaryKeyViolation
+            | fsqlite_error::FrankenError::UniqueViolation { .. },
+        )) => {
+            tracing::debug!(
+                id = %issue.id,
+                "Import insert found a concurrent key collision; falling back to upsert"
+            );
+            storage.upsert_issue_for_import(issue)?;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn record_imported_relation_counts(result: &mut ImportResult, issue: &Issue) {
+    result.labels_imported += issue.labels.len();
+    result.dependencies_imported += issue.dependencies.len();
+    result.comments_imported += issue.comments.len();
 }
 
 /// Sync labels, dependencies, and comments for an imported issue.
@@ -3539,6 +4626,7 @@ fn sync_issue_relations(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
 pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(path)?;
+    self::path::validate_jsonl_fd_metadata(&file, path)?;
     let mut reader = std::io::BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut line_buf = Vec::with_capacity(4096);
@@ -3559,7 +4647,7 @@ pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
         }
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 // ============================================================================
@@ -3571,6 +4659,8 @@ pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
 pub enum ConflictType {
     /// Issue was modified locally but deleted externally (or vice versa).
     DeleteVsModify,
+    /// Issue was modified independently in both local and external stores.
+    BothModified,
     /// Issue was created in both local and external with different content.
     ConvergentCreation,
 }
@@ -3802,22 +4892,7 @@ pub fn merge_issue(
                             )
                         }
                     }
-                    ConflictResolution::Manual => {
-                        // For manual, we still need to pick one, so use newer but mark as note
-                        if l.updated_at >= r.updated_at {
-                            MergeResult::KeepWithNote(
-                                l.clone(),
-                                "Both modified - kept local (newer), review recommended"
-                                    .to_string(),
-                            )
-                        } else {
-                            MergeResult::KeepWithNote(
-                                r.clone(),
-                                "Both modified - kept external (newer), review recommended"
-                                    .to_string(),
-                            )
-                        }
-                    }
+                    ConflictResolution::Manual => MergeResult::Conflict(ConflictType::BothModified),
                 },
             }
         }
@@ -3838,7 +4913,7 @@ pub fn merge_issue(
                         r.clone(),
                         "Convergent creation - kept external".to_string(),
                     ),
-                    ConflictResolution::PreferNewer | ConflictResolution::Manual => {
+                    ConflictResolution::PreferNewer => {
                         if l.updated_at >= r.updated_at {
                             MergeResult::KeepWithNote(
                                 l.clone(),
@@ -3850,6 +4925,9 @@ pub fn merge_issue(
                                 "Convergent creation - kept external (newer)".to_string(),
                             )
                         }
+                    }
+                    ConflictResolution::Manual => {
+                        MergeResult::Conflict(ConflictType::ConvergentCreation)
                     }
                 }
             }
@@ -3889,9 +4967,23 @@ pub fn three_way_merge(
 
         // Check tombstone protection: if issue is tombstoned and trying to resurrect
         if tombstones.contains(&id) {
-            // Issue is tombstoned - only allow if it exists in local (left)
-            if left.is_none() && right.is_some() {
-                // Trying to resurrect from external - skip
+            let local_tombstone =
+                left.is_some_and(|issue| issue.status == crate::model::Status::Tombstone);
+            let external_non_tombstone =
+                right.is_some_and(|issue| issue.status != crate::model::Status::Tombstone);
+
+            if local_tombstone && external_non_tombstone {
+                // Import paths never allow JSONL to resurrect a local tombstone.
+                // Merge winner flags must preserve that invariant too.
+                if let Some(issue) = left {
+                    report.kept.push(issue.clone());
+                }
+                report.tombstone_protected.push(id.clone());
+                continue;
+            }
+
+            if left.is_none() && external_non_tombstone {
+                // Trying to resurrect from external - skip.
                 report.tombstone_protected.push(id.clone());
                 continue;
             }
@@ -3941,24 +5033,7 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
     jsonl_dir: &Path,
 ) -> Result<()> {
     let snapshot_path = jsonl_dir.join("beads.base.jsonl");
-    let pid = std::process::id();
-    let temp_path = snapshot_path.with_extension(format!("jsonl.{pid}.tmp"));
-    validate_temp_file_path(&temp_path, &snapshot_path, jsonl_dir, false)?;
-
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                BeadsError::Config(format!(
-                    "Temporary base snapshot file already exists: {}",
-                    temp_path.display()
-                ))
-            } else {
-                err.into()
-            }
-        })?;
+    let (temp_path, temp_file) = create_base_snapshot_temp_file(&snapshot_path, jsonl_dir)?;
     let mut temp_guard = TempFileGuard::new(temp_path.clone());
     let mut writer = BufWriter::new(temp_file);
 
@@ -3981,9 +5056,28 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
         .sync_all()?;
     require_safe_sync_overwrite_path(&temp_path, jsonl_dir, false, "rename base snapshot")?;
     require_safe_sync_overwrite_path(&snapshot_path, jsonl_dir, false, "overwrite base snapshot")?;
-    fs::rename(&temp_path, &snapshot_path)?;
+    crate::util::durable_rename(&temp_path, &snapshot_path)?;
     temp_guard.persist();
     Ok(())
+}
+
+/// Save the base snapshot from a finalized JSONL export.
+///
+/// This is used after a successful merge export so `beads.base.jsonl` reflects
+/// the exact JSONL state that reached disk, including DB-side merge notes or
+/// other derived fields added after the merge report was calculated.
+///
+/// # Errors
+///
+/// Returns an error if the finalized JSONL cannot be read or the base snapshot
+/// cannot be written.
+pub fn save_base_snapshot_from_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Result<()> {
+    ensure_no_conflict_markers(jsonl_path)?;
+    let issues: std::collections::HashMap<String, Issue> = read_issues_from_jsonl(jsonl_path)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    save_base_snapshot(&issues, jsonl_dir)
 }
 
 /// Load the base snapshot from a file.
@@ -4234,8 +5328,9 @@ pub(crate) fn restore_tombstones(
 /// - `non_tombstone_updated_at`: IDs whose JSONL record carries a *non*-
 ///   tombstone status, mapped to the record's `updated_at`. When the local
 ///   DB has one of these IDs as a tombstone, there is a disagreement: the
-///   JSONL says the issue is alive, the DB says it's deleted. We resolve
-///   it by timestamp — whichever side's last write is newer wins.
+///   JSONL says the issue is alive, the DB says it's deleted. Import and
+///   rebuild paths must keep the tombstone; reopening is a separate,
+///   explicit user action.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JsonlTombstoneFilter {
     pub(crate) tombstone_ids: HashSet<String>,
@@ -4249,15 +5344,11 @@ pub(crate) struct JsonlTombstoneFilter {
 /// 1. JSONL has this ID as a tombstone: drop from preservation set — the
 ///    rebuild's own `import_from_jsonl` will reinstate the tombstone.
 ///
-/// 2. JSONL has this ID as a non-tombstone: the user's local delete
-///    competes with the JSONL's live record. Keep the local tombstone
-///    only if `deleted_at > updated_at` (i.e. the local deletion actually
-///    happened after the state the JSONL captured). Otherwise the JSONL
-///    is newer and we let the rebuild's import win, same way a 3-way
-///    merge with `--merge` would resolve it. Missing `deleted_at` (which
-///    shouldn't happen for a well-formed tombstone) is treated
-///    conservatively as "local is newer": preserve the tombstone rather
-///    than silently lose a local deletion.
+/// 2. JSONL has this ID as a non-tombstone: preserve the local tombstone
+///    and restore it after import. This mirrors the normal
+///    `import_from_jsonl` tombstone guard, which rejects resurrection even
+///    when force-upsert is enabled. Timestamp ordering cannot make a
+///    deleted issue live again; the operator must reopen it explicitly.
 ///
 /// 3. JSONL doesn't have this ID at all: the deletion has never been
 ///    flushed anywhere. Always preserve — otherwise this path would
@@ -4269,7 +5360,7 @@ pub(crate) fn tombstones_missing_from_jsonl_tombstones(
 ) -> Vec<PreservedTombstone> {
     let original_count = tombstones.len();
     let mut skipped_already_flushed = 0usize;
-    let mut skipped_jsonl_newer = 0usize;
+    let mut preserved_non_tombstone_conflicts = 0usize;
     let preserved: Vec<PreservedTombstone> = tombstones
         .into_iter()
         .filter(|tombstone| {
@@ -4278,24 +5369,18 @@ pub(crate) fn tombstones_missing_from_jsonl_tombstones(
                 skipped_already_flushed += 1;
                 return false;
             }
-            if let Some(jsonl_updated_at) = jsonl_filter.non_tombstone_updated_at.get(id) {
-                let local_deleted_at = tombstone.issue.deleted_at;
-                let local_is_newer =
-                    local_deleted_at.is_none_or(|deleted_at| deleted_at > *jsonl_updated_at);
-                if !local_is_newer {
-                    skipped_jsonl_newer += 1;
-                    return false;
-                }
+            if jsonl_filter.non_tombstone_updated_at.contains_key(id) {
+                preserved_non_tombstone_conflicts += 1;
             }
             true
         })
         .collect();
 
-    if skipped_already_flushed > 0 || skipped_jsonl_newer > 0 {
+    if skipped_already_flushed > 0 || preserved_non_tombstone_conflicts > 0 {
         tracing::debug!(
             preserved = preserved.len(),
             skipped_already_flushed,
-            skipped_jsonl_newer,
+            preserved_non_tombstone_conflicts,
             original = original_count,
             "Filtered preserved tombstones against JSONL state"
         );
@@ -4362,7 +5447,6 @@ mod tests {
     use crate::model::{Comment, Issue, IssueType, Priority, Status};
     use chrono::Utc;
     use fsqlite_types::SqliteValue;
-    use indicatif::{ProgressBar, ProgressStyle};
     use std::collections::HashMap;
     use std::io::{self, Write};
     #[cfg(unix)]
@@ -4411,6 +5495,106 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn blocking_write_lock_errors_when_lock_path_cannot_open() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(beads_dir.join(".write.lock")).unwrap();
+
+        let err = blocking_write_lock(&beads_dir).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Failed to open write lock")
+                        && message.contains(".write.lock")
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::incompatible_msrv)]
+    fn blocking_write_lock_with_timeout_errors_when_lock_is_held() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let lock_path = beads_dir.join(".write.lock");
+        let held_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open held write lock");
+        held_lock.lock().expect("hold write lock");
+
+        let start = Instant::now();
+        let err = blocking_write_lock_with_timeout(&beads_dir, Some(25)).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "timeout should fail promptly"
+        );
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Timed out after 25ms")
+                        && message.contains(".write.lock")
+                        && message.contains("stuck process")
+            ),
+            "unexpected error: {err}"
+        );
+
+        drop(held_lock);
+        let acquired =
+            blocking_write_lock_with_timeout(&beads_dir, Some(25)).expect("lock after release");
+        drop(acquired);
+    }
+
+    #[test]
+    fn try_sync_lock_errors_when_lock_path_cannot_open() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(beads_dir.join(".sync.lock")).unwrap();
+
+        let err = try_sync_lock(&beads_dir).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Failed to open sync lock")
+                        && message.contains(".sync.lock")
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::incompatible_msrv)]
+    fn try_sync_lock_returns_none_when_lock_is_held() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let lock_path = beads_dir.join(".sync.lock");
+        let held_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open held sync lock");
+        held_lock.lock().expect("hold sync lock");
+
+        assert!(try_sync_lock(&beads_dir).unwrap().is_none());
+
+        drop(held_lock);
+        let acquired = try_sync_lock(&beads_dir)
+            .expect("sync lock after release")
+            .expect("uncontended lock should be acquired");
+        drop(acquired);
     }
 
     #[test]
@@ -4601,6 +5785,46 @@ mod tests {
         assert!(output_path.exists());
     }
 
+    #[test]
+    fn test_save_base_snapshot_skips_stale_regular_temp_file() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let snapshot_path = beads_dir.join("beads.base.jsonl");
+        fs::write(&snapshot_path, "old-snapshot\n").unwrap();
+        let stale_temp_path = export_temp_path_for_attempt(&snapshot_path, 0);
+        let retry_temp_path = export_temp_path_for_attempt(&snapshot_path, 1);
+        fs::write(&stale_temp_path, "stale temp\n").unwrap();
+
+        let mut issues = HashMap::new();
+        issues.insert(
+            "bd-base".to_string(),
+            Issue {
+                id: "bd-base".to_string(),
+                title: "New base snapshot".to_string(),
+                ..Issue::default()
+            },
+        );
+
+        save_base_snapshot(&issues, &beads_dir).unwrap();
+
+        let snapshot = fs::read_to_string(&snapshot_path).unwrap();
+        assert!(
+            snapshot.contains("\"id\":\"bd-base\""),
+            "base snapshot should be rewritten with the requested issue: {snapshot}"
+        );
+        assert_eq!(
+            fs::read_to_string(&stale_temp_path).unwrap(),
+            "stale temp\n",
+            "stale regular temp file should be left untouched"
+        );
+        assert!(
+            !retry_temp_path.exists(),
+            "successful retry temp path should be renamed away"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_save_base_snapshot_rejects_existing_temp_symlink() {
@@ -4690,6 +5914,39 @@ mod tests {
         let second: Issue = serde_json::from_str(&lines[1]).unwrap();
         assert_eq!(first.id, "bd-a");
         assert_eq!(second.id, "bd-z");
+    }
+
+    #[test]
+    fn test_save_base_snapshot_from_jsonl_uses_finalized_export_contents() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let issue = Issue {
+            id: "bd-final".to_string(),
+            title: "Finalized".to_string(),
+            comments: vec![Comment {
+                id: 1,
+                issue_id: "bd-final".to_string(),
+                author: "br-sync".to_string(),
+                body: "merge note written after report".to_string(),
+                created_at: Utc::now(),
+            }],
+            ..Issue::default()
+        };
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        save_base_snapshot_from_jsonl(&jsonl_path, &beads_dir).unwrap();
+
+        let base = load_base_snapshot(&beads_dir).unwrap();
+        let saved = base.get("bd-final").expect("saved base issue");
+        assert_eq!(saved.comments.len(), 1);
+        assert_eq!(saved.comments[0].body, "merge note written after report");
     }
 
     #[cfg(unix)]
@@ -4839,15 +6096,14 @@ mod tests {
         fs::write(&path, content).unwrap();
 
         let err = analyze_jsonl(&path).unwrap_err();
-        match err {
-            BeadsError::Config(message) => {
-                assert!(
-                    message.contains("Duplicate issue id 'bd-dup'"),
-                    "unexpected duplicate-id error: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(
+                &err,
+                BeadsError::Config(message)
+                    if message.contains("Duplicate issue id 'bd-dup'")
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -4984,6 +6240,71 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_import_probe_validates_external_path_before_hashing() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let external_jsonl = temp_dir.path().join("external").join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_jsonl).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .unwrap();
+
+        let err = auto_import_probe(&storage, &beads_dir, &external_jsonl, false).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("outside the beads directory")
+                || message.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+
+        let err = auto_import_probe_refreshing_witnesses(
+            &mut storage,
+            &beads_dir,
+            &external_jsonl,
+            false,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("outside the beads directory")
+                || message.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_auto_import_if_stale_validates_external_path_before_hashing() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let external_jsonl = temp_dir.path().join("external").join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_jsonl).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .unwrap();
+
+        let err = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &external_jsonl,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("outside the beads directory")
+                || message.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_compute_staleness_uses_matching_jsonl_mtime_witness() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -5094,6 +6415,56 @@ mod tests {
         let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
         assert!(staleness.db_newer);
         assert!(!staleness.jsonl_exists);
+    }
+
+    #[test]
+    fn test_auto_flush_propagates_jsonl_scan_io_errors() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&jsonl_path).unwrap();
+
+        let issue = make_test_issue("bd-scan-error", "Dirty issue");
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
+        assert!(
+            err.to_string().contains("directory")
+                || err.to_string().contains("Is a directory")
+                || err.to_string().contains("not a regular file")
+                || err.to_string().contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec!["bd-scan-error".to_string()],
+            "failed auto-flush must leave dirty markers intact"
+        );
+    }
+
+    #[test]
+    fn test_auto_flush_validates_path_before_reading_existing_jsonl() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let outside_jsonl_path = temp_dir.path().join("outside.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(&outside_jsonl_path, "<<<<<<< HEAD\n").unwrap();
+
+        let issue = make_test_issue("bd-auto-flush-path", "Dirty issue");
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the beads directory"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec!["bd-auto-flush-path".to_string()],
+            "rejected auto-flush must leave dirty markers intact"
+        );
     }
 
     #[test]
@@ -5259,6 +6630,55 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_issue_hashes_trimmed_external_ref() {
+        let mut issue = make_test_issue("bd-001", "Test");
+        issue.external_ref = Some("  ext-123  ".to_string());
+
+        normalize_issue(&mut issue);
+
+        let expected_hash = crate::util::content_hash(&issue);
+        assert_eq!(issue.external_ref.as_deref(), Some("ext-123"));
+        assert_eq!(issue.content_hash.as_deref(), Some(expected_hash.as_str()));
+    }
+
+    #[test]
+    fn test_normalize_issue_remaps_legacy_done_to_closed() {
+        // Go-beads "done" survives round-tripping as Status::Custom; ensure
+        // import normalization promotes it to the canonical Closed variant
+        // and that closed_at gets populated to satisfy the DB CHECK.
+        let mut issue = make_test_issue("bd-001", "Legacy done");
+        issue.status = Status::Custom("done".to_string());
+        issue.closed_at = None;
+
+        normalize_issue(&mut issue);
+
+        assert_eq!(issue.status, Status::Closed);
+        assert!(issue.closed_at.is_some());
+    }
+
+    #[test]
+    fn test_normalize_issue_remaps_mixed_case_terminal_aliases() {
+        for raw in ["Done", "COMPLETE", "completed", "Finished", "Resolved"] {
+            let mut issue = make_test_issue("bd-001", "Legacy alias");
+            issue.status = Status::Custom(raw.to_string());
+            normalize_issue(&mut issue);
+            assert_eq!(
+                issue.status,
+                Status::Closed,
+                "alias {raw:?} should map to Closed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_issue_preserves_unknown_custom_status() {
+        let mut issue = make_test_issue("bd-001", "Custom status");
+        issue.status = Status::Custom("qa-review".to_string());
+        normalize_issue(&mut issue);
+        assert_eq!(issue.status, Status::Custom("qa-review".to_string()));
+    }
+
+    #[test]
     fn test_normalize_issue_normalizes_legacy_standard_dependency_type_with_underscores() {
         let mut issue = make_test_issue("bd-001", "Legacy dependency");
         issue.dependencies.push(crate::model::Dependency {
@@ -5306,8 +6726,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("issues.jsonl");
 
-        // Create existing issue in DB with older timestamp
+        // Create existing issue in DB with older timestamp.
+        // Pin both created_at and updated_at so the validator's
+        // "updated_at >= created_at" rule holds.
         let mut existing = make_test_issue("test-001", "Old title");
+        existing.created_at = Utc::now() - chrono::Duration::hours(2);
         existing.updated_at = Utc::now() - chrono::Duration::hours(1);
         storage.create_issue(&existing, "test").unwrap();
 
@@ -5354,6 +6777,68 @@ mod tests {
 
         let unchanged = storage.get_issue("test-001").unwrap().unwrap();
         assert_eq!(unchanged.title, "Newer title");
+    }
+
+    #[test]
+    fn test_import_tombstone_skip_marks_flush_pending() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let mut tombstone = make_issue_at("bd-tomb", "Deleted locally", fixed_time(100));
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time(100));
+        storage.create_issue(&tombstone, "test").unwrap();
+        storage
+            .clear_dirty_issues_legacy(&["bd-tomb".to_string()])
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+
+        let mut incoming = make_issue_at("bd-tomb", "Remote resurrection", fixed_time(200));
+        incoming.status = Status::Open;
+        let json = serde_json::to_string(&incoming).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(result.tombstone_skipped, 1);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert!(storage.get_export_hash("bd-tomb").unwrap().is_none());
+
+        let still_tombstone = storage.get_issue("bd-tomb").unwrap().unwrap();
+        assert_eq!(still_tombstone.status, Status::Tombstone);
+    }
+
+    #[test]
+    fn test_import_relation_only_local_win_marks_flush_pending() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let existing = make_issue_at("bd-rel", "Same content", fixed_time(200));
+        storage.create_issue(&existing, "test").unwrap();
+        storage.add_label("bd-rel", "local-only", "test").unwrap();
+        storage
+            .clear_dirty_issues_legacy(&["bd-rel".to_string()])
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+
+        let incoming = make_issue_at("bd-rel", "Same content", fixed_time(100));
+        let json = serde_json::to_string(&incoming).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert!(storage.get_export_hash("bd-rel").unwrap().is_none());
+        assert_eq!(storage.get_labels("bd-rel").unwrap(), vec!["local-only"]);
     }
 
     #[test]
@@ -5447,6 +6932,27 @@ mod tests {
         assert_eq!(result.updated_count, 0);
         assert_eq!(result.skipped_count, 0);
         assert!(storage.get_issue("test-new").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_import_stores_content_hash_after_external_ref_trim() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let mut new_issue = make_test_issue("test-ext", "External ref trim");
+        new_issue.external_ref = Some("  ext-123  ".to_string());
+        let json = serde_json::to_string(&new_issue).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let config = ImportConfig::default();
+        let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
+
+        assert_eq!(result.imported_count, 1);
+        let stored = storage.get_issue("test-ext").unwrap().unwrap();
+        let expected_hash = crate::util::content_hash(&stored);
+        assert_eq!(stored.external_ref.as_deref(), Some("ext-123"));
+        assert_eq!(stored.content_hash.as_deref(), Some(expected_hash.as_str()));
     }
 
     #[test]
@@ -5622,6 +7128,125 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
         assert_eq!(fk_enabled, 1, "foreign key enforcement should be restored");
+    }
+
+    #[test]
+    fn test_import_orphan_cleanup_preserves_external_dependency_endpoints() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut epic = make_test_issue("bd-epic", "Epic");
+        epic.issue_type = IssueType::Epic;
+        storage.create_issue(&epic, "tester").unwrap();
+
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('external:child:cap', 'bd-epic', 'parent-child', '2026-01-01T00:00:00Z', 'tester');
+                 INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('missing-issue', 'tester', 'dangling', '2026-01-01T00:00:00Z');
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let cleaned = cleanup_import_orphans_in_tx(&storage).unwrap();
+
+        assert_eq!(cleaned, 1, "only the real local orphan should be removed");
+        let external_rows = storage
+            .execute_raw_query(
+                "SELECT issue_id, depends_on_id
+                 FROM dependencies
+                 WHERE issue_id = 'external:child:cap'",
+            )
+            .unwrap();
+        assert_eq!(
+            external_rows.len(),
+            1,
+            "external dependency endpoints must survive import cleanup"
+        );
+    }
+
+    #[test]
+    fn test_import_new_issue_replaces_preexisting_owned_relation_orphans() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let parent = make_test_issue("bd-parent", "Parent");
+        storage.create_issue(&parent, "tester").unwrap();
+
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO labels (issue_id, label)
+                 VALUES ('bd-new', 'stale-label');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-new', 'bd-parent', 'blocks', '2026-01-01T00:00:00Z', 'legacy');
+                 INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('bd-new', 'legacy', 'stale comment', '2026-01-01T00:00:00Z');
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let issue = make_test_issue("bd-new", "Clean import");
+        let json = serde_json::to_string(&issue).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd-")).unwrap();
+
+        assert_eq!(result.created_count, 1);
+        assert!(
+            storage.get_labels("bd-new").unwrap().is_empty(),
+            "fresh import must delete stale owned labels"
+        );
+        assert!(
+            storage.get_dependencies_full("bd-new").unwrap().is_empty(),
+            "fresh import must delete stale owned dependencies"
+        );
+        assert!(
+            storage.get_comments("bd-new").unwrap().is_empty(),
+            "fresh import must delete stale owned comments"
+        );
+    }
+
+    #[test]
+    fn test_import_error_reports_foreign_key_restore_failure_when_both_fail() {
+        let apply_result: Result<ImportResult> =
+            Err(BeadsError::Config("stream import failed".to_string()));
+        let fk_restore_result: Result<()> = Err(BeadsError::Config(
+            "foreign keys stayed disabled".to_string(),
+        ));
+
+        let err =
+            finish_import_after_foreign_key_restore(apply_result, fk_restore_result).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains(
+                "jsonl import failed, and SQLite foreign key enforcement could not be re-enabled"
+            ),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("foreign keys stayed disabled"),
+            "restore error should be included: {msg}"
+        );
+        assert!(
+            msg.contains("stream import failed"),
+            "original import error should be preserved as the source: {msg}"
+        );
+
+        assert!(
+            matches!(&err, BeadsError::WithContext { .. }),
+            "expected WithContext wrapping both failures"
+        );
+        if let BeadsError::WithContext { context, source } = err {
+            assert!(context.contains("foreign keys stayed disabled"));
+            assert_eq!(
+                source.to_string(),
+                "Configuration error: stream import failed"
+            );
+        }
     }
 
     #[test]
@@ -6099,6 +7724,65 @@ mod tests {
     }
 
     #[test]
+    fn test_export_hashes_certified_current_requires_no_dirty_and_matching_hash() {
+        let mut result = ExportResult {
+            exported_count: 1,
+            exported_ids: vec!["bd-1".to_string()],
+            exported_marked_at: Vec::new(),
+            skipped_tombstone_ids: Vec::new(),
+            content_hash: "content-hash".to_string(),
+            output_path: None,
+            issue_hashes: vec![("bd-1".to_string(), "issue-hash".to_string())],
+        };
+
+        assert!(export_hashes_certified_current(
+            &result,
+            Some("content-hash")
+        ));
+        assert!(!export_hashes_certified_current(
+            &result,
+            Some("different-hash")
+        ));
+        assert!(!export_hashes_certified_current(&result, None));
+
+        result
+            .exported_marked_at
+            .push(("bd-1".to_string(), "dirty-marker".to_string()));
+        assert!(!export_hashes_certified_current(
+            &result,
+            Some("content-hash")
+        ));
+    }
+
+    #[test]
+    fn test_auto_flush_clears_byte_identical_dirty_marker_without_rewrite() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let output_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let issue = make_test_issue("bd-noop", "No-op dirty marker");
+        storage.create_issue(&issue, "test").unwrap();
+
+        let first = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        assert!(first.flushed);
+        let before = fs::read_to_string(&output_path).unwrap();
+
+        storage
+            .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
+            .unwrap();
+
+        let second = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        assert!(
+            !second.flushed,
+            "byte-identical dirty markers should not rewrite JSONL"
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), before);
+    }
+
+    #[test]
     fn test_filter_dirty_metadata_for_export_only_includes_exported_ids() {
         let dirty_metadata = vec![
             ("bd-1".to_string(), "t1".to_string()),
@@ -6145,10 +7829,10 @@ mod tests {
             &output_path,
         )
         .unwrap_err();
-        match err {
-            BeadsError::Database(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(err, BeadsError::Database(_)),
+            "unexpected error: {err:?}"
+        );
 
         assert_eq!(
             storage.get_dirty_issue_ids().unwrap(),
@@ -6187,6 +7871,37 @@ mod tests {
         let mut writer = LineFailWriter::new("bd-002");
         let result = export_to_writer_with_policy(&storage, &mut writer, ExportErrorPolicy::Strict);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_export_to_writer_streams_large_issue_set_in_id_order() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue_count = (EXPORT_ISSUE_BATCH_SIZE * 2) + 3;
+
+        for index in (0..issue_count).rev() {
+            let id = format!("bd-{index:04}");
+            let title = format!("Issue {index}");
+            let issue = make_test_issue(&id, &title);
+            storage.create_issue(&issue, "test").unwrap();
+        }
+
+        let mut writer = Vec::new();
+        let (result, report) =
+            export_to_writer_with_policy(&storage, &mut writer, ExportErrorPolicy::Strict).unwrap();
+
+        assert_eq!(result.exported_count, issue_count);
+        assert_eq!(report.issues_exported, issue_count);
+
+        let output = String::from_utf8(writer).unwrap();
+        let ids = output
+            .lines()
+            .map(|line| serde_json::from_str::<Issue>(line).unwrap().id)
+            .collect::<Vec<_>>();
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort();
+
+        assert_eq!(ids.len(), issue_count);
+        assert_eq!(ids, sorted_ids);
     }
 
     #[test]
@@ -6389,6 +8104,40 @@ mod tests {
                 .failures()
                 .iter()
                 .any(|c| c.name == "no_conflict_markers")
+        );
+    }
+
+    #[test]
+    fn test_preflight_import_does_not_inspect_rejected_path() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let outside_jsonl_path = temp.path().join("outside.jsonl");
+        std::fs::write(&outside_jsonl_path, "not json\n").unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            allow_external_jsonl: false,
+            ..Default::default()
+        };
+
+        let result = preflight_import(&outside_jsonl_path, &config, Some("bd")).unwrap();
+
+        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
+        assert!(
+            result
+                .failures()
+                .iter()
+                .any(|c| c.name == "path_validation"),
+            "rejected path should fail path validation"
+        );
+        assert!(
+            result.checks.iter().all(|c| c.name != "file_readable"
+                && c.name != "no_conflict_markers"
+                && c.name != "json_valid"
+                && c.name != "prefix_match"),
+            "preflight should not read or parse rejected paths: {:?}",
+            result.checks
         );
     }
 
@@ -6720,6 +8469,50 @@ mod tests {
             PreflightCheckStatus::Pass,
             "prefix_match should pass for matching prefix"
         );
+    }
+
+    #[test]
+    fn test_preflight_import_prefix_accepts_slugged_ids() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let issue = make_test_issue("bd-survey-my-thing-abc123", "Slugged issue");
+        let json = serde_json::to_string(&issue).unwrap();
+        std::fs::write(&jsonl_path, format!("{json}\n")).unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            ..Default::default()
+        };
+
+        let result = preflight_import(&jsonl_path, &config, Some("bd")).unwrap();
+        let prefix_check = result.checks.iter().find(|c| c.name == "prefix_match");
+        assert!(
+            prefix_check.is_some(),
+            "prefix_match check should be present"
+        );
+        assert_eq!(
+            prefix_check.unwrap().status,
+            PreflightCheckStatus::Pass,
+            "slugged IDs generated from the expected prefix should pass"
+        );
+    }
+
+    #[test]
+    fn test_id_matches_expected_prefix_keeps_non_delimited_supersets_out() {
+        assert!(id_matches_expected_prefix(
+            "bd-survey-my-thing-abc123",
+            "bd"
+        ));
+        assert!(id_matches_expected_prefix(
+            "bd-survey-my-thing-abc123",
+            "bd-"
+        ));
+        assert!(!id_matches_expected_prefix("bdx-survey-abc123", "bd"));
+        assert!(!id_matches_expected_prefix("x-bd-survey-abc123", "bd"));
+        assert!(!id_matches_expected_prefix("bd-survey-abc123", ""));
     }
 
     #[test]
@@ -7365,6 +9158,42 @@ mod tests {
     }
 
     #[test]
+    fn test_three_way_merge_tombstone_protection_blocks_external_winner() {
+        let base = make_issue_with_hash("bd-tomb", "Base", fixed_time_merge(100), Some("base"));
+        let mut local_tombstone =
+            make_issue_with_hash("bd-tomb", "Deleted", fixed_time_merge(200), Some("deleted"));
+        local_tombstone.status = crate::model::Status::Tombstone;
+        local_tombstone.deleted_at = Some(fixed_time_merge(200));
+        let external = make_issue_with_hash(
+            "bd-tomb",
+            "Resurrection attempt",
+            fixed_time_merge(300),
+            Some("external"),
+        );
+
+        let mut base_map = std::collections::HashMap::new();
+        base_map.insert("bd-tomb".to_string(), base);
+        let mut left = std::collections::HashMap::new();
+        left.insert("bd-tomb".to_string(), local_tombstone);
+        let mut right = std::collections::HashMap::new();
+        right.insert("bd-tomb".to_string(), external);
+        let context = MergeContext::new(base_map, left, right);
+        let tombstones = std::collections::HashSet::from(["bd-tomb".to_string()]);
+
+        let report = three_way_merge(
+            &context,
+            ConflictResolution::PreferExternal,
+            Some(&tombstones),
+        );
+
+        assert!(report.conflicts.is_empty());
+        assert_eq!(report.tombstone_protected, vec!["bd-tomb".to_string()]);
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(report.kept[0].status, crate::model::Status::Tombstone);
+        assert_eq!(report.kept[0].title, "Deleted");
+    }
+
+    #[test]
     fn test_three_way_merge_deletions() {
         // Setup: issue in base but deleted in both left and right
         let base_issue =
@@ -7464,41 +9293,66 @@ mod tests {
         assert!(report.notes[0].1.contains("Both modified"));
     }
 
-    /// Create a progress bar if enabled.
-    #[allow(dead_code)]
-    fn progress_bar(show: bool, len: u64, message: &str) -> ProgressBar {
-        if !show {
-            return ProgressBar::hidden();
-        }
-        let pb = ProgressBar::new(len);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-                )
-                .unwrap()
-                .progress_chars("#>-"),
+    #[test]
+    fn test_manual_merge_reports_both_modified_conflict() {
+        let base_issue = make_issue_with_hash(
+            "bd-001",
+            "Base Title",
+            fixed_time_merge(100),
+            Some("base_hash"),
         );
-        pb.set_message(message.to_string());
-        pb
+        let local_issue = make_issue_with_hash(
+            "bd-001",
+            "Local Title",
+            fixed_time_merge(200),
+            Some("local_hash"),
+        );
+        let external_issue = make_issue_with_hash(
+            "bd-001",
+            "External Title",
+            fixed_time_merge(300),
+            Some("external_hash"),
+        );
+
+        let result = merge_issue(
+            Some(&base_issue),
+            Some(&local_issue),
+            Some(&external_issue),
+            ConflictResolution::Manual,
+        );
+
+        assert!(matches!(
+            result,
+            MergeResult::Conflict(ConflictType::BothModified)
+        ));
     }
 
-    /// Create a progress spinner if enabled.
-    #[allow(dead_code)]
-    fn progress_spinner(show: bool, message: &str) -> ProgressBar {
-        if !show {
-            return ProgressBar::hidden();
-        }
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .tick_chars("/|\\\\- ")
-                .template("{spinner:.blue} {msg}")
-                .unwrap(),
+    #[test]
+    fn test_manual_merge_reports_convergent_creation_conflict() {
+        let local_issue = make_issue_with_hash(
+            "bd-001",
+            "Local Title",
+            fixed_time_merge(200),
+            Some("local_hash"),
         );
-        pb.set_message(message.to_string());
-        pb.enable_steady_tick(std::time::Duration::from_millis(100));
-        pb
+        let external_issue = make_issue_with_hash(
+            "bd-001",
+            "External Title",
+            fixed_time_merge(300),
+            Some("external_hash"),
+        );
+
+        let result = merge_issue(
+            None,
+            Some(&local_issue),
+            Some(&external_issue),
+            ConflictResolution::Manual,
+        );
+
+        assert!(matches!(
+            result,
+            MergeResult::Conflict(ConflictType::ConvergentCreation)
+        ));
     }
 
     #[test]

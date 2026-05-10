@@ -6,7 +6,7 @@
 
 mod common;
 
-use beads_rust::model::{DependencyType, EventType, Issue, IssueType, Priority, Status};
+use beads_rust::model::{Comment, DependencyType, EventType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, SqliteStorage};
 use chrono::{Duration, Utc};
 use common::{fixtures, test_db, test_db_with_dir};
@@ -220,6 +220,54 @@ fn get_issue_for_export_includes_relations() {
 }
 
 #[test]
+fn comments_with_same_timestamp_are_ordered_by_id() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("same-timestamp-comments");
+    let created_at = Utc::now();
+
+    storage.create_issue(&issue, "tester").unwrap();
+    storage
+        .sync_comments_for_import(
+            &issue.id,
+            &[
+                Comment {
+                    id: 20,
+                    issue_id: issue.id.clone(),
+                    author: "reviewer".to_string(),
+                    body: "second by id".to_string(),
+                    created_at,
+                },
+                Comment {
+                    id: 10,
+                    issue_id: issue.id.clone(),
+                    author: "reviewer".to_string(),
+                    body: "first by id".to_string(),
+                    created_at,
+                },
+            ],
+        )
+        .unwrap();
+
+    let comments = storage.get_comments(&issue.id).unwrap();
+    let ids = comments
+        .iter()
+        .map(|comment| comment.id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![10, 20]);
+
+    let exported = storage
+        .get_issue_for_export(&issue.id)
+        .unwrap()
+        .expect("issue exists");
+    let exported_ids = exported
+        .comments
+        .iter()
+        .map(|comment| comment.id)
+        .collect::<Vec<_>>();
+    assert_eq!(exported_ids, vec![10, 20]);
+}
+
+#[test]
 fn get_issue_details_includes_events_and_relations() {
     let mut storage = test_db();
     let issue = fixtures::issue("details-test");
@@ -396,6 +444,50 @@ fn update_nonexistent_issue_fails() {
 
     let result = storage.update_issue("nonexistent", &update, "updater");
     assert!(result.is_err());
+}
+
+#[test]
+fn update_issue_rejects_empty_title_without_persisting() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("reject-empty-title-update");
+
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let update = IssueUpdate {
+        title: Some("   ".to_string()),
+        ..Default::default()
+    };
+
+    let error = storage
+        .update_issue(&issue.id, &update, "updater")
+        .expect_err("empty updated title must fail validation");
+
+    assert!(error.to_string().contains("title"));
+
+    let retrieved = storage.get_issue(&issue.id).unwrap().expect("issue exists");
+    assert_eq!(retrieved.title, issue.title);
+}
+
+#[test]
+fn update_issue_rejects_negative_estimate_without_persisting() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("reject-negative-estimate-update");
+
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let update = IssueUpdate {
+        estimated_minutes: Some(Some(-1)),
+        ..Default::default()
+    };
+
+    let error = storage
+        .update_issue(&issue.id, &update, "updater")
+        .expect_err("negative updated estimate must fail validation");
+
+    assert!(error.to_string().contains("estimated_minutes"));
+
+    let retrieved = storage.get_issue(&issue.id).unwrap().expect("issue exists");
+    assert_eq!(retrieved.estimated_minutes, issue.estimated_minutes);
 }
 
 #[test]
@@ -670,6 +762,58 @@ fn upsert_issue_for_import_updates_existing() {
     let retrieved = storage.get_issue(&issue.id).unwrap().expect("issue exists");
     assert_eq!(retrieved.title, "Updated via upsert");
     assert_eq!(retrieved.description, Some("New description".to_string()));
+}
+
+#[test]
+fn dotted_issue_ids_upsert_lookup_and_update_exact_rows() {
+    let mut storage = test_db();
+    let mut parent = fixtures::issue("dotted parent");
+    parent.id = "bd-rchk0.5".to_string();
+    let mut target = fixtures::issue("dotted target");
+    target.id = "bd-rchk0.5.6".to_string();
+    let mut child = fixtures::issue("dotted child");
+    child.id = "bd-rchk0.5.6.1".to_string();
+
+    storage.upsert_issue_for_import(&parent).unwrap();
+    storage.upsert_issue_for_import(&target).unwrap();
+    storage.upsert_issue_for_import(&child).unwrap();
+
+    assert!(storage.id_exists("bd-rchk0.5").unwrap());
+    assert!(storage.id_exists("bd-rchk0.5.6").unwrap());
+    assert!(storage.id_exists("bd-rchk0.5.6.1").unwrap());
+    assert_eq!(
+        storage.find_ids_by_hash("rchk0.5.6").unwrap(),
+        vec!["bd-rchk0.5.6".to_string()]
+    );
+
+    let update = IssueUpdate {
+        title: Some("Updated dotted target".to_string()),
+        priority: Some(Priority::HIGH),
+        ..IssueUpdate::default()
+    };
+    let updated = storage
+        .update_issue("bd-rchk0.5.6", &update, "tester")
+        .unwrap();
+
+    assert_eq!(updated.id, "bd-rchk0.5.6");
+    assert_eq!(updated.title, "Updated dotted target");
+    assert_eq!(updated.priority, Priority::HIGH);
+    assert_eq!(
+        storage
+            .get_issue("bd-rchk0.5")
+            .unwrap()
+            .expect("parent exists")
+            .title,
+        "dotted parent"
+    );
+    assert_eq!(
+        storage
+            .get_issue("bd-rchk0.5.6.1")
+            .unwrap()
+            .expect("child exists")
+            .title,
+        "dotted child"
+    );
 }
 
 #[test]

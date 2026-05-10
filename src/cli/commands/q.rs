@@ -1,10 +1,11 @@
 use crate::cli::QuickArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
-use crate::validation::LabelValidator;
+use crate::validation::{IssueValidator, LabelValidator};
 use chrono::Utc;
 use rich_rust::prelude::*;
 use std::collections::HashSet;
@@ -27,6 +28,14 @@ fn push_unique_label(labels: &mut Vec<String>, label: &str) {
     if !labels.iter().any(|existing| existing == label) {
         labels.push(label.to_string());
     }
+}
+
+fn invalid_label_warning(label: &str, reason: &str) -> String {
+    format!(
+        "Warning: invalid label '{}': {}",
+        sanitize_terminal_inline(label),
+        sanitize_terminal_inline(reason)
+    )
 }
 
 /// Execute the quick capture command.
@@ -117,7 +126,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     let labels = split_labels(&args.labels);
     for label in labels {
         if let Err(err) = LabelValidator::validate(&label) {
-            eprintln!("Warning: invalid label '{label}': {}", err.message);
+            eprintln!("{}", invalid_label_warning(&label, &err.message));
             continue;
         }
         push_unique_label(&mut valid_labels, &label);
@@ -193,6 +202,8 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     // Compute content hash
     issue.content_hash = Some(issue.compute_content_hash());
 
+    IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
+
     storage.create_issue(&issue, &actor)?;
     let created_id = issue.id.clone();
     let last_touched_dir = storage_ctx.paths.beads_dir.clone();
@@ -238,7 +249,7 @@ fn render_quick_created_rich(id: &str, title: &str, ctx: &OutputContext) {
     content.append_styled(id, theme.emphasis.clone());
     content.append("\n");
     content.append_styled("  \"", theme.dimmed.clone());
-    content.append(title);
+    content.append(sanitize_terminal_inline(title).as_ref());
     content.append_styled("\"", theme.dimmed.clone());
     content.append("\n");
 
@@ -261,5 +272,15 @@ mod tests {
         push_unique_label(&mut labels, "ops");
 
         assert_eq!(labels, vec!["backend".to_string(), "ops".to_string()]);
+    }
+
+    #[test]
+    fn invalid_label_warning_sanitizes_terminal_controls() {
+        let warning = invalid_label_warning("bad\x1b[2J\rlabel", "no bell\x07 allowed");
+
+        assert!(!warning.chars().any(char::is_control));
+        assert!(warning.contains("\\u{1b}[2J"));
+        assert!(warning.contains("\\r"));
+        assert!(warning.contains("\\u{7}"));
     }
 }

@@ -3,11 +3,13 @@
 //! Shows project statistics including issue counts by status, type, priority,
 //! assignee, and label. Also supports recent activity tracking via git.
 
+use super::auto_import_external_projects_if_stale;
 use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::Result;
 use crate::format::{
-    Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary, truncate_title,
+    Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary, sanitize_terminal_inline,
+    truncate_title,
 };
 use crate::model::{Issue, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
@@ -15,10 +17,11 @@ use crate::storage::{SqliteStorage, StatsIssueRow};
 use chrono::Utc;
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use tracing::{debug, info};
 
 /// Execute the stats command.
@@ -89,38 +92,40 @@ fn execute_inner(
             || beads_dir.join("issues.jsonl"),
             |ctx| ctx.paths.jsonl_path.clone(),
         );
-    let config_layer =
-        if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
-            storage_ctx.load_config(cli)?
-        } else {
-            config::load_config(beads_dir, Some(storage), cli)?
-        };
-    let use_color = config::should_use_color(&config_layer);
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
         outer_ctx.inherited_output_mode(),
         args.robot,
     );
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
+    let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
+    let storage_ctx_for_config = preloaded_storage_ctx.or(owned_storage_ctx.as_ref());
+    let mut config_layer: Option<config::ConfigLayer> = None;
 
     info!("Computing project statistics");
 
-    let all_issues = storage.list_stats_issues()?;
+    let now = Utc::now();
+    let all_issues = list_issues_for_stats(storage, args)?;
+    debug!(total = all_issues.len(), "Loaded issues for stats");
+    let has_potential_ready_candidates = all_issues
+        .iter()
+        .any(|issue| is_potential_ready_candidate(issue, &now));
+    let external_blockers = resolve_stats_external_blockers(
+        storage,
+        beads_dir,
+        storage_ctx_for_config,
+        cli,
+        &mut config_layer,
+        has_potential_ready_candidates,
+    )?;
 
-    debug!(total = all_issues.len(), "Loaded all issues for stats");
-
-    // Compute summary counts
-    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
-    let external_blockers = if storage.has_external_dependencies(true)? {
-        let external_statuses =
-            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
-        Some(storage.external_blockers(&external_statuses)?)
-    } else {
-        None
-    };
-
-    let summary = compute_summary(storage, &all_issues, external_blockers.as_ref())?;
+    let summary = compute_summary(
+        storage,
+        &all_issues,
+        external_blockers.as_ref(),
+        &now,
+        has_potential_ready_candidates,
+    )?;
 
     // Compute breakdowns if requested
     let mut breakdowns = Vec::new();
@@ -138,7 +143,7 @@ fn execute_inner(
         breakdowns.push(compute_label_breakdown(storage, &all_issues)?);
     }
 
-    let recent_activity = if should_include_activity(args) {
+    let recent_activity = if should_collect_activity(args, early_ctx.mode()) {
         compute_recent_activity(Some(storage), &jsonl_path, args.activity_hours)
     } else {
         None
@@ -150,11 +155,21 @@ fn execute_inner(
         recent_activity,
     };
 
-    // Output based on mode
-    if matches!(ctx.mode(), OutputMode::Quiet) {
+    if matches!(early_ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
 
+    let ctx = stats_output_context(
+        output_format,
+        quiet,
+        beads_dir,
+        storage,
+        storage_ctx_for_config,
+        cli,
+        &mut config_layer,
+    )?;
+
+    // Output based on mode
     match output_format {
         OutputFormat::Json => {
             ctx.json_pretty(&output);
@@ -174,8 +189,105 @@ fn execute_inner(
     Ok(())
 }
 
+fn resolve_stats_external_blockers(
+    storage: &SqliteStorage,
+    beads_dir: &Path,
+    storage_ctx: Option<&config::OpenStorageResult>,
+    cli: &config::CliOverrides,
+    config_layer: &mut Option<config::ConfigLayer>,
+    has_potential_ready_candidates: bool,
+) -> Result<Option<HashMap<String, Vec<String>>>> {
+    if !has_potential_ready_candidates || !storage.has_external_dependencies(true)? {
+        return Ok(None);
+    }
+
+    let config_layer =
+        ensure_stats_config_layer(beads_dir, storage, storage_ctx, cli, config_layer)?;
+    auto_import_external_projects_if_stale(config_layer, beads_dir, cli);
+    let external_db_paths = config::external_project_db_paths(config_layer, beads_dir);
+    let external_statuses =
+        storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+    Ok(Some(storage.external_blockers(&external_statuses)?))
+}
+
+fn stats_output_context(
+    output_format: OutputFormat,
+    quiet: bool,
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+    storage_ctx: Option<&config::OpenStorageResult>,
+    cli: &config::CliOverrides,
+    config_layer: &mut Option<config::ConfigLayer>,
+) -> Result<OutputContext> {
+    let use_color = if matches!(output_format, OutputFormat::Text | OutputFormat::Csv) {
+        config::should_use_color(ensure_stats_config_layer(
+            beads_dir,
+            storage,
+            storage_ctx,
+            cli,
+            config_layer,
+        )?)
+    } else {
+        false
+    };
+    Ok(OutputContext::from_output_format(
+        output_format,
+        quiet,
+        !use_color,
+    ))
+}
+
+fn ensure_stats_config_layer<'a>(
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+    storage_ctx: Option<&config::OpenStorageResult>,
+    cli: &config::CliOverrides,
+    config_layer: &'a mut Option<config::ConfigLayer>,
+) -> Result<&'a config::ConfigLayer> {
+    if config_layer.is_none() {
+        *config_layer = Some(load_stats_config_layer(
+            beads_dir,
+            storage,
+            storage_ctx,
+            cli,
+        )?);
+    }
+    Ok(config_layer
+        .as_ref()
+        .expect("stats config layer loaded before use"))
+}
+
+fn load_stats_config_layer(
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+    storage_ctx: Option<&config::OpenStorageResult>,
+    cli: &config::CliOverrides,
+) -> Result<config::ConfigLayer> {
+    if let Some(storage_ctx) = storage_ctx {
+        storage_ctx.load_config(cli)
+    } else {
+        config::load_config(beads_dir, Some(storage), cli)
+    }
+}
+
 const fn should_include_activity(args: &StatsArgs) -> bool {
     !args.no_activity
+}
+
+const fn should_collect_activity(args: &StatsArgs, output_mode: OutputMode) -> bool {
+    should_include_activity(args) && !matches!(output_mode, OutputMode::Quiet)
+}
+
+const fn needs_stats_issue_rows(args: &StatsArgs) -> bool {
+    args.by_type || args.by_priority || args.by_assignee || args.by_label
+}
+
+fn list_issues_for_stats(storage: &SqliteStorage, args: &StatsArgs) -> Result<Vec<StatsIssueRow>> {
+    if needs_stats_issue_rows(args) {
+        storage.list_stats_issues()
+    } else {
+        storage.list_stats_summary_issues()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -267,11 +379,13 @@ fn compute_summary(
     storage: &SqliteStorage,
     issues: &[StatsIssueRow],
     external_blockers: Option<&std::collections::HashMap<String, Vec<String>>>,
+    now: &chrono::DateTime<Utc>,
+    has_potential_ready_candidates: bool,
 ) -> Result<StatsSummary> {
     let mut open = 0;
     let mut in_progress = 0;
     let mut closed = 0;
-    let mut blocked_by_status = 0;
+    let mut status_blocked_ids = HashSet::new();
     let mut deferred = 0;
     let mut draft = 0;
     let mut tombstone = 0;
@@ -279,28 +393,25 @@ fn compute_summary(
     let mut epics = Vec::new();
     let mut lead_times = Vec::new();
 
-    // Compute blocked-by-blocks in memory to avoid an expensive double LEFT JOIN
-    // in fsqlite. We already have all issues loaded, so we build a status lookup
-    // and filter the raw dependency edges in Rust.
-    let blocked_by_blocks = {
-        let status_map: HashSet<&str> = issues
-            .iter()
-            .filter(|i| !matches!(i.status, Status::Closed | Status::Tombstone))
-            .map(|i| i.id.as_str())
-            .collect();
-        let edges = storage.get_blocks_dep_edges()?;
-        let mut blocked = HashSet::new();
-        for (issue_id, depends_on_id) in &edges {
-            if status_map.contains(depends_on_id.as_str()) && status_map.contains(issue_id.as_str())
-            {
-                blocked.insert(issue_id.clone());
-            }
-        }
-        blocked
-    };
+    let active_issue_ids: HashSet<&str> = issues
+        .iter()
+        .filter(|i| !matches!(i.status, Status::Closed | Status::Tombstone))
+        .map(|i| i.id.as_str())
+        .collect();
 
-    // Get full blocked cache for accurate Ready count (must match `br ready` behavior)
-    let all_blocked_ids = storage.get_blocked_ids()?;
+    // Reuse the storage blocked-ID path for both blocked and ready counts.
+    // It reads the materialized cache when healthy and falls back to direct
+    // graph computation when needed; keep the active filter local so status
+    // accounting remains anchored to the rows already loaded for stats.
+    let dependency_blocked_ids: HashSet<String> = if active_issue_ids.is_empty() {
+        HashSet::new()
+    } else {
+        storage
+            .get_blocked_ids()?
+            .into_iter()
+            .filter(|issue_id| active_issue_ids.contains(issue_id.as_str()))
+            .collect()
+    };
 
     for issue in issues {
         match issue.status {
@@ -314,7 +425,9 @@ fn compute_summary(
                     lead_times.push(lead_time.num_hours() as f64);
                 }
             }
-            Status::Blocked => blocked_by_status += 1,
+            Status::Blocked => {
+                status_blocked_ids.insert(issue.id.as_str());
+            }
             Status::Deferred => deferred += 1,
             Status::Draft => draft += 1,
             Status::Tombstone => tombstone += 1,
@@ -334,23 +447,23 @@ fn compute_summary(
     }
 
     // Ready count: status=open (not in_progress), no blockers (full definition).
-    let now = Utc::now();
-    let ready = issues
-        .iter()
-        .filter(|i| {
-            i.status == Status::Open
-                && !all_blocked_ids.contains(&i.id)
-                && external_blockers.is_none_or(|eb| !eb.contains_key(&i.id))
-                && !i.ephemeral
-                && !is_wisp_issue_id(&i.id)
-                && !i.pinned
-                && !i.is_template
-                && i.defer_until.is_none_or(|d| d <= now)
-        })
-        .count();
+    let ready = if has_potential_ready_candidates {
+        issues
+            .iter()
+            .filter(|i| {
+                is_potential_ready_candidate(i, now)
+                    && !dependency_blocked_ids.contains(&i.id)
+                    && external_blockers.is_none_or(|eb| !eb.contains_key(&i.id))
+            })
+            .count()
+    } else {
+        0
+    };
 
-    // Blocked count based on 'blocks' deps only (classic bd semantics).
-    let blocked = blocked_by_blocks.len();
+    // Blocked count includes both dependency-blocked issues and manual
+    // Status::Blocked issues, deduped by ID when both conditions apply.
+    status_blocked_ids.extend(dependency_blocked_ids.iter().map(String::as_str));
+    let blocked = status_blocked_ids.len();
 
     // Epics eligible for closure: all children closed
     let epics_eligible = count_epics_eligible_for_closure(storage, &epics)?;
@@ -368,9 +481,6 @@ fn compute_summary(
         .iter()
         .filter(|i| i.status != Status::Tombstone)
         .count();
-
-    // blocked_by_status is unused but kept for potential future use
-    let _ = blocked_by_status;
 
     Ok(StatsSummary {
         total_issues: total,
@@ -390,6 +500,18 @@ fn compute_summary(
 
 fn is_wisp_issue_id(id: &str) -> bool {
     id.contains("-wisp-")
+}
+
+fn is_potential_ready_candidate(issue: &StatsIssueRow, now: &chrono::DateTime<Utc>) -> bool {
+    issue.status == Status::Open
+        && !issue.ephemeral
+        && !is_wisp_issue_id(&issue.id)
+        && !issue.pinned
+        && !issue.is_template
+        && issue
+            .defer_until
+            .as_ref()
+            .is_none_or(|defer_until| defer_until <= now)
 }
 
 /// Count epics that have all children closed.
@@ -484,29 +606,26 @@ fn compute_assignee_breakdown(issues: &[StatsIssueRow]) -> Breakdown {
 
 /// Compute breakdown by label.
 fn compute_label_breakdown(storage: &SqliteStorage, issues: &[StatsIssueRow]) -> Result<Breakdown> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    let issue_ids: Vec<String> = issues
+    let active_issue_ids: HashSet<&str> = issues
         .iter()
         .filter(|issue| issue.status != Status::Tombstone)
-        .map(|issue| issue.id.clone())
+        .map(|issue| issue.id.as_str())
         .collect();
-    let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
+    let mut labeled_issue_ids: HashSet<String> = HashSet::new();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
 
-    for issue in issues {
-        if issue.status == Status::Tombstone {
-            continue;
+    for (issue_id, label) in storage.list_label_pairs_unordered()? {
+        if active_issue_ids.contains(issue_id.as_str()) {
+            *counts.entry(label).or_insert(0) += 1;
+            labeled_issue_ids.insert(issue_id);
         }
-        if let Some(labels) = labels_map.remove(&issue.id) {
-            if labels.is_empty() {
-                *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
-            } else {
-                for label in labels {
-                    *counts.entry(label).or_insert(0) += 1;
-                }
-            }
-        } else {
-            *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
-        }
+    }
+
+    let unlabeled_count = active_issue_ids
+        .len()
+        .saturating_sub(labeled_issue_ids.len());
+    if unlabeled_count > 0 {
+        counts.insert("(no labels)".to_string(), unlabeled_count);
     }
 
     Ok(Breakdown {
@@ -592,7 +711,7 @@ fn git_recent_activity(
     use std::io::{BufReader, Read};
     use std::process::Stdio;
 
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .args([
             "log",
             "--format=__BR_ACTIVITY_COMMIT__:%H\t%ct",
@@ -690,6 +809,12 @@ fn parse_issue_activity_patch(patch: &str) -> ActivityCounts {
     count_issue_activity_transitions(&removed, &added)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IssuePatchMarker {
+    Added,
+    Removed,
+}
+
 fn record_issue_activity_patch_line(
     line: &str,
     removed: &mut BTreeMap<String, Issue>,
@@ -701,13 +826,12 @@ fn record_issue_activity_patch_line(
 
     match serde_json::from_str::<Issue>(payload) {
         Ok(issue) => match marker {
-            '+' => {
+            IssuePatchMarker::Added => {
                 added.insert(issue.id.clone(), issue);
             }
-            '-' => {
+            IssuePatchMarker::Removed => {
                 removed.insert(issue.id.clone(), issue);
             }
-            _ => unreachable!("parse_issue_patch_line only returns +/- markers"),
         },
         Err(err) => {
             debug!(%err, "Skipping unparsable issue line from git diff");
@@ -730,7 +854,7 @@ fn count_issue_activity_transitions(
     counts
 }
 
-fn parse_issue_patch_line(line: &str) -> Option<(char, &str)> {
+fn parse_issue_patch_line(line: &str) -> Option<(IssuePatchMarker, &str)> {
     if line.starts_with("+++ ")
         || line.starts_with("--- ")
         || line.starts_with("@@")
@@ -744,9 +868,11 @@ fn parse_issue_patch_line(line: &str) -> Option<(char, &str)> {
     }
 
     let marker = *line.as_bytes().first()? as char;
-    if !matches!(marker, '+' | '-') {
-        return None;
-    }
+    let marker = match marker {
+        '+' => IssuePatchMarker::Added,
+        '-' => IssuePatchMarker::Removed,
+        _ => return None,
+    };
 
     let payload = &line[1..];
     if !payload.starts_with('{') {
@@ -763,7 +889,122 @@ fn parse_activity_commit_marker(line: &str) -> Option<i64> {
 }
 
 fn git_repo_context(start: &Path) -> Option<GitRepoContext> {
-    let output = Command::new("git")
+    git_repo_context_from_filesystem(start).or_else(|| git_repo_context_from_command(start))
+}
+
+fn git_repo_context_from_filesystem(start: &Path) -> Option<GitRepoContext> {
+    let mut repo_root = dunce::canonicalize(start).ok()?;
+
+    loop {
+        let git_entry = repo_root.join(".git");
+        if git_entry.is_dir() {
+            let head = read_git_head(&git_entry)?;
+            return Some(GitRepoContext { repo_root, head });
+        }
+
+        if git_entry.is_file() {
+            let git_dir = read_gitdir_file(&git_entry, &repo_root)?;
+            let head = read_git_head(&git_dir)?;
+            return Some(GitRepoContext { repo_root, head });
+        }
+
+        if !repo_root.pop() {
+            return None;
+        }
+    }
+}
+
+fn read_gitdir_file(git_file: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let raw = fs::read_to_string(git_file).ok()?;
+    let gitdir = raw.trim().strip_prefix("gitdir:")?.trim();
+    if gitdir.is_empty() {
+        return None;
+    }
+
+    let path = PathBuf::from(gitdir);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    };
+    dunce::canonicalize(path).ok()
+}
+
+fn read_git_head(git_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = raw.trim();
+    let Some(reference) = head.strip_prefix("ref:") else {
+        return non_empty_string(head);
+    };
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return None;
+    }
+
+    let common_dir = git_common_dir(git_dir);
+    read_git_ref(git_dir, reference)
+        .or_else(|| read_git_ref(&common_dir, reference))
+        .or_else(|| read_packed_git_ref(&common_dir, reference))
+}
+
+fn git_common_dir(git_dir: &Path) -> PathBuf {
+    let Ok(raw) = fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let common_dir = raw.trim();
+    if common_dir.is_empty() {
+        return git_dir.to_path_buf();
+    }
+
+    let path = PathBuf::from(common_dir);
+    if path.is_absolute() {
+        path
+    } else {
+        git_dir.join(path)
+    }
+}
+
+fn read_git_ref(git_dir: &Path, reference: &str) -> Option<String> {
+    let ref_path = safe_git_ref_path(git_dir, reference)?;
+    let raw = fs::read_to_string(ref_path).ok()?;
+    non_empty_string(raw.trim())
+}
+
+fn read_packed_git_ref(git_dir: &Path, reference: &str) -> Option<String> {
+    let raw = fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        if parts.next() == Some(reference) {
+            return non_empty_string(hash);
+        }
+    }
+    None
+}
+
+fn safe_git_ref_path(git_dir: &Path, reference: &str) -> Option<PathBuf> {
+    let ref_path = Path::new(reference);
+    if ref_path.is_absolute()
+        || ref_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(git_dir.join(ref_path))
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn git_repo_context_from_command(start: &Path) -> Option<GitRepoContext> {
+    let output = git_command()
         .args(["rev-parse", "--show-toplevel", "HEAD"])
         .current_dir(start)
         .output()
@@ -785,6 +1026,48 @@ fn git_repo_context(start: &Path) -> Option<GitRepoContext> {
         repo_root: PathBuf::from(repo_root),
         head: head.to_string(),
     })
+}
+
+fn git_command() -> Command {
+    Command::new(git_executable())
+}
+
+fn git_executable() -> &'static Path {
+    static GIT_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
+    GIT_EXECUTABLE.get_or_init(resolve_git_executable)
+}
+
+fn resolve_git_executable() -> PathBuf {
+    let binary_name = if cfg!(windows) { "git.exe" } else { "git" };
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return PathBuf::from(binary_name);
+    };
+
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+
+        let candidate = dir.join(binary_name);
+        if is_executable_file(&candidate) {
+            return candidate;
+        }
+    }
+
+    PathBuf::from(binary_name)
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn repo_relative_git_path(path: &Path, repo_root: &Path) -> Option<PathBuf> {
@@ -836,7 +1119,6 @@ fn parse_recent_activity_cache(
         .ok()?;
 
     if entry.repo_root != repo_ctx.repo_root.to_string_lossy()
-        || entry.repo_head != repo_ctx.head
         || entry.pathspec != pathspec
         || entry.hours != hours
         || entry
@@ -846,7 +1128,55 @@ fn parse_recent_activity_cache(
         return None;
     }
 
-    Some(entry.activity)
+    if entry.repo_head == repo_ctx.head
+        || zero_activity_cache_covers_current_head(&entry, repo_ctx, pathspec)
+    {
+        Some(entry.activity)
+    } else {
+        None
+    }
+}
+
+fn zero_activity_cache_covers_current_head(
+    entry: &RecentActivityCacheEntry,
+    repo_ctx: &GitRepoContext,
+    pathspec: &str,
+) -> bool {
+    if entry.valid_until_epoch.is_some()
+        || entry.activity.commit_count != 0
+        || entry.activity.total_changes != 0
+        || !looks_like_git_oid(&entry.repo_head)
+        || !looks_like_git_oid(&repo_ctx.head)
+    {
+        return false;
+    }
+
+    let range = format!("{}..{}", entry.repo_head, repo_ctx.head);
+    let Ok(status) = git_command()
+        .args(["diff", "--quiet", &range, "--", pathspec])
+        .current_dir(&repo_ctx.repo_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    else {
+        return false;
+    };
+
+    if status.success() {
+        debug!(
+            cached_head = %entry.repo_head,
+            current_head = %repo_ctx.head,
+            pathspec,
+            "Reusing zero-activity stats cache across a code-only HEAD change"
+        );
+        true
+    } else {
+        false
+    }
+}
+
+fn looks_like_git_oid(value: &str) -> bool {
+    (4..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn recent_activity_cache_policy(
@@ -937,7 +1267,11 @@ fn print_text_output(output: &Statistics) {
     for breakdown in &output.breakdowns {
         println!("\nBy {}:", breakdown.dimension);
         for entry in &breakdown.counts {
-            println!("  {}: {}", entry.key, entry.count);
+            println!(
+                "  {}: {}",
+                sanitize_terminal_inline(&entry.key),
+                entry.count
+            );
         }
     }
 
@@ -1164,7 +1498,7 @@ mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use chrono::{TimeZone, Utc};
+    use chrono::{Duration, TimeZone, Utc};
     use std::fs;
     use tempfile::TempDir;
 
@@ -1226,6 +1560,14 @@ mod tests {
             pinned: issue.pinned,
             is_template: issue.is_template,
         }
+    }
+
+    fn compute_test_summary(storage: &SqliteStorage, issues: &[StatsIssueRow]) -> StatsSummary {
+        let now = Utc::now();
+        let has_potential_ready_candidates = issues
+            .iter()
+            .any(|issue| is_potential_ready_candidate(issue, &now));
+        compute_summary(storage, issues, None, &now, has_potential_ready_candidates).unwrap()
     }
 
     #[test]
@@ -1317,7 +1659,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.total_issues, 3);
         assert_eq!(summary.open_issues, 1);
@@ -1342,10 +1684,49 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.blocked_issues, 1);
         assert_eq!(summary.ready_issues, 1); // t-1 is ready, t-2 is blocked
+    }
+
+    #[test]
+    fn test_blocked_by_parent_child_deps() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let epic = make_issue("t-epic", Status::Open, IssueType::Epic);
+        let child = make_issue("t-child", Status::Open, IssueType::Task);
+
+        storage.create_issue(&epic, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+        storage
+            .add_dependency("t-child", "t-epic", "parent-child", "tester")
+            .unwrap();
+
+        let all_issues = [&epic, &child]
+            .into_iter()
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_test_summary(&storage, &all_issues);
+
+        assert_eq!(summary.blocked_issues, 1);
+    }
+
+    #[test]
+    fn test_blocked_by_status_counts_without_dependency_blocker() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let blocked_issue = make_issue("t-1", Status::Blocked, IssueType::Task);
+
+        storage.create_issue(&blocked_issue, "tester").unwrap();
+
+        let all_issues = std::iter::once(&blocked_issue)
+            .map(stats_row)
+            .collect::<Vec<_>>();
+        let summary = compute_test_summary(&storage, &all_issues);
+
+        assert_eq!(summary.blocked_issues, 1);
+        assert_eq!(summary.ready_issues, 0);
     }
 
     #[test]
@@ -1363,7 +1744,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.ready_issues, 1);
     }
@@ -1382,7 +1763,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.ready_issues, 1);
     }
@@ -1407,7 +1788,7 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         assert_eq!(summary.epics_eligible_for_closure, 0);
     }
@@ -1430,10 +1811,94 @@ mod tests {
             .into_iter()
             .map(stats_row)
             .collect::<Vec<_>>();
-        let summary = compute_summary(&storage, &all_issues, None).unwrap();
+        let summary = compute_test_summary(&storage, &all_issues);
 
         // t-2 should NOT be blocked because t-1 is closed
         assert_eq!(summary.blocked_issues, 0);
+    }
+
+    #[test]
+    fn test_stats_summary_rows_match_full_summary() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+
+        let open_issue = make_issue("t-open", Status::Open, IssueType::Task);
+        let in_progress_issue = make_issue("t-progress", Status::InProgress, IssueType::Task);
+        let status_blocked_issue = make_issue("t-status-blocked", Status::Blocked, IssueType::Task);
+        let blocking_issue = make_issue("t-blocker", Status::Open, IssueType::Task);
+        let dependent_issue = make_issue("t-dependent", Status::Open, IssueType::Task);
+        let mut closed_issue = make_issue("t-closed", Status::Closed, IssueType::Bug);
+        closed_issue.created_at = now - Duration::hours(48);
+        closed_issue.closed_at = Some(now);
+        let deferred_issue = make_issue("t-deferred", Status::Deferred, IssueType::Task);
+        let draft_issue = make_issue("t-draft", Status::Draft, IssueType::Task);
+        let mut pinned_issue = make_issue("t-pinned", Status::Open, IssueType::Task);
+        pinned_issue.pinned = true;
+        let mut template_issue = make_issue("t-template", Status::Open, IssueType::Task);
+        template_issue.is_template = true;
+        let wisp_issue = make_issue("t-wisp-1", Status::Open, IssueType::Task);
+        let epic_issue = make_issue("t-epic", Status::Open, IssueType::Epic);
+        let mut epic_child = make_issue("t-epic-child", Status::Closed, IssueType::Task);
+        epic_child.created_at = now - Duration::hours(1);
+        epic_child.closed_at = Some(now);
+        let tombstone_issue = make_issue("t-tombstone", Status::Open, IssueType::Task);
+
+        for issue in [
+            &open_issue,
+            &in_progress_issue,
+            &status_blocked_issue,
+            &blocking_issue,
+            &dependent_issue,
+            &closed_issue,
+            &deferred_issue,
+            &draft_issue,
+            &pinned_issue,
+            &template_issue,
+            &wisp_issue,
+            &epic_issue,
+            &epic_child,
+            &tombstone_issue,
+        ] {
+            storage.create_issue(issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency("t-dependent", "t-blocker", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("t-epic-child", "t-epic", "parent-child", "tester")
+            .unwrap();
+        storage
+            .delete_issue("t-tombstone", "tester", "summary parity", None)
+            .unwrap();
+
+        let full_rows = storage.list_stats_issues().unwrap();
+        let summary_rows = storage.list_stats_summary_issues().unwrap();
+        let mut external_blockers = std::collections::HashMap::new();
+        external_blockers.insert("t-open".to_string(), vec!["external-1".to_string()]);
+        let has_potential_ready_candidates = full_rows
+            .iter()
+            .any(|issue| is_potential_ready_candidate(issue, &now));
+        let full = compute_summary(
+            &storage,
+            &full_rows,
+            Some(&external_blockers),
+            &now,
+            has_potential_ready_candidates,
+        )
+        .unwrap();
+        let lean = compute_summary(
+            &storage,
+            &summary_rows,
+            Some(&external_blockers),
+            &now,
+            has_potential_ready_candidates,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&lean).unwrap(),
+            serde_json::to_value(&full).unwrap()
+        );
     }
 
     #[test]
@@ -1443,19 +1908,30 @@ mod tests {
         let first_issue = make_issue("t-1", Status::Open, IssueType::Task);
         let second_issue = make_issue("t-2", Status::Open, IssueType::Task);
         let third_issue = make_issue("t-3", Status::Open, IssueType::Task);
+        let tombstone_issue = make_issue("t-4", Status::Open, IssueType::Task);
+        let mut closed_issue = make_issue("t-5", Status::Closed, IssueType::Task);
+        closed_issue.closed_at = Some(Utc::now());
+        let mut template_issue = make_issue("t-6", Status::Open, IssueType::Task);
+        template_issue.is_template = true;
 
         storage.create_issue(&first_issue, "tester").unwrap();
         storage.create_issue(&second_issue, "tester").unwrap();
         storage.create_issue(&third_issue, "tester").unwrap();
+        storage.create_issue(&tombstone_issue, "tester").unwrap();
+        storage.create_issue(&closed_issue, "tester").unwrap();
+        storage.create_issue(&template_issue, "tester").unwrap();
 
         storage.add_label("t-1", "backend", "tester").unwrap();
         storage.add_label("t-1", "urgent", "tester").unwrap();
         storage.add_label("t-2", "backend", "tester").unwrap();
+        storage.add_label("t-4", "backend", "tester").unwrap();
+        storage.add_label("t-5", "closed", "tester").unwrap();
+        storage.add_label("t-6", "template", "tester").unwrap();
+        storage
+            .delete_issue("t-4", "tester", "tombstone label count target", None)
+            .unwrap();
 
-        let test_issues = [&first_issue, &second_issue, &third_issue]
-            .into_iter()
-            .map(stats_row)
-            .collect::<Vec<_>>();
+        let test_issues = storage.list_stats_issues().unwrap();
         let breakdown = compute_label_breakdown(&storage, &test_issues).unwrap();
 
         let mut map: BTreeMap<String, usize> = BTreeMap::new();
@@ -1465,6 +1941,8 @@ mod tests {
 
         assert_eq!(map.get("backend"), Some(&2));
         assert_eq!(map.get("urgent"), Some(&1));
+        assert_eq!(map.get("closed"), Some(&1));
+        assert_eq!(map.get("template"), Some(&1));
         assert_eq!(map.get("(no labels)"), Some(&1));
     }
 
@@ -1526,6 +2004,84 @@ mod tests {
     fn write_issue_jsonl(path: &Path, issue: &Issue) {
         let line = serde_json::to_string(issue).expect("serialize issue");
         fs::write(path, format!("{line}\n")).expect("write issue jsonl");
+    }
+
+    #[test]
+    fn test_zero_activity_cache_reused_across_code_only_head_change() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "tester@example.com"]);
+        git(temp.path(), &["config", "user.name", "Tester"]);
+
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let issue = make_issue("bd-cache", Status::Open, IssueType::Task);
+        write_issue_jsonl(&jsonl_path, &issue);
+        git(temp.path(), &["add", ".beads/issues.jsonl"]);
+        git(temp.path(), &["commit", "-q", "-m", "seed issue jsonl"]);
+        let cached_head = git_stdout(temp.path(), &["rev-parse", "HEAD"]);
+
+        fs::write(temp.path().join("README.md"), "code-only change\n").expect("write readme");
+        git(temp.path(), &["add", "README.md"]);
+        git(temp.path(), &["commit", "-q", "-m", "code only"]);
+        let repo_ctx = GitRepoContext {
+            repo_root: temp.path().to_path_buf(),
+            head: git_stdout(temp.path(), &["rev-parse", "HEAD"]),
+        };
+
+        let activity = RecentActivity {
+            hours_tracked: 24,
+            commit_count: 0,
+            issues_created: 0,
+            issues_closed: 0,
+            issues_updated: 0,
+            issues_reopened: 0,
+            total_changes: 0,
+        };
+        let cache_entry = RecentActivityCacheEntry {
+            repo_root: temp.path().to_string_lossy().into_owned(),
+            repo_head: cached_head,
+            pathspec: ".beads/issues.jsonl".to_string(),
+            hours: 24,
+            valid_until_epoch: None,
+            activity,
+        };
+        let raw = serde_json::to_string(&cache_entry).expect("serialize cache entry");
+
+        assert!(
+            parse_recent_activity_cache(
+                &raw,
+                &repo_ctx,
+                ".beads/issues.jsonl",
+                24,
+                Utc::now().timestamp(),
+            )
+            .is_some(),
+            "code-only commits should not invalidate a zero-activity cache"
+        );
+
+        let mut changed_issue = issue;
+        changed_issue.title = "Issue bd-cache updated".to_string();
+        write_issue_jsonl(&jsonl_path, &changed_issue);
+        git(temp.path(), &["add", ".beads/issues.jsonl"]);
+        git(temp.path(), &["commit", "-q", "-m", "touch issue jsonl"]);
+        let repo_ctx = GitRepoContext {
+            repo_root: temp.path().to_path_buf(),
+            head: git_stdout(temp.path(), &["rev-parse", "HEAD"]),
+        };
+
+        assert!(
+            parse_recent_activity_cache(
+                &raw,
+                &repo_ctx,
+                ".beads/issues.jsonl",
+                24,
+                Utc::now().timestamp(),
+            )
+            .is_none(),
+            "issue JSONL changes must force a fresh activity scan"
+        );
     }
 
     #[test]
@@ -1680,6 +2236,27 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_issue_activity_patch_skips_non_issue_markers() {
+        let issue = make_issue("bd-skipped", Status::Open, IssueType::Task);
+        let issue_json = serde_json::to_string(&issue).expect("serialize skipped issue");
+        let patch = format!(
+            "diff --git a/.beads/issues.jsonl b/.beads/issues.jsonl\n\
+             @@ -1 +1 @@\n\
+             !{issue_json}\n\
+             ~{issue_json}\n\
+             context line\n"
+        );
+
+        assert_eq!(parse_issue_patch_line(&format!("!{issue_json}")), None);
+        let counts = parse_issue_activity_patch(&patch);
+        assert_eq!(counts.created, 0);
+        assert_eq!(counts.closed, 0);
+        assert_eq!(counts.updated, 0);
+        assert_eq!(counts.reopened, 0);
+        assert_eq!(counts.total_changes(), 0);
+    }
+
+    #[test]
     fn test_parse_issue_activity_stream_keeps_commit_boundaries_separate() {
         let base_time = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
         let mut original = make_issue("bd-activity", Status::Open, IssueType::Task);
@@ -1720,10 +2297,13 @@ mod tests {
     #[test]
     fn test_recent_activity_cache_valid_until_expires_at_boundary() {
         let earliest_commit_ts = 1_000_i64;
-        let RecentActivityCachePolicy::Cache { valid_until_epoch } =
-            recent_activity_cache_policy(1, Some(earliest_commit_ts), 24)
-        else {
-            panic!("expected cache entry");
+        let policy = recent_activity_cache_policy(1, Some(earliest_commit_ts), 24);
+        assert!(
+            matches!(policy, RecentActivityCachePolicy::Cache { .. }),
+            "expected cache entry"
+        );
+        let RecentActivityCachePolicy::Cache { valid_until_epoch } = policy else {
+            return;
         };
         let valid_until = valid_until_epoch.expect("expiry timestamp");
         assert_eq!(valid_until, earliest_commit_ts + 24 * 3600);
@@ -1792,6 +2372,25 @@ mod tests {
     }
 
     #[test]
+    fn test_should_collect_activity_skips_true_quiet_mode() {
+        assert!(should_collect_activity(
+            &StatsArgs::default(),
+            OutputMode::Json
+        ));
+        assert!(!should_collect_activity(
+            &StatsArgs::default(),
+            OutputMode::Quiet
+        ));
+        assert!(!should_collect_activity(
+            &StatsArgs {
+                no_activity: true,
+                ..StatsArgs::default()
+            },
+            OutputMode::Json
+        ));
+    }
+
+    #[test]
     fn test_repo_relative_git_path_rejects_path_outside_repo() {
         let temp = TempDir::new().expect("tempdir");
         let repo_root = temp.path().join("repo");
@@ -1815,6 +2414,48 @@ mod tests {
             git_pathspec_string(&PathBuf::from(".beads/issues.jsonl")),
             ".beads/issues.jsonl"
         );
+    }
+
+    #[test]
+    fn test_git_repo_context_from_filesystem_reads_loose_head() {
+        let temp = TempDir::new().expect("tempdir");
+        let git_dir = temp.path().join(".git");
+        let refs_dir = git_dir.join("refs").join("heads");
+        fs::create_dir_all(&refs_dir).expect("create refs");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("write head");
+        fs::write(
+            refs_dir.join("main"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .expect("write ref");
+
+        let repo_ctx = git_repo_context_from_filesystem(temp.path()).expect("repo context");
+        assert_eq!(repo_ctx.repo_root, temp.path());
+        assert_eq!(repo_ctx.head, "0123456789abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn test_git_repo_context_from_filesystem_reads_gitdir_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_root = temp.path().join("worktree");
+        let git_dir = temp.path().join("actual.git");
+        fs::create_dir_all(&repo_root).expect("create worktree");
+        fs::create_dir_all(git_dir.join("refs").join("heads")).expect("create refs");
+        fs::write(
+            repo_root.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect("write gitdir");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("write head");
+        fs::write(
+            git_dir.join("refs").join("heads").join("main"),
+            "fedcba9876543210fedcba9876543210fedcba98\n",
+        )
+        .expect("write ref");
+
+        let repo_ctx = git_repo_context_from_filesystem(&repo_root).expect("repo context");
+        assert_eq!(repo_ctx.repo_root, repo_root);
+        assert_eq!(repo_ctx.head, "fedcba9876543210fedcba9876543210fedcba98");
     }
 
     #[test]

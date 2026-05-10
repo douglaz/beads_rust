@@ -29,7 +29,7 @@ where
 }
 
 /// Issue lifecycle status.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     #[default]
@@ -47,7 +47,31 @@ pub enum Status {
     Custom(String),
 }
 
+impl<'de> Deserialize<'de> for Status {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match Self::known_value(&value) {
+            Some(status) => status,
+            None => Self::Custom(value),
+        })
+    }
+}
+
 impl Status {
+    fn known_value(value: &str) -> Option<Self> {
+        Some(match value.to_lowercase().as_str() {
+            "open" => Self::Open,
+            "in_progress" | "inprogress" => Self::InProgress,
+            "blocked" => Self::Blocked,
+            "deferred" => Self::Deferred,
+            "draft" => Self::Draft,
+            "closed" => Self::Closed,
+            "tombstone" => Self::Tombstone,
+            "pinned" => Self::Pinned,
+            _ => return None,
+        })
+    }
+
     #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
@@ -90,17 +114,7 @@ impl FromStr for Status {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "open" => Ok(Self::Open),
-            "in_progress" | "inprogress" => Ok(Self::InProgress),
-            "blocked" => Ok(Self::Blocked),
-            "deferred" => Ok(Self::Deferred),
-            "draft" => Ok(Self::Draft),
-            "closed" => Ok(Self::Closed),
-            "tombstone" => Ok(Self::Tombstone),
-            "pinned" => Ok(Self::Pinned),
-            other => Ok(Self::Custom(other.to_string())),
-        }
+        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_string())))
     }
 }
 
@@ -151,7 +165,7 @@ impl FromStr for Priority {
 }
 
 /// Issue type category.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueType {
     #[default]
@@ -166,7 +180,30 @@ pub enum IssueType {
     Custom(String),
 }
 
+impl<'de> Deserialize<'de> for IssueType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match Self::known_value(&value) {
+            Some(issue_type) => issue_type,
+            None => Self::Custom(value),
+        })
+    }
+}
+
 impl IssueType {
+    fn known_value(value: &str) -> Option<Self> {
+        Some(match value.to_lowercase().as_str() {
+            "task" => Self::Task,
+            "bug" => Self::Bug,
+            "feature" => Self::Feature,
+            "epic" => Self::Epic,
+            "chore" => Self::Chore,
+            "docs" => Self::Docs,
+            "question" => Self::Question,
+            _ => return None,
+        })
+    }
+
     #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
@@ -199,21 +236,12 @@ impl FromStr for IssueType {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "task" => Ok(Self::Task),
-            "bug" => Ok(Self::Bug),
-            "feature" => Ok(Self::Feature),
-            "epic" => Ok(Self::Epic),
-            "chore" => Ok(Self::Chore),
-            "docs" => Ok(Self::Docs),
-            "question" => Ok(Self::Question),
-            other => Ok(Self::Custom(other.to_string())),
-        }
+        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_string())))
     }
 }
 
 /// Dependency relationship type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum DependencyType {
     Blocks,
@@ -229,6 +257,26 @@ pub enum DependencyType {
     CausedBy,
     #[serde(untagged)]
     Custom(String),
+}
+
+impl<'de> Deserialize<'de> for DependencyType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.to_lowercase().as_str() {
+            "blocks" => Self::Blocks,
+            "parent-child" => Self::ParentChild,
+            "conditional-blocks" => Self::ConditionalBlocks,
+            "waits-for" => Self::WaitsFor,
+            "related" => Self::Related,
+            "discovered-from" => Self::DiscoveredFrom,
+            "replies-to" => Self::RepliesTo,
+            "relates-to" => Self::RelatesTo,
+            "duplicates" => Self::Duplicates,
+            "supersedes" => Self::Supersedes,
+            "caused-by" => Self::CausedBy,
+            _ => Self::Custom(value),
+        })
+    }
 }
 
 impl DependencyType {
@@ -568,9 +616,8 @@ impl Default for Issue {
 impl Issue {
     /// Compute the deterministic content hash for this issue.
     ///
-    /// Includes: title, description, design, `acceptance_criteria`, notes,
-    /// status, priority, `issue_type`, assignee, `external_ref`, pinned, `is_template`.
-    /// Excludes: id, timestamps, relations, tombstones.
+    /// Uses the Go bd canonical field order for cross-tool deduplication.
+    /// Excludes IDs, timestamps, relations, and tombstone metadata.
     ///
     /// Delegates to [`crate::util::hash::content_hash`] for the canonical implementation.
     #[must_use]
@@ -803,6 +850,15 @@ mod tests {
         assert_eq!(status, Status::Custom("custom_status".to_string()));
         let serialized = serde_json::to_string(&status).unwrap();
         assert_eq!(serialized, "\"custom_status\"");
+
+        let mixed_case: Status = serde_json::from_str("\"QaReview\"").unwrap();
+        assert_eq!(mixed_case, Status::Custom("QaReview".to_string()));
+    }
+
+    #[test]
+    fn issue_type_custom_deserialize_preserves_spelling() {
+        let issue_type: IssueType = serde_json::from_str("\"Odd_Type\"").unwrap();
+        assert_eq!(issue_type, IssueType::Custom("Odd_Type".to_string()));
     }
 
     #[test]
@@ -968,6 +1024,9 @@ mod tests {
     fn test_status_from_str_unknown_becomes_custom() {
         let result = Status::from_str("invalid_status").unwrap();
         assert_eq!(result, Status::Custom("invalid_status".to_string()));
+
+        let mixed_case = Status::from_str("QaReview").unwrap();
+        assert_eq!(mixed_case, Status::Custom("QaReview".to_string()));
     }
 
     #[test]
@@ -1133,6 +1192,9 @@ mod tests {
             result.unwrap(),
             IssueType::Custom("custom_type".to_string())
         );
+
+        let mixed_case = IssueType::from_str("Odd_Type").unwrap();
+        assert_eq!(mixed_case, IssueType::Custom("Odd_Type".to_string()));
     }
 
     #[test]

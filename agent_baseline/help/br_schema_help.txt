@@ -1,4 +1,6 @@
-Emit JSON Schemas for br output types (for agent/tooling integration)
+Emit JSON Schemas and per-command output envelope shapes (for agent/tooling integration)
+
+IMPORTANT: br schema is not a stable API and is subject to change. Use at your own risk.
 
 Usage: br schema [OPTIONS] [TARGET]
 
@@ -7,22 +9,24 @@ Arguments:
           Which schema to emit
 
           Possible values:
-          - all:               Emit a bundle containing all schemas
-          - issue:             Core Issue object (used by many commands)
-          - issue-with-counts: List/search row: Issue + dependency/dependent counts
-          - issue-details:     Show view: Issue + relations/comments/events
-          - ready-issue:       Ready list row
-          - stale-issue:       Stale list row
-          - blocked-issue:     Blocked list row
-          - tree-node:         Dependency tree node
-          - statistics:        Stats output
-          - error:             Structured error envelope (stderr JSON when robot mode or non-TTY)
-          
+          - all:                 Emit a bundle containing all schemas and the per-command shape map
+          - issue:               Core Issue object (used by many commands)
+          - issue-with-counts:   List/search row: Issue + dependency/dependent counts
+          - issue-details:       Show view: Issue + relations/comments/events
+          - ready-issue:         Ready list row
+          - stale-issue:         Stale list row
+          - blocked-issue:       Blocked list row
+          - tree-node:           Dependency tree node
+          - statistics:          Stats output
+          - coordination-status: Coordination status output
+          - error:               Structured error envelope (stderr JSON when robot mode or non-TTY)
+          - commands:            Per-command JSON output envelope map (top-level shape + jq filter per command)
+
           [default: all]
 
 Options:
       --format <FORMAT>
-          Output format (text, json, toon)
+          Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT
 
           Possible values:
           - text: Human-readable text (default)
@@ -54,7 +58,7 @@ Options:
           Allow stale DB (bypass freshness check warning)
 
       --lock-timeout <LOCK_TIMEOUT>
-          `SQLite` busy timeout in ms
+          `SQLite` busy/write-lock timeout in ms
 
       --no-db
           JSONL-only mode (no DB connection)

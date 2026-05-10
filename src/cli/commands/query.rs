@@ -5,6 +5,7 @@
 use crate::cli::{ListArgs, QueryCommands, QueryDeleteArgs, QueryRunArgs, QuerySaveArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::sanitize_terminal_inline;
 use crate::output::{OutputContext, OutputMode};
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
@@ -64,6 +65,8 @@ pub struct SavedFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub reverse: bool,
@@ -97,6 +100,7 @@ impl From<&ListArgs> for SavedFilters {
             notes_contains: args.notes_contains.clone(),
             all: args.all,
             limit: args.limit,
+            offset: args.offset,
             sort: args.sort.clone(),
             reverse: args.reverse,
             deferred: args.deferred,
@@ -125,7 +129,7 @@ impl SavedFilters {
             notes_contains: self.notes_contains.clone(),
             all: self.all,
             limit: self.limit,
-            offset: Some(0),
+            offset: self.offset,
             sort: self.sort.clone(),
             reverse: self.reverse,
             deferred: self.deferred,
@@ -247,11 +251,25 @@ pub fn execute(
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    ensure_query_storage_available(&storage_ctx)?;
+    execute_with_storage_ctx(command, cli, ctx, &mut storage_ctx)
+}
+
+/// Execute the query command using storage already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or if inputs are invalid.
+pub fn execute_with_storage_ctx(
+    command: &QueryCommands,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    storage_ctx: &mut config::OpenStorageResult,
+) -> Result<()> {
+    ensure_query_storage_available(storage_ctx)?;
 
     match command {
         QueryCommands::Save(args) => query_save(args, &mut storage_ctx.storage, ctx),
-        QueryCommands::Run(args) => query_run(args, &storage_ctx.storage, cli, ctx),
+        QueryCommands::Run(args) => query_run(args, storage_ctx, cli, ctx),
         QueryCommands::List => query_list(&storage_ctx.storage, ctx),
         QueryCommands::Delete(args) => query_delete(args, &mut storage_ctx.storage, ctx),
     }
@@ -292,7 +310,10 @@ fn query_save(
     if storage.get_config(&key)?.is_some() {
         return Err(BeadsError::validation(
             "name",
-            format!("Query '{name}' already exists. Delete it first to replace."),
+            format!(
+                "Query '{}' already exists. Delete it first to replace.",
+                query_display_text(name)
+            ),
         ));
     }
 
@@ -331,7 +352,7 @@ fn query_save(
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_save_rich(name, args.description.as_deref(), ctx);
     } else {
-        println!("Saved query '{name}'");
+        println!("{}", format_query_saved_line(name));
     }
 
     Ok(())
@@ -339,16 +360,17 @@ fn query_save(
 
 fn query_run(
     args: &QueryRunArgs,
-    storage: &crate::storage::SqliteStorage,
+    storage_ctx: &config::OpenStorageResult,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
     let name = args.name.trim();
     let key = format!("{QUERY_KEY_PREFIX}{name}");
 
-    let value = storage
+    let value = storage_ctx
+        .storage
         .get_config(&key)?
-        .ok_or_else(|| BeadsError::validation("query", format!("Query '{name}' not found")))?;
+        .ok_or_else(|| BeadsError::validation("query", format_query_not_found_message(name)))?;
 
     let saved_query: SavedQuery = serde_json::from_str(&value).map_err(|e| {
         BeadsError::validation("saved_query", format!("Invalid saved query format: {e}"))
@@ -362,8 +384,7 @@ fn query_run(
     debug!(?merged_args, "Merged filters");
 
     // Execute list command with merged args
-    // We call the list execute function directly
-    super::list::execute(&merged_args, ctx.is_json(), cli, ctx)
+    super::list::execute_with_storage(&merged_args, cli, ctx, storage_ctx)
 }
 
 fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> Result<()> {
@@ -397,11 +418,7 @@ fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> R
     }
 
     if ctx.is_json() {
-        let output = QueryListOutput {
-            count: queries.len(),
-            queries,
-        };
-        ctx.json_pretty(&output);
+        ctx.json_array_count("queries", queries.iter(), "count", queries.len());
     } else if ctx.is_toon() {
         let output = QueryListOutput {
             count: queries.len(),
@@ -415,12 +432,7 @@ fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> R
     } else {
         println!("Saved queries:");
         for q in &queries {
-            let desc = q.description.as_deref().unwrap_or("");
-            if desc.is_empty() {
-                println!("  {}", q.name);
-            } else {
-                println!("  {} - {}", q.name, desc);
-            }
+            println!("  {}", format_query_list_plain_entry(q));
         }
         println!("\n{} query(ies) total", queries.len());
     }
@@ -441,7 +453,7 @@ fn query_delete(
     if !deleted {
         return Err(BeadsError::validation(
             "query",
-            format!("Query '{name}' not found"),
+            format_query_not_found_message(name),
         ));
     }
 
@@ -468,7 +480,7 @@ fn query_delete(
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_delete_rich(name, ctx);
     } else {
-        println!("Deleted query '{name}'");
+        println!("{}", format_query_deleted_line(name));
     }
 
     Ok(())
@@ -477,6 +489,30 @@ fn query_delete(
 // ─────────────────────────────────────────────────────────────
 // Rich Output Rendering
 // ─────────────────────────────────────────────────────────────
+
+fn query_display_text(value: &str) -> String {
+    sanitize_terminal_inline(value).into_owned()
+}
+
+fn format_query_saved_line(name: &str) -> String {
+    format!("Saved query '{}'", query_display_text(name))
+}
+
+fn format_query_deleted_line(name: &str) -> String {
+    format!("Deleted query '{}'", query_display_text(name))
+}
+
+fn format_query_not_found_message(name: &str) -> String {
+    format!("Query '{}' not found", query_display_text(name))
+}
+
+fn format_query_list_plain_entry(query: &QueryListItem) -> String {
+    let name = query_display_text(&query.name);
+    match query.description.as_deref() {
+        Some(desc) if !desc.is_empty() => format!("{} - {}", name, query_display_text(desc)),
+        _ => name,
+    }
+}
 
 /// Render query save result with rich formatting.
 fn render_query_save_rich(name: &str, description: Option<&str>, ctx: &OutputContext) {
@@ -487,11 +523,11 @@ fn render_query_save_rich(name: &str, description: Option<&str>, ctx: &OutputCon
     let mut content = Text::new("");
     content.append_styled("\u{2713} ", theme.success.clone());
     content.append_styled("Saved query ", theme.success.clone());
-    content.append_styled(name, theme.emphasis.clone());
+    content.append_styled(&query_display_text(name), theme.emphasis.clone());
     content.append("\n");
     if let Some(desc) = description {
         content.append_styled("  ", theme.dimmed.clone());
-        content.append_styled(desc, theme.dimmed.clone());
+        content.append_styled(&query_display_text(desc), theme.dimmed.clone());
         content.append("\n");
     }
 
@@ -514,13 +550,30 @@ fn render_query_list_rich(queries: &[QueryListItem], ctx: &OutputContext) {
         content.append_styled("No saved queries\n", theme.dimmed.clone());
     } else {
         // Find longest name for alignment
-        let max_name_len = queries.iter().map(|q| q.name.len()).max().unwrap_or(0);
+        let rendered_queries: Vec<(String, Option<String>)> = queries
+            .iter()
+            .map(|query| {
+                (
+                    query_display_text(&query.name),
+                    query.description.as_deref().map(query_display_text),
+                )
+            })
+            .collect();
+        let max_name_len = rendered_queries
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap_or(0);
 
-        for q in queries {
-            let padded_name = format!("{:<width$}", q.name, width = max_name_len);
-            content.append_styled(&padded_name, theme.emphasis.clone());
+        for (mut name, description) in rendered_queries {
+            let padding = max_name_len.saturating_sub(name.len());
+            name.reserve(padding);
+            for _ in 0..padding {
+                name.push(' ');
+            }
+            content.append_styled(&name, theme.emphasis.clone());
             content.append("  ");
-            if let Some(ref desc) = q.description {
+            if let Some(ref desc) = description {
                 content.append_styled(desc, theme.dimmed.clone());
             } else {
                 content.append_styled("(no description)", theme.dimmed.clone());
@@ -552,7 +605,7 @@ fn render_query_delete_rich(name: &str, ctx: &OutputContext) {
     let mut content = Text::new("");
     content.append_styled("\u{2713} ", theme.success.clone());
     content.append_styled("Deleted query ", theme.success.clone());
-    content.append_styled(name, theme.emphasis.clone());
+    content.append_styled(&query_display_text(name), theme.emphasis.clone());
     content.append("\n");
 
     let panel = Panel::from_rich_text(&content, width)
@@ -565,7 +618,7 @@ fn render_query_delete_rich(name: &str, ctx: &OutputContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::OutputFormat;
+    use crate::cli::{DEFAULT_LIST_LIMIT, OutputFormat};
     use crate::storage::SqliteStorage;
 
     #[test]
@@ -575,6 +628,7 @@ mod tests {
             type_: vec!["bug".to_string()],
             assignee: Some("alice".to_string()),
             priority: vec!["1".to_string(), "2".to_string()],
+            offset: Some(3),
             ..Default::default()
         };
 
@@ -583,6 +637,7 @@ mod tests {
         assert_eq!(filters.type_, vec!["bug"]);
         assert_eq!(filters.assignee, Some("alice".to_string()));
         assert_eq!(filters.priority, vec!["1", "2"]);
+        assert_eq!(filters.offset, Some(3));
     }
 
     #[test]
@@ -591,6 +646,7 @@ mod tests {
             status: vec!["open".to_string()],
             assignee: Some("bob".to_string()),
             all: true,
+            offset: Some(3),
             ..Default::default()
         };
 
@@ -598,6 +654,7 @@ mod tests {
         assert_eq!(args.status, vec!["open"]);
         assert_eq!(args.assignee, Some("bob".to_string()));
         assert!(args.all);
+        assert_eq!(args.offset, Some(3));
     }
 
     #[test]
@@ -620,6 +677,56 @@ mod tests {
         assert_eq!(merged.status, vec!["closed"]); // CLI wins
         assert_eq!(merged.assignee, Some("alice".to_string())); // Saved retained
         assert_eq!(merged.limit, Some(20)); // CLI wins
+    }
+
+    #[test]
+    fn test_merge_preserves_saved_limit_when_cli_limit_absent() {
+        let saved = SavedFilters {
+            limit: Some(10),
+            ..Default::default()
+        };
+
+        let cli = ListArgs::default();
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, Some(10));
+    }
+
+    #[test]
+    fn test_merge_preserves_saved_unlimited_limit_when_cli_limit_absent() {
+        let saved = SavedFilters {
+            limit: Some(0),
+            ..Default::default()
+        };
+
+        let cli = ListArgs::default();
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, Some(0));
+    }
+
+    #[test]
+    fn test_merge_keeps_limit_absent_when_saved_and_cli_omit_limit() {
+        let saved = SavedFilters::default();
+        let cli = ListArgs::default();
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, None);
+    }
+
+    #[test]
+    fn test_merge_cli_limit_can_override_saved_with_default_limit_value() {
+        let saved = SavedFilters {
+            limit: Some(10),
+            ..Default::default()
+        };
+        let cli = ListArgs {
+            limit: Some(DEFAULT_LIST_LIMIT),
+            ..Default::default()
+        };
+
+        let merged = saved.merge_with_cli(&cli);
+        assert_eq!(merged.limit, Some(DEFAULT_LIST_LIMIT));
     }
 
     #[test]
@@ -661,6 +768,33 @@ mod tests {
         assert_eq!(parsed.filters.type_, vec!["bug"]);
     }
 
+    #[test]
+    fn query_human_output_helpers_escape_terminal_controls() {
+        let item = QueryListItem {
+            name: "triage\x1b[2J".to_string(),
+            description: Some("desc\x07\rnext".to_string()),
+            created_at: Utc::now().to_rfc3339(),
+            filters: SavedFilters::default(),
+        };
+
+        let rendered_saved = format_query_saved_line(&item.name);
+        let rendered_deleted = format_query_deleted_line(&item.name);
+        let rendered_not_found = format_query_not_found_message(&item.name);
+        let rendered_entry = format_query_list_plain_entry(&item);
+        assert!(rendered_entry.contains("\\u{7}"));
+        assert!(rendered_entry.contains("\\rnext"));
+
+        for line in [
+            &rendered_saved,
+            &rendered_deleted,
+            &rendered_not_found,
+            &rendered_entry,
+        ] {
+            assert!(!line.chars().any(char::is_control));
+            assert!(line.contains("\\u{1b}[2J"));
+        }
+    }
+
     // ============================================================
     // Additional tests for comprehensive query module coverage
     // ============================================================
@@ -683,6 +817,7 @@ mod tests {
         assert!(filters.notes_contains.is_none());
         assert!(!filters.all);
         assert!(filters.limit.is_none());
+        assert!(filters.offset.is_none());
         assert!(filters.sort.is_none());
         assert!(!filters.reverse);
         assert!(!filters.deferred);
@@ -837,6 +972,7 @@ mod tests {
             desc_contains: Some("error".to_string()),
             notes_contains: Some("important".to_string()),
             limit: Some(100),
+            offset: Some(5),
             sort: Some("priority".to_string()),
             ..Default::default()
         };
@@ -851,6 +987,7 @@ mod tests {
         assert_eq!(merged.desc_contains, Some("error".to_string()));
         assert_eq!(merged.notes_contains, Some("important".to_string()));
         assert_eq!(merged.limit, Some(100));
+        assert_eq!(merged.offset, Some(5));
         assert_eq!(merged.sort, Some("priority".to_string()));
 
         // CLI with Some values - cli wins
@@ -862,6 +999,7 @@ mod tests {
             desc_contains: Some("new".to_string()),
             notes_contains: Some("todo".to_string()),
             limit: Some(50),
+            offset: Some(2),
             sort: Some("updated".to_string()),
             ..Default::default()
         };
@@ -873,6 +1011,7 @@ mod tests {
         assert_eq!(merged2.desc_contains, Some("new".to_string()));
         assert_eq!(merged2.notes_contains, Some("todo".to_string()));
         assert_eq!(merged2.limit, Some(50));
+        assert_eq!(merged2.offset, Some(2));
         assert_eq!(merged2.sort, Some("updated".to_string()));
     }
 
@@ -929,6 +1068,7 @@ mod tests {
             notes_contains: Some("notes search".to_string()),
             all: true,
             limit: Some(25),
+            offset: Some(5),
             sort: Some("created".to_string()),
             reverse: true,
             deferred: true,
@@ -953,6 +1093,7 @@ mod tests {
         assert_eq!(parsed.notes_contains, filters.notes_contains);
         assert_eq!(parsed.all, filters.all);
         assert_eq!(parsed.limit, filters.limit);
+        assert_eq!(parsed.offset, filters.offset);
         assert_eq!(parsed.sort, filters.sort);
         assert_eq!(parsed.reverse, filters.reverse);
         assert_eq!(parsed.deferred, filters.deferred);

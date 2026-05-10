@@ -145,13 +145,25 @@
           # OpenSSL configuration
           OPENSSL_NO_VENDOR = "1";
           OPENSSL_STATIC = if isLinux then "1" else "";
-        } // pkgs.lib.optionalAttrs isLinux {
-          # Static musl build on Linux
-          CARGO_BUILD_TARGET = muslTarget;
-          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static -C linker=${muslPkgs.stdenv.cc}/bin/${muslPkgs.stdenv.cc.targetPrefix}cc";
-          # Point pkg-config at musl OpenSSL
-          PKG_CONFIG_PATH = "${muslPkgs.openssl.dev}/lib/pkgconfig";
-        };
+        } // pkgs.lib.optionalAttrs isLinux (
+          let
+            muslCC = "${muslPkgs.stdenv.cc}/bin/${muslPkgs.stdenv.cc.targetPrefix}cc";
+            muslCXX = "${muslPkgs.stdenv.cc}/bin/${muslPkgs.stdenv.cc.targetPrefix}c++";
+          in {
+            # Static musl build on Linux
+            CARGO_BUILD_TARGET = muslTarget;
+            CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static -C linker=${muslCC}";
+            # cc-rs (mimalloc, aws-lc-sys, ring, …) defaults to the host gcc, which
+            # pulls in glibc 2.38+ ISO C wrappers (__isoc23_strtol) and _FORTIFY_SOURCE
+            # symbols (__memset_chk, __fprintf_chk) that musl doesn't export — link
+            # then fails. Force per-target C/C++ to the musl cross-compiler so its
+            # headers and stubs are used instead.
+            "CC_${muslTarget}" = muslCC;
+            "CXX_${muslTarget}" = muslCXX;
+            # Point pkg-config at musl OpenSSL
+            PKG_CONFIG_PATH = "${muslPkgs.openssl.dev}/lib/pkgconfig";
+          }
+        );
 
         # Build only dependencies (cached between builds)
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
